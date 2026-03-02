@@ -1,3 +1,5 @@
+#ingest_simple_wiki.py
+
 import json
 from datasets import load_dataset
 

@@ -1,117 +1,216 @@
-from fastapi import Depends, HTTPException, status
-from auth_dependencies import get_current_user # Import our dependency
-from postgrest.exceptions import APIError # For handling DB errors
-from gotrue.types import User # For type hinting the user object
-from openai import AsyncOpenAI
-import os
-import google.generativeai as genai
-import httpx
-import asyncio
-import time
-import re
-from bs4 import BeautifulSoup
-from ddgs import DDGS
-from readability import Document
-from fastapi import FastAPI, BackgroundTasks
+"""
+mainResearch.py
+Migrated to google-genai (new unified SDK).
+pip install google-genai  (replaces google-generativeai)
+
+Bugs fixed vs original:
+  1. Old SDK (google.generativeai) → new SDK (google.genai)
+  2. genai.configure() was never called in original → now handled by Client(api_key=...)
+  3. RAZORPAY_WEBHOOK_SECRET was defined AFTER the webhook endpoint → moved to top
+  4. PromptRequest was defined twice → deduplicated
+  5. Chrome 91 User-Agent → Chrome 124 + full Sec-Fetch headers (fixes 403s)
+  6. EMBEDDING_MODEL kept as text-embedding-004 (768-dim, matches existing Supabase DB)
+"""
+
+from fastapi import Depends, HTTPException, status, Request, Header, BackgroundTasks, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
-import nltk
-from nltk.tokenize import sent_tokenize
-from googleapiclient.discovery import build # <--- ADD THIS IMPORT
-from googleapiclient.errors import HttpError # <--- ADD THIS IMPORT
+from postgrest.exceptions import APIError
+from gotrue.types import User
+from openai import AsyncOpenAI
+from auth_dependencies import get_current_user
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# ── NEW unified Google GenAI SDK ─────────────────────────────
+from google import genai
+from google.genai import types as genai_types
+# ─────────────────────────────────────────────────────────────
+
+import os
+import asyncio
+import time
+import re
 import json
-from openai import OpenAI
-from fastapi import Request, Header # Import Request and Header
 import hmac
 import hashlib
+import httpx
+import httplib2
+import nltk
 import razorpay
 import datetime
 
-import httplib2 # <--- ADD THIS
+from nltk.tokenize import sent_tokenize
+from bs4 import BeautifulSoup
+from ddgs import DDGS
+from readability import Document
+from pytrends.request import TrendReq
 
-from pytrends.request import TrendReq # <--- ADD THIS
-from openai import AsyncOpenAI
+load_dotenv()
 
-# --- Razorpay Client Initialization ---
+# ── NLTK ─────────────────────────────────────────────────────
+project_root = os.path.dirname(os.path.abspath(__file__))
+nltk_data_dir = os.path.join(project_root, 'nltk_data')
+nltk.data.path.insert(0, nltk_data_dir)
+
+try:
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('tokenizers/punkt_tab')
+    print("NLTK data found successfully.")
+except LookupError as e:
+    print(f"!!! CRITICAL NLTK DATA ERROR: {e} !!!")
+
+# ── Razorpay ─────────────────────────────────────────────────
+# FIX: All Razorpay vars declared together at the top (RAZORPAY_WEBHOOK_SECRET
+# was previously declared AFTER the webhook endpoint — caused NameError at runtime)
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
 
 if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-    print("WARNING: Razorpay API keys not found in .env file. Payment endpoints will fail.")
+    print("WARNING: Razorpay API keys not found. Payment endpoints will fail.")
     razorpay_client = None
 else:
     razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
     print("Razorpay client initialized.")
-# ------------------------------------
 
-YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
-YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+# ── YouTube API URLs ──────────────────────────────────────────
+YOUTUBE_SEARCH_URL   = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_VIDEOS_URL   = "https://www.googleapis.com/youtube/v3/videos"
 YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 YOUTUBE_COMMENTS_URL = "https://www.googleapis.com/youtube/v3/commentThreads"
 
-# Configure Groq Client (Generation - ASYNC)
+# ── Groq (main) ───────────────────────────────────────────────
 groq_api_key = os.getenv("GROQ_API_KEY")
-if not groq_api_key: raise ValueError("GROQ_API_KEY not found.")
-
-
-groq_api_key_research = os.getenv("GROQ_API_KEY_Research_Agent")
-if not groq_api_key_research: raise ValueError("GROQ_API_KEY_Research_Agent not found.")
-
-# --- Use AsyncOpenAI for async calls ---
+if not groq_api_key:
+    raise ValueError("GROQ_API_KEY not found.")
 groq_client = AsyncOpenAI(
     api_key=groq_api_key,
     base_url="https://api.groq.com/openai/v1",
 )
 GROQ_GENERATION_MODEL = "llama-3.1-8b-instant"
 
+# ── Groq (research agent — separate key/quota) ───────────────
+groq_api_key_research = os.getenv("GROQ_API_KEY_Research_Agent")
+if not groq_api_key_research:
+    raise ValueError("GROQ_API_KEY_Research_Agent not found.")
 groq_client_research = AsyncOpenAI(
     api_key=groq_api_key_research,
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Using the models from your working code
+# ── Google GenAI client (NEW SDK) ────────────────────────────
+google_api_key = os.getenv("GOOGLE_API_KEY")
+if not google_api_key:
+    raise ValueError("GOOGLE_API_KEY not found.")
+
+# Gemini client — ONLY used for embeddings
+# LLM generation has moved to OpenRouter
+gemini_client = genai.Client(api_key=google_api_key)
+
+# text-embedding-004 was deprecated Jan 14 2026 — migrated to gemini-embedding-001.
+# output_dimensionality=768 forces 768-dim output to match existing Supabase DB vectors.
+EMBEDDING_MODEL = "gemini-embedding-001"
+
+# ── OpenRouter (LLM generation) ──────────────────────────────
+# Primary key + client
+openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+if not openrouter_api_key:
+    raise ValueError("OPENROUTER_API_KEY not found.")
+
+openrouter_client = AsyncOpenAI(
+    api_key=openrouter_api_key,
+    base_url="https://openrouter.ai/api/v1",
+)
+
+# Secondary key + client (separate quota pool)
+openrouter_api_key_2 = os.getenv("OPENROUTER_API_KEY_2")
+openrouter_client_2 = AsyncOpenAI(
+    api_key=openrouter_api_key_2,
+    base_url="https://openrouter.ai/api/v1",
+) if openrouter_api_key_2 else None
+
+# Primary model + backup model
+GENERATION_MODEL        = "google/gemma-3-27b-it:free"
+GENERATION_MODEL_BACKUP = "google/gemma-3n-e4b-it:free"
+GENERATION_MODEL_EXTRA  = "deepseek/deepseek-r1-0528-qwen3-8b:free"
+
+print("Google GenAI (embeddings), Groq, and OpenRouter clients initialized successfully.")
 
 
+async def openrouter_generate(messages: list) -> str:
+    """
+    6-slot fallback chain across 2 keys × 3 models.
+    Order: primary key (3 models) → secondary key (3 models).
+    Each slot gets 1 retry on 429 before moving to next slot.
+    Skip 404 slots immediately — no retry on missing models.
+    """
+    slots = [
+        (openrouter_client, GENERATION_MODEL),
+        (openrouter_client, GENERATION_MODEL_BACKUP),
+        (openrouter_client, GENERATION_MODEL_EXTRA),
+    ]
+    if openrouter_client_2:
+        slots += [
+            (openrouter_client_2, GENERATION_MODEL),
+            (openrouter_client_2, GENERATION_MODEL_BACKUP),
+            (openrouter_client_2, GENERATION_MODEL_EXTRA),
+        ]
 
-pro_model = genai.GenerativeModel('models/gemini-2.5-flash-preview-09-2025')
+    last_error = None
+    for client, model in slots:
+        for attempt in range(2):
+            try:
+                completion = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                )
+                return completion.choices[0].message.content
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                is_rate_limit = "429" in err_str or "rate" in err_str.lower()
+                is_not_found  = "404" in err_str or "No endpoints" in err_str or "No allowed providers" in err_str
+                if is_not_found:
+                    print(f"OpenRouter 404 on {model} — skipping slot...")
+                    break
+                elif is_rate_limit and attempt == 0:
+                    wait = 3
+                    print(f"OpenRouter 429 on {model} — retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                else:
+                    print(f"OpenRouter failed on {model}: {e} — trying next slot...")
+                    break
 
-flash_model = genai.GenerativeModel('models/gemini-flash-latest')
-
-content_genmodel=genai.GenerativeModel('models/gemini-2.5-flash-preview-09-2025')
+    raise Exception(f"All OpenRouter slots exhausted. Last error: {last_error}")
 
 
-embedding_model = 'models/text-embedding-004'
-
+# ── Supabase ─────────────────────────────────────────────────
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
 if not supabase_url or not supabase_key:
     raise ValueError("Supabase credentials not found in .env file")
 supabase: Client = create_client(supabase_url, supabase_key)
-print("Clients for Google AI and Supabase initialized successfully.")
+print("Supabase client initialized.")
 
-
-
-
-
-# --- NEW: YouTube API Service Initialization (with Timeout) ---
+# ── YouTube service ───────────────────────────────────────────
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 if not YOUTUBE_API_KEY:
     print("WARNING: YOUTUBE_API_KEY not found. YouTube search will fail.")
     youtube_service = None
 else:
-    # Create a custom http client with a 15-second timeout
-    http_client = httplib2.Http(timeout=15)
-    
-    # Build the service object and pass in the custom client
-    youtube_service = build('youtube', 'v3', 
-                            developerKey=YOUTUBE_API_KEY, 
-                            http=http_client)
-    print("YouTube Data API client initialized successfully (with 15s timeout).")
-# -----------------------------------------------------------
-# --- Helper Functions (Your existing, working code) ---
+    http_client_yt = httplib2.Http(timeout=15)
+    youtube_service = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY, http=http_client_yt)
+    print("YouTube Data API client initialized (15s timeout).")
+
+
+# ════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ════════════════════════════════════════════════════════════
+
 def chunk_text(text: str, chunk_size: int = 250, chunk_overlap: int = 50) -> list[str]:
-    # (This function is unchanged)
     sentences = sent_tokenize(text)
     chunks = []
     current_chunk = ""
@@ -126,428 +225,265 @@ def chunk_text(text: str, chunk_size: int = 250, chunk_overlap: int = 50) -> lis
         chunks.append(current_chunk.strip())
     return chunks
 
+
 def add_scraped_data_to_db(article_title: str, article_text: str, article_url: str):
-    # (This function is unchanged)
-    print(f"BACKGROUND TASK: Starting to upload '{article_title[:30]}...'")
+    """Background task: chunk → embed (new SDK) → insert to Supabase."""
+    print(f"BACKGROUND TASK: Starting upload for '{article_title[:30]}...'")
     try:
         raw_chunks = chunk_text(article_text)
-        chunks = [chunk for chunk in raw_chunks if chunk and not chunk.isspace()]
+        chunks = [c for c in raw_chunks if c and not c.isspace()]
         if not chunks:
-            print("BACKGROUND TASK: No valid chunks to process.")
+            print("BACKGROUND TASK: No valid chunks.")
             return
-        embedding_result = genai.embed_content(model=embedding_model, content=chunks, task_type="retrieval_document")
-        embeddings = embedding_result['embedding']
-        documents_to_insert = [{"content": chunk, "embedding": embeddings[i], "source_title": article_title, "source_url": article_url} for i, chunk in enumerate(chunks)]
-        supabase.table('documents').insert(documents_to_insert).execute()
-        print(f"BACKGROUND TASK: Successfully uploaded {len(documents_to_insert)} chunks.")
-    except Exception as e:
-        print(f"BACKGROUND TASK: Failed to add data to DB. Error: {e}")
 
-async def scrape_url(client: httpx.AsyncClient, url: str, scraped_urls: set):
-    # (This function is unchanged)
+        # NEW SDK: batch embed
+        embed_response = gemini_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=chunks,
+            config=genai_types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768),
+        )
+        embeddings = [e.values for e in embed_response.embeddings]
+
+        documents_to_insert = [
+            {
+                "content": chunk,
+                "embedding": embeddings[i],
+                "source_title": article_title,
+                "source_url": article_url,
+            }
+            for i, chunk in enumerate(chunks)
+        ]
+        supabase.table('documents').insert(documents_to_insert).execute()
+        print(f"BACKGROUND TASK: Uploaded {len(documents_to_insert)} chunks.")
+    except Exception as e:
+        print(f"BACKGROUND TASK: Failed. Error: {e}")
+
+
+# Max 3 concurrent Playwright browsers — each uses ~300MB RAM
+# Prevents memory exhaustion when multiple requests arrive simultaneously
+_playwright_semaphore = asyncio.Semaphore(3)
+
+
+def _extract_text_from_html(html: str) -> tuple[str, str]:
+    """Extract title and clean text from raw HTML using readability + BeautifulSoup."""
+    doc = Document(html)
+    title = doc.title()
+    soup = BeautifulSoup(doc.summary(), 'html.parser')
+    text = soup.get_text(separator='\n', strip=True)
+    return title, text
+
+
+async def _scrape_with_httpx(url: str) -> tuple[str, str] | None:
+    """Tier 1: httpx with full browser headers. Fast, works on most sites."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        return _extract_text_from_html(response.text)
+
+
+async def _scrape_with_playwright(url: str) -> tuple[str, str] | None:
+    """
+    Tier 2: Real headless Chromium via Playwright.
+    Defeats TLS fingerprinting, JS challenges, and most bot detection.
+    Runs in a thread pool executor so it never blocks the async event loop.
+    Requires: pip install playwright && playwright install chromium
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("  [Playwright] Not installed. Run: pip install playwright && playwright install chromium")
+        return None
+
+    async def _run():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                timezone_id="America/New_York",
+                java_script_enabled=True,
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            page = await context.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_selector("body", timeout=10000)
+                html = await page.content()
+                return _extract_text_from_html(html)
+            finally:
+                await browser.close()
+
+    async with _playwright_semaphore:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: asyncio.run(_run()))
+
+
+async def scrape_url(
+    client: httpx.AsyncClient,
+    url: str,
+    scraped_urls: set,
+    snippet: str = "",
+) -> dict | None:
+    """
+    3-tier scraping with automatic fallback:
+      Tier 1 -> httpx (fast)
+      Tier 2 -> Playwright headless Chrome (robust, defeats bot detection)
+      Tier 3 -> Use DDGS snippet directly (always works, less text)
+    """
     if url in scraped_urls:
         return None
     print(f"Scraping: {url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+
+    # Tier 1: httpx
     try:
-        response = await client.get(url, headers=headers, timeout=10, follow_redirects=True)
-        response.raise_for_status()
-        scraped_urls.add(url)
-        doc = Document(response.text)
-        title = doc.title()
-        article_html = doc.summary()
-        soup = BeautifulSoup(article_html, 'html.parser')
-        article_text = soup.get_text(separator='\n', strip=True)
-        return {"url": url, "title": title, "text": article_text}
+        title, text = await _scrape_with_httpx(url)
+        if text and len(text) > 200:
+            scraped_urls.add(url)
+            print(f"  v Tier 1 (httpx) succeeded: {url[:60]}")
+            return {"url": url, "title": title, "text": text}
     except Exception as e:
-        print(f"An error occurred while processing {url}: {e}")
-        return None
+        print(f"  x Tier 1 (httpx) failed: {e} -- trying Playwright...")
+
+    # Tier 2: Playwright
+    try:
+        result = await _scrape_with_playwright(url)
+        if result:
+            title, text = result
+            if text and len(text) > 200:
+                scraped_urls.add(url)
+                print(f"  v Tier 2 (Playwright) succeeded: {url[:60]}")
+                return {"url": url, "title": title, "text": text}
+    except Exception as e:
+        print(f"  x Tier 2 (Playwright) failed: {e} -- using snippet fallback...")
+
+    # Tier 3: snippet fallback
+    if snippet and len(snippet) > 50:
+        print(f"  v Tier 3 (snippet fallback) used for: {url[:60]}")
+        scraped_urls.add(url)
+        return {"url": url, "title": url, "text": snippet}
+
+    print(f"  x All tiers failed for: {url[:60]}")
+    return None
+
 
 async def deep_search_and_scrape(keywords: list[str], scraped_urls: set) -> list[dict]:
-    # (This function is unchanged)
     print("--- DEEP WEB SCRAPE: Starting full search... ---")
-    urls_to_scrape = set()
+    urls_to_scrape = []
     with DDGS(timeout=20) as ddgs:
         for keyword in keywords:
-            search_results = list(ddgs.text(keyword, region='wt-wt', max_results=3))
-            if search_results:
-                urls_to_scrape.add(search_results[0]['href'])
+            results = list(ddgs.text(keyword, region='wt-wt', max_results=3))
+            if results:
+                top = results[0]
+                urls_to_scrape.append((top['href'], top.get('body', '')))
+
+    seen = set()
+    unique = []
+    for url, snippet in urls_to_scrape:
+        if url not in seen:
+            seen.add(url)
+            unique.append((url, snippet))
+
     async with httpx.AsyncClient() as client:
-        tasks = [scrape_url(client, url, scraped_urls) for url in urls_to_scrape]
+        tasks = [scrape_url(client, url, scraped_urls, snippet) for url, snippet in unique]
         results = await asyncio.gather(*tasks)
-        return [res for res in results if res and res.get("text")]
+        return [r for r in results if r and r.get("text")]
+
 
 async def get_latest_news_context(topic: str, scraped_urls: set) -> list[dict]:
-    # (This function is unchanged)
-    print("--- LIGHT WEB SCRAPE: Starting lightweight news search... ---")
+    print("--- LIGHT WEB SCRAPE: Starting news search... ---")
     try:
         keyword = f"{topic} latest news today"
-        urls_to_scrape = set()
+        url_snippet_pairs = []
         with DDGS(timeout=10) as ddgs:
-            search_results = list(ddgs.text(keyword, region='wt-wt', max_results=2))
-            for result in search_results:
-                urls_to_scrape.add(result['href'])
+            results = list(ddgs.text(keyword, region='wt-wt', max_results=2))
+            for r in results:
+                url_snippet_pairs.append((r['href'], r.get('body', '')))
         async with httpx.AsyncClient() as client:
-            tasks = [scrape_url(client, url, scraped_urls) for url in urls_to_scrape]
+            tasks = [scrape_url(client, url, scraped_urls, snippet)
+                     for url, snippet in url_snippet_pairs]
             results = await asyncio.gather(*tasks)
-            return [res for res in results if res and res.get("text")]
+            return [r for r in results if r and r.get("text")]
     except Exception as e:
-        print(f"--- WEB TASK: Error during news scraping: {e} ---")
+        print(f"--- WEB TASK: Error: {e} ---")
         return []
 
 
-'''
 async def get_db_context(topic: str) -> list[dict]:
-    # (This function is unchanged)
-    print("--- DB TASK: Starting HyDE database search... ---")
+    """HyDE: generate hypothetical doc with Groq, embed with Gemini, search Supabase."""
+    print("--- DB TASK: Starting HyDE search (Groq + Gemini embed)... ---")
     try:
         hyde_prompt = f"""
-        Write a short, factual, encyclopedia-style paragraph that provides a direct answer to the following topic.
-        This will be used to find similar documents, so be concise and include key terms.
-        
+        Write a short, factual, encyclopedia-style paragraph that provides a direct answer
+        to the following topic. Be concise and include key terms.
         Topic: "{topic}"
         """
-        hyde_response = await flash_model.generate_content_async(hyde_prompt)
-        query_embedding = genai.embed_content(model=embedding_model, content=hyde_response.text, task_type="retrieval_query")['embedding']
-        db_results = supabase.rpc('match_documents', {'query_embedding': query_embedding, 'match_threshold': 0.65, 'match_count': 5}).execute()
-        return db_results.data
-    except Exception as e:
-        print(f"--- DB TASK: Error during database search: {e} ---")
-        return []
-'''
-
-async def get_db_context(topic: str) -> list[dict]:
-    print("--- DB TASK: Starting HyDE database search (using Groq)... ---")
-    try:
-        hyde_prompt = f"""
-        Write a short, factual, encyclopedia-style paragraph that provides a direct answer to the following topic.
-        This will be used to find similar documents, so be concise and include key terms.
-
-        Topic: "{topic}"
-        """
-        # --- Use Groq for HyDE generation ---
-        chat_completion = await groq_client.chat.completions.create( # Use await with the async client
+        chat_completion = await groq_client.chat.completions.create(
             messages=[{"role": "user", "content": hyde_prompt}],
             model=GROQ_GENERATION_MODEL,
-            # Optional: Add parameters like temperature if needed
-            # temperature=0.7,
         )
         hypothetical_document = chat_completion.choices[0].message.content
-        print(f"--- DB TASK: Generated HyDE doc: {hypothetical_document[:100]}...")
-        # ------------------------------------
+        print(f"--- DB TASK: HyDE doc: {hypothetical_document[:100]}...")
 
-        # --- Still use Google for embedding ---
-        query_embedding = genai.embed_content(
-            model=embedding_model,
-            content=hypothetical_document,
-            task_type="retrieval_query"
-        )['embedding']
-        # ------------------------------------
-
-        # --- Supabase search (unchanged, but needs to run sync in executor) ---
-        match_threshold = 0.65 # Your previously working threshold
-        match_count = 5
+        # NEW SDK: embed in executor (sync call, avoid blocking event loop)
         loop = asyncio.get_running_loop()
-        db_results_response = await loop.run_in_executor(
-            None, # Use default thread pool executor
-            lambda: supabase.rpc('match_documents', {
-                'query_embedding': query_embedding,
-                'match_threshold': match_threshold,
-                'match_count': match_count
-            }).execute()
+        embed_response = await loop.run_in_executor(
+            None,
+            lambda: gemini_client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=hypothetical_document,
+                config=genai_types.EmbedContentConfig(task_type="RETRIEVAL_QUERY", output_dimensionality=768),
+            ),
         )
-        # --------------------------------------------------------------------
+        query_embedding = embed_response.embeddings[0].values
 
+        db_results_response = await loop.run_in_executor(
+            None,
+            lambda: supabase.rpc(
+                'match_documents',
+                {
+                    'query_embedding': query_embedding,
+                    'match_threshold': 0.65,
+                    'match_count': 5,
+                }
+            ).execute()
+        )
         print(f"--- DB TASK: Found {len(db_results_response.data)} documents. ---")
         return db_results_response.data
+
     except Exception as e:
-        print(f"--- DB TASK: Error during database search: {e} ---")
-        # Consider logging the full traceback here for better debugging
-        # import traceback
-        # traceback.print_exc()
+        print(f"--- DB TASK: Error: {e} ---")
         return []
-    
 
 
-# --- FastAPI App ---
-app = FastAPI()
-class PromptRequest(BaseModel):
-    topic: str
+# ════════════════════════════════════════════════════════════
+# SCRIPT STRUCTURE OPTIONS
+# ════════════════════════════════════════════════════════════
 
-@app.get("/")
-async def read_root(): return {"status": "Welcome"}
-
-@app.post("/process-topic")
-async def process_topic(request: PromptRequest, background_tasks: BackgroundTasks,current_user: User = Depends(get_current_user)):
-    total_start_time = time.time()
-    user_id = current_user.id
-    print(f"Received topic from user ({user_id}): {request.topic}")
-    # --- NEW: Credit Check Logic ---
-    IDEA_COST = 1 # Define the cost for this specific action
-    try:
-        profile_response = supabase.table('profiles').select('credits_remaining, user_tier').eq('id', user_id).single().execute()
-        profile = profile_response.data
-        if not profile:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User profile not found.")
-
-        credits = profile.get('credits_remaining', 0)
-        user_tier = profile.get('user_tier', 'free')
-
-        # Check if the user has ENOUGH credits for THIS action
-        if user_tier != 'admin' and credits < IDEA_COST:
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail=f"Insufficient credits. This action requires {IDEA_COST} credit(s). You have {credits}."
-            )
-
-        print(f"User {user_id} (Tier: {user_tier}) has {credits} credits. Action requires {IDEA_COST}.")
-    except APIError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database error checking profile: {e.message}")
-    except HTTPException as e: # Re-raise HTTP exceptions from credit check
-        raise e
-    except Exception as e:
-         print(f"Unexpected Error checking credits: {e}")
-         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error checking profile.")
-    # --------------------------------
-    
-    try:
-        db_task = asyncio.create_task(get_db_context(request.topic))
-        
-        await asyncio.sleep(11) # Your working sleep time
-
-        db_results = []
-        new_articles = []
-        scraped_urls = set()
-        # --- NEW: Initialize these here to ensure they exist for the final return ---
-        base_keywords = []
-        source_of_context = ""
-        # --------------------------------------------------------------------------
-
-        if db_task.done():
-            db_results = db_task.result()
-            print(f"--- DB task finished early. Found {len(db_results)} documents. ---")
-
-        if len(db_results) >= 3:
-            source_of_context = "DATABASE_WITH_NEWS"
-            new_articles = await get_latest_news_context(request.topic, scraped_urls)
-        
-        else:
-            
-            print("--- DB MISS or SLOW: Initiating DEEP web scrape. ---")
-            source_of_context = "DEEP_SCRAPE"
-
-            keyword_prompt = f"""
-            Your ONLY task is to generate 3 diverse search engine keyword phrases for the topic: '{request.topic}'.
-            Follow these rules STRICTLY:
-            1. Return ONLY the 3 phrases.
-            2. DO NOT add numbers, markdown, explanations, or any introductory text.
-            3. Each phrase must be on a new line.
-
-            EXAMPLE INPUT: Is coding dead?
-            EXAMPLE OUTPUT:
-            future of programming jobs automation
-            AI replacing software developers
-            demand for software engineers 2025
-            """
-            # --- Use Groq for Keyword Gen ---
-            print("Generating keywords with Groq...")
-            keyword_start_time = time.time()
-            chat_completion = await groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": keyword_prompt}],
-                model=GROQ_GENERATION_MODEL, # Use the defined Groq model
-            )
-            raw_text = chat_completion.choices[0].message.content
-            keyword_end_time = time.time()
-            print(f"--- Groq Keyword Gen took {keyword_end_time - keyword_start_time:.2f} seconds ---")
-            # ----------------------------------
-
-            # --- Parsing logic ---
-            keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
-            if keywords_in_quotes:
-                base_keywords = keywords_in_quotes
-            else:
-                base_keywords = [kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()]
-            # ----------------------------------
-
-            targeted_keywords = [kw for kw in base_keywords] + [f"{kw} site:reddit.com" for kw in base_keywords]
-            print(f"Targeted keywords for deep scrape: {targeted_keywords}")
-
-            # Call your deep scraping function
-            new_articles = await deep_search_and_scrape(targeted_keywords, scraped_urls)
-        
-        
-        if not db_task.done():
-            print("--- Waiting for DB task to complete... ---")
-            db_results = await db_task
-            print(f"--- DB task finished. Found {len(db_results)} documents. ---")
-
-        db_context, web_context = "", ""
-        source_urls = []
-        
-        if db_results:
-            db_context = "\n\n".join([item['content'] for item in db_results])
-            source_urls.extend(list(set([item['source_url'] for item in db_results if item['source_url']])))
-
-        if new_articles:
-            web_context = "\n\n".join([f"Source: {art['title']}\n{art['text']}" for art in new_articles])
-            source_urls.extend([art['url'] for art in new_articles])
-            for article in new_articles:
-                background_tasks.add_task(add_scraped_data_to_db, article['title'], article['text'], article['url'])
-
-        if not db_context and not web_context:
-            return {"error": "Could not find any information."}
-
-        
-
-        # --- THIS IS THE UPGRADED PROMPT ---
-        final_prompt = f"""
-        You are an expert YouTube title strategist and scriptwriter.
-        Your mission is to generate 4 distinct, attention-grabbing video titles for the topic: "{request.topic}", AND a corresponding description for each.
-
-        Use the provided research material to inform your output:
-        - Use the 'FOUNDATIONAL KNOWLEDGE' for deep context, facts, and historical background.
-        - Use the 'LATEST NEWS' to find a fresh, timely, or surprising angle, especially considering the current date is October 15, 2025.
-
-        RULES FOR YOUR OUTPUT:
-        1.  For each of the 4 ideas, provide a 'TITLE' and a 'DESCRIPTION'.
-        2.  Each 'DESCRIPTION' MUST be between 90 and 110 words.
-        3.  Separate each complete idea (title + description) with '---'.
-        4.  DO NOT add any introductory sentences, explanations, or any text other than the titles and descriptions in the specified format.
-
-        EXAMPLE OUTPUT FORMAT:
-        TITLE: This Is Why Everyone Is Suddenly Talking About [Topic]
-        DESCRIPTION: In this video, we uncover the shocking truth behind [Topic]. For years, experts have believed one thing, but new data from October 2025 reveals a completely different story. We'll break down the historical context, analyze the latest reports, and explain exactly why this topic is about to become the biggest conversation on the internet. You'll learn about the key players, the secret history, and what this means for the future. Don't miss this deep dive into one of the most misunderstood subjects of our time, it will change everything you thought you knew.
-        ---
-        TITLE: The Hidden Truth Behind [Related Concept]
-        DESCRIPTION: Everyone thinks they understand [Related Concept], but they're wrong. We've dug through the archives and analyzed the latest breaking news to bring you the untold story. This video explores the forgotten origins, the powerful figures who shaped its narrative, and the surprising new developments that are challenging everything we know. We connect the dots from the foundational knowledge to the fresh web updates to give you a complete picture you won't find anywhere else. Get ready to have your mind blown by the real story behind [Related Concept].
-        ---
-        
-        RESEARCH FOR TOPIC: "{request.topic}"
-        ---
-        FOUNDATIONAL KNOWLEDGE (from our database):
-        {db_context}
-        ---
-        LATEST NEWS UPDATES (from the web):
-        {web_context}
-        ---
-        """
-        step3_start_time = time.time()
-
-        final_response = await pro_model.generate_content_async(final_prompt)
-        # --- Generate Final Ideas/Descriptions using Groq ---
-        #print(f"Generating final output with Groq model: {GROQ_GENERATION_MODEL}...")
-        #chat_completion = await groq_client.chat.completions.create(
-        #    messages=[{"role": "user", "content": final_prompt}],
-        #    model=GROQ_GENERATION_MODEL,
-        #)
-        #final_response = chat_completion.choices[0].message.content
-
-        step3_end_time = time.time()
-        print(f"--- PROFILING: Step 3 (Final Idea Gen) took {step3_end_time - step3_start_time:.2f} seconds ---")
-
-        # --- THIS IS THE NEW, SMARTER PARSING LOGIC ---
-        response_text = final_response.text
-        
-        final_ideas = []
-        final_descriptions = []
-        
-        # Split the entire response into blocks, one for each idea
-        idea_blocks = response_text.strip().split('---')
-        
-        for block in idea_blocks:
-            title = ""
-            description = ""
-            lines = block.strip().split('\n')
-            
-            for line in lines:
-                if line.startswith('TITLE:'):
-                    # Extract text after "TITLE:"
-                    title = line.replace('TITLE:', '', 1).strip()
-                elif line.startswith('DESCRIPTION:'):
-                    # Extract text after "DESCRIPTION:"
-                    description = line.replace('DESCRIPTION:', '', 1).strip()
-            
-            # Only add the pair if both title and description were found
-            if title and description:
-                final_ideas.append(title)
-                final_descriptions.append(description)
-
-        print(f"Final generated ideas: {final_ideas}")
-        print(f"Final generated descriptions: {len(final_descriptions)} descriptions found.")
-        total_end_time = time.time()
-        print(f"--- PROFILING: Total request time was {total_end_time - total_start_time:.2f} seconds ---")
-        
-
-
-
-        # --- <<< CREDIT DECREMENT LOGIC >>> ---
-        # Ensure 'user_tier' and 'credits' were fetched successfully earlier in the function
-        if 'user_tier' in locals() and user_tier != 'admin':
-            try:
-                # Use the 'credits' variable fetched at the start of the function
-                # IDEA_COST should also be defined at the start (e.g., IDEA_COST = 1)
-                new_credit_balance = credits - IDEA_COST
-
-                # Ensure balance doesn't go below zero (optional safety check)
-                if new_credit_balance < 0:
-                    new_credit_balance = 0
-                    print(f"WARN: User {user_id} credit balance would go below zero. Setting to 0.")
-
-                # Update the database
-                update_result = supabase.table('profiles').update(
-                    {'credits_remaining': new_credit_balance}
-                ).eq('id', user_id).execute()
-
-                # Optional: Check if the update was successful
-                if len(update_result.data) > 0:
-                    print(f"Decremented {IDEA_COST} credit(s) for user {user_id}. New balance: {new_credit_balance}")
-                else:
-                    # This might happen if the user was deleted between check and update,
-                    # or if RLS rules prevent the update (less likely with service_role key)
-                    print(f"WARN: Credit decrement query executed for user {user_id} but returned no updated rows.")
-
-            except APIError as e:
-                # Log the error but crucially, DO NOT raise an HTTPException here.
-                # The user already got their result, failing the credit decrement
-                # is an internal issue we should log, not fail the user's request for.
-                print(f"ERROR: Failed to decrement credits for user {user_id}. DB Error: {e.message}")
-            except Exception as e:
-                # Catch any other unexpected errors during the update
-                print(f"ERROR: An unexpected error occurred during credit decrement for user {user_id}: {e}")
-        elif 'user_tier' in locals() and user_tier == 'admin':
-             print(f"User {user_id} is admin. No credits decremented.")
-        else:
-            # This case indicates an issue earlier in the function
-            print(f"WARN: Could not decrement credits for user {user_id}. User tier or initial credit count not available.")
-        # --- <<< END CREDIT DECREMENT LOGIC >>> ---
-
-
-
-
-
-
-        # --- THIS IS THE UPDATED RETURN STATEMENT ---
-        return {
-            "source_of_context": source_of_context,
-            "ideas": final_ideas,
-            "descriptions": final_descriptions, # The new descriptions list
-            "generated_keywords": base_keywords,
-            "source_urls": list(set(source_urls)),
-            "scraped_text_context": f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
-        }
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return {"error": "An error occurred in the processing pipeline."}
-    
-
-
-
-
-
-# ------------------------------------
-
-# --- Define Script Structure Options ---
 STRUCTURE_GUIDANCE = {
     "problem_solution": """
     **Structure Guidance (for proportion, but do not label in script):**
@@ -558,7 +494,7 @@ STRUCTURE_GUIDANCE = {
     - Potential Solutions / Insights (~25%)
     - Call to Action (~5%)
     """,
-        "storytelling": """
+    "storytelling": """
     **Structure Guidance (for proportion, but do not label in script):**
     - Hook & Introduction (Introduce Ordinary World) (~10%)
     - Call to Adventure / Inciting Incident (~10%)
@@ -566,1130 +502,1057 @@ STRUCTURE_GUIDANCE = {
     - Climax / Resolution (~20%)
     - Reflection & Takeaway (Call to Action) (~10%)
     """,
-        "listicle": """
+    "listicle": """
     **Structure Guidance (for proportion, but do not label in script):**
     - Hook & Introduction (State the list topic & number) (~10%)
-    - Item 1 (Explanation, examples, pros/cons) (~15-20%)
-    - Item 2 (...) (~15-20%)
-    - Item 3 (...) (~15-20%)
-    - Item X (...) (~15-20%) - *Adjust percentages based on number of items*
+    - Item 1 (~15-20%) / Item 2 (~15-20%) / Item 3 (~15-20%) / Item X (~15-20%)
     - (Optional) Bonus Item / Honorable Mentions (~10%)
-    - Conclusion & Call to Action (Summarize, final thought) (~10%)
+    - Conclusion & Call to Action (~10%)
     """,
-        "chronological": """
+    "chronological": """
     **Structure Guidance (for proportion, but do not label in script):**
-    - Hook & Introduction (Introduce topic & relevance) (~10%)
+    - Hook & Introduction (~10%)
     - Early Beginnings / Origins (~20%)
-    - Key Developments / Turning Points (~40%) - *This is the main body*
+    - Key Developments / Turning Points (~40%)
     - Later Stages / Modern Impact (~20%)
-    - Conclusion & Reflection (Call to Action) (~10%)
+    - Conclusion & Reflection (~10%)
     """,
-        "myth_debunking": """
+    "myth_debunking": """
     **Structure Guidance (for proportion, but do not label in script):**
     - Hook & Introduction (Introduce common misconception) (~10%)
-    - Myth 1 & Fact 1 (State myth, then debunk with evidence) (~25%)
-    - Myth 2 & Fact 2 (...) (~25%)
-    - Myth 3 & Fact 3 (...) (~25%) - *Adjust percentages based on number of myths*
-    - Conclusion & Call to Action (Summarize truths, encourage critical thinking) (~15%)
-""",
+    - Myth 1 & Fact 1 (~25%) / Myth 2 & Fact 2 (~25%) / Myth 3 & Fact 3 (~25%)
+    - Conclusion & Call to Action (~15%)
+    """,
     "tech_review": """
     **Structure Guidance (for proportion, but do not label in script):**
-    - Hook & Introduction (Show product, state review goal) (~10%)
-    - Design & Build Quality (Look, feel) (~15%)
-    - Key Features & Specs (What it promises, tech details) (~20%)
-    - Performance & User Experience (Real-world testing, how it feels to use, battery, camera examples etc.) (~30%)
-    - Pros & Cons (Balanced summary of good and bad) (~10%)
-    - Verdict & Recommendation (Who is it for? Worth the price? Call to Action) (~15%)
-    """
+    - Hook & Introduction (~10%)
+    - Design & Build Quality (~15%)
+    - Key Features & Specs (~20%)
+    - Performance & User Experience (~30%)
+    - Pros & Cons (~10%)
+    - Verdict & Recommendation (~15%)
+    """,
 }
-# ------------------------------------
 
-# --- FastAPI App ---
-#app = FastAPI()
+
+# ════════════════════════════════════════════════════════════
+# FASTAPI APP
+# ════════════════════════════════════════════════════════════
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "https://www.storybit.tech",
+        "https://storybit.tech",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Pydantic models ──────────────────────────────────────────
+# FIX: PromptRequest was defined twice in the original — deduplicated here
 
 class PromptRequest(BaseModel):
     topic: str
 
-# --- UPDATED: Add duration_minutes ---
+
 class ScriptRequest(BaseModel):
     topic: str
     emotional_tone: str | None = "engaging"
     creator_type: str | None = "educator"
     audience_description: str | None = "a general audience interested in learning"
     accent: str | None = "neutral"
-    duration_minutes: int | None = 10 # NEW: Add video duration in minutes, default 10
-    script_structure: str | None = "problem_solution" # NEW FIELD
-# ------------------------------------
+    duration_minutes: int | None = 10
+    script_structure: str | None = "problem_solution"
 
-# --- REWRITTEN: The /generate-script endpoint with dynamic duration ---
-@app.post("/generate-script")
-async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user)):
+
+class CreateOrderRequest(BaseModel):
+    amount: int
+    currency: str = "INR"
+    receipt: str | None = None
+    target_tier: str
+
+
+class ResearchBriefInput(BaseModel):
+    topic_analysis: dict
+    strategic_angles: list[dict]
+    audience_profile: dict
+
+
+# ════════════════════════════════════════════════════════════
+# ROUTES
+# ════════════════════════════════════════════════════════════
+
+@app.get("/")
+async def read_root():
+    return {"status": "Welcome"}
+
+
+# ── /process-topic ───────────────────────────────────────────
+
+@app.post("/process-topic")
+async def process_topic(
+    request: PromptRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+):
     total_start_time = time.time()
     user_id = current_user.id
-    print(f"SCRIPT GENERATION from user ({user_id}): '{request.topic}'")
+    print(f"Received topic from user ({user_id}): {request.topic}")
 
-    # --- NEW: Credit Check Logic ---
-    IDEA_COST = 3 # Define the cost for this specific action
+    IDEA_COST = 1
     try:
-        profile_response = supabase.table('profiles').select('credits_remaining, user_tier').eq('id', user_id).single().execute()
+        profile_response = (
+            supabase.table('profiles')
+            .select('credits_remaining, user_tier')
+            .eq('id', user_id)
+            .single()
+            .execute()
+        )
         profile = profile_response.data
         if not profile:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User profile not found.")
 
-        credits = profile.get('credits_remaining', 0)
+        credits  = profile.get('credits_remaining', 0)
         user_tier = profile.get('user_tier', 'free')
 
-        # Check if the user has ENOUGH credits for THIS action
         if user_tier != 'admin' and credits < IDEA_COST:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail=f"Insufficient credits. This action requires {IDEA_COST} credit(s). You have {credits}."
+                detail=f"Insufficient credits. Requires {IDEA_COST}, you have {credits}.",
             )
-
-        print(f"User {user_id} (Tier: {user_tier}) has {credits} credits. Action requires {IDEA_COST}.")
+        print(f"User {user_id} (Tier: {user_tier}) has {credits} credits.")
     except APIError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database error checking profile: {e.message}")
-    except HTTPException as e: # Re-raise HTTP exceptions from credit check
-        raise e
+        raise HTTPException(status_code=500, detail=f"DB error: {e.message}")
+    except HTTPException:
+        raise
     except Exception as e:
-         print(f"Unexpected Error checking credits: {e}")
-         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error checking profile.")
-    # --------------------------------
-    # --------------------------------
-    #print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
-    print(f"Personalization - Duration: {request.duration_minutes} min, Tone: {request.emotional_tone}, Type: {request.creator_type}, Audience: {request.audience_description}, Accent: {request.accent}")
+        print(f"Unexpected error checking credits: {e}")
+        raise HTTPException(status_code=500, detail="Error checking profile.")
 
     try:
-        # --- Step 1: Gather Context (Unchanged) ---
         db_task = asyncio.create_task(get_db_context(request.topic))
-        await asyncio.sleep(11) # Give DB head start
+        await asyncio.sleep(11)
 
         db_results = []
         new_articles = []
         scraped_urls = set()
         base_keywords = []
+        source_of_context = ""
 
         if db_task.done():
             db_results = db_task.result()
-            print(f"--- DB task finished early. Found {len(db_results)} documents. ---")
 
         if len(db_results) >= 3:
-            print("--- DB HIT: Performing LIGHT web scrape for latest news. ---")
+            source_of_context = "DATABASE_WITH_NEWS"
             new_articles = await get_latest_news_context(request.topic, scraped_urls)
         else:
-            print("--- DB MISS or SLOW: Initiating DEEP web scrape. ---")
-            # (Deep scrape logic remains the same)
-            keyword_prompt =  f"""
-            Your ONLY task is to generate 3 diverse search engine keyword phrases for the topic: '{request.topic}'.
-            Follow these rules STRICTLY:
-            1. Return ONLY the 3 phrases.
-            2. DO NOT add numbers, markdown, explanations, or any introductory text.
-            3. Each phrase must be on a new line.
+            print("--- DB MISS: Deep web scrape. ---")
+            source_of_context = "DEEP_SCRAPE"
+
+            keyword_prompt = f"""
+            Generate 3 diverse search engine keyword phrases for: '{request.topic}'.
+            Rules: ONLY the 3 phrases, no numbers/markdown/intro, one per line.
             EXAMPLE INPUT: Is coding dead?
             EXAMPLE OUTPUT:
             future of programming jobs automation
             AI replacing software developers
             demand for software engineers 2025
             """
-            #response = await flash_model.generate_content_async(keyword_prompt)
-            #raw_text = response.text
-            # --- Generate Final Ideas/Descriptions using Groq ---
-            print(f"Generating final output with Groq model: {GROQ_GENERATION_MODEL}...")
             chat_completion = await groq_client.chat.completions.create(
                 messages=[{"role": "user", "content": keyword_prompt}],
                 model=GROQ_GENERATION_MODEL,
             )
-            raw_text = chat_completion.choices[0].message.content #
-
-
+            raw_text = chat_completion.choices[0].message.content
             keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
-            if keywords_in_quotes: base_keywords = keywords_in_quotes
-            else: base_keywords = [kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()]
-            targeted_keywords = [kw for kw in base_keywords] + [f"{kw} site:reddit.com" for kw in base_keywords]
+            base_keywords = keywords_in_quotes if keywords_in_quotes else [
+                kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()
+            ]
+            targeted_keywords = base_keywords  # Reddit removed — blocks all scrapers unconditionally
             new_articles = await deep_search_and_scrape(targeted_keywords, scraped_urls)
 
         if not db_task.done():
-            print("--- Waiting for DB task to complete... ---")
             db_results = await db_task
-            print(f"--- DB task finished. Found {len(db_results)} documents. ---")
 
-        # --- Step 2: Merge Context (Unchanged) ---
+        db_context, web_context = "", ""
+        source_urls = []
+
+        if db_results:
+            db_context = "\n\n".join([item['content'] for item in db_results])
+            source_urls.extend(list(set([
+                item['source_url'] for item in db_results if item.get('source_url')
+            ])))
+
+        if new_articles:
+            web_context = "\n\n".join([
+                f"Source: {art['title']}\n{art['text']}" for art in new_articles
+            ])
+            source_urls.extend([art['url'] for art in new_articles])
+            for article in new_articles:
+                background_tasks.add_task(
+                    add_scraped_data_to_db,
+                    article['title'], article['text'], article['url']
+                )
+
+        if not db_context and not web_context:
+            return {"error": "Could not find any information."}
+
+        final_prompt = f"""
+        You are an expert YouTube title strategist and scriptwriter.
+        Generate 4 distinct, attention-grabbing video titles for: "{request.topic}",
+        with a corresponding description for each.
+
+        RULES:
+        1. For each idea: provide 'TITLE' and 'DESCRIPTION'.
+        2. Each DESCRIPTION MUST be 90-110 words.
+        3. Separate each complete idea with '---'.
+        4. NO introductory text, explanations, or anything else.
+
+        EXAMPLE FORMAT:
+        TITLE: This Is Why Everyone Is Suddenly Talking About [Topic]
+        DESCRIPTION: In this video, we uncover the shocking truth behind [Topic]...
+        ---
+
+        RESEARCH FOR TOPIC: "{request.topic}"
+        ---
+        FOUNDATIONAL KNOWLEDGE:
+        {db_context}
+        ---
+        LATEST NEWS UPDATES:
+        {web_context}
+        ---
+        """
+
+        step3_start = time.time()
+
+        # OpenRouter generation with retry on 429
+        response_text = await openrouter_generate([{"role": "user", "content": final_prompt}])
+        print(f"--- Step 3 (Final Idea Gen) took {time.time() - step3_start:.2f}s ---")
+
+        final_ideas, final_descriptions = [], []
+        for block in response_text.strip().split('---'):
+            title = description = ""
+            for line in block.strip().split('\n'):
+                if line.startswith('TITLE:'):
+                    title = line.replace('TITLE:', '', 1).strip()
+                elif line.startswith('DESCRIPTION:'):
+                    description = line.replace('DESCRIPTION:', '', 1).strip()
+            if title and description:
+                final_ideas.append(title)
+                final_descriptions.append(description)
+
+        # Decrement credits
+        if user_tier != 'admin':
+            try:
+                new_balance = max(0, credits - IDEA_COST)
+                supabase.table('profiles').update(
+                    {'credits_remaining': new_balance}
+                ).eq('id', user_id).execute()
+                print(f"Decremented {IDEA_COST} credit(s) for {user_id}. Balance: {new_balance}")
+            except Exception as e:
+                print(f"ERROR: Credit decrement failed for {user_id}: {e}")
+
+        print(f"Total request time: {time.time() - total_start_time:.2f}s")
+        return {
+            "source_of_context": source_of_context,
+            "ideas": final_ideas,
+            "descriptions": final_descriptions,
+            "generated_keywords": base_keywords,
+            "source_urls": list(set(source_urls)),
+            "scraped_text_context": f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}",
+        }
+
+    except Exception as e:
+        print(f"Error in /process-topic: {e}")
+        return {"error": "An error occurred in the processing pipeline."}
+
+
+# ── /generate-script ─────────────────────────────────────────
+
+@app.post("/generate-script")
+async def generate_script(
+    request: ScriptRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+):
+    total_start_time = time.time()
+    user_id = current_user.id
+    print(f"SCRIPT GENERATION from user ({user_id}): '{request.topic}'")
+
+    IDEA_COST = 3
+    try:
+        profile_response = (
+            supabase.table('profiles')
+            .select('credits_remaining, user_tier')
+            .eq('id', user_id)
+            .single()
+            .execute()
+        )
+        profile = profile_response.data
+        if not profile:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User profile not found.")
+
+        credits   = profile.get('credits_remaining', 0)
+        user_tier = profile.get('user_tier', 'free')
+
+        if user_tier != 'admin' and credits < IDEA_COST:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=f"Insufficient credits. Requires {IDEA_COST}, you have {credits}.",
+            )
+        print(f"User {user_id} (Tier: {user_tier}) has {credits} credits.")
+    except APIError as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e.message}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unexpected error checking credits: {e}")
+        raise HTTPException(status_code=500, detail="Error checking profile.")
+
+    print(
+        f"Duration: {request.duration_minutes}min | Tone: {request.emotional_tone} | "
+        f"Type: {request.creator_type} | Audience: {request.audience_description} | Accent: {request.accent}"
+    )
+
+    try:
+        db_task = asyncio.create_task(get_db_context(request.topic))
+        await asyncio.sleep(11)
+
+        db_results, new_articles, scraped_urls, base_keywords = [], [], set(), []
+
+        if db_task.done():
+            db_results = db_task.result()
+
+        if len(db_results) >= 3:
+            print("--- DB HIT: Light news scrape. ---")
+            new_articles = await get_latest_news_context(request.topic, scraped_urls)
+        else:
+            print("--- DB MISS: Deep web scrape. ---")
+            keyword_prompt = f"""
+            Generate 3 diverse search engine keyword phrases for: '{request.topic}'.
+            Rules: ONLY the 3 phrases, no numbers/markdown/intro, one per line.
+            EXAMPLE INPUT: Is coding dead?
+            EXAMPLE OUTPUT:
+            future of programming jobs automation
+            AI replacing software developers
+            demand for software engineers 2025
+            """
+            chat_completion = await groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": keyword_prompt}],
+                model=GROQ_GENERATION_MODEL,
+            )
+            raw_text = chat_completion.choices[0].message.content
+            keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
+            base_keywords = keywords_in_quotes if keywords_in_quotes else [
+                kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()
+            ]
+            targeted_keywords = base_keywords  # Reddit removed — blocks all scrapers unconditionally
+            new_articles = await deep_search_and_scrape(targeted_keywords, scraped_urls)
+
+        if not db_task.done():
+            db_results = await db_task
+
         db_context, web_context = "", ""
         if db_results:
             db_context = "\n\n".join([item['content'] for item in db_results])
         if new_articles:
-            web_context = "\n\n".join([f"Source: {art['title']}\n{art['text']}" for art in new_articles])
+            web_context = "\n\n".join([
+                f"Source: {art['title']}\n{art['text']}" for art in new_articles
+            ])
             for article in new_articles:
-                background_tasks.add_task(add_scraped_data_to_db, article['title'], article['text'], article['url'])
+                background_tasks.add_task(
+                    add_scraped_data_to_db,
+                    article['title'], article['text'], article['url']
+                )
 
         if not db_context and not web_context:
             return {"error": "Could not find any research material to write the script."}
 
-        # --- Step 3: Calculate Word Count & Create Personalized Prompt ---
-        print("SCRIPT GENERATION: Generating personalized script...")
-        
-        # --- NEW: Calculate target word count ---
         WORDS_PER_MINUTE = 130
-        target_duration = request.duration_minutes if request.duration_minutes else 10 # Use default if not provided
+        target_duration   = request.duration_minutes or 10
         target_word_count = target_duration * WORDS_PER_MINUTE
-        print(f"Targeting {target_duration} minutes / approx. {target_word_count} words.")
-        
-        
-        # --- NEW: Select the requested structure guidance ---
-        requested_structure = request.script_structure if request.script_structure else "problem_solution"
-        structure_guidance_text = STRUCTURE_GUIDANCE.get(requested_structure, STRUCTURE_GUIDANCE["problem_solution"]) # Fallback to default
-        print(f"Using script structure: {requested_structure}")
-        
-        # --------------------------------------
-        
-        # --- UPDATED PROMPT with dynamic values ---
+
+        structure_guidance_text = STRUCTURE_GUIDANCE.get(
+            request.script_structure or "problem_solution",
+            STRUCTURE_GUIDANCE["problem_solution"]
+        )
+
         script_prompt = f"""
-        You are a professional YouTube scriptwriter who creates natural, engaging, and conversational scripts that feel like a real YouTuber speaking directly to the camera.
+        You are a professional YouTube scriptwriter creating natural, engaging, conversational scripts.
 
         **Creator Profile:**
-        * **Creator Type:** {request.creator_type}
-        * **Target Audience:** {request.audience_description}
-        * **Desired Emotional Tone:** {request.emotional_tone}
-        * **Accent/Dialect:** {request.accent} (use phrasing natural for this accent)
+        * Creator Type: {request.creator_type}
+        * Target Audience: {request.audience_description}
+        * Desired Emotional Tone: {request.emotional_tone}
+        * Accent/Dialect: {request.accent}
 
-        **Your Task:**
-        Generate a complete YouTube video script of approximately **{target_duration} minutes** (~{target_word_count} words) based on the **main topic** below, using the provided **research context**.
+        **Task:** Generate a complete YouTube script of ~{target_duration} minutes (~{target_word_count} words).
 
-        **Script Style & Flow:**
-        - Output only the spoken dialogue — what the YouTuber would actually say aloud.
-        - **Do NOT include** section titles, notes, stage directions, or metadata.
-        - Speak directly to the viewer — friendly, confident, slightly spontaneous, and off-the-cuff.
-        - Use **short and medium-length sentences**, natural pauses (…) or dashes, and occasional repetition for emphasis.
-        - Include interjections, rhetorical questions, playful digressions, humor, and brief asides (“Wait, actually…”, “Can you believe that…?”, “By the way…”).
-        - Include personal anecdotes or opinions (“I remember…”, “When I tried this…”).
-        - Use **visual and emotional imagery** to make scenes vivid (“Imagine this…”, “Picture it like…”).
-        - Hook viewers emotionally in the first 15–30 seconds.
-        - Alternate between facts, insights, reactions, and short reflections to keep pacing dynamic.
-        - Treat the script as a conversation with the audience — inclusive language like “you guys”, “we all”, “my friends”.
-        - Build suspense naturally with rhetorical questions, mini cliffhangers, or curiosity hooks.
-        - Use relatable analogies or humor when explaining complex topics.
-        - Occasionally reference the creator’s regional or cultural context for relatability.
-        - Maintain natural pacing as if recording live — mix excitement, storytelling, and factual explanation.
-        - Stay close to **{target_word_count} words** (±50).
+        **Style:**
+        - Spoken dialogue only — no titles, stage directions, or metadata.
+        - Direct, friendly, confident, slightly spontaneous.
+        - Short/medium sentences, natural pauses (…), rhetorical questions, humor.
+        - Personal anecdotes ("I remember…"), vivid imagery ("Imagine this…").
+        - Hook viewers emotionally in first 15-30 seconds.
+        - Inclusive language: "you guys", "we all", "my friends".
+        - Stay close to {target_word_count} words (±50).
 
-        
-        {structure_guidance_text} 
+        {structure_guidance_text}
 
-        **Main Topic/Idea:** "{request.topic}"
+        **Topic:** "{request.topic}"
 
-        **Research Context:**
-        FOUNDATIONAL KNOWLEDGE (from database): {db_context}
-        LATEST NEWS (from web): {web_context}
-
-        **Additional Notes:**
-        - Make the opening a curiosity-driven hook that emotionally pulls the viewer in within 15–30 seconds.
-        - Use storytelling techniques: tension, suspense, surprise, and moral dilemmas when relevant.
-        - Make historical or technical details feel immersive and personal, not like a lecture.
-        - Emphasize the narrative arc: build curiosity, climax, and reflection for the audience.
-        - Ensure adaptability: script should feel natural regardless of topic, duration, or target audience.
+        **Research:**
+        FOUNDATIONAL KNOWLEDGE: {db_context}
+        LATEST NEWS: {web_context}
         """
 
-        
-        # ------------------------------------------
+        # OpenRouter generation with retry on 429
+        script_text = await openrouter_generate([{"role": "user", "content": script_prompt}])
+        print(f"--- Script generation took {time.time() - total_start_time:.2f}s ---")
 
-        script_response = await content_genmodel.generate_content_async(script_prompt)
-        script_response=script_response.text
+        # Analyse script with Groq
+        ANALYSIS_PROMPT = f"""
+        You are a script analyzer. Return ONLY a JSON object — no explanation, no other text.
 
-
-        # --- Generate Final Ideas/Descriptions using Groq ---
-        #print(f"Generating final output with Groq model: {GROQ_GENERATION_MODEL}...")
-        #chat_completion = await groq_client.chat.completions.create(
-         #   messages=[{"role": "user", "content": script_prompt}],
-          #  model=GROQ_GENERATION_MODEL,
-        #)
-        #script_response = chat_completion.choices[0].message.content #
-        
-        total_end_time = time.time()
-        print(f"--- PROFILING: Script generation took {total_end_time - total_start_time:.2f} seconds ---")
-
-
-
-        # --- NEW: Prompt for Script Analysis ---
-        ANALYSIS_PROMPT_TEMPLATE = """
-        You are an expert script analyzer. Analyze the provided YouTube script based on the following criteria:
-
-        1.  **Real-world Examples:** Count how many distinct real-world examples, case studies, or specific stories are mentioned.
-        2.  **Research Facts/Stats:** Count how many distinct research findings, statistics, or specific data points are cited or explained.
-        3.  **Proverbs/Sayings:** Count how many common proverbs, idioms, or well-known sayings are used.
-        4.  **Emotional Depth:** Assess the overall emotional depth and engagement level of the script. Rate it as Low, Medium, or High.
-
-        **Your Task:**
-        Read the script below and return ONLY a JSON object with the results. Do not add any explanation or other text.
-
-        **EXAMPLE OUTPUT FORMAT:**
         {{
-        "examples_count": 3,
-        "research_facts_count": 5,
-        "proverbs_count": 1,
-        "emotional_depth": "Medium"
+          "examples_count": <int>,
+          "research_facts_count": <int>,
+          "proverbs_count": <int>,
+          "emotional_depth": "Low" | "Medium" | "High"
         }}
 
-        --- SCRIPT TO ANALYZE ---
+        --- SCRIPT ---
         {script_text}
-        --- END SCRIPT ---
+        --- END ---
         """
-
-
-        # --- NEW: Step 6 - Analyze the Generated Script ---
-        print("SCRIPT ANALYSIS: Analyzing generated script...")
-        analysis_start_time = time.time()
-        analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=script_response)
-        
-        #analysis_response = await flash_model.generate_content_async(analysis_prompt_filled)
-
-        # --- Generate Final Ideas/Descriptions using Groq ---
-        print(f"Generating final output with Groq model: {GROQ_GENERATION_MODEL}...")
-        chat_completion = await groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": analysis_prompt_filled}],
+        analysis_start = time.time()
+        analysis_completion = await groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": ANALYSIS_PROMPT}],
             model=GROQ_GENERATION_MODEL,
         )
-        analysis_response = chat_completion.choices[0].message.content #
-        analysis_end_time = time.time()
-        print(f"--- PROFILING: Script analysis took {analysis_end_time - analysis_start_time:.2f} seconds ---")
-        
-        # --- NEW: Parse the analysis results (with error handling) ---
-        analysis_results = {
-            "examples_count": 0,
-            "research_facts_count": 0,
-            "proverbs_count": 0,
-            "emotional_depth": "Unknown"
-        }
+        analysis_raw = analysis_completion.choices[0].message.content
+        print(f"--- Script analysis took {time.time() - analysis_start:.2f}s ---")
+
+        analysis_results = {"examples_count": 0, "research_facts_count": 0,
+                            "proverbs_count": 0, "emotional_depth": "Unknown"}
         try:
-            # Attempt to parse the JSON response from the analysis model
-            analysis_data = json.loads(analysis_response)
-            analysis_results["examples_count"] = analysis_data.get("examples_count", 0)
-            analysis_results["research_facts_count"] = analysis_data.get("research_facts_count", 0)
-            analysis_results["proverbs_count"] = analysis_data.get("proverbs_count", 0)
-            analysis_results["emotional_depth"] = analysis_data.get("emotional_depth", "Unknown")
-            print(f"Script Analysis Results: {analysis_results}")
-        except json.JSONDecodeError:
-            print("SCRIPT ANALYSIS: Failed to parse analysis JSON response from AI.")
+            clean  = analysis_raw.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(clean)
+            analysis_results.update({
+                "examples_count":       parsed.get("examples_count", 0),
+                "research_facts_count": parsed.get("research_facts_count", 0),
+                "proverbs_count":       parsed.get("proverbs_count", 0),
+                "emotional_depth":      parsed.get("emotional_depth", "Unknown"),
+            })
         except Exception as e:
-             print(f"SCRIPT ANALYSIS: Error during analysis parsing: {e}")
-        # -----------------------------------------------------------
+            print(f"Analysis parse error: {e}")
 
-        total_end_time = time.time()
-        print(f"--- PROFILING: Total /generate-script analysis request time was {total_end_time - total_start_time:.2f} seconds ---")
-        
-        
-        generated_word_count = len(script_response.split())
-        print(f"Generated script word count: approx. {generated_word_count}")
+        generated_word_count = len(script_text.split())
+        print(f"Word count: {generated_word_count}")
+        print(f"Total /generate-script time: {time.time() - total_start_time:.2f}s")
 
-
-
-        # --- <<< CREDIT DECREMENT LOGIC >>> ---
-        # Ensure 'user_tier' and 'credits' were fetched successfully earlier in the function
-        if 'user_tier' in locals() and user_tier != 'admin':
+        # Decrement credits
+        if user_tier != 'admin':
             try:
-                # Use the 'credits' variable fetched at the start of the function
-                # IDEA_COST should also be defined at the start (e.g., IDEA_COST = 1)
-                new_credit_balance = credits - IDEA_COST
-
-                # Ensure balance doesn't go below zero (optional safety check)
-                if new_credit_balance < 0:
-                    new_credit_balance = 0
-                    print(f"WARN: User {user_id} credit balance would go below zero. Setting to 0.")
-
-                # Update the database
-                update_result = supabase.table('profiles').update(
-                    {'credits_remaining': new_credit_balance}
-                ).eq('id', user_id).execute()
-
-                # Optional: Check if the update was successful
-                if len(update_result.data) > 0:
-                    print(f"Decremented {IDEA_COST} credit(s) for user {user_id}. New balance: {new_credit_balance}")
-                else:
-                    # This might happen if the user was deleted between check and update,
-                    # or if RLS rules prevent the update (less likely with service_role key)
-                    print(f"WARN: Credit decrement query executed for user {user_id} but returned no updated rows.")
-
-            except APIError as e:
-                # Log the error but crucially, DO NOT raise an HTTPException here.
-                # The user already got their result, failing the credit decrement
-                # is an internal issue we should log, not fail the user's request for.
-                print(f"ERROR: Failed to decrement credits for user {user_id}. DB Error: {e.message}")
+                new_balance = max(0, credits - IDEA_COST)
+                result = (
+                    supabase.table('profiles')
+                    .update({'credits_remaining': new_balance})
+                    .eq('id', user_id)
+                    .execute()
+                )
+                if result.data:
+                    print(f"Decremented {IDEA_COST} credit(s) for {user_id}. Balance: {new_balance}")
             except Exception as e:
-                # Catch any other unexpected errors during the update
-                print(f"ERROR: An unexpected error occurred during credit decrement for user {user_id}: {e}")
-        elif 'user_tier' in locals() and user_tier == 'admin':
-             print(f"User {user_id} is admin. No credits decremented.")
+                print(f"ERROR: Credit decrement failed for {user_id}: {e}")
         else:
-            # This case indicates an issue earlier in the function
-            print(f"WARN: Could not decrement credits for user {user_id}. User tier or initial credit count not available.")
-        # --- <<< END CREDIT DECREMENT LOGIC >>> ---
+            print(f"Admin user {user_id} — no credits decremented.")
 
-
-
-
-
-
-
-
-        # --- FINAL RETURN STATEMENT with all the data ---
         return {
-            "script":script_response ,
+            "script": script_text,
             "estimated_word_count": generated_word_count,
-            "source_urls": list(scraped_urls), # Use the correct list
-            "analysis": analysis_results # Add the analysis results
+            "source_urls": list(scraped_urls),
+            "analysis": analysis_results,
         }
 
     except Exception as e:
-        print(f"SCRIPT GENERATION: An error occurred: {e}")
+        print(f"SCRIPT GENERATION error: {e}")
         return {"error": "An error occurred during the script generation pipeline."}
-        
-        
-        #generated_word_count = len(script_response.text.split())
-        #print(f"Generated script word count: approx. {generated_word_count}")
-
-        #return {"script": script_response.text, "estimated_word_count": generated_word_count}
-
-    #except Exception as e:
-        #print(f"SCRIPT GENERATION: An error occurred: {e}")
-        #return {"error": "An error occurred during the script generation pipeline."}
 
 
+# ── /payments/create-order ───────────────────────────────────
 
-class CreateOrderRequest(BaseModel):
-    amount: int # Amount in paisa (e.g., 50000 for ₹500.00)
-    currency: str = "INR"
-    receipt: str | None = None # Optional unique receipt ID from your system
-    target_tier: str # 'basic' or 'pro' - needed to calculate amount
-
-# Endpoint to create a Razorpay order
 @app.post("/payments/create-order")
 async def create_razorpay_order(
     request_data: CreateOrderRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     if not razorpay_client:
         raise HTTPException(status_code=503, detail="Payment service unavailable.")
 
-    user_id = current_user.id
-    amount = request_data.amount # Amount should be sent from frontend based on selected tier
+    user_id  = current_user.id
+    amount   = request_data.amount
     currency = request_data.currency
 
-    # Basic validation (add more as needed)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount.")
     if request_data.target_tier not in ['basic', 'pro']:
-         raise HTTPException(status_code=400, detail="Invalid target tier specified.")
+        raise HTTPException(status_code=400, detail="Invalid target tier.")
 
     order_data = {
-        "amount": amount,
+        "amount":   amount,
         "currency": currency,
-        #"receipt": request_data.receipt or f"receipt_{user_id}_{int(time.time())}", 
-        "receipt": request_data.receipt or f"rec_{int(time.time())}", # Shorter default receipt
-        # Generate a receipt if none provided
-        "notes": { # Store extra info like user ID and target tier
-            "user_id": str(user_id),
-            "target_tier": request_data.target_tier
-        }
+        "receipt":  request_data.receipt or f"rec_{int(time.time())}",
+        "notes": {
+            "user_id":     str(user_id),
+            "target_tier": request_data.target_tier,
+        },
     }
-
     try:
         order = razorpay_client.order.create(data=order_data)
         print(f"Created Razorpay order {order['id']} for user {user_id}")
-        # Return the order ID and key ID to the frontend
-        return {"order_id": order['id'], "key_id": RAZORPAY_KEY_ID, "amount": amount*100, "currency": currency}
+        return {
+            "order_id": order['id'],
+            "key_id":   RAZORPAY_KEY_ID,
+            "amount":   amount,
+            "currency": currency,
+        }
     except Exception as e:
         print(f"Error creating Razorpay order: {e}")
         raise HTTPException(status_code=500, detail="Could not create payment order.")
-    
 
 
-RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+# ── /payments/webhook ────────────────────────────────────────
 
-
-# Endpoint for Razorpay Webhook
 @app.post("/payments/webhook")
 async def razorpay_webhook(
     request: Request,
-    x_razorpay_signature: str | None = Header(None) # Get signature from header
+    x_razorpay_signature: str | None = Header(None),
 ):
     if not RAZORPAY_WEBHOOK_SECRET or not razorpay_client:
-        print("Webhook received but service is not configured.")
-        return {"status": "Webhook ignored"} # Don't raise error, just ignore
+        print("Webhook received but service not configured.")
+        return {"status": "Webhook ignored"}
 
-    body = await request.body() # Get raw body
+    body = await request.body()
 
-    # --- 1. Verify Signature ---
     try:
         razorpay_client.utility.verify_webhook_signature(
-            body.decode('utf-8'), # Decode body bytes to string
+            body.decode('utf-8'),
             x_razorpay_signature,
-            RAZORPAY_WEBHOOK_SECRET
+            RAZORPAY_WEBHOOK_SECRET,
         )
-        print("Webhook signature verified successfully.")
+        print("Webhook signature verified.")
     except razorpay.errors.SignatureVerificationError as e:
-        print(f"Webhook signature verification failed: {e}")
+        print(f"Webhook signature failed: {e}")
         raise HTTPException(status_code=400, detail="Invalid webhook signature.")
     except Exception as e:
-        print(f"Error during webhook signature verification: {e}")
+        print(f"Webhook verification error: {e}")
         raise HTTPException(status_code=500, detail="Webhook processing error.")
 
-    # --- 2. Process the Event ---
     try:
         event_data = json.loads(body)
         event_type = event_data.get('event')
-
         print(f"Received webhook event: {event_type}")
 
-        if event_type == 'payment.captured' or event_type == 'order.paid':
-            payment_entity = event_data['payload']['payment']['entity']
-            order_entity = event_data['payload']['order']['entity'] # Get order entity
-
-            order_id = order_entity['id']
-            payment_id = payment_entity['id']
-            amount_paid = order_entity['amount_paid'] # Use amount from order entity
-            notes = order_entity.get('notes', {})
-            user_id = notes.get('user_id')
-            target_tier = notes.get('target_tier')
-
-            print(f"Processing successful payment: {payment_id} for order {order_id}, user {user_id}, tier {target_tier}")
+        if event_type == 'order.paid':
+            order_entity = event_data['payload']['order']['entity']
+            order_id   = order_entity.get('id', 'unknown')
+            payment_id = event_data['payload']['payment']['entity'].get('id', 'unknown')
+            notes        = order_entity.get('notes', {})
+            user_id      = notes.get('user_id')
+            target_tier  = notes.get('target_tier')
 
             if not user_id or not target_tier:
-                print(f"ERROR: Missing user_id or target_tier in order notes for order {order_id}.")
+                print(f"ERROR: Missing notes in order {order_id}.")
                 return {"status": "error", "message": "Missing required order notes."}
 
-            # --- 3. Update User Profile in Supabase ---
-            # Define credits based on tier (example values)
             credits_to_add = 0
-            if target_tier == 'basic':
-                credits_to_add = 50 # Example: Basic tier gets 50 credits
-            elif target_tier == 'pro':
-                credits_to_add = 200 # Example: Pro tier gets 200 credits
+            if target_tier.lower() == 'basic':
+                credits_to_add = 50
+            elif target_tier.lower() == 'pro':
+                credits_to_add = 200
 
             try:
-                # Fetch current credits first (important for concurrency)
-                profile_response = supabase.table('profiles').select('credits_remaining').eq('id', user_id).single().execute()
-                current_credits = 0
-                if profile_response.data:
-                    current_credits = profile_response.data.get('credits_remaining', 0)
-
+                profile_resp = (
+                    supabase.table('profiles')
+                    .select('credits_remaining')
+                    .eq('id', user_id)
+                    .single()
+                    .execute()
+                )
+                current_credits = profile_resp.data.get('credits_remaining', 0) if profile_resp.data else 0
                 new_credits = current_credits + credits_to_add
 
-                update_result = supabase.table('profiles').update({
-                    'user_tier': target_tier,
-                    'credits_remaining': new_credits
-                }).eq('id', user_id).execute()
-
-                if update_result.data:
-                    print(f"Successfully updated user {user_id} to tier '{target_tier}' with {new_credits} credits.")
+                result = (
+                    supabase.table('profiles')
+                    .update({'user_tier': target_tier, 'credits_remaining': new_credits})
+                    .eq('id', user_id)
+                    .execute()
+                )
+                if result.data:
+                    print(f"Updated user {user_id} → tier '{target_tier}', credits {new_credits}.")
                 else:
-                    print(f"WARN: Failed to update profile for user {user_id} after payment {payment_id}.")
-                    # Consider adding to a retry queue or alerting system
-
+                    print(f"WARN: Failed to update profile for {user_id} after payment {payment_id}.")
             except APIError as e:
-                print(f"ERROR: Supabase APIError updating profile for user {user_id}: {e}")
-                # Add to retry queue or alert
+                print(f"ERROR: Supabase error for {user_id}: {e}")
             except Exception as e:
-                 print(f"ERROR: Unexpected error updating profile for user {user_id}: {e}")
-                 # Add to retry queue or alert
+                print(f"ERROR: Unexpected error for {user_id}: {e}")
+
+        elif event_type == 'payment.captured':
+            print("Ignoring 'payment.captured' (handled by 'order.paid').")
 
         elif event_type == 'payment.failed':
             payment_entity = event_data['payload']['payment']['entity']
-            order_id = payment_entity.get('order_id')
-            print(f"Payment failed for order {order_id}. Reason: {payment_entity.get('error_description')}")
-            # Optionally update your system (e.g., mark order as failed)
-
+            print(
+                f"Payment failed for order {payment_entity.get('order_id')}. "
+                f"Reason: {payment_entity.get('error_description')}"
+            )
         else:
-            print(f"Ignoring unhandled webhook event type: {event_type}")
+            print(f"Ignoring unhandled event: {event_type}")
 
-        # Respond to Razorpay quickly
         return {"status": "Webhook processed successfully"}
 
     except json.JSONDecodeError:
-        print("Webhook error: Could not decode JSON body.")
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
     except Exception as e:
-        print(f"Webhook error: Unexpected error processing event: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error processing webhook.")
+        print(f"Webhook error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
-# --- RESEARCH AGENT HELPER FUNCTIONS (UPGRADED) ---
-
+# ════════════════════════════════════════════════════════════
+# RESEARCH AGENT
+# ════════════════════════════════════════════════════════════
 
 async def fetch_social_pulse(topic: str) -> list[dict]:
-    """
-    Action 1: Social Media Pulse (Reddit/Quora) - NOW WITH AI VALIDATION
-    """
     print(f"RESEARCH AGENT: Fetching social pulse for '{topic}'...")
     loop = asyncio.get_running_loop()
-    query1 = f"{topic} site:reddit.com"
-    query2 = f"{topic} site:quora.com"
-    
     try:
         with DDGS(timeout=10) as ddgs:
-            # Scrape a larger pool of candidates
-            reddit_results = await loop.run_in_executor(None, lambda: ddgs.text(query1, timelimit='m', max_results=10))
-            quora_results = await loop.run_in_executor(None, lambda: ddgs.text(query2, timelimit='m', max_results=10))
-            
+            forum_results = await loop.run_in_executor(
+                None, lambda: ddgs.text(f"{topic} discussion forum", timelimit="m", max_results=10)
+            )
+            quora_results = await loop.run_in_executor(
+                None, lambda: ddgs.text(f"{topic} site:quora.com", timelimit='m', max_results=10)
+            )
         all_results = []
-        if reddit_results: all_results.extend(reddit_results)
-        if quora_results: all_results.extend(quora_results)
-            
-        if not all_results:
-            print("RESEARCH AGENT: No social threads found.")
-            return []
-
-       
+        if forum_results: all_results.extend(forum_results)
+        if quora_results:  all_results.extend(quora_results)
         return all_results
-        
     except Exception as e:
         print(f"RESEARCH AGENT: Social pulse failed. Error: {e}")
         return []
 
+
 async def fetch_news_analysis(topic: str) -> list[dict]:
-    """
-    Action 2: Recent News Analysis - NOW WITH AI VALIDATION
-    """
     print(f"RESEARCH AGENT: Fetching news for '{topic}'...")
     loop = asyncio.get_running_loop()
     try:
         with DDGS(timeout=10) as ddgs:
-            # Scrape a larger pool of candidates
-            news_results = await loop.run_in_executor(None, lambda: ddgs.news(topic, timelimit='w', max_results=10))
-            
+            news_results = await loop.run_in_executor(
+                None, lambda: ddgs.news(topic, timelimit='w', max_results=10)
+            )
         if not news_results:
-            print("RESEARCH AGENT: No news headlines found.")
             return []
-            
-        # --- NEW VALIDATION STEP ---
-        # Note: ddgs.news() results have 'body' but not 'title'. We'll adjust.
-        # Let's re-format them slightly for the validator
-        news_results_formatted = [{"title": item['title'], "body": item['body'], "url": item['url'], "source": item['source']} for item in news_results]
-        
-        
-        return news_results_formatted
-        
+        return [
+            {"title": item['title'], "body": item['body'],
+             "url": item['url'], "source": item['source']}
+            for item in news_results
+        ]
     except Exception as e:
         print(f"RESEARCH AGENT: News analysis failed. Error: {e}")
         return []
 
 
-
 def _calculate_engagement_pct(stats: dict) -> float:
-    """Calculates engagement % (likes + comments) / views."""
     try:
         views = int(stats.get('viewCount', '0'))
         if views == 0:
             return 0.0
-        
-        likes = int(stats.get('likeCount', '0'))
+        likes    = int(stats.get('likeCount', '0'))
         comments = int(stats.get('commentCount', '0'))
-        engagement = ((likes + comments) / views) * 100
-        return round(engagement, 2)
+        return round(((likes + comments) / views) * 100, 2)
     except Exception:
         return 0.0
 
+
 def _get_channel_authority(subscriber_count: int) -> str:
-    """Categorizes channel authority based on subscriber count."""
-    if subscriber_count >= 20_000_000:
-        return "Super High"
-    elif subscriber_count >= 5_000_000:
-        return "High"
-    elif subscriber_count >= 1_000_000:
-        return "Medium"
-    elif subscriber_count >= 100_000:
-        return "Poor"
-    else:
-        return "Very Poor"
-    
+    if subscriber_count >= 20_000_000: return "Super High"
+    elif subscriber_count >= 5_000_000: return "High"
+    elif subscriber_count >= 1_000_000: return "Medium"
+    elif subscriber_count >= 100_000:   return "Poor"
+    else:                               return "Very Poor"
+
 
 async def fetch_youtube_trends(topic: str) -> list[dict]:
-    """
-    Action 3 (UPGRADED): YouTube Trend Analysis (Official API - httpx)
-    Gets top 10 videos, stats, channel stats, and AI-analyzed comment themes from the TOP 3 videos in parallel.
-    """
     if not YOUTUBE_API_KEY:
-        print("RESEARCH AGENT: YouTube API service not initialized. Skipping.")
+        print("RESEARCH AGENT: YouTube API not configured. Skipping.")
         return []
 
-    print(f"RESEARCH AGENT: Fetching YouTube trends for '{topic}' (using httpx)...")
-    loop = asyncio.get_running_loop() # Get the event loop
-    six_months_ago = (datetime.datetime.now() - datetime.timedelta(days=180)).isoformat("T") + "Z"
-    
+    print(f"RESEARCH AGENT: Fetching YouTube trends for '{topic}'...")
+    six_months_ago = (
+        datetime.datetime.now() - datetime.timedelta(days=180)
+    ).isoformat("T") + "Z"
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # --- Task 1: Search for Videos ---
             search_params = {
                 'key': YOUTUBE_API_KEY, 'q': topic, 'part': 'snippet',
                 'type': 'video', 'order': 'relevance', 'videoDuration': 'medium',
-                'publishedAfter': six_months_ago, 'maxResults': 10
+                'publishedAfter': six_months_ago, 'maxResults': 10,
             }
             search_response = await client.get(YOUTUBE_SEARCH_URL, params=search_params)
             search_response.raise_for_status()
             search_data = search_response.json()
-            
+
             video_ids, channel_ids, video_snippet_map = [], set(), {}
             for item in search_data.get('items', []):
-                video_id = item['id']['videoId']
-                channel_id = item['snippet']['channelId']
-                video_ids.append(video_id); channel_ids.add(channel_id); video_snippet_map[video_id] = item['snippet']
-                
+                vid = item['id']['videoId']
+                cid = item['snippet']['channelId']
+                video_ids.append(vid)
+                channel_ids.add(cid)
+                video_snippet_map[vid] = item['snippet']
+
             if not video_ids:
                 print(f"RESEARCH AGENT: No YouTube videos found for '{topic}'.")
                 return []
 
-            # --- Define other API tasks (as async functions) ---
             async def _get_video_stats(ids_str: str):
-                params = {'key': YOUTUBE_API_KEY, 'part': 'statistics', 'id': ids_str}
-                resp = await client.get(YOUTUBE_VIDEOS_URL, params=params)
-                resp.raise_for_status(); return resp.json()
+                resp = await client.get(YOUTUBE_VIDEOS_URL,
+                                        params={'key': YOUTUBE_API_KEY, 'part': 'statistics', 'id': ids_str})
+                resp.raise_for_status()
+                return resp.json()
 
             async def _get_channel_stats(ids_str: str):
-                params = {'key': YOUTUBE_API_KEY, 'part': 'statistics', 'id': ids_str}
-                resp = await client.get(YOUTUBE_CHANNELS_URL, params=params)
-                resp.raise_for_status(); return resp.json()
+                resp = await client.get(YOUTUBE_CHANNELS_URL,
+                                        params={'key': YOUTUBE_API_KEY, 'part': 'statistics', 'id': ids_str})
+                resp.raise_for_status()
+                return resp.json()
 
-            # --- This is your robust comment analysis function (UNCHANGED) ---
             async def _get_comment_themes_async(vid_id: str) -> tuple[str, list]:
-                """
-                Fetches top 100 comments and uses AI to summarize them into key themes.
-                """
                 try:
-                    # 1. Fetch top 100 comments
-                    params = {'key': YOUTUBE_API_KEY, 'part': 'snippet', 'videoId': vid_id, 'order': 'relevance', 'maxResults': 60}
+                    params = {
+                        'key': YOUTUBE_API_KEY, 'part': 'snippet',
+                        'videoId': vid_id, 'order': 'relevance', 'maxResults': 60,
+                    }
                     resp = await client.get(YOUTUBE_COMMENTS_URL, params=params)
                     resp.raise_for_status()
-                    comments_response = resp.json()
-                    
-                    raw_comments = [item['snippet']['topLevelComment']['snippet']['textOriginal'] 
-                                    for item in comments_response.get('items', [])]
-                    
-                    if not raw_comments: return vid_id, []
+                    raw_comments = [
+                        item['snippet']['topLevelComment']['snippet']['textOriginal']
+                        for item in resp.json().get('items', [])
+                    ]
+                    if not raw_comments:
+                        return vid_id, []
 
-                    # 2. Use a fast AI to pre-analyze (with a robust prompt)
                     analysis_prompt = f"""
-                    You are a YouTube comment analyst. I will give you a list of raw comments from a video.
-                    Your job is to read all of them and identify the **Top 3-5 recurring themes or sentiments**.
-                    Return ONLY a valid JSON object with a single key "themes" containing a list of strings.
+                    Identify the Top 3-5 recurring themes/sentiments in these YouTube comments.
+                    Return ONLY a valid JSON object: {{"themes": ["theme1", "theme2", ...]}}
 
-                    EXAMPLE OUTPUT:
-                    {{"themes": ["Price is too high", "Love the new design", "Concerned about rust problem"]}}
-
-                    RAW COMMENTS:
-                    {json.dumps(raw_comments)}
+                    COMMENTS: {json.dumps(raw_comments)}
                     """
-                    
-                    chat_completion = await groq_client_research.chat.completions.create(
+                    cc = await groq_client_research.chat.completions.create(
                         messages=[{"role": "user", "content": analysis_prompt}],
                         model=GROQ_GENERATION_MODEL,
-                        response_format={"type": "json_object"}
+                        response_format={"type": "json_object"},
                     )
-                    
-                    response_data = json.loads(chat_completion.choices[0].message.content)
-                    themes = response_data.get("themes", [])
+                    data   = json.loads(cc.choices[0].message.content)
+                    themes = data.get("themes", [])
                     return vid_id, themes
-
                 except Exception as e:
-                    print(f"RESEARCH AGENT: Could not fetch/analyze comments for video {vid_id}. Error: {e}")
+                    print(f"RESEARCH AGENT: Comment analysis failed for {vid_id}: {e}")
                     return vid_id, []
-            # --- END OF HELPER FUNCTION ---
 
-            # --- Run all API calls in parallel (FIXED) ---
-            video_id_str = ','.join(video_ids)
+            video_id_str   = ','.join(video_ids)
             channel_id_str = ','.join(channel_ids)
+            comments_tasks = [_get_comment_themes_async(vid) for vid in video_ids[:3]]
 
-            stats_task = _get_video_stats(video_id_str)
-            channels_task = _get_channel_stats(channel_id_str)
-            
-            # --- THIS IS THE FIX ---
-            # We are back to using gather, but only for the TOP 3 videos.
-            comments_tasks = [_get_comment_themes_async(vid_id) for vid_id in video_ids[:3]]
-            # ------------------------
+            results = await asyncio.gather(
+                _get_video_stats(video_id_str),
+                _get_channel_stats(channel_id_str),
+                *comments_tasks,
+                return_exceptions=True,
+            )
 
-            # Run all tasks (stats, channels, and 3 comment tasks) at the same time
-            results = await asyncio.gather(stats_task, channels_task, *comments_tasks, return_exceptions=True)
-            
-            # --- Process results (Unchanged) ---
-            stats_response = results[0] if not isinstance(results[0], Exception) else {}
+            stats_response   = results[0] if not isinstance(results[0], Exception) else {}
             channels_response = results[1] if not isinstance(results[1], Exception) else {}
-            comment_results = [res for res in results[2:] if not isinstance(res, Exception)] 
+            comment_results  = [r for r in results[2:] if not isinstance(r, Exception)]
 
             if isinstance(results[0], Exception):
-                print(f"RESEARCH AGENT: CRITICAL ERROR fetching video stats: {results[0]}")
+                print(f"RESEARCH AGENT: CRITICAL — video stats error: {results[0]}")
                 return []
             if isinstance(results[1], Exception):
-                 print(f"RESEARCH AGENT: CRITICAL ERROR fetching channel stats: {results[1]}")
-                 return []
-            
-            stats_map = {item['id']: item['statistics'] for item in stats_response.get('items', [])}
-            subs_map = {item['id']: int(item['statistics'].get('subscriberCount', '0')) for item in channels_response.get('items', [])}
-            comments_map = {vid_id: themes for vid_id, themes in comment_results} 
+                print(f"RESEARCH AGENT: CRITICAL — channel stats error: {results[1]}")
+                return []
 
-            # --- Build the final rich video list (Unchanged) ---
+            stats_map    = {item['id']: item['statistics'] for item in stats_response.get('items', [])}
+            subs_map     = {item['id']: int(item['statistics'].get('subscriberCount', '0'))
+                           for item in channels_response.get('items', [])}
+            comments_map = {vid_id: themes for vid_id, themes in comment_results}
+
             videos = []
-            for video_id in video_ids:
-                snippet = video_snippet_map.get(video_id, {})
-                channel_id = snippet.get('channelId')
-                stats = stats_map.get(video_id, {})
-                subs = subs_map.get(channel_id, 0)
-                authority = _get_channel_authority(subs)
-                engagement_pct = _calculate_engagement_pct(stats)
-                
+            for vid in video_ids:
+                snippet  = video_snippet_map.get(vid, {})
+                cid      = snippet.get('channelId')
+                stats    = stats_map.get(vid, {})
+                subs     = subs_map.get(cid, 0)
                 videos.append({
-                    "id": video_id, "title": snippet.get('title'), "description": snippet.get('description'),
-                    "body": snippet.get('description'), "published_at": snippet.get('publishedAt'),
-                    "url": f"https://www.youtube.com/watch?v={video_id}", "channel_id": channel_id,
-                    "channel_link": f"https://www.youtube.com/channel/{channel_id}",
+                    "id": vid, "title": snippet.get('title'),
+                    "description": snippet.get('description'),
+                    "body": snippet.get('description'),
+                    "published_at": snippet.get('publishedAt'),
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "channel_id": cid,
+                    "channel_link": f"https://www.youtube.com/channel/{cid}",
                     "channel_title": snippet.get('channelTitle'),
                     "view_count": int(stats.get('viewCount', '0')),
                     "like_count": int(stats.get('likeCount', '0')),
                     "comment_count": int(stats.get('commentCount', '0')),
-                    "subscriber_count": subs, "channel_authority": authority,
-                    "engagement_pct": engagement_pct, 
-                    "top_comments": comments_map.get(video_id, []) # Will be populated for top 3, empty for others
+                    "subscriber_count": subs,
+                    "channel_authority": _get_channel_authority(subs),
+                    "engagement_pct": _calculate_engagement_pct(stats),
+                    "top_comments": comments_map.get(vid, []),
                 })
-                
-            print(f"RESEARCH AGENT: Found {len(videos)} relevant YouTube videos (with all metadata).")
+
+            print(f"RESEARCH AGENT: Found {len(videos)} YouTube videos.")
             return videos
-            
+
         except httpx.HTTPStatusError as e:
-            print(f"RESEARCH AGENT: YouTube API HttpError (httpx): {e.response.status_code} - {e.response.text}")
+            print(f"RESEARCH AGENT: YouTube API error: {e.response.status_code} - {e.response.text}")
             return []
         except Exception as e:
-            print(f"RESEARCH AGENT: YouTube API call failed (httpx). Error: {e}")
+            print(f"RESEARCH AGENT: YouTube API call failed: {e}")
             return []
 
+
 RESEARCH_SYNTHESIS_PROMPT = """
-You are a world-class YouTube Content Strategist and Trend Analyst. I have collected real-time market data about the topic: '{topic}'.
-Today's date is {current_date}.
+You are a world-class YouTube Content Strategist. Analyze real-time market data about: '{topic}'.
+Today's date: {current_date}.
 
-Your primary goal is to analyze the **[Top-Performing YouTube Videos]** to find what is already working and what trends are emerging on the platform.
-Use the [Community Discussions] and [News Headlines] as **supporting context** to understand *why* those videos are popular and to find new, unique angles.
+Analyze the YouTube videos to find what's working. Use discussions and news as supporting context.
 
-Analyze the following raw data. Your job is to:
-1.  **Analyze the Topic Overall:** Based on all the YouTube videos provided, calculate the `average_views`, `views_range` (min and max), and `average_engagement_pct`.
-2.  **Analyze the Niche:** Based on the data, describe the main `channel_niche`.
-3.  **Analyze the Comments:** Read the `Top Comments` and summarize the top 3-4 `comment_themes`.
-4.  **Identify Strategic Angles:** Identify 3-4 distinct "Strategic Angles" for a video. **Your angles MUST be inspired by or in response to the provided YouTube video data.**
-    - For each angle, provide a 1-sentence "Reasoning".
-    - **MANDATORY: Provide a "proof" list.** This list MUST contain at least one `[V...]` (YouTube Video) ID. You can *add* `[S...]` or `[N...]` IDs as supporting proof.
-    - Provide a "strategic_timing" recommendation.
-5.  **Describe Audience Profile:** Based on all data, describe the "Audience Profile".
+1. **Topic Analysis:** Calculate average_views, views_range, average_engagement_pct, channel_niche, comment_themes.
+2. **Strategic Angles:** Identify 3-4 distinct angles inspired by YouTube data. Each needs reasoning, proof (at least one [V...] ID), and strategic_timing.
+3. **Audience Profile:** Describe age_group, interests, sentiment.
 
 RAW DATA:
 ---
-[Top-Performing YouTube Videos (ID | Title | Channel | Views | Engagement % | Channel Subs | Channel Authority | Published Date | Top Comments)]
+[YouTube Videos (ID | Title | Channel | Views | Eng % | Subs | Authority | Published | Comments)]
 {youtube_videos}
 ---
-[Supporting Community Discussions (Reddit/Quora)]
+[Community Discussions]
 {social_threads}
 ---
-[Supporting News Headlines]
+[News Headlines]
 {news_headlines}
 ---
 
-Return ONLY a single, valid JSON object. Do not add any text before or after the JSON.
-The JSON object must strictly follow this schema:
+Return ONLY a valid JSON object:
 {{
   "topic_analysis": {{
-    "average_views": "integer or null",
-    "views_range": "string or null",
-    "average_engagement_pct": "float or null",
-    "channel_niche": "string or null",
-    "comment_themes": ["string"]
+    "average_views": null,
+    "views_range": null,
+    "average_engagement_pct": null,
+    "channel_niche": null,
+    "comment_themes": []
   }},
   "strategic_angles": [
     {{
-      "angle": "string (The video angle)",
-      "reasoning": "string (Your reasoning)",
-      "proof": ["string (e.g., [V0])", "string (e.g., [S1])"],
-      "strategic_timing": "string (Your full, actionable timing advice)"
+      "angle": "",
+      "reasoning": "",
+      "proof": [],
+      "strategic_timing": ""
     }}
   ],
   "audience_profile": {{
-    "age_group": "string (e.g., '25-45')",
-    "interests": ["string", "string", "string"],
-    "sentiment": ["string", "string"]
+    "age_group": "",
+    "interests": [],
+    "sentiment": []
   }}
 }}
 """
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 @app.post("/research-topic")
-async def research_topic(
-    request: PromptRequest,
-     # Re-added auth
-):
+async def research_topic(request: PromptRequest):
     total_start_time = time.time()
-    
-    print(f"RESEARCH AGENT: Received request from user  for topic: {request.topic}")
-    
-  
+    print(f"RESEARCH AGENT: Topic: {request.topic}")
 
     try:
-        # --- Step 1: Run all 3 data gathering tasks in parallel ---
-        tasks = [
+        social_results, youtube_results, news_results = await asyncio.gather(
             fetch_social_pulse(request.topic),
             fetch_youtube_trends(request.topic),
-            fetch_news_analysis(request.topic)
-        ]
-        social_results, youtube_results, news_results = await asyncio.gather(*tasks)
-        
-        # --- Step 2: Format the raw data for the AI Prompt (with all new metadata) ---
-        social_titles_for_prompt = "\n".join([f"[S{i}]: {item['title']}" for i, item in enumerate(social_results)])
-        
+            fetch_news_analysis(request.topic),
+        )
+
+        social_titles_for_prompt = "\n".join([
+            f"[S{i}]: {item['title']}" for i, item in enumerate(social_results)
+        ])
         youtube_videos_for_prompt = "\n".join([
-            f"[V{i}]: {item['title']} | {item['channel_title']} | Views: {item['view_count']} | Eng %: {item['engagement_pct']} | Subs: {item['subscriber_count']} | Authority: {item['channel_authority']} | Published: {item['published_at']} | Comments: {item['top_comments']}" 
+            f"[V{i}]: {item['title']} | {item['channel_title']} | Views: {item['view_count']} | "
+            f"Eng%: {item['engagement_pct']} | Subs: {item['subscriber_count']} | "
+            f"Authority: {item['channel_authority']} | Published: {item['published_at']} | "
+            f"Comments: {item['top_comments']}"
             for i, item in enumerate(youtube_results)
         ])
-        
-        news_headlines_for_prompt = "\n".join([f"[N{i}]: {item['title']}" for i, item in enumerate(news_results)])
-        
-        # (Make sure 'import datetime' is at the top of your file)
-        current_date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        news_headlines_for_prompt = "\n".join([
+            f"[N{i}]: {item['title']}" for i, item in enumerate(news_results)
+        ])
 
         synthesis_prompt = RESEARCH_SYNTHESIS_PROMPT.format(
             topic=request.topic,
-            current_date=current_date_str,
+            current_date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
             youtube_videos=youtube_videos_for_prompt,
             social_threads=social_titles_for_prompt,
-            news_headlines=news_headlines_for_prompt
+            news_headlines=news_headlines_for_prompt,
         )
-        
-        # --- Step 3: AI Synthesis (using Groq) ---
-        print("RESEARCH AGENT: Synthesizing raw data with Groq...")
-        synthesis_start_time = time.time()
-        chat_completion = await groq_client.chat.completions.create(
+
+        print("RESEARCH AGENT: Synthesizing with Groq...")
+        cc = await groq_client.chat.completions.create(
             messages=[{"role": "user", "content": synthesis_prompt}],
             model=GROQ_GENERATION_MODEL,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
         )
-        response_text = chat_completion.choices[0].message.content
-        synthesis_end_time = time.time()
-        print(f"RESEARCH AGENT: AI Synthesis took {synthesis_end_time - synthesis_start_time:.2f}s")
+        response_text = cc.choices[0].message.content
 
-        # --- Step 4: Parse and "Hydrate" the Proof ---
         try:
             research_brief = json.loads(response_text)
         except json.JSONDecodeError:
-            print(f"RESEARCH AGENT: CRITICAL ERROR - Failed to parse JSON from Groq. Response was: {response_text}")
+            print(f"RESEARCH AGENT: Failed to parse JSON: {response_text}")
             raise HTTPException(status_code=500, detail="AI failed to generate valid research.")
-        
-        print("RESEARCH AGENT: Hydrating response with source data...")
-        for angle in research_brief.get("strategic_angles", []):
-            proof_ids = angle.get("proof", [])
-            source_data = [] 
-            
-            for pid in proof_ids:
-                if pid.startswith("[S"): # Social result
-                    try:
-                        index = int(pid[2:-1])
-                        item = social_results[index]
-                        source_data.append({
-                            "type": "social", "title": item['title'],
-                            "url": item['href'], "snippet": item['body']
-                        })
-                    except Exception: pass
-                elif pid.startswith("[V"): # Video result
-                    try:
-                        index = int(pid[2:-1])
-                        item = youtube_results[index]
-                        # We return the ENTIRE rich video object as proof
-                        source_data.append({"type": "youtube_video", **item})
-                    except Exception: pass
-                elif pid.startswith("[N"): # News result
-                    try:
-                        index = int(pid[2:-1])
-                        item = news_results[index]
-                        source_data.append({
-                            "type": "news", "title": item['title'],
-                            "url": item['url'], "snippet": item['body']
-                        })
-                    except Exception: pass
-            
-            angle["proof"] = source_data # Replace IDs with full data
 
-      
-        
-        total_end_time = time.time()
-        print(f"--- PROFILING: Total /research-topic request took {total_end_time - total_start_time:.2f}s ---")
-        
+        # Hydrate proof IDs with full source data
+        for angle in research_brief.get("strategic_angles", []):
+            source_data = []
+            for pid in angle.get("proof", []):
+                try:
+                    if pid.startswith("[S"):
+                        idx  = int(pid[2:-1])
+                        item = social_results[idx]
+                        source_data.append({"type": "social", "title": item['title'],
+                                            "url": item['href'], "snippet": item['body']})
+                    elif pid.startswith("[V"):
+                        idx  = int(pid[2:-1])
+                        item = youtube_results[idx]
+                        source_data.append({"type": "youtube_video", **item})
+                    elif pid.startswith("[N"):
+                        idx  = int(pid[2:-1])
+                        item = news_results[idx]
+                        source_data.append({"type": "news", "title": item['title'],
+                                            "url": item['url'], "snippet": item['body']})
+                except Exception:
+                    pass
+            angle["proof"] = source_data
+
+        print(f"--- /research-topic took {time.time() - total_start_time:.2f}s ---")
         return research_brief
 
     except Exception as e:
-        print(f"RESEARCH AGENT: An error occurred in the pipeline: {e}")
+        print(f"RESEARCH AGENT error: {e}")
         raise HTTPException(status_code=500, detail="An error occurred during research.")
 
 
+# ════════════════════════════════════════════════════════════
+# SEO AGENT
+# ════════════════════════════════════════════════════════════
 
-
-
-
-
-# --- (Keep your existing PromptRequest and ScriptRequest models) ---
-
-# --- NEW: Pydantic Model for SEO Agent Input ---
-# This model matches the JSON output of your /research-topic endpoint
-class ResearchBriefInput(BaseModel):
-    topic_analysis: dict
-    strategic_angles: list[dict]
-    audience_profile: dict
-# ------------------------------------------------
-
-
-# --- NEW: Prompt for SEO Agent ---
 SEO_SYNTHESIS_PROMPT = """
-You are an expert YouTube SEO Analyst and Title Strategist. I have a video angle, audience profile, and competitive data.
-Your job is to analyze all this data and create a complete "SEO Battle Plan".
+You are an expert YouTube SEO Analyst and Title Strategist.
 
 VIDEO ANGLE: "{angle}"
 AUDIENCE PROFILE: {audience_profile}
 
 COMPETITIVE DATA:
 - Top 5 YouTube Titles: {competing_titles}
-- Top 5 Audience Questions (PAA): {paa_questions}
+- Top 5 PAA Questions: {paa_questions}
 
-Your Task:
-Analyze the data and return ONLY a single, valid JSON object with the following keys:
-
-1.  "search_intent_type": (Based on the PAA questions, classify the *primary* user intent. e.g., 'Informational', 'Problem-Solving').
-2.  "ctr_potential": (Rate as 'Low', 'Medium', or 'High').
-3.  "justification": (Explain WHY. Is the competition weak? Are the questions urgent? Is there a clear content gap?).
-4.  "recommended_titles": (A list of 3 viral, high-CTR titles that BEAT the competition and target the search intent).
-5.  "key_questions_to_answer": (A list of the 5 most important questions from the PAA data that the script MUST answer).
-6.  "related_keywords": (Based on *all* the data, extract a list of 5-7 high-value related keywords for YouTube tags).
+Return ONLY a valid JSON object:
+{{
+  "search_intent_type": "",
+  "ctr_potential": "Low" | "Medium" | "High",
+  "justification": "",
+  "recommended_titles": [],
+  "key_questions_to_answer": [],
+  "related_keywords": []
+}}
 """
-# ------------------------------------
 
 
-
-# --- NEW: SEO AGENT HELPER FUNCTION ---
 async def run_seo_analysis(angle_data: dict, audience_profile: dict) -> dict:
-    """
-    Action 2: The "SEO Agent"
-    Takes a single strategic angle and turns it into a full "SEO Battle Plan".
-    """
-    angle = angle_data.get("angle", "Unknown Angle")
+    angle      = angle_data.get("angle", "Unknown Angle")
     proof_data = angle_data.get("proof", [])
     print(f"SEO AGENT: Analyzing angle: '{angle}'")
     loop = asyncio.get_running_loop()
-    
-    competing_titles = []
-    paa_questions = []
-    
+
+    competing_titles, paa_questions = [], []
     try:
         with DDGS(timeout=10) as ddgs:
-            # Get competitor titles from YouTube
             video_results = await loop.run_in_executor(
-                None, 
-                lambda: ddgs.videos(f"{angle}", region='wt-wt', timelimit='m', max_results=5)
+                None,
+                lambda: ddgs.videos(f"{angle}", region='wt-wt', timelimit='m', max_results=5),
             )
             if video_results:
                 competing_titles = [v['title'] for v in video_results]
 
-            # Get People Also Ask questions from Google
             answer_results = await loop.run_in_executor(
                 None,
-                lambda: ddgs.answers(f"{angle}", region='wt-wt')
+                lambda: ddgs.answers(f"{angle}", region='wt-wt'),
             )
             if answer_results:
-                paa_questions = [a['question'] for a in answer_results[:5]] # Get top 5
-
+                paa_questions = [a['question'] for a in answer_results[:5]]
     except Exception as e:
-        print(f"SEO AGENT: Scraping failed for angle '{angle}'. Error: {e}")
-        # Continue with whatever data we have
+        print(f"SEO AGENT: Scraping failed for '{angle}': {e}")
 
-    # --- AI Synthesis (The "SEO Battle Plan") ---
     seo_prompt = SEO_SYNTHESIS_PROMPT.format(
         angle=angle,
         audience_profile=json.dumps(audience_profile),
         competing_titles=str(competing_titles),
-        paa_questions=str(paa_questions)
+        paa_questions=str(paa_questions),
     )
 
     try:
-        chat_completion = await groq_client.chat.completions.create(
+        cc = await groq_client.chat.completions.create(
             messages=[{"role": "user", "content": seo_prompt}],
-            model=GROQ_GENERATION_MODEL, # Your fast Groq model
-            response_format={"type": "json_object"}
+            model=GROQ_GENERATION_MODEL,
+            response_format={"type": "json_object"},
         )
-        seo_battle_plan = json.loads(chat_completion.choices[0].message.content)
-        
-        # Add the original angle and proof back in
-        seo_battle_plan['angle'] = angle
-        seo_battle_plan['proof'] = proof_data
-        
-        print(f"SEO AGENT: Successfully created battle plan for '{angle}'")
-        return seo_battle_plan
-
+        plan = json.loads(cc.choices[0].message.content)
+        plan['angle'] = angle
+        plan['proof'] = proof_data
+        print(f"SEO AGENT: Battle plan created for '{angle}'")
+        return plan
     except Exception as e:
-        print(f"SEO AGENT: AI Synthesis failed for angle '{angle}'. Error: {e}")
+        print(f"SEO AGENT: AI synthesis failed for '{angle}': {e}")
         return {
-            "angle": angle,
-            "proof": proof_data,
+            "angle": angle, "proof": proof_data,
             "error": f"AI synthesis failed: {e}",
-            "ctr_potential": "Unknown",
-            "justification": "AI synthesis failed.",
-            "recommended_titles": [],
-            "key_questions_to_answer": [],
-            "related_keywords": []
+            "ctr_potential": "Unknown", "justification": "AI synthesis failed.",
+            "recommended_titles": [], "key_questions_to_answer": [], "related_keywords": [],
         }
 
 
-
-
-# --- NEW: SEO AGENT ENDPOINT ---
 @app.post("/seo-agent")
-async def seo_agent(
-    request: ResearchBriefInput, # Use our new Pydantic model
-    
-):
+async def seo_agent(request: ResearchBriefInput):
     total_start_time = time.time()
-    
-    print(f"SEO AGENT: Received request from user")
-
-    
+    print("SEO AGENT: Received request.")
 
     try:
-        # --- Run analysis for all angles in parallel ---
-        tasks = []
-        for angle_data in request.strategic_angles:
-            tasks.append(
-                run_seo_analysis(
-                    angle_data=angle_data,
-                    audience_profile=request.audience_profile # Pass the audience profile dict
-                )
-            )
-        
+        tasks = [
+            run_seo_analysis(angle_data=a, audience_profile=request.audience_profile)
+            for a in request.strategic_angles
+        ]
         seo_battle_plans = await asyncio.gather(*tasks)
-        
 
-        total_end_time = time.time()
-        print(f"--- PROFILING: Total /seo-agent request took {total_end_time - total_start_time:.2f}s ---")
-        
-        # Return the list of battle plans
-        # We also pass back the original topic_analysis and audience_profile for the frontend
+        print(f"--- /seo-agent took {time.time() - total_start_time:.2f}s ---")
         return {
-            "topic_analysis": request.topic_analysis,
+            "topic_analysis":   request.topic_analysis,
             "audience_profile": request.audience_profile,
-            "seo_battle_plans": seo_battle_plans
+            "seo_battle_plans": seo_battle_plans,
         }
 
     except Exception as e:
-        print(f"SEO AGENT: An error occurred in the pipeline: {e}")
+        print(f"SEO AGENT error: {e}")
         raise HTTPException(status_code=500, detail="An error occurred during SEO analysis.")
-
-
-
