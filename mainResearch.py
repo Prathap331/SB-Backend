@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
-from gotrue.types import User
+from supabase_auth.types import User
 from openai import AsyncOpenAI
 from auth_dependencies import get_current_user
 from googleapiclient.discovery import build
