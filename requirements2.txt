@@ -41,12 +41,12 @@ groq                                # Direct Groq async client
 
 # ── Supabase ──────────────────────────────────────────────────
 supabase==2.22.0
-supabase-auth==2.22.0
-supabase-functions==2.22.0
-storage3==2.22.0
-postgrest==2.22.0
-realtime==2.22.0
-gotrue==2.22.0
+supabase-auth
+supabase-functions
+storage3
+postgrest
+realtime
+gotrue
 
 # ── Payments ──────────────────────────────────────────────────
 razorpay                            # Razorpay order creation + webhook verification
