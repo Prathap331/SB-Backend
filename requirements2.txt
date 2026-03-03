@@ -40,13 +40,11 @@ openai==2.2.0                       # Used for both Groq + OpenRouter (AsyncOpen
 groq                                # Direct Groq async client
 
 # ── Supabase ──────────────────────────────────────────────────
-supabase==2.22.0
-supabase-auth
-supabase-functions
-storage3
-postgrest
-realtime
-gotrue
+supabase==2.7.4
+gotrue==2.9.3
+postgrest==0.16.11
+realtime==2.0.2
+storage3==0.7.7
 
 # ── Payments ──────────────────────────────────────────────────
 razorpay                            # Razorpay order creation + webhook verification
