@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
-from supabase_auth.types import User
+from gotrue.types import User
 from openai import AsyncOpenAI
 from auth_dependencies import get_current_user
 from googleapiclient.discovery import build
@@ -1556,3 +1556,4 @@ async def seo_agent(request: ResearchBriefInput):
     except Exception as e:
         print(f"SEO AGENT error: {e}")
         raise HTTPException(status_code=500, detail="An error occurred during SEO analysis.")
+
