@@ -6,6 +6,7 @@
 from fastapi import Depends, HTTPException, status, Request, Header, BackgroundTasks
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -13,6 +14,7 @@ from postgrest.exceptions import APIError
 from gotrue.types import User
 from openai import AsyncOpenAI
 from auth_dependencies import get_current_user
+from auth_dependencies import login_user
 
 # ── NEW unified Google GenAI SDK ─────────────────────────────
 from google import genai
@@ -557,7 +559,9 @@ class CreateOrderRequest(BaseModel):
 @app.get("/")
 async def read_root():
     return {"status": "Welcome"}
-
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    return await login_user(form_data)
 
 # ── /process-topic ───────────────────────────────────────────
 
