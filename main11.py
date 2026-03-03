@@ -12,7 +12,7 @@ from supabase import create_client, Client
 from postgrest.exceptions import APIError
 from gotrue.types import User
 from openai import AsyncOpenAI
-from auth_dependencies import get_current_user
+from auth_dependencies import get_current_user, login_user
 
 # ── NEW unified Google GenAI SDK ─────────────────────────────
 from google import genai
@@ -557,6 +557,13 @@ class CreateOrderRequest(BaseModel):
 @app.get("/")
 async def read_root():
     return {"status": "Welcome"}
+
+@app.post("/token")
+async def token(form_data = Depends(login_user)):
+    """
+    Swagger OAuth2 password flow endpoint.
+    """
+    return form_data
 
 
 # ── /process-topic ───────────────────────────────────────────
