@@ -600,18 +600,6 @@ async def groq_script_generate(messages: list, model: str = GROQ_SCRIPT_MODEL) -
     return await _groq_generate_with_slots(messages, GROQ_SCRIPT_CLIENTS, model, "script")
 
 
-async def generate_process_topic_ideas(messages: list) -> str:
-    combined = "\n".join(str(m.get("content", "")) for m in messages if isinstance(m, dict))
-    if _estimate_tokens(combined) > PROCESS_TOPIC_TOKEN_BUDGET:
-        print("Idea generation prompt too large for Groq TPM limits; using OpenRouter directly.")
-        return await openrouter_generate(messages)
-    try:
-        return await groq_idea_generate(messages)
-    except Exception as exc:
-        print(f"Groq idea generation failed, falling back to OpenRouter: {exc}")
-        return await openrouter_generate(messages)
-
-
 async def generate_script_content(messages: list) -> str:
     try:
         return await groq_script_generate(messages)
@@ -1335,65 +1323,70 @@ async def process_topic(request: PromptRequest, background_tasks: BackgroundTask
                 db_context, web_context = await _summarize_context_for_ideas(
                     request.topic, db_context, web_context
                 )
+            print("--- Step 3 (Final Idea Gen) using CAGS pipeline ---")
+            tss_payload = await asyncio.wait_for(run_tss(request.topic), timeout=TSS_TIMEOUT_SEC)
+            cags_payload = tss_payload.get("cags") or {}
+            gap_angles = cags_payload.get("gap_angles") or []
+            briefs = cags_payload.get("briefs") or []
+            perspective_tree = cags_payload.get("perspective_tree") or []
+            if not gap_angles or not perspective_tree:
+                return {"error": "Could not produce CAGS-aligned ideas."}
 
-            final_prompt = f"""
-            You are an expert YouTube title strategist and scriptwriter.
-            Generate 4 distinct, attention-grabbing video titles for: "{request.topic}", 
-            with a corresponding description for each.
+            social_payload, news_payload = await asyncio.gather(
+                _safe_scan_topic_signals(
+                    label="social",
+                    scanner=scan_social_topic,
+                    topic=request.topic,
+                    timeout_sec=SOCIAL_SCAN_TIMEOUT_SEC,
+                    fallback_key="sample_posts",
+                ),
+                _safe_scan_topic_signals(
+                    label="news",
+                    scanner=scan_news_topic,
+                    topic=request.topic,
+                    timeout_sec=NEWS_SCAN_TIMEOUT_SEC,
+                    fallback_key="sample_articles",
+                ),
+            )
+            social_data = social_payload.get("sample_posts") or []
+            news_data = news_payload.get("sample_articles") or []
 
-            Use the provided research:
-            - FOUNDATIONAL KNOWLEDGE: deep context, facts, historical background.
-            - LATEST NEWS: fresh, timely angles (current date is today).
-
-            RULES:
-            1. For each idea: provide 'TITLE' and 'DESCRIPTION'.
-            2. Each DESCRIPTION MUST be 150-180 words. Write in full sentences, expand on the hook, tease 2-3 specific points the video covers, and end with a curiosity gap or question.
-            3. Separate each complete idea with '---'.
-            4. NO introductory text, explanations, or anything else.
-
-            EXAMPLE FORMAT:
-            TITLE: This Is Why Everyone Is Suddenly Talking About [Topic]
-            DESCRIPTION: In this video, we uncover the shocking truth behind [Topic]...
-            ---
-            TITLE: The Hidden Truth Behind [Related Concept]
-            DESCRIPTION: Everyone thinks they understand [Related Concept], but they're wrong...
-            ---
-
-            RESEARCH FOR TOPIC: "{request.topic}"
-            ---
-            FOUNDATIONAL KNOWLEDGE:
-            {db_context}
-            ---
-            LATEST NEWS UPDATES:
-            {web_context}
-            ---
-            """
-
-            step3_start = time.time()
-            response_text = await generate_process_topic_ideas([{"role": "user", "content": final_prompt}])
-            print(f"--- Step 3 (Final Idea Gen) took {time.time() - step3_start:.2f}s ---")
+            idea_payload = await generate_cags_aligned_ideas(
+                topic=request.topic,
+                gap_angles=gap_angles,
+                briefs=briefs,
+                perspective_tree=perspective_tree,
+                social_data=social_data,
+                news_data=news_data,
+                db_context=db_context,
+                web_context=web_context,
+                max_angles=4,
+                ideas_per_angle=1,
+                used_angle_ids=[],
+                groq_client=groq_client,
+                gemini_client=EMBED_CLIENTS[0] if EMBED_CLIENTS else None,
+                cache_lookup=TOPIC_CACHE.lookup,
+                cache_store=None,
+            )
 
             final_ideas = []
             final_descriptions = []
-            for block in response_text.strip().split('---'):
-                title = description = ""
-                for line in block.strip().split('\n'):
-                    if line.startswith('TITLE:'):
-                        title = line.replace('TITLE:', '', 1).strip()
-                    elif line.startswith('DESCRIPTION:'):
-                        description = line.replace('DESCRIPTION:', '', 1).strip()
+            for cluster in idea_payload.get("idea_clusters") or []:
+                variant = (cluster.get("idea_variants") or [{}])[0]
+                title = str(variant.get("title") or "").strip()
+                description = str(variant.get("description") or "").strip()
                 if title and description:
                     final_ideas.append(title)
                     final_descriptions.append(description)
 
-            return {
-                "source_of_context": source_of_context,
-                "ideas": final_ideas,
-                "descriptions": final_descriptions,
-                "generated_keywords": base_keywords,
-                "source_urls": list(set(source_urls)),
-                "scraped_text_context": f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}",
-            }
+            idea_payload["source_of_context"] = source_of_context
+            idea_payload["generated_keywords"] = base_keywords
+            idea_payload["source_urls"] = list(set(source_urls))
+            idea_payload["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
+            idea_payload["ideas"] = final_ideas
+            idea_payload["descriptions"] = final_descriptions
+            idea_payload["total_request_time_sec"] = round(time.time() - total_start_time, 2)
+            return idea_payload
 
     try:
         payload, cache_hit = await _run_singleflight_cached(
