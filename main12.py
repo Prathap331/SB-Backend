@@ -1274,146 +1274,25 @@ async def pipeline_metrics(request: PromptRequest):
 
 @app.post("/process-topic")
 async def process_topic(request: PromptRequest, background_tasks: BackgroundTasks):
-    total_start_time = time.time()
-    print(f"Received topic: {request.topic}")
+    topic = (request.topic or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic must be a non-empty string")
 
-    async def _compute() -> dict:
-        async with _process_topic_request_semaphore:
-            scraped_urls: set = set()
-            source_of_context = ""
-            base_keywords: list[str] = []
-
-            print("--- Phase 1: DB lookup + keyword gen in parallel ---")
-            db_results, base_keywords = await asyncio.gather(
-                get_db_context(request.topic),
-                _generate_search_keywords(request.topic),
-            )
-            print(f"--- Phase 1 done: {len(db_results)} DB docs, keywords: {base_keywords} ---")
-
-            db_count = len(db_results)
-            if db_count >= 5:
-                source_of_context = "DATABASE_RICH"
-                print(f"--- DB RICH ({db_count} docs): Light news scrape for freshness. ---")
-                new_articles = await get_latest_news_context(request.topic, scraped_urls)
-            elif db_count >= 1:
-                source_of_context = "DATABASE_PARTIAL"
-                print(f"--- DB PARTIAL ({db_count} docs): Deep scrape to supplement. ---")
-                new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
-            else:
-                source_of_context = "DEEP_SCRAPE"
-                print(f"--- DB MISS: Full deep scrape with keywords: {base_keywords} ---")
-                new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
-
-            db_context, web_context = "", ""
-            source_urls = []
-
-            if db_results:
-                db_blocks = [item.get('content', '') for item in db_results]
-                db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
-                source_urls.extend(list(set([
-                    item['source_url'] for item in db_results if item.get('source_url')
-                ])))
-
-            if new_articles:
-                web_blocks = [
-                    f"Source: {art['title']}\n{art['text']}" for art in new_articles
-                ]
-                web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
-                source_urls.extend([art['url'] for art in new_articles])
-                for article in new_articles:
-                    background_tasks.add_task(
-                        add_scraped_data_to_db,
-                        article['title'], article['text'], article['url'],
-                        "",
-                        request.topic,
-                        base_keywords,
-                    )
-
-            if not db_context and not web_context:
-                return {"error": "Could not find any information."}
-
-            merged_context = f"{db_context}\n\n{web_context}"
-            if _estimate_tokens(merged_context) > PROCESS_TOPIC_TOKEN_BUDGET:
-                print("Process-topic context is large; summarizing before final idea generation.")
-                db_context, web_context = await _summarize_context_for_ideas(
-                    request.topic, db_context, web_context
-                )
-            print("--- Step 3 (Final Idea Gen) using CAGS pipeline ---")
-            tss_payload = await asyncio.wait_for(run_tss(request.topic), timeout=TSS_TIMEOUT_SEC)
-            cags_payload = tss_payload.get("cags") or {}
-            gap_angles = cags_payload.get("gap_angles") or []
-            briefs = cags_payload.get("briefs") or []
-            perspective_tree = cags_payload.get("perspective_tree") or []
-            if not gap_angles or not perspective_tree:
-                return {"error": "Could not produce CAGS-aligned ideas."}
-
-            social_payload, news_payload = await asyncio.gather(
-                _safe_scan_topic_signals(
-                    label="social",
-                    scanner=scan_social_topic,
-                    topic=request.topic,
-                    timeout_sec=SOCIAL_SCAN_TIMEOUT_SEC,
-                    fallback_key="sample_posts",
-                ),
-                _safe_scan_topic_signals(
-                    label="news",
-                    scanner=scan_news_topic,
-                    topic=request.topic,
-                    timeout_sec=NEWS_SCAN_TIMEOUT_SEC,
-                    fallback_key="sample_articles",
-                ),
-            )
-            social_data = social_payload.get("sample_posts") or []
-            news_data = news_payload.get("sample_articles") or []
-
-            idea_payload = await generate_cags_aligned_ideas(
-                topic=request.topic,
-                gap_angles=gap_angles,
-                briefs=briefs,
-                perspective_tree=perspective_tree,
-                social_data=social_data,
-                news_data=news_data,
-                db_context=db_context,
-                web_context=web_context,
-                max_angles=4,
-                ideas_per_angle=3,
-                used_angle_ids=[],
-                groq_client=groq_client,
-                gemini_client=EMBED_CLIENTS[0] if EMBED_CLIENTS else None,
-                cache_lookup=TOPIC_CACHE.lookup,
-                cache_store=None,
-            )
-
-            final_ideas = []
-            final_descriptions = []
-            for cluster in idea_payload.get("idea_clusters") or []:
-                for variant in cluster.get("idea_variants") or []:
-                    title = str(variant.get("title") or "").strip()
-                    description = str(variant.get("description") or "").strip()
-                    if title and description:
-                        final_ideas.append(title)
-                        final_descriptions.append(description)
-
-            idea_payload["source_of_context"] = source_of_context
-            idea_payload["generated_keywords"] = base_keywords
-            idea_payload["source_urls"] = list(set(source_urls))
-            idea_payload["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
-            idea_payload["ideas"] = final_ideas
-            idea_payload["descriptions"] = final_descriptions
-            idea_payload["total_request_time_sec"] = round(time.time() - total_start_time, 2)
-            return idea_payload
-
+    print("Received /process-topic request; forwarding to /generate-ideas pipeline.")
+    gen_request = GenerateIdeasRequest(
+        topic=topic,
+        max_angles=4,
+        ideas_per_angle=3,
+        used_angle_ids=[],
+        force_refresh=False,
+    )
     try:
-        payload, cache_hit = await _run_singleflight_cached(
-            group="process_topic",
-            topic=request.topic,
-            ttl_seconds=PROCESS_TOPIC_CACHE_TTL_SEC,
-            compute_coro=_compute,
-        )
-        if cache_hit:
-            print(f"process-topic cache hit for topic: {request.topic}")
-        print(f"Total request time: {time.time() - total_start_time:.2f}s")
+        payload = await generate_ideas_endpoint(gen_request, background_tasks)
+        if isinstance(payload, dict):
+            payload["legacy_route"] = "process-topic"
         return payload
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error in /process-topic: {e}")
         return {"error": "An error occurred in the processing pipeline."}
@@ -1539,6 +1418,18 @@ async def generate_ideas_endpoint(
             "csi": (tss_payload.get("csi") or {}).get("csi"),
             "total_angles": len(gap_angles),
         }
+        final_ideas = []
+        final_descriptions = []
+        for cluster in idea_clusters.get("idea_clusters") or []:
+            for variant in cluster.get("idea_variants") or []:
+                title = str(variant.get("title") or "").strip()
+                description = str(variant.get("description") or "").strip()
+                if title and description:
+                    final_ideas.append(title)
+                    final_descriptions.append(description)
+        idea_clusters["ideas"] = final_ideas
+        idea_clusters["descriptions"] = final_descriptions
+        idea_clusters["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
         idea_clusters["total_request_time_sec"] = round(time.time() - total_start_time, 2)
         TOPIC_CACHE.store(topic, idea_clusters, cache_client)
         background_tasks.add_task(_store_topic_cache_db, topic, idea_clusters, cache_client)
