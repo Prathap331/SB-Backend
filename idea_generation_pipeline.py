@@ -18,6 +18,7 @@ DEFAULT_CAGS_THRESHOLD = 40.0
 DEFAULT_RELAXED_CAGS_THRESHOLD = 20.0
 DEFAULT_MAX_ANGLES = 5
 DEFAULT_IDEAS_PER_ANGLE = 3
+TOPIC_RELEVANCE_THRESHOLD = 0.42
 
 SOURCE_WORD_CAPS = {
     "db_context": 3000,
@@ -30,6 +31,168 @@ SOURCE_WORD_CAPS = {
 
 def _normalize_topic(topic: str) -> str:
     return " ".join((topic or "").strip().lower().split())
+
+
+def _token_set(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9']+", (text or "").lower())
+        if len(token) > 1
+    }
+
+
+def _angle_relevance_text(angle: dict[str, Any]) -> str:
+    return " ".join(
+        part for part in [
+            str(angle.get("angle_string") or ""),
+            str(angle.get("who") or ""),
+            " ".join(map(str, angle.get("what") or [])),
+            str(angle.get("when") or ""),
+            str(angle.get("scale") or ""),
+            str(angle.get("how") or ""),
+            str(angle.get("who_benefits") or ""),
+            str(angle.get("story_frame") or ""),
+        ]
+        if part and str(part).strip()
+    ).strip()
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b:
+        return 0.0
+    a_arr = np.asarray(a, dtype=np.float32)
+    b_arr = np.asarray(b, dtype=np.float32)
+    denom = float((np.linalg.norm(a_arr) or 0.0) * (np.linalg.norm(b_arr) or 0.0))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a_arr, b_arr) / denom)
+
+
+def _embed_texts_with_gemini(client: Any, texts: list[str]) -> list[list[float]] | None:
+    if client is None or not texts:
+        return None
+    try:
+        from google.genai import types as gt
+    except Exception:
+        return None
+    models = getattr(client, "models", None)
+    if models is None or not hasattr(models, "embed_content"):
+        return None
+    try:
+        resp = models.embed_content(
+            model="gemini-embedding-001",
+            contents=texts,
+            config=gt.EmbedContentConfig(
+                task_type="SEMANTIC_SIMILARITY",
+                output_dimensionality=768,
+            ),
+        )
+        vecs = [list(e.values) for e in getattr(resp, "embeddings", []) or []]
+        if len(vecs) != len(texts) or any(len(vec) != 768 for vec in vecs):
+            return None
+        return vecs
+    except Exception:
+        return None
+
+
+DOMAIN_HINTS: dict[str, set[str]] = {
+    "gaming": {
+        "gaming", "game", "games", "gamer", "gamers", "esports", "noob", "pro", "hacker",
+        "hackers", "stream", "streamer", "streamers", "tournament", "players", "player",
+        "ranked", "matchmaking", "fps", "moba", "rpg", "battle", "rank", "clan", "guild",
+    },
+    "cybersecurity": {
+        "cyber", "cybersecurity", "security", "hacker", "hackers", "malware", "phishing",
+        "breach", "breaches", "ransomware", "exploit", "exploits", "vulnerability", "vulnerabilities",
+    },
+    "politics": {
+        "government", "policy", "policies", "politics", "election", "elections", "law",
+        "regulation", "regulations", "parliament", "congress", "senate", "minister", "agency",
+        "agencies", "regulatory", "regulators",
+    },
+    "war": {
+        "war", "conflict", "military", "battle", "ceasefire", "security", "defense",
+        "geopolitics", "sanctions", "invasion", "strike", "missile", "drone",
+    },
+    "finance": {
+        "finance", "financial", "market", "markets", "stock", "stocks", "crypto", "bitcoin",
+        "economy", "economic", "bank", "banks", "trade", "trading", "investor", "investors",
+    },
+    "technology": {
+        "ai", "artificial", "intelligence", "llm", "software", "developer", "developers",
+        "technology", "tech", "automation", "startup", "startups", "computing", "cloud", "data",
+    },
+}
+
+
+def _infer_topic_domains(topic: str) -> set[str]:
+    tokens = _token_set(topic)
+    raw = (topic or "").lower()
+    detected: set[str] = set()
+    for domain, anchors in DOMAIN_HINTS.items():
+        if tokens & anchors or any(anchor in raw for anchor in anchors):
+            detected.add(domain)
+    return detected
+
+
+def _topic_relevance_details(
+    topic: str,
+    angle: dict[str, Any],
+    *,
+    topic_vector: list[float] | None = None,
+    angle_vector: list[float] | None = None,
+) -> dict[str, Any]:
+    topic_text = _normalize_topic(topic)
+    angle_text = _normalize_topic(_angle_relevance_text(angle))
+    topic_tokens = _token_set(topic_text)
+    angle_tokens = _token_set(angle_text)
+    lexical_hits = topic_tokens & angle_tokens
+    lexical_score = len(lexical_hits) / max(len(topic_tokens), 1)
+
+    semantic_score = 0.0
+    if topic_vector is not None and angle_vector is not None:
+        semantic_score = _cosine_similarity(topic_vector, angle_vector)
+
+    topic_domains = _infer_topic_domains(topic_text)
+    angle_domains = set()
+    for domain, anchors in DOMAIN_HINTS.items():
+        if angle_tokens & anchors or any(anchor in angle_text for anchor in anchors):
+            angle_domains.add(domain)
+
+    domain_overlap = topic_domains & angle_domains
+    score = (semantic_score * 0.55) + (lexical_score * 0.20)
+    if topic_domains:
+        if domain_overlap:
+            score += 0.55
+            score += 0.03 * min(len(domain_overlap), 3)
+        else:
+            score -= 0.35
+
+    who = angle.get("who") or ""
+    who_text = str(who).lower()
+    if topic_domains and "gaming" in topic_domains:
+        if any(term in who_text for term in {"government", "policy", "regulatory", "regulation", "law", "agency", "agencies"}):
+            score -= 0.25
+    if topic_domains and "war" in topic_domains:
+        if any(term in who_text for term in {"gaming", "esports", "stream", "streamer"}):
+            score -= 0.25
+
+    score = max(0.0, min(score, 1.0))
+    reasons = []
+    if lexical_hits:
+        reasons.append(f"lexical:{','.join(sorted(lexical_hits)[:5])}")
+    if domain_overlap:
+        reasons.append(f"domain:{','.join(sorted(domain_overlap))}")
+    if semantic_score:
+        reasons.append(f"semantic:{semantic_score:.2f}")
+    if not reasons:
+        reasons.append("weak_topic_match")
+    return {
+        "score": round(score, 3),
+        "reasons": reasons,
+        "topic_domains": sorted(topic_domains),
+        "angle_domains": sorted(angle_domains),
+    }
 
 
 def _count_words(text: str) -> int:
@@ -182,18 +345,46 @@ TOPIC_CACHE = SemanticIdeaCache()
 
 
 def select_candidate_angles(
+    topic: str,
     gap_angles: list[dict[str, Any]],
     used_angle_ids: list[str] | None,
+    gemini_client: Any | None = None,
     cags_threshold: float = DEFAULT_CAGS_THRESHOLD,
 ) -> list[dict[str, Any]]:
     used = set(used_angle_ids or [])
+    topic_vec = None
+    angle_vecs: dict[str, list[float]] = {}
+    if gemini_client is not None:
+        texts = [_normalize_topic(topic)] + [_angle_relevance_text(angle) for angle in gap_angles]
+        vecs = _embed_texts_with_gemini(gemini_client, texts)
+        if vecs and len(vecs) == len(texts):
+            topic_vec = vecs[0]
+            for angle, vec in zip(gap_angles, vecs[1:]):
+                angle_id = str(angle.get("angle_id") or "")
+                if angle_id:
+                    angle_vecs[angle_id] = vec
 
     def _filter(threshold: float) -> list[dict[str, Any]]:
-        return [
-            angle for angle in gap_angles
-            if float(angle.get("cags_score", 0.0) or 0.0) >= threshold
-            and angle.get("angle_id") not in used
-        ]
+        kept: list[dict[str, Any]] = []
+        for angle in gap_angles:
+            angle_id = angle.get("angle_id")
+            if angle_id in used:
+                continue
+            relevance = _topic_relevance_details(
+                topic,
+                angle,
+                topic_vector=topic_vec,
+                angle_vector=angle_vecs.get(str(angle_id or "")),
+            )
+            if relevance["score"] < TOPIC_RELEVANCE_THRESHOLD:
+                continue
+            if float(angle.get("cags_score", 0.0) or 0.0) < threshold:
+                continue
+            enriched = dict(angle)
+            enriched["topic_relevance_score"] = relevance["score"]
+            enriched["topic_relevance_reasons"] = relevance["reasons"]
+            kept.append(enriched)
+        return kept
 
     selected = _filter(cags_threshold)
     if not selected:
@@ -571,7 +762,7 @@ async def generate_ideas(
         if cached:
             return cached
 
-    candidates = select_candidate_angles(gap_angles, used_angle_ids or [])
+    candidates = select_candidate_angles(topic, gap_angles, used_angle_ids or [], gemini_client)
     if not candidates:
         raise ValueError("no_viable_angles")
     selected, diversity_applied = apply_diversity_pass(
@@ -596,13 +787,6 @@ async def generate_ideas(
     )
     depth_fallback_used = False
     depth_fallback_reason = ""
-    if not passing and suppressed:
-        # Keep the endpoint useful on sparse topics by returning the best
-        # suppressed clusters with an explicit warning instead of failing hard.
-        suppressed.sort(key=lambda x: x.get("cags_score", 0), reverse=True)
-        passing = suppressed[: min(len(suppressed), max_angles)]
-        depth_fallback_used = True
-        depth_fallback_reason = "all_clusters_suppressed"
 
     response = assemble_response(
         topic=topic,
@@ -616,13 +800,6 @@ async def generate_ideas(
         served_from_cache=False,
         cache_age_hours=None,
     )
-    if depth_fallback_used:
-        response["depth_fallback_used"] = True
-        response["depth_fallback_reason"] = depth_fallback_reason
-        response["depth_check_summary"] = dict(depth_summary, depth_fallback_used=True)
-        for cluster in response.get("idea_clusters", []):
-            cluster["depth_warning"] = True
-            cluster["depth_status"] = "warning"
     if cache_store:
         cache_store(topic, response, gemini_client)
     return response

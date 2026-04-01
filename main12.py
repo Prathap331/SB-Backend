@@ -1376,7 +1376,7 @@ async def process_topic(request: PromptRequest, background_tasks: BackgroundTask
                 db_context=db_context,
                 web_context=web_context,
                 max_angles=4,
-                ideas_per_angle=1,
+                ideas_per_angle=3,
                 used_angle_ids=[],
                 groq_client=groq_client,
                 gemini_client=EMBED_CLIENTS[0] if EMBED_CLIENTS else None,
@@ -1387,12 +1387,12 @@ async def process_topic(request: PromptRequest, background_tasks: BackgroundTask
             final_ideas = []
             final_descriptions = []
             for cluster in idea_payload.get("idea_clusters") or []:
-                variant = (cluster.get("idea_variants") or [{}])[0]
-                title = str(variant.get("title") or "").strip()
-                description = str(variant.get("description") or "").strip()
-                if title and description:
-                    final_ideas.append(title)
-                    final_descriptions.append(description)
+                for variant in cluster.get("idea_variants") or []:
+                    title = str(variant.get("title") or "").strip()
+                    description = str(variant.get("description") or "").strip()
+                    if title and description:
+                        final_ideas.append(title)
+                        final_descriptions.append(description)
 
             idea_payload["source_of_context"] = source_of_context
             idea_payload["generated_keywords"] = base_keywords
