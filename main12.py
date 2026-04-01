@@ -54,12 +54,23 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 nltk_data_dir = os.path.join(project_root, 'nltk_data')
 nltk.data.path.insert(0, nltk_data_dir)
 
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('tokenizers/punkt_tab')
-    print("NLTK 'punkt' and 'punkt_tab' data found successfully.")
-except LookupError as e:
-    print(f"!!! CRITICAL NLTK DATA ERROR: {e} !!!")
+def _ensure_nltk_resource(resource_path: str, download_name: str) -> None:
+    try:
+        nltk.data.find(resource_path)
+        return
+    except LookupError:
+        pass
+    try:
+        print(f"Downloading NLTK resource: {download_name}")
+        nltk.download(download_name, download_dir=nltk_data_dir, quiet=True)
+        nltk.data.find(resource_path)
+    except LookupError as e:
+        print(f"!!! CRITICAL NLTK DATA ERROR: {e} !!!")
+
+
+_ensure_nltk_resource("tokenizers/punkt", "punkt")
+_ensure_nltk_resource("tokenizers/punkt_tab", "punkt_tab")
+print("NLTK 'punkt' and 'punkt_tab' data checked.")
 
 # ── Razorpay ─────────────────────────────────────────────────
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
@@ -621,7 +632,11 @@ print("Supabase client initialized.")
 # ════════════════════════════════════════════════════════════
 
 def chunk_text(text: str, chunk_size: int = 250, chunk_overlap: int = 50) -> list[str]:
-    sentences = sent_tokenize(text)
+    try:
+        sentences = sent_tokenize(text)
+    except LookupError:
+        # Fallback for cold-start environments where NLTK data is still being provisioned.
+        sentences = re.split(r'(?<=[.!?])\s+', text or "")
     chunks = []
     current_chunk = ""
     for sentence in sentences:
