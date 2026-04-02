@@ -476,6 +476,11 @@ def _is_embedding_quota_error(error_text: str) -> bool:
     return "resource_exhausted" in t or "quota" in t
 
 
+def _is_groq_rate_limit_error(error_text: str) -> bool:
+    t = (error_text or "").lower()
+    return "rate limit" in t or "rate_limit_exceeded" in t or "too many requests" in t
+
+
 def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -1058,54 +1063,66 @@ async def get_db_context(topic: str) -> list[dict]:
     try:
         loop = asyncio.get_running_loop()
 
-        # ── Stage 1: HyDE vector search ──────────────────────
-        hyde_prompt = f"""
-        Write a short, factual, encyclopedia-style paragraph that provides a direct answer
-        to the following topic. Be concise and include key terms.
+        hypothetical_document = topic
+        try:
+            # ── Stage 1: HyDE vector search ──────────────────────
+            hyde_prompt = f"""
+            Write a short, factual, encyclopedia-style paragraph that provides a direct answer
+            to the following topic. Be concise and include key terms.
 
-        Topic: "{topic}"
-        """
-        chat_completion = await groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": hyde_prompt}],
-            model=GROQ_GENERATION_MODEL,
-        )
-        hypothetical_document = chat_completion.choices[0].message.content
-        print(f"--- DB TASK: HyDE doc: {hypothetical_document[:100]}...")
-
-        embed_response = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: _embed_with_failover(
-                    contents=hypothetical_document,
-                    task_type="RETRIEVAL_QUERY",
-                    output_dimensionality=768,
-                ),
-            ),
-            timeout=DB_LOOKUP_TIMEOUT_SEC,
-        )
-        query_embedding = embed_response.embeddings[0].values
+            Topic: "{topic}"
+            """
+            chat_completion = await groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": hyde_prompt}],
+                model=GROQ_GENERATION_MODEL,
+            )
+            hypothetical_document = chat_completion.choices[0].message.content
+            print(f"--- DB TASK: HyDE doc: {hypothetical_document[:100]}...")
+        except Exception as exc:
+            if _is_groq_rate_limit_error(str(exc)):
+                print(f"--- DB TASK: HyDE rate-limited, falling back to raw topic keyword search: {exc} ---")
+            else:
+                print(f"--- DB TASK: HyDE failed, falling back to raw topic keyword search: {exc} ---")
+            hypothetical_document = topic
 
         try:
-            vector_response = await asyncio.wait_for(
+            embed_response = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    lambda: supabase.rpc(
-                        'match_documents',
-                        {
-                            'query_embedding':  query_embedding,
-                            'match_threshold':  0.55,   # relaxed: was 0.65
-                            'match_count':      8,
-                        }
-                    ).execute()
+                    lambda: _embed_with_failover(
+                        contents=hypothetical_document,
+                        task_type="RETRIEVAL_QUERY",
+                        output_dimensionality=768,
+                    ),
                 ),
                 timeout=DB_LOOKUP_TIMEOUT_SEC,
             )
-            vector_results = vector_response.data or []
-            for row in vector_results:
-                combined[row['id']] = row
-            print(f"--- DB TASK: Vector search → {len(vector_results)} results ---")
-        except asyncio.TimeoutError:
-            print(f"--- DB TASK: Vector search timed out after {DB_LOOKUP_TIMEOUT_SEC}s ---")
+            query_embedding = embed_response.embeddings[0].values
+
+            try:
+                vector_response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: supabase.rpc(
+                            'match_documents',
+                            {
+                                'query_embedding':  query_embedding,
+                                'match_threshold':  0.55,   # relaxed: was 0.65
+                                'match_count':      8,
+                            }
+                        ).execute()
+                    ),
+                    timeout=DB_LOOKUP_TIMEOUT_SEC,
+                )
+                vector_results = vector_response.data or []
+                for row in vector_results:
+                    combined[row['id']] = row
+                print(f"--- DB TASK: Vector search → {len(vector_results)} results ---")
+            except asyncio.TimeoutError:
+                print(f"--- DB TASK: Vector search timed out after {DB_LOOKUP_TIMEOUT_SEC}s ---")
+                vector_results = []
+        except Exception as exc:
+            print(f"--- DB TASK: Vector stage unavailable, using keyword fallback only: {exc} ---")
             vector_results = []
 
         # ── Stage 2: Keyword fallback if vector was thin ──────
