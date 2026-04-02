@@ -1128,27 +1128,37 @@ async def get_db_context(topic: str) -> list[dict]:
         # ── Stage 2: Keyword fallback if vector was thin ──────
         if len(combined) < 3:
             print(f"--- DB TASK: Thin vector results ({len(combined)}), running keyword search... ---")
-            try:
-                keyword_response = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None,
-                        lambda: supabase.rpc(
-                            'search_documents',
-                            {
-                                'search_query': topic,
-                                'match_count':  8,
-                            }
-                        ).execute()
-                    ),
-                    timeout=DB_LOOKUP_TIMEOUT_SEC,
-                )
-                keyword_results = keyword_response.data or []
-                for row in keyword_results:
-                    if row['id'] not in combined:
-                        combined[row['id']] = row
-                print(f"--- DB TASK: Keyword search → {len(keyword_results)} results, total unique: {len(combined)} ---")
-            except asyncio.TimeoutError:
-                print(f"--- DB TASK: Keyword search timed out after {DB_LOOKUP_TIMEOUT_SEC}s ---")
+            topic_terms = [term for term in re.findall(r"[A-Za-z0-9']+", topic.lower()) if len(term) > 2][:5]
+            if not topic_terms:
+                topic_terms = [topic.lower()]
+
+            keyword_rows: list[dict] = []
+            seen_ids: set[Any] = set(combined.keys())
+            for term in topic_terms:
+                try:
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda term=term: supabase.table("documents")
+                            .select("id, content, source_title, source_url, metadata, created_at")
+                            .or_(f"content.ilike.%{term}%,source_title.ilike.%{term}%")
+                            .limit(8)
+                            .execute()
+                        ),
+                        timeout=DB_LOOKUP_TIMEOUT_SEC,
+                    )
+                except Exception as exc:
+                    print(f"--- DB TASK: Keyword table fallback failed for term '{term}': {exc} ---")
+                    continue
+                rows = response.data or []
+                for row in rows:
+                    row_id = row.get("id")
+                    if row_id is None or row_id in seen_ids:
+                        continue
+                    seen_ids.add(row_id)
+                    combined[row_id] = row
+                    keyword_rows.append(row)
+            print(f"--- DB TASK: Keyword table search → {len(keyword_rows)} results, total unique: {len(combined)} ---")
 
     except Exception as e:
         print(f"--- DB TASK: Error: {e} ---")
