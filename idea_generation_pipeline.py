@@ -39,12 +39,40 @@ def _normalize_topic(topic: str) -> str:
 def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
+    if _payload_uses_fallback_variants(payload):
+        return False
     ideas = payload.get("ideas")
-    if isinstance(ideas, list) and len(ideas) > 0:
+    if isinstance(ideas, list) and any(str(item).strip() for item in ideas):
         return True
     clusters = payload.get("idea_clusters")
-    if isinstance(clusters, list) and len(clusters) > 0:
-        return True
+    if not isinstance(clusters, list) or not clusters:
+        return False
+    for cluster in clusters:
+        variants = (cluster or {}).get("idea_variants")
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            title = str((variant or {}).get("title") or "").strip()
+            desc = str((variant or {}).get("description") or "").strip()
+            if title and desc:
+                return True
+    return False
+
+
+def _payload_uses_fallback_variants(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    clusters = payload.get("idea_clusters")
+    if not isinstance(clusters, list):
+        return False
+    for cluster in clusters:
+        variants = (cluster or {}).get("idea_variants")
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            reason = str((variant or {}).get("gap_reason") or "").lower()
+            if "fallback expansion" in reason:
+                return True
     return False
 
 
@@ -512,10 +540,19 @@ def _safe_groq_parse(resp: Any) -> dict[str, Any]:
 
 def _fallback_variant_title(topic: str, angle: dict[str, Any], index: int) -> str:
     who = str(angle.get("who") or "the audience").strip()
-    frame = str(angle.get("story_frame") or "unexpected").replace("_", " ").strip()
+    frame = str(angle.get("story_frame") or "hidden angle").replace("_", " ").strip()
     when = str(angle.get("when") or "now").strip()
+    how = str(angle.get("how") or "data-driven").replace("_", " ").strip()
+    scale = str(angle.get("scale") or "global").strip()
     topic_clean = " ".join((topic or "").split())
-    return f"{topic_clean}: {who} {frame.title()} {when.title()} Angle {index + 1}"
+    templates = [
+        f"{topic_clean}: {who} {frame.title()} Signals {when.title()}",
+        f"Who Gains, Who Pays? {topic_clean} Through {who}",
+        f"{topic_clean} {scale.title()} Outlook: {who} on the {how.title()} Trade-offs",
+        f"{topic_clean}: The {who} Case Nobody Is Tracking",
+        f"{topic_clean} Explained for {who}: What Changes Next",
+    ]
+    return templates[index % len(templates)]
 
 
 def _fallback_expand_variants(
@@ -534,10 +571,22 @@ def _fallback_expand_variants(
     story_frame = str(angle.get("story_frame") or "curiosity").replace("_", " ").strip()
     base_hook = seed.get("hook_sentence") or f"What if {topic} looked different through the eyes of {who}?"
     base_title = seed.get("suggested_title") or _fallback_variant_title(topic, angle, 0)
+    base_gap_reason = _normalized_angle_gap_reason(angle)
 
     variants: list[dict[str, Any]] = []
     for index in range(max(1, ideas_per_angle)):
         variant_title = base_title if index == 0 else _fallback_variant_title(topic, angle, index)
+        hook_variant = base_hook
+        if index == 1:
+            hook_variant = (
+                f"Most coverage misses the {who} viewpoint. "
+                f"What changes when we track {how.replace('_', ' ')} at the {scale} level?"
+            )
+        elif index >= 2:
+            hook_variant = (
+                f"The headline tells one story, but the {who} perspective reveals a different "
+                f"winner-loser map across {what}."
+            )
         variant_description = (
             f"Explore {topic} through {who} while focusing on {what}. "
             f"Frame it around a {when} {scale} lens and use a {how} structure to reveal who benefits, "
@@ -549,14 +598,140 @@ def _fallback_expand_variants(
                 "title": variant_title,
                 "description": variant_description,
                 "content_pillars": [what, when, scale],
-                "gap_reason": f"Fallback expansion for {who} because the model response was unavailable.",
+                "gap_reason": base_gap_reason,
                 "target_audience": who,
-                "hook_strategy": base_hook,
+                "hook_strategy": hook_variant,
                 "who_benefits": who_benefits,
                 "story_frame": story_frame,
             }
         )
     return variants[:ideas_per_angle]
+
+
+def _extract_json_object(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        snippet = text[start : end + 1]
+        try:
+            parsed = json.loads(snippet)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _normalized_angle_gap_reason(angle: dict[str, Any]) -> str:
+    coverage = str(angle.get("coverage_label") or "NOT_COVERED").replace("_", " ").lower()
+    who = str(angle.get("who") or "this audience").strip()
+    return f"Low direct coverage for {who}; strong opportunity in current content landscape ({coverage})."
+
+
+def _normalize_variant(
+    *,
+    variant: dict[str, Any],
+    index: int,
+    topic: str,
+    angle: dict[str, Any],
+    briefs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    seed = get_cags_brief_seed(angle.get("angle_id"), briefs)
+    who = str(angle.get("who") or "the audience").strip()
+    what = _build_what_str(angle.get("what")) or "the core topic"
+    when = str(angle.get("when") or "now").strip()
+    scale = str(angle.get("scale") or "global").strip()
+    how = str(angle.get("how") or "contrast").strip()
+    story_frame = str(angle.get("story_frame") or "curiosity").replace("_", " ").strip()
+
+    title = str(variant.get("title") or "").strip()
+    if not title:
+        if index == 0 and seed.get("suggested_title"):
+            title = str(seed.get("suggested_title") or "").strip()
+        else:
+            title = _fallback_variant_title(topic, angle, index)
+
+    description = str(variant.get("description") or "").strip()
+    if not description:
+        description = (
+            f"Explore {topic} through {who} while focusing on {what}. "
+            f"Frame it around a {when} {scale} lens and use a {how} structure to reveal who benefits, "
+            f"who loses, and why the story still matters. End with a curiosity gap about {story_frame}."
+        )
+
+    pillars = variant.get("content_pillars")
+    if not isinstance(pillars, list) or len(pillars) < 3:
+        content_pillars = [what, when, scale]
+    else:
+        clean = [str(p).strip() for p in pillars if str(p).strip()]
+        while len(clean) < 3:
+            clean.append([what, when, scale][len(clean)])
+        content_pillars = clean[:3]
+
+    gap_reason = str(variant.get("gap_reason") or "").strip() or _normalized_angle_gap_reason(angle)
+    target_audience = str(variant.get("target_audience") or "").strip() or who
+    hook_strategy = str(variant.get("hook_strategy") or "").strip()
+    if not hook_strategy:
+        hook_strategy = str(seed.get("hook_sentence") or f"What if {topic} looked different through the eyes of {who}?").strip()
+
+    return {
+        "variant_index": index + 1,
+        "title": title,
+        "description": description,
+        "content_pillars": content_pillars,
+        "gap_reason": gap_reason,
+        "target_audience": target_audience,
+        "hook_strategy": hook_strategy,
+        "who_benefits": str(variant.get("who_benefits") or angle.get("who_benefits") or "unclear"),
+        "story_frame": str(variant.get("story_frame") or angle.get("story_frame") or "curiosity"),
+    }
+
+
+def _normalize_variants_payload(
+    *,
+    parsed: dict[str, Any],
+    topic: str,
+    angle: dict[str, Any],
+    briefs: list[dict[str, Any]],
+    ideas_per_angle: int,
+) -> list[dict[str, Any]]:
+    variants_raw = parsed.get("variants")
+    if not isinstance(variants_raw, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for idx, item in enumerate(variants_raw[: max(ideas_per_angle, 1)]):
+        if not isinstance(item, dict):
+            continue
+        normalized.append(
+            _normalize_variant(
+                variant=item,
+                index=idx,
+                topic=topic,
+                angle=angle,
+                briefs=briefs,
+            )
+        )
+    if not normalized:
+        return []
+    while len(normalized) < ideas_per_angle:
+        idx = len(normalized)
+        normalized.append(
+            _normalize_variant(
+                variant={},
+                index=idx,
+                topic=topic,
+                angle=angle,
+                briefs=briefs,
+            )
+        )
+    return normalized[:ideas_per_angle]
 
 
 async def expand_angle_ideas(
@@ -565,6 +740,7 @@ async def expand_angle_ideas(
     briefs: list[dict[str, Any]],
     ideas_per_angle: int,
     groq_client: Any,
+    groq_generate: Callable[[list[dict[str, str]], str], Any] | None = None,
 ) -> list[dict[str, Any]] | None:
     seed = get_cags_brief_seed(angle.get("angle_id"), briefs)
     prompt = MULTI_IDEA_EXPANSION_PROMPT.format(
@@ -585,25 +761,66 @@ async def expand_angle_ideas(
         suggested_title=seed.get("suggested_title"),
         hook_sentence=seed.get("hook_sentence"),
     )
-    try:
-        resp = await groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=1800,
-            temperature=0.85,
-        )
-        parsed = json.loads(resp.choices[0].message.content)
-        required = ["title", "description", "content_pillars", "gap_reason", "target_audience", "hook_strategy"]
-        valid = [
-            variant for variant in parsed.get("variants", [])
-            if all(variant.get(field) for field in required)
-            and isinstance(variant.get("content_pillars"), list)
-            and len(variant["content_pillars"]) == 3
-        ]
-        return valid if valid else _fallback_expand_variants(angle, topic, briefs, ideas_per_angle)
-    except Exception:
-        return _fallback_expand_variants(angle, topic, briefs, ideas_per_angle)
+    attempts = (
+        {
+            "model": "llama-3.1-8b-instant",
+            "temperature": 0.85,
+            "max_tokens": 1800,
+            "json_mode": True,
+        },
+        {
+            "model": "llama-3.1-8b-instant",
+            "temperature": 0.4,
+            "max_tokens": 1400,
+            "json_mode": False,
+        },
+        {
+            "model": "llama-3.3-70b-versatile",
+            "temperature": 0.35,
+            "max_tokens": 1400,
+            "json_mode": False,
+        },
+    )
+    for attempt_no, attempt in enumerate(attempts, start=1):
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            raw = ""
+            if groq_generate is not None:
+                raw = str(await groq_generate(messages, attempt["model"]) or "").strip()
+            else:
+                kwargs: dict[str, Any] = {
+                    "model": attempt["model"],
+                    "messages": messages,
+                    "max_tokens": attempt["max_tokens"],
+                    "temperature": attempt["temperature"],
+                }
+                if attempt.get("json_mode"):
+                    kwargs["response_format"] = {"type": "json_object"}
+                resp = await groq_client.chat.completions.create(**kwargs)
+                raw = (resp.choices[0].message.content or "").strip()
+            if not raw:
+                print(f"[warn] expand_angle_ideas empty model response (attempt {attempt_no}) for angle {angle.get('angle_id')}")
+                continue
+            parsed = _extract_json_object(raw)
+            valid = _normalize_variants_payload(
+                parsed=parsed,
+                topic=topic,
+                angle=angle,
+                briefs=briefs,
+                ideas_per_angle=ideas_per_angle,
+            )
+            if valid:
+                return valid
+            print(
+                f"[warn] expand_angle_ideas invalid/empty variant payload "
+                f"(attempt {attempt_no}, model {attempt['model']}) for angle {angle.get('angle_id')}"
+            )
+        except Exception as exc:
+            print(
+                f"[warn] expand_angle_ideas failed (attempt {attempt_no}, model {attempt['model']}) "
+                f"for angle {angle.get('angle_id')}: {exc}"
+            )
+    return _fallback_expand_variants(angle, topic, briefs, ideas_per_angle)
 
 
 async def expand_all_angles(
@@ -612,9 +829,17 @@ async def expand_all_angles(
     briefs: list[dict[str, Any]],
     ideas_per_angle: int,
     groq_client: Any,
+    groq_generate: Callable[[list[dict[str, str]], str], Any] | None = None,
 ) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
     tasks = [
-        expand_angle_ideas(angle, topic, briefs, ideas_per_angle, groq_client)
+        expand_angle_ideas(
+            angle,
+            topic,
+            briefs,
+            ideas_per_angle,
+            groq_client,
+            groq_generate=groq_generate,
+        )
         for angle in selected_angles
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -800,6 +1025,7 @@ async def generate_ideas(
     ideas_per_angle: int = DEFAULT_IDEAS_PER_ANGLE,
     used_angle_ids: list[str] | None = None,
     groq_client: Any | None = None,
+    groq_generate: Callable[[list[dict[str, str]], str], Any] | None = None,
     gemini_client: Any | None = None,
     cache_lookup: Callable[[str, Any | None], dict[str, Any] | None] | None = None,
     cache_store: Callable[[str, dict[str, Any], Any | None], None] | None = None,
@@ -841,7 +1067,14 @@ async def generate_ideas(
     if not selected:
         raise ValueError("no_angles_after_diversity")
 
-    expanded = await expand_all_angles(selected, topic, briefs, ideas_per_angle, groq_client)
+    expanded = await expand_all_angles(
+        selected,
+        topic,
+        briefs,
+        ideas_per_angle,
+        groq_client,
+        groq_generate=groq_generate,
+    )
     if not expanded:
         raise RuntimeError("idea_expansion_failed")
 
@@ -885,6 +1118,7 @@ async def regenerate_with_expansion(
     db_context: str,
     web_context: str,
     groq_client: Any,
+    groq_generate: Callable[[list[dict[str, str]], str], Any] | None = None,
     gemini_client: Any | None = None,
     cache_lookup: Callable[[str, Any | None], dict[str, Any] | None] | None = None,
     cache_store: Callable[[str, dict[str, Any], Any | None], None] | None = None,
@@ -903,6 +1137,7 @@ async def regenerate_with_expansion(
         ideas_per_angle=5,
         used_angle_ids=old_angle_ids,
         groq_client=groq_client,
+        groq_generate=groq_generate,
         gemini_client=gemini_client,
         cache_lookup=cache_lookup,
         cache_store=cache_store,

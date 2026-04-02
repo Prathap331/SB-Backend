@@ -682,54 +682,57 @@ async def calculate_cags(
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Entry point for Module 03."""
+    cags_warnings: list[str] = []
+
     if corpus_embeddings is None:
         corpus_embeddings = _embed_corpus_for_cags(corpus, gemini_client)
     if corpus_embeddings is None:
-        return {
-            "topic": topic,
-            "cags_error": "embeddings_unavailable",
-            "perspective_tree": [],
-            "labelled_corpus": [],
-            "scored_angles": [],
-            "gap_angles": [],
-            "briefs": [],
-        }
+        cags_warnings.append("corpus_embeddings_unavailable")
 
-    corpus_embeddings = np.asarray(corpus_embeddings, dtype=np.float32)
-    expected_rows = len(corpus)
-    invalid_shape = (
-        corpus_embeddings.ndim != 2
-        or corpus_embeddings.shape[1] != 768
-        or corpus_embeddings.shape[0] != expected_rows
-    )
-    if invalid_shape:
-        # CSI can occasionally hand over vectors with an unexpected shape.
-        # Rebuild corpus embeddings here to keep CAGS resilient.
-        rebuilt = _embed_corpus_for_cags(corpus, gemini_client)
-        if rebuilt is not None:
-            corpus_embeddings = np.asarray(rebuilt, dtype=np.float32)
-            invalid_shape = (
-                corpus_embeddings.ndim != 2
-                or corpus_embeddings.shape[1] != 768
-                or corpus_embeddings.shape[0] != expected_rows
-            )
+    corpus_embeddings_arr: np.ndarray | None = None
+    if corpus_embeddings is not None:
+        corpus_embeddings_arr = np.asarray(corpus_embeddings, dtype=np.float32)
+        expected_rows = len(corpus)
+        invalid_shape = (
+            corpus_embeddings_arr.ndim != 2
+            or corpus_embeddings_arr.shape[1] != 768
+            or corpus_embeddings_arr.shape[0] != expected_rows
+        )
         if invalid_shape:
-            return {
-                "topic": topic,
-                "cags_error": "embeddings_invalid_shape",
-                "perspective_tree": [],
-                "labelled_corpus": [],
-                "scored_angles": [],
-                "gap_angles": [],
-                "briefs": [],
-            }
+            # CSI can occasionally hand over vectors with an unexpected shape.
+            # Rebuild corpus embeddings here to keep CAGS resilient.
+            rebuilt = _embed_corpus_for_cags(corpus, gemini_client)
+            if rebuilt is not None:
+                corpus_embeddings_arr = np.asarray(rebuilt, dtype=np.float32)
+                invalid_shape = (
+                    corpus_embeddings_arr.ndim != 2
+                    or corpus_embeddings_arr.shape[1] != 768
+                    or corpus_embeddings_arr.shape[0] != expected_rows
+                )
+            if invalid_shape:
+                cags_warnings.append("corpus_embeddings_invalid_shape")
+                corpus_embeddings_arr = None
+
     perspective_tree = await tree_interrogation(topic, social_data, news_data, groq_client)
-    angle_vectors = embed_landscape(perspective_tree, gemini_client)
-    angle_vectors = np.asarray(angle_vectors)
-    avg_views = float(
-        sum(float(v.get("view_count", 0) or 0) for v in corpus) / max(len(corpus), 1)
-    )
-    labelled = label_youtube_corpus(corpus, corpus_embeddings, angle_vectors, perspective_tree, avg_views)
+    labelled: list[dict[str, Any]] = []
+    if corpus_embeddings_arr is not None:
+        try:
+            angle_vectors = embed_landscape(perspective_tree, gemini_client)
+            angle_vectors = np.asarray(angle_vectors)
+            avg_views = float(
+                sum(float(v.get("view_count", 0) or 0) for v in corpus) / max(len(corpus), 1)
+            )
+            labelled = label_youtube_corpus(
+                corpus,
+                corpus_embeddings_arr,
+                angle_vectors,
+                perspective_tree,
+                avg_views,
+            )
+        except Exception as exc:
+            print(f"CAGS labelling fallback activated: {exc}", flush=True)
+            cags_warnings.append("angle_embeddings_unavailable")
+
     scored_angles = score_all_angles(perspective_tree, labelled, social_data, tss_score)
     gap_angles = [
         entry
@@ -738,7 +741,7 @@ async def calculate_cags(
     ]
     briefs = await generate_briefs(gap_angles, topic, groq_client)
 
-    return {
+    payload = {
         "topic": topic,
         "perspective_tree": perspective_tree,
         "labelled_corpus": labelled,
@@ -746,3 +749,7 @@ async def calculate_cags(
         "gap_angles": gap_angles,
         "briefs": briefs,
     }
+    if cags_warnings:
+        payload["cags_error"] = ",".join(cags_warnings)
+        payload["cags_warnings"] = cags_warnings
+    return payload

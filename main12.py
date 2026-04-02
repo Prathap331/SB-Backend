@@ -278,6 +278,7 @@ async def _lookup_topic_cache_db(topic: str) -> dict[str, Any] | None:
         payload = dict(row.get("payload") or {})
         if not _payload_has_ideas(payload):
             return None
+        payload.pop("cags", None)
         payload["served_from_cache"] = True
         payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
         payload["source_of_context"] = payload.get("source_of_context", "CACHE_DB")
@@ -315,6 +316,7 @@ async def _lookup_topic_cache_db_semantic(topic: str, cache_client: Any | None =
         payload = dict(row.get("payload") or {})
         if not _payload_has_ideas(payload):
             return None
+        payload.pop("cags", None)
         payload["served_from_cache"] = True
         payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
         payload["cache_similarity"] = round(float(row.get("similarity") or 0.0), 3)
@@ -366,6 +368,7 @@ def _build_cache_payload(payload: dict[str, Any]) -> dict[str, Any]:
 async def _lookup_topic_cache(topic: str, cache_client: Any | None = None) -> dict[str, Any] | None:
     cached = TOPIC_CACHE.lookup(topic, cache_client)
     if cached:
+        cached.pop("cags", None)
         return cached
     db_semantic = await _lookup_topic_cache_db_semantic(topic, cache_client)
     if db_semantic:
@@ -494,12 +497,40 @@ def _is_groq_rate_limit_error(error_text: str) -> bool:
 def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
+    if _payload_uses_fallback_variants(payload):
+        return False
     ideas = payload.get("ideas")
-    if isinstance(ideas, list) and len(ideas) > 0:
+    if isinstance(ideas, list) and any(str(item).strip() for item in ideas):
         return True
     clusters = payload.get("idea_clusters")
-    if isinstance(clusters, list) and len(clusters) > 0:
-        return True
+    if not isinstance(clusters, list) or not clusters:
+        return False
+    for cluster in clusters:
+        variants = (cluster or {}).get("idea_variants")
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            title = str((variant or {}).get("title") or "").strip()
+            desc = str((variant or {}).get("description") or "").strip()
+            if title and desc:
+                return True
+    return False
+
+
+def _payload_uses_fallback_variants(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    clusters = payload.get("idea_clusters")
+    if not isinstance(clusters, list):
+        return False
+    for cluster in clusters:
+        variants = (cluster or {}).get("idea_variants")
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            reason = str((variant or {}).get("gap_reason") or "").lower()
+            if "fallback expansion" in reason:
+                return True
     return False
 
 
@@ -1474,6 +1505,7 @@ async def generate_ideas_endpoint(
             ideas_per_angle=int(request.ideas_per_angle or 3),
             used_angle_ids=request.used_angle_ids or [],
             groq_client=groq_client,
+            groq_generate=groq_idea_generate,
             gemini_client=EMBED_CLIENTS[0] if EMBED_CLIENTS else None,
             cache_lookup=cache_lookup,
             cache_store=None,
@@ -1502,6 +1534,11 @@ async def generate_ideas_endpoint(
         idea_clusters["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
         idea_clusters["total_request_time_sec"] = round(time.time() - total_start_time, 2)
         if len(final_ideas) > 0:
+            if _payload_uses_fallback_variants(idea_clusters):
+                print(f"Skipping cache write for '{topic}' because fallback variants were used.")
+                idea_clusters["cache_write_skipped"] = "fallback_variants"
+                print(f"Total /generate-ideas time: {idea_clusters['total_request_time_sec']:.2f}s")
+                return idea_clusters
             cache_payload = _build_cache_payload(idea_clusters)
             TOPIC_CACHE.store(topic, cache_payload, cache_client)
             background_tasks.add_task(_store_topic_cache_db, topic, cache_payload, cache_client)
