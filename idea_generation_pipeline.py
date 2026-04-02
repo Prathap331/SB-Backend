@@ -153,6 +153,11 @@ DOMAIN_HINTS: dict[str, set[str]] = {
         "ai", "artificial", "intelligence", "llm", "software", "developer", "developers",
         "technology", "tech", "automation", "startup", "startups", "computing", "cloud", "data",
     },
+    "education": {
+        "learn", "learning", "use", "using", "tutorial", "course", "courses", "student",
+        "students", "teacher", "teachers", "beginner", "beginners", "skills", "training",
+        "curriculum", "classroom", "education",
+    },
 }
 
 
@@ -201,12 +206,36 @@ def _topic_relevance_details(
 
     who = angle.get("who") or ""
     who_text = str(who).lower()
+    topic_requests_policy = any(
+        term in topic_text for term in {"policy", "law", "regulation", "regulatory", "government", "geopolitics"}
+    )
+    learning_intent = any(
+        term in topic_text for term in {"learn", "learning", "how to", "tutorial", "beginner", "use ai", "using ai"}
+    )
+
     if topic_domains and "gaming" in topic_domains:
         if any(term in who_text for term in {"government", "policy", "regulatory", "regulation", "law", "agency", "agencies"}):
             score -= 0.25
     if topic_domains and "war" in topic_domains:
         if any(term in who_text for term in {"gaming", "esports", "stream", "streamer"}):
             score -= 0.25
+    if learning_intent and ({"technology", "education"} & topic_domains) and not topic_requests_policy:
+        if any(
+            term in who_text
+            for term in {
+                "government", "agency", "agencies", "regulator", "regulatory", "policy",
+                "international organization", "ethics committee",
+            }
+        ):
+            score -= 0.40
+        if any(
+            term in who_text
+            for term in {
+                "student", "teacher", "developer", "creator", "engineer", "professional",
+                "freelancer", "entrepreneur", "educator",
+            }
+        ):
+            score += 0.20
 
     score = max(0.0, min(score, 1.0))
     reasons = []

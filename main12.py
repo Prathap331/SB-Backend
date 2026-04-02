@@ -353,6 +353,16 @@ async def _store_topic_cache_db(topic: str, payload: dict[str, Any], cache_clien
         print(f"[warn] idea cache DB store failed for '{topic}': {e}")
 
 
+def _build_cache_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Keep idea cache stable: do not persist volatile trend metrics (TSS/CSI/CAGS)
+    because they are time-sensitive and should be computed fresh.
+    """
+    cached = dict(payload or {})
+    cached.pop("cags", None)
+    return cached
+
+
 async def _lookup_topic_cache(topic: str, cache_client: Any | None = None) -> dict[str, Any] | None:
     cached = TOPIC_CACHE.lookup(topic, cache_client)
     if cached:
@@ -1322,20 +1332,9 @@ async def pipeline_metrics(request: PromptRequest):
       TSS + CSI + CAGS + verdict
     """
     try:
-        async def _compute() -> dict:
-            async with _pipeline_request_semaphore:
-                result = await asyncio.wait_for(run_tss(request.topic), timeout=TSS_TIMEOUT_SEC)
-                return adapt_pipeline_payload(result)
-
-        payload, cache_hit = await _run_singleflight_cached(
-            group="pipeline_metrics",
-            topic=request.topic,
-            ttl_seconds=PIPELINE_CACHE_TTL_SEC,
-            compute_coro=_compute,
-        )
-        if cache_hit:
-            print(f"pipeline-metrics cache hit for topic: {request.topic}")
-        return payload
+        async with _pipeline_request_semaphore:
+            result = await asyncio.wait_for(run_tss(request.topic), timeout=TSS_TIMEOUT_SEC)
+            return adapt_pipeline_payload(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
 
@@ -1503,8 +1502,9 @@ async def generate_ideas_endpoint(
         idea_clusters["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
         idea_clusters["total_request_time_sec"] = round(time.time() - total_start_time, 2)
         if len(final_ideas) > 0:
-            TOPIC_CACHE.store(topic, idea_clusters, cache_client)
-            background_tasks.add_task(_store_topic_cache_db, topic, idea_clusters, cache_client)
+            cache_payload = _build_cache_payload(idea_clusters)
+            TOPIC_CACHE.store(topic, cache_payload, cache_client)
+            background_tasks.add_task(_store_topic_cache_db, topic, cache_payload, cache_client)
         else:
             print(f"Skipping cache write for '{topic}' because no ideas were generated.")
 
