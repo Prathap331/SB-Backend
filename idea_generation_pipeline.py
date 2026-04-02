@@ -14,8 +14,8 @@ import numpy as np
 DEPTH_TARGET_WORDS = 2600
 DEPTH_SUPPRESS_THRESHOLD = 60.0
 DEPTH_PASS_THRESHOLD = 65.0
-DEPTH_SOFT_MIN_WORDS = 650
-DEPTH_CLEAN_MIN_WORDS = 1200
+DEPTH_SOFT_MIN_WORDS = 500
+DEPTH_CLEAN_MIN_WORDS = 900
 DEFAULT_CAGS_THRESHOLD = 40.0
 DEFAULT_RELAXED_CAGS_THRESHOLD = 20.0
 DEFAULT_MAX_ANGLES = 5
@@ -656,18 +656,16 @@ def apply_depth_check(
     passing: list[dict[str, Any]] = []
     suppressed: list[dict[str, Any]] = []
     assessed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    total_support_words = db_words + web_words + social_words + news_words
-
     for cluster in clusters:
         angle_words = min(_count_words(_coerce_text(cluster.get("angle_string"))), SOURCE_WORD_CAPS["angle_richness"])
         available_words = db_words + web_words + social_words + news_words + angle_words
         depth_percent = round((available_words / DEPTH_TARGET_WORDS) * 100.0, 1)
         depth_status = "suppressed"
         depth_warning = False
-        if total_support_words >= DEPTH_CLEAN_MIN_WORDS:
+        if available_words >= DEPTH_CLEAN_MIN_WORDS:
             depth_status = "pass"
             depth_warning = depth_percent < 80.0
-        elif total_support_words >= DEPTH_SOFT_MIN_WORDS:
+        elif available_words >= DEPTH_SOFT_MIN_WORDS:
             depth_status = "warning"
             depth_warning = True
 
@@ -702,7 +700,7 @@ def apply_depth_check(
         "suppress_threshold": DEPTH_SUPPRESS_THRESHOLD,
         "soft_min_words": DEPTH_SOFT_MIN_WORDS,
         "clean_min_words": DEPTH_CLEAN_MIN_WORDS,
-        "total_support_words": total_support_words,
+        "total_support_words": db_words + web_words + social_words + news_words,
         "db_context_words": db_words,
         "web_context_words": web_words,
         "social_data_words": social_words,
