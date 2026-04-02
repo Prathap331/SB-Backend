@@ -19,6 +19,7 @@ DEFAULT_RELAXED_CAGS_THRESHOLD = 20.0
 DEFAULT_MAX_ANGLES = 5
 DEFAULT_IDEAS_PER_ANGLE = 3
 TOPIC_RELEVANCE_THRESHOLD = 0.42
+GEMINI_EMBED_BLOCKED_UNTIL_TS = 0.0
 
 SOURCE_WORD_CAPS = {
     "db_context": 3000,
@@ -31,6 +32,20 @@ SOURCE_WORD_CAPS = {
 
 def _normalize_topic(topic: str) -> str:
     return " ".join((topic or "").strip().lower().split())
+
+
+def _is_embedding_quota_error(error_text: str) -> bool:
+    text = (error_text or "").lower()
+    return "resource_exhausted" in text or "quota" in text
+
+
+def _gemini_embeddings_blocked() -> bool:
+    return time.time() < GEMINI_EMBED_BLOCKED_UNTIL_TS
+
+
+def _block_gemini_embeddings_for(seconds: float = 3600.0) -> None:
+    global GEMINI_EMBED_BLOCKED_UNTIL_TS
+    GEMINI_EMBED_BLOCKED_UNTIL_TS = max(GEMINI_EMBED_BLOCKED_UNTIL_TS, time.time() + seconds)
 
 
 def _token_set(text: str) -> set[str]:
@@ -69,7 +84,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def _embed_texts_with_gemini(client: Any, texts: list[str]) -> list[list[float]] | None:
-    if client is None or not texts:
+    if client is None or not texts or _gemini_embeddings_blocked():
         return None
     try:
         from google.genai import types as gt
@@ -91,7 +106,9 @@ def _embed_texts_with_gemini(client: Any, texts: list[str]) -> list[list[float]]
         if len(vecs) != len(texts) or any(len(vec) != 768 for vec in vecs):
             return None
         return vecs
-    except Exception:
+    except Exception as exc:
+        if _is_embedding_quota_error(str(exc)):
+            _block_gemini_embeddings_for(3600.0)
         return None
 
 
@@ -266,11 +283,13 @@ class SemanticIdeaCache:
         self._items: list[CachedIdeaResult] = []
 
     def _vector_from_client(self, topic: str, gemini_client: Any | None) -> list[float] | None:
-        if gemini_client is None:
+        if gemini_client is None or _gemini_embeddings_blocked():
             return None
         try:
             from google.genai import types as gt
-        except Exception:
+        except Exception as exc:
+            if _is_embedding_quota_error(str(exc)):
+                _block_gemini_embeddings_for(3600.0)
             return None
         try:
             resp = gemini_client.models.embed_content(

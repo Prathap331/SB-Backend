@@ -467,12 +467,31 @@ def _is_daily_quota_error(error_text: str) -> bool:
     return "resource_exhausted" in t and "perday" in t
 
 
+def _is_embedding_quota_error(error_text: str) -> bool:
+    t = (error_text or "").lower()
+    return "resource_exhausted" in t or "quota" in t
+
+
+GEMINI_EMBED_BLOCKED_UNTIL_TS = 0.0
+
+
+def _gemini_embeddings_blocked() -> bool:
+    return time.time() < GEMINI_EMBED_BLOCKED_UNTIL_TS
+
+
+def _block_gemini_embeddings_for(seconds: float = 3600.0) -> None:
+    global GEMINI_EMBED_BLOCKED_UNTIL_TS
+    GEMINI_EMBED_BLOCKED_UNTIL_TS = max(GEMINI_EMBED_BLOCKED_UNTIL_TS, time.time() + seconds)
+
+
 def _embed_with_failover(
     *,
     contents: str | list[str],
     task_type: str,
     output_dimensionality: int = 768,
 ):
+    if _gemini_embeddings_blocked():
+        raise RuntimeError("Gemini embeddings temporarily blocked after quota exhaustion.")
     last_exc: Exception | None = None
     for idx, client in enumerate(EMBED_CLIENTS, start=1):
         try:
@@ -487,6 +506,9 @@ def _embed_with_failover(
         except Exception as exc:
             last_exc = exc
             print(f"Embedding client slot {idx} failed: {exc}")
+            if _is_embedding_quota_error(str(exc)):
+                _block_gemini_embeddings_for(3600.0)
+                break
             continue
     if last_exc:
         raise last_exc
@@ -515,6 +537,11 @@ async def _embed_chunks_with_backoff(chunks: list[str]) -> list[list[float]] | N
                 err = str(exc)
                 if _is_daily_quota_error(err):
                     print("BACKGROUND TASK: Gemini daily embedding quota exhausted; skipping ingest.")
+                    _block_gemini_embeddings_for(3600.0)
+                    return None
+                if _is_embedding_quota_error(err):
+                    print("BACKGROUND TASK: Gemini embedding quota exhausted; skipping ingest.")
+                    _block_gemini_embeddings_for(3600.0)
                     return None
                 delay = _extract_retry_delay_seconds(err)
                 if "429" in err or "RESOURCE_EXHAUSTED" in err:
