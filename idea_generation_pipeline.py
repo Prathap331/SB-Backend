@@ -34,6 +34,18 @@ def _normalize_topic(topic: str) -> str:
     return " ".join((topic or "").strip().lower().split())
 
 
+def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    ideas = payload.get("ideas")
+    if isinstance(ideas, list) and len(ideas) > 0:
+        return True
+    clusters = payload.get("idea_clusters")
+    if isinstance(clusters, list) and len(clusters) > 0:
+        return True
+    return False
+
+
 def _is_embedding_quota_error(error_text: str) -> bool:
     text = (error_text or "").lower()
     return "resource_exhausted" in text or "quota" in text
@@ -311,6 +323,8 @@ class SemanticIdeaCache:
         exact = next((item for item in self._items if item.topic_key == topic_key), None)
         if exact:
             payload = dict(exact.payload)
+            if not _payload_has_ideas(payload):
+                return None
             payload["served_from_cache"] = True
             payload["cache_age_hours"] = round(exact.age_hours, 3)
             return payload
@@ -338,6 +352,8 @@ class SemanticIdeaCache:
                 best_item = item
         if best_item:
             payload = dict(best_item.payload)
+            if not _payload_has_ideas(payload):
+                return None
             payload["served_from_cache"] = True
             payload["cache_age_hours"] = round(best_item.age_hours, 3)
             payload["cache_similarity"] = round(best_sim, 3)

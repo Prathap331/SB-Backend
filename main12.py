@@ -276,6 +276,8 @@ async def _lookup_topic_cache_db(topic: str) -> dict[str, Any] | None:
             return None
         row = rows[0] or {}
         payload = dict(row.get("payload") or {})
+        if not _payload_has_ideas(payload):
+            return None
         payload["served_from_cache"] = True
         payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
         payload["source_of_context"] = payload.get("source_of_context", "CACHE_DB")
@@ -311,6 +313,8 @@ async def _lookup_topic_cache_db_semantic(topic: str, cache_client: Any | None =
             return None
         row = rows[0] or {}
         payload = dict(row.get("payload") or {})
+        if not _payload_has_ideas(payload):
+            return None
         payload["served_from_cache"] = True
         payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
         payload["cache_similarity"] = round(float(row.get("similarity") or 0.0), 3)
@@ -470,6 +474,18 @@ def _is_daily_quota_error(error_text: str) -> bool:
 def _is_embedding_quota_error(error_text: str) -> bool:
     t = (error_text or "").lower()
     return "resource_exhausted" in t or "quota" in t
+
+
+def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    ideas = payload.get("ideas")
+    if isinstance(ideas, list) and len(ideas) > 0:
+        return True
+    clusters = payload.get("idea_clusters")
+    if isinstance(clusters, list) and len(clusters) > 0:
+        return True
+    return False
 
 
 GEMINI_EMBED_BLOCKED_UNTIL_TS = 0.0
@@ -1418,6 +1434,7 @@ async def generate_ideas_endpoint(
         social_data = social_payload.get("sample_posts") or []
         news_data = news_payload.get("sample_articles") or []
 
+        cache_lookup = None if request.force_refresh else TOPIC_CACHE.lookup
         idea_clusters = await generate_cags_aligned_ideas(
             topic=topic,
             gap_angles=gap_angles,
@@ -1432,7 +1449,7 @@ async def generate_ideas_endpoint(
             used_angle_ids=request.used_angle_ids or [],
             groq_client=groq_client,
             gemini_client=EMBED_CLIENTS[0] if EMBED_CLIENTS else None,
-            cache_lookup=TOPIC_CACHE.lookup,
+            cache_lookup=cache_lookup,
             cache_store=None,
         )
 
@@ -1458,8 +1475,11 @@ async def generate_ideas_endpoint(
         idea_clusters["descriptions"] = final_descriptions
         idea_clusters["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
         idea_clusters["total_request_time_sec"] = round(time.time() - total_start_time, 2)
-        TOPIC_CACHE.store(topic, idea_clusters, cache_client)
-        background_tasks.add_task(_store_topic_cache_db, topic, idea_clusters, cache_client)
+        if len(final_ideas) > 0:
+            TOPIC_CACHE.store(topic, idea_clusters, cache_client)
+            background_tasks.add_task(_store_topic_cache_db, topic, idea_clusters, cache_client)
+        else:
+            print(f"Skipping cache write for '{topic}' because no ideas were generated.")
 
         print(f"Total /generate-ideas time: {idea_clusters['total_request_time_sec']:.2f}s")
         return idea_clusters
