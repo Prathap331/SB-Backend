@@ -19,6 +19,14 @@ from pipeline_response_adapter import adapt_pipeline_payload
 from idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas, TOPIC_CACHE
 from social_market_signals import scan_topic as scan_social_topic
 from news_market_signals import scan_topic as scan_news_topic
+from shared.schemas.pipeline_context import (
+    AgentPipelineContext,
+    extract_angle_for_prompt,
+    staleness_hours,
+)
+from script_templates.registry import TEMPLATE_REGISTRY
+from script_templates.selector import select_template_key
+from script_templates.injector import assemble_structure_section, assemble_chapter_scaffold
 
 # ── NEW unified Google GenAI SDK ─────────────────────────────
 from google import genai
@@ -37,6 +45,8 @@ import httpx
 import nltk
 import razorpay
 import datetime
+from datetime import timezone, timedelta
+from uuid import uuid4
 from collections import OrderedDict
 from typing import Any
 
@@ -94,6 +104,7 @@ groq_client = AsyncOpenAI(
 )
 GROQ_GENERATION_MODEL = "llama-3.1-8b-instant"
 GROQ_SCRIPT_MODEL = os.getenv("GROQ_SCRIPT_MODEL", GROQ_GENERATION_MODEL).strip() or GROQ_GENERATION_MODEL
+SCRIPT_FRAMECHECK_PROVIDER = (os.getenv("SCRIPT_FRAMECHECK_PROVIDER") or "groq").strip().lower()
 
 # ── Google GenAI client(s) (NEW SDK) ─────────────────────────
 def _collect_embed_keys() -> list[str]:
@@ -1293,13 +1304,16 @@ class PromptRequest(BaseModel):
 
 
 class ScriptRequest(BaseModel):
-    topic: str
+    topic: str | None = None
+    context: AgentPipelineContext | None = None
     emotional_tone: str | None = "engaging"
     creator_type: str | None = "educator"
     audience_description: str | None = "a general audience interested in learning"
     accent: str | None = "neutral"
     duration_minutes: int | None = 10
-    script_structure: str | None = "problem_solution"
+    script_structure: str | None = None
+    template_key_override: str | None = None
+    user_wpm: int | None = None
 
 
 class CreateOrderRequest(BaseModel):
@@ -1321,6 +1335,20 @@ class GenerateIdeasRequest(BaseModel):
     force_refresh: bool | None = False
 
 
+class ChannelContextInput(BaseModel):
+    channel_id: str | None = None
+    channel_niche: str | None = None
+    subscriber_count: int | None = None
+    top_video_titles: list[str] | None = None
+    existing_hashtags: list[str] | None = None
+    avg_ctr_pct: float | None = None
+
+
+class SEOAgentRequest(BaseModel):
+    context: AgentPipelineContext
+    channel_context: ChannelContextInput | None = None
+
+
 async def _safe_scan_topic_signals(
     *,
     label: str,
@@ -1335,6 +1363,800 @@ async def _safe_scan_topic_signals(
     except Exception as exc:
         print(f"[warn] {label} scan failed ({exc}); falling back to empty signal")
         return {fallback_key: []}
+
+
+BLOCKED_TITLE_TYPES = {
+    "CAT-03": ["controversy"],
+    "CAT-04": ["controversy"],
+}
+
+CAT_FACE_DEFAULTS = {
+    "CAT-01": False,
+    "CAT-02": True,
+    "CAT-03": False,
+    "CAT-04": False,
+    "CAT-05": True,
+    "CAT-06": True,
+    "CAT-07": False,
+    "CAT-08": True,
+}
+
+SEO_SYNTHESIS_PROMPT = """
+You are an expert YouTube SEO Analyst and Title Strategist.
+
+VIDEO ANGLE: "{angle_string}"
+STAKEHOLDER: {who} | LENS: {what} | FRAME: {story_frame}
+AUDIENCE PROFILE: {audience_profile}
+CATEGORY: {cat_id} — {cat_label}
+
+COMPETITIVE DATA:
+Top 5 YouTube Titles: {competing_titles}
+Top 5 PAA Questions: {paa_questions}
+
+CTR SIGNAL (pre-computed):
+ctr_potential: {ctr_label} (score: {ctr_score})
+{degraded_note}
+
+TITLE SAFETY:
+- category blocked title types: {blocked_title_types}
+- max title length: 70 chars
+- no fabricated quotes / factual claims
+
+Return ONLY valid JSON:
+{{
+  "search_intent_type": "educational|entertainment|comparative|news_driven|problem_solving|inspirational",
+  "recommended_structure": "problem_solution|storytelling|listicle|chronological|myth_debunking|tech_review",
+  "ctr_potential": "{ctr_label}",
+  "ctr_signal_degraded": {ctr_signal_degraded},
+  "justification": "2 sentence rationale",
+  "recommended_titles": [
+    {{"type":"curiosity_gap|data_led|how_to|controversy|narrative","title":"...","rationale":"..."}}
+  ],
+  "keyword_clusters": {{
+    "primary": [],
+    "secondary": [],
+    "longtail": [],
+    "question_based": []
+  }},
+  "description_template": {{
+    "hook": "",
+    "body_bullets": [],
+    "outro": ""
+  }},
+  "thumbnail_brief": [
+    {{"concept_type":"curiosity_gap|data_driven|face_reaction|before_after","text_overlay":"","visual_theme":"","colour_temperature":"warm|cool|high_contrast","face_recommended":true,"rationale":""}}
+  ],
+  "hashtags": [],
+  "chapter_structure": [
+    {{"index":1,"title":"","covers":"","section_pct":0.2}}
+  ],
+  "key_questions_to_answer": []
+}}
+"""
+
+
+def _strip_json_fences(raw: str) -> str:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    return text
+
+
+def _parse_json_object(raw: str) -> dict[str, Any]:
+    text = _strip_json_fences(raw)
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(text[start : end + 1])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def _get_title_config(cat_id: str) -> tuple[list[str], bool]:
+    return BLOCKED_TITLE_TYPES.get(cat_id, []), CAT_FACE_DEFAULTS.get(cat_id, True)
+
+
+async def _validate_seo_entry(ctx: AgentPipelineContext) -> list[str]:
+    warnings: list[str] = []
+    stale_h = staleness_hours(ctx.pipeline_assembled_at)
+    if stale_h > 2.0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "pipeline_context_stale",
+                "staleness_hours": round(stale_h, 1),
+                "message": "Re-run from TSS to refresh trend signals.",
+            },
+        )
+    if stale_h > 1.0:
+        warnings.append("context_stale_warning")
+
+    if (ctx.selected_idea or {}).get("idea_id") != ctx.selected_idea_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "selected_idea_id_mismatch",
+                "provided": ctx.selected_idea_id,
+                "cluster_id": (ctx.selected_idea or {}).get("idea_id"),
+                "message": "selected_idea_id does not match selected_idea.idea_id",
+            },
+        )
+
+    combined_words = len([w for w in f"{ctx.db_context} {ctx.web_context}".split() if len(w) > 3])
+    if combined_words < 50:
+        warnings.append("research_context_thin")
+    return warnings
+
+
+def _compute_ctr_signal(
+    gap_context: dict[str, Any],
+    csi_scores: dict[str, Any],
+    csi_quality: dict[str, Any],
+    tss_scores: dict[str, Any],
+) -> tuple[str, float, bool]:
+    demand = float(csi_scores.get("demand_score", 50) or 50) / 100.0
+    supply = float(csi_scores.get("supply_score", 50) or 50) / 100.0
+    openness = 1.0 - supply
+    momentum = float(tss_scores.get("m1_score", 50) or 50) / 100.0
+
+    score = (demand * 0.45) + (momentum * 0.30) + (openness * 0.25)
+    label = "High" if score >= 0.65 else "Medium" if score >= 0.40 else "Low"
+    degraded = bool(
+        csi_quality.get("engagement_insufficient")
+        or csi_quality.get("redundancy_embedding_failed")
+    )
+    if degraded:
+        label = {"High": "Medium", "Medium": "Low", "Low": "Low"}[label]
+    return label, round(score, 3), degraded
+
+
+async def _run_ddgs_scrape(angle: str) -> tuple[list[str], list[str]]:
+    loop = asyncio.get_running_loop()
+    competing_titles: list[str] = []
+    paa_questions: list[str] = []
+    try:
+        with DDGS(timeout=10) as ddgs:
+            videos = await loop.run_in_executor(
+                None,
+                lambda: list(ddgs.videos(angle, region="wt-wt", timelimit="m", max_results=5)),
+            )
+            competing_titles = [str(v.get("title") or "").strip() for v in videos if str(v.get("title") or "").strip()]
+    except Exception:
+        competing_titles = []
+
+    try:
+        with DDGS(timeout=10) as ddgs:
+            answers = await loop.run_in_executor(
+                None,
+                lambda: list(ddgs.answers(angle, region="wt-wt")),
+            )
+            paa_questions = [str(a.get("question") or "").strip() for a in answers[:5] if str(a.get("question") or "").strip()]
+    except Exception:
+        paa_questions = []
+    return competing_titles, paa_questions
+
+
+def _deduplicate_hashtags(generated: list[str], existing_channel_hashtags: list[str]) -> list[dict[str, Any]]:
+    existing_set = {h.lower().lstrip("#") for h in (existing_channel_hashtags or [])}
+    result: list[dict[str, Any]] = []
+    for h in generated:
+        clean = str(h or "").strip()
+        if not clean:
+            continue
+        normalized = clean if clean.startswith("#") else f"#{clean}"
+        key = normalized.lower().lstrip("#")
+        strategy = "established" if key in existing_set else "expansion"
+        result.append({"hashtag": normalized, "strategy": strategy})
+    result = result[:5]
+    expansions = [x for x in result if x.get("strategy") == "expansion"]
+    if len(expansions) < 2:
+        result.append({"hashtag": None, "strategy": "expansion", "needs_generation": True})
+    return result
+
+
+SEO_INTENT_TYPES = {
+    "educational",
+    "entertainment",
+    "comparative",
+    "news_driven",
+    "problem_solving",
+    "inspirational",
+}
+
+SEO_STRUCTURES = {
+    "problem_solution",
+    "storytelling",
+    "listicle",
+    "chronological",
+    "myth_debunking",
+    "tech_review",
+}
+
+
+def _first_allowed_pipe_token(value: Any, allowed: set[str], default: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return default
+    tokens = [t.strip() for t in raw.split("|") if t.strip()]
+    for token in tokens:
+        if token in allowed:
+            return token
+    return default
+
+
+def _ensure_chapter_structure(chapters: Any, fallback_titles: list[str] | None = None) -> list[dict[str, Any]]:
+    fallback_titles = fallback_titles or ["Hook", "Context", "Analysis", "Takeaway"]
+    cleaned: list[dict[str, Any]] = []
+    if isinstance(chapters, list):
+        for idx, item in enumerate(chapters):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()[:40]
+            covers = str(item.get("covers") or "").strip()
+            pct = item.get("section_pct")
+            try:
+                pct_f = float(pct)
+            except Exception:
+                pct_f = 0.0
+            if not title:
+                continue
+            cleaned.append(
+                {
+                    "index": idx + 1,
+                    "title": title,
+                    "covers": covers or "Core discussion",
+                    "section_pct": pct_f,
+                }
+            )
+    if len(cleaned) < 3:
+        cleaned = [
+            {"index": 1, "title": fallback_titles[0], "covers": "Open with the central tension", "section_pct": 0.18},
+            {"index": 2, "title": fallback_titles[1], "covers": "Set background and stakeholders", "section_pct": 0.24},
+            {"index": 3, "title": fallback_titles[2], "covers": "Break down evidence and dynamics", "section_pct": 0.34},
+            {"index": 4, "title": fallback_titles[3], "covers": "Close with implications and CTA", "section_pct": 0.24},
+        ]
+        return cleaned
+    total = sum(max(float(c.get("section_pct") or 0.0), 0.0) for c in cleaned)
+    if total <= 0.0:
+        weight = 1.0 / len(cleaned)
+        for c in cleaned:
+            c["section_pct"] = round(weight, 4)
+    else:
+        for c in cleaned:
+            c["section_pct"] = round(max(float(c.get("section_pct") or 0.0), 0.0) / total, 4)
+    for idx, c in enumerate(cleaned, start=1):
+        c["index"] = idx
+    return cleaned
+
+
+def _ensure_hashtag_floor(
+    hashtags: list[dict[str, Any]],
+    topic: str,
+    existing_channel_hashtags: list[str],
+) -> list[dict[str, Any]]:
+    out = [h for h in hashtags if h.get("hashtag")]
+    if len(out) >= 3:
+        return out[:5]
+    words = [w for w in re.findall(r"[a-zA-Z0-9]+", topic) if len(w) >= 3]
+    candidates = [f"#{''.join(words[:2])}" if words else "#StoryBitTopic"]
+    candidates += [f"#{w}" for w in words[:4]]
+    existing = {str(h.get("hashtag") or "").lower() for h in out}
+    existing_tags = {f"#{str(h).lstrip('#').lower()}" for h in (existing_channel_hashtags or [])}
+    for cand in candidates:
+        key = cand.lower()
+        if key in existing:
+            continue
+        out.append(
+            {
+                "hashtag": cand,
+                "strategy": "established" if key in existing_tags else "expansion",
+            }
+        )
+        existing.add(key)
+        if len(out) >= 5:
+            break
+    return out[:5]
+
+
+def _safe_recommended_titles(raw_titles: Any, blocked_types: list[str]) -> list[dict[str, str]]:
+    if not isinstance(raw_titles, list):
+        return []
+    cleaned: list[dict[str, str]] = []
+    for item in raw_titles:
+        if not isinstance(item, dict):
+            continue
+        t_type = str(item.get("type") or "").strip()
+        if not t_type or t_type in blocked_types:
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        cleaned.append(
+            {
+                "type": t_type,
+                "title": title[:70],
+                "rationale": str(item.get("rationale") or "").strip()[:300],
+            }
+        )
+        if len(cleaned) >= 4:
+            break
+    return cleaned
+
+
+WPM_BY_CREATOR_TYPE = {
+    "storyteller": 120,
+    "educator": 145,
+    "entertainer": 160,
+    "journalist": 135,
+    "commentator": 140,
+}
+WPM_DEFAULT = 130
+SCRIPT_CREDIT_COST = 3
+PROMPT_TOKEN_BUDGET = 6500
+FIXED_PROMPT_OVERHEAD = 800
+
+
+def get_wpm(creator_type: str, user_wpm: int | None) -> int:
+    if user_wpm is not None and 80 <= int(user_wpm) <= 200:
+        return int(user_wpm)
+    return int(WPM_BY_CREATOR_TYPE.get((creator_type or "").strip().lower(), WPM_DEFAULT))
+
+
+def assess_context_quality(db_ctx: str, web_ctx: str) -> tuple[bool, int]:
+    combined = f"{db_ctx} {web_ctx}"
+    word_count = len([w for w in combined.split() if len(w) > 3])
+    return word_count >= 100, word_count
+
+
+def estimate_tokens(text: str) -> int:
+    return int(max(len((text or "").split()) * 1.35, 0))
+
+
+def trim_to_budget(
+    db_ctx: str,
+    web_ctx: str,
+    social: list[dict[str, Any]],
+    news: list[dict[str, Any]],
+    angle_spec_tokens: int,
+    seo_section_tokens: int,
+) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]], bool]:
+    budget = PROMPT_TOKEN_BUDGET - FIXED_PROMPT_OVERHEAD
+    budget -= angle_spec_tokens + seo_section_tokens
+    budget -= estimate_tokens(db_ctx)
+    truncated = False
+    wc = web_ctx
+    s = list(social or [])
+    n = list(news or [])
+    if estimate_tokens(wc) > budget:
+        wc = wc[: int(len(wc) * 0.6)]
+        truncated = True
+    if estimate_tokens(wc) > budget:
+        s = s[:3]
+        n = n[:3]
+        truncated = True
+    return db_ctx, wc, s, n, truncated
+
+
+def check_depth_alignment(target_wc: int, depth_check_target: int) -> dict[str, Any] | None:
+    if target_wc > int(depth_check_target * 1.15):
+        return {
+            "type": "content_depth_warning",
+            "target_words": target_wc,
+            "depth_checked_words": depth_check_target,
+            "message": (
+                f"Target {target_wc}w exceeds research depth validated for this idea "
+                f"({depth_check_target}w). Later sections may be less factual."
+            ),
+            "recommendation": "Reduce duration_minutes or lower user_wpm.",
+        }
+    return None
+
+
+async def check_and_deduct_credits(
+    user_id: str,
+    async_mode: bool,
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    profile = (
+        supabase.table("profiles")
+        .select("credits_remaining, user_tier")
+        .eq("id", user_id)
+        .single()
+        .execute()
+    )
+    if not profile.data:
+        raise HTTPException(status_code=404, detail="User profile not found")
+    tier = profile.data.get("user_tier", "free")
+    credits = int(profile.data.get("credits_remaining", 0) or 0)
+    if tier == "admin":
+        return {"admin": True, "deducted": False}
+    if credits < SCRIPT_CREDIT_COST:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "insufficient_credits",
+                "balance": credits,
+                "required": SCRIPT_CREDIT_COST,
+            },
+        )
+    if async_mode:
+        new_balance = max(0, credits - SCRIPT_CREDIT_COST)
+        supabase.table("profiles").update({"credits_remaining": new_balance}).eq("id", user_id).execute()
+        return {"admin": False, "deducted": True, "new_balance": new_balance}
+    return {"admin": False, "deducted": False, "credits": credits}
+
+
+async def deduct_after_success(user_id: str, credits: int) -> None:
+    new_balance = max(0, int(credits) - SCRIPT_CREDIT_COST)
+    supabase.table("profiles").update({"credits_remaining": new_balance}).eq("id", user_id).execute()
+
+
+async def issue_refund(user_id: str, job_id: str) -> None:
+    profile = (
+        supabase.table("profiles")
+        .select("credits_remaining")
+        .eq("id", user_id)
+        .single()
+        .execute()
+    )
+    if not profile.data:
+        return
+    new_balance = int(profile.data.get("credits_remaining", 0) or 0) + SCRIPT_CREDIT_COST
+    supabase.table("profiles").update({"credits_remaining": new_balance}).eq("id", user_id).execute()
+    supabase.table("script_jobs").update({"refund_issued": True}).eq("id", job_id).execute()
+
+
+def compute_chapter_timestamps(script: str, chapter_structure: list[dict[str, Any]], wpm: int) -> list[dict[str, Any]]:
+    words = (script or "").split()
+    total_words = max(len(words), 1)
+    result: list[dict[str, Any]] = []
+    cumulative_pct = 0.0
+    for idx, ch in enumerate(chapter_structure):
+        word_pos = int(cumulative_pct * total_words)
+        seconds = int((word_pos / max(wpm, 1)) * 60)
+        pct = float(ch.get("section_pct", 0.0) or 0.0)
+        result.append(
+            {
+                **ch,
+                "index": idx + 1,
+                "timestamp_seconds": seconds,
+                "timestamp_fmt": f"{seconds//60}:{seconds%60:02d}",
+                "section_pct": pct,
+            }
+        )
+        cumulative_pct += pct
+    return result
+
+
+def assemble_sources(
+    db_context: str,
+    web_context: str,
+    social_data: list[dict[str, Any]],
+    news_data: list[dict[str, Any]],
+    scraped_urls: list[str],
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    if (db_context or "").strip():
+        sources.append(
+            {
+                "type": "database",
+                "title": "Knowledge base (Supabase)",
+                "url": None,
+                "snippet": db_context[:200],
+            }
+        )
+    for url in scraped_urls:
+        sources.append({"type": "web_article", "title": url, "url": url, "snippet": ""})
+    for s in (social_data or [])[:5]:
+        sources.append(
+            {
+                "type": "social",
+                "title": s.get("title", ""),
+                "url": s.get("url"),
+                "snippet": str(s.get("body", ""))[:200],
+            }
+        )
+    for n in (news_data or [])[:5]:
+        sources.append(
+            {
+                "type": "news",
+                "title": n.get("title", ""),
+                "url": n.get("url"),
+                "snippet": str(n.get("body", ""))[:200],
+            }
+        )
+    return sources
+
+
+ANALYSIS_PROMPT_V2 = """
+Analyse this YouTube script and return ONLY valid JSON.
+
+Script:
+{script}
+
+Angle specification:
+  story_frame target: {story_frame}
+  system_dynamic target: {system_dynamic}
+
+Return:
+{{
+  "examples_count": 0,
+  "research_facts_count": 0,
+  "proverbs_count": 0,
+  "emotional_depth": "Low|Medium|High",
+  "frame_executed": {{
+    "story_frame_target": "{story_frame}",
+    "is_executed": true,
+    "confidence": "Low|Med|High",
+    "evidence": ""
+  }},
+  "dynamic_revealed": {{
+    "system_dynamic_target": "{system_dynamic}",
+    "is_revealed": true,
+    "confidence": "Low|Med|High",
+    "evidence": ""
+  }}
+}}
+"""
+
+
+async def analyse_script_v2(script: str, angle: dict[str, Any]) -> dict[str, Any]:
+    try:
+        raw = await groq_idea_generate(
+            [
+                {
+                    "role": "user",
+                    "content": ANALYSIS_PROMPT_V2.format(
+                        script=(script or "")[:8000],
+                        story_frame=str(angle.get("story_frame", "")),
+                        system_dynamic=str(angle.get("system_dynamic", "")),
+                    ),
+                }
+            ],
+            model=GROQ_GENERATION_MODEL,
+        )
+        parsed = _parse_json_object(raw)
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+    return {
+        "examples_count": 0,
+        "research_facts_count": 0,
+        "proverbs_count": 0,
+        "emotional_depth": "Unknown",
+        "frame_executed": {
+            "story_frame_target": str(angle.get("story_frame", "")),
+            "is_executed": None,
+            "confidence": "Low",
+            "evidence": "Analysis failed",
+        },
+        "dynamic_revealed": {
+            "system_dynamic_target": str(angle.get("system_dynamic", "")),
+            "is_revealed": None,
+            "confidence": "Low",
+            "evidence": "Analysis failed",
+        },
+    }
+
+
+async def framecheck_generate_text(prompt: str) -> str:
+    messages = [{"role": "user", "content": prompt}]
+    provider = SCRIPT_FRAMECHECK_PROVIDER
+    if provider == "openrouter":
+        try:
+            return await openrouter_generate(messages)
+        except Exception as exc:
+            print(f"Framecheck OpenRouter failed, falling back to Groq: {exc}")
+            return await groq_script_generate(messages)
+    if provider == "auto":
+        return await generate_script_content(messages)
+    # Default: groq main, openrouter backup.
+    try:
+        return await groq_script_generate(messages)
+    except Exception as exc:
+        print(f"Framecheck Groq failed, falling back to OpenRouter: {exc}")
+        return await openrouter_generate(messages)
+
+
+async def generate_with_frame_check(prompt: str, angle: dict[str, Any], story_frame: str) -> tuple[str, dict[str, Any], bool]:
+    script_v1 = await framecheck_generate_text(prompt)
+    analysis_v1 = await analyse_script_v2(script_v1, angle)
+    frame_check = analysis_v1.get("frame_executed", {}) or {}
+    needs_regen = bool(frame_check.get("is_executed") is False and str(frame_check.get("confidence")) == "High")
+    if not needs_regen:
+        return script_v1, analysis_v1, False
+    corrective = (
+        f"\n\nCORRECTION: Previous draft did not execute '{story_frame}' frame strongly enough. "
+        f"Rewrite with '{story_frame}' as the primary structural device in each major section."
+    )
+    script_v2 = await framecheck_generate_text(prompt + corrective)
+    analysis_v2 = await analyse_script_v2(script_v2, angle)
+    if bool((analysis_v2.get("frame_executed", {}) or {}).get("is_executed")):
+        return script_v2, analysis_v2, True
+    return script_v1, analysis_v1, True
+
+
+def _validate_script_entry(ctx: AgentPipelineContext, template_key_override: str | None = None) -> list[Any]:
+    stale_h = staleness_hours(ctx.pipeline_assembled_at)
+    if stale_h > 2.0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "pipeline_context_stale",
+                "staleness_hours": round(stale_h, 1),
+                "message": "Re-run from TSS to refresh trend signals.",
+            },
+        )
+    if (ctx.selected_idea or {}).get("idea_id") != ctx.selected_idea_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "selected_idea_id_mismatch",
+                "provided": ctx.selected_idea_id,
+                "cluster_id": (ctx.selected_idea or {}).get("idea_id"),
+            },
+        )
+    if ctx.seo_output is None:
+        raise HTTPException(status_code=400, detail="seo_output is required. Run /seo-agent before /generate-script.")
+    if template_key_override and template_key_override not in TEMPLATE_REGISTRY:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_template_key", "valid_keys": sorted(TEMPLATE_REGISTRY.keys())},
+        )
+    warnings: list[Any] = []
+    if stale_h > 1.0:
+        warnings.append("context_stale_warning")
+    return warnings
+
+
+async def run_script_sync_context(
+    request: ScriptRequest,
+    wpm: int,
+) -> dict[str, Any]:
+    ctx = request.context
+    assert ctx is not None
+    warnings = _validate_script_entry(ctx, request.template_key_override)
+    target_wc = int((request.duration_minutes or 10) * wpm)
+    depth_target = int((((ctx.selected_idea or {}).get("content_depth") or {}).get("required_words") or 2600))
+    depth_warn = check_depth_alignment(target_wc, depth_target)
+    if depth_warn:
+        warnings.append(depth_warn)
+
+    angle_for_prompt = extract_angle_for_prompt(ctx.gap_context or {})
+    template_key, selection_method = select_template_key(
+        scored_angle=ctx.gap_context or {},
+        tss_scores=ctx.tss_scores or {},
+        seo_output=ctx.seo_output or {},
+        template_key_override=request.template_key_override,
+    )
+    template = TEMPLATE_REGISTRY[template_key]
+    seo = ctx.seo_output or {}
+    primary_keyword = ((seo.get("keyword_clusters") or {}).get("primary") or [""])[0]
+    rec_title = str(((seo.get("recommended_titles") or [{}])[0]).get("title", "") or "")
+    chapters = list(seo.get("chapter_structure") or [])
+    chapter_scaffold = assemble_chapter_scaffold(chapters, int(request.duration_minutes or 10), wpm)
+
+    social_data = list(ctx.social_data or [])
+    news_data = list(ctx.news_data or [])
+    db_ctx, web_ctx, social_data, news_data, truncation_applied = trim_to_budget(
+        ctx.db_context or "",
+        ctx.web_context or "",
+        social_data,
+        news_data,
+        angle_spec_tokens=estimate_tokens(json.dumps(angle_for_prompt)),
+        seo_section_tokens=estimate_tokens(json.dumps(seo)),
+    )
+
+    structure_section = assemble_structure_section(template_key, target_wc)
+    social_summary = "\n".join(
+        [f"- {s.get('title','')}: {str(s.get('body',''))[:100]}" for s in social_data[:5]]
+    )
+    news_summary = "\n".join([f"- {n.get('title','')}" for n in news_data[:5]])
+
+    prompt = f"""
+ROLE: You are a professional YouTube scriptwriter who writes engaging, research-backed, spoken scripts.
+
+Creator type: {request.creator_type}
+Emotional tone: {request.emotional_tone}
+Audience: {request.audience_description}
+Accent/dialect: {request.accent}
+
+ANGLE SPECIFICATION:
+- Stakeholder perspective: {angle_for_prompt.get('who')}
+- Disciplinary lens: {angle_for_prompt.get('what')}
+- Time/scale: {angle_for_prompt.get('when')}, {angle_for_prompt.get('scale')}
+- System dynamic: {angle_for_prompt.get('system_dynamic')}
+- Power layer: {angle_for_prompt.get('power_layer')}
+- Narrative frame: {angle_for_prompt.get('story_frame')}
+- Full angle: "{angle_for_prompt.get('angle_string')}"
+- Opening hook seed: "{angle_for_prompt.get('hook_sentence')}"
+
+SEO ALIGNMENT:
+- Recommended title seed: "{rec_title}"
+- Primary keyword: "{primary_keyword}"
+- Chapter scaffold:
+{chapter_scaffold}
+
+TASK:
+Write a spoken YouTube script of exactly {target_wc} words (±50). Duration: {request.duration_minutes} minutes.
+
+STYLE RULES:
+- Output only spoken dialogue — no section titles, stage directions, or metadata.
+- Speak directly to the viewer — friendly, confident, slightly spontaneous.
+- Hook viewers emotionally in the first 15–30 seconds.
+- Keep script factual and grounded in provided research context.
+
+{structure_section}
+
+RESEARCH MATERIAL:
+Knowledge base: {db_ctx}
+Web sources: {web_ctx}
+Social signals: {social_summary}
+News context: {news_summary}
+"""
+    script_text, analysis, regeneration_attempted = await generate_with_frame_check(
+        prompt,
+        angle_for_prompt,
+        str(angle_for_prompt.get("story_frame") or ""),
+    )
+
+    timestamps = compute_chapter_timestamps(script_text, chapters, wpm)
+    sources = assemble_sources(db_ctx, web_ctx, social_data, news_data, [])
+    quality_gate_passed = bool((analysis.get("frame_executed", {}) or {}).get("is_executed"))
+
+    return {
+        "script": script_text,
+        "estimated_word_count": len((script_text or "").split()),
+        "sources": sources,
+        "corrected_chapter_timestamps": timestamps,
+        "analysis": {
+            **analysis,
+            "quality_gate_passed": quality_gate_passed,
+        },
+        "regeneration_attempted": regeneration_attempted,
+        "truncation_applied": truncation_applied,
+        "selected_template_key": template_key,
+        "selected_template_name": template.get("name"),
+        "template_selection_method": selection_method,
+        "warnings": warnings,
+    }
+
+
+async def run_script_worker(job_id: str, request_body: dict[str, Any], user_id: str, wpm: int) -> None:
+    try:
+        supabase.table("script_jobs").update({"status": "running", "progress_pct": 20}).eq("id", job_id).execute()
+        req = ScriptRequest.model_validate(request_body)
+        result = await run_script_sync_context(req, wpm=wpm)
+        supabase.table("script_jobs").update(
+            {
+                "status": "completed",
+                "progress_pct": 100,
+                "result_script": result.get("script"),
+                "result_analysis": result.get("analysis"),
+                "result_sources": result.get("sources"),
+                "result_timestamps": result.get("corrected_chapter_timestamps"),
+                "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+        ).eq("id", job_id).execute()
+    except Exception as exc:
+        await issue_refund(user_id, job_id)
+        supabase.table("script_jobs").update(
+            {
+                "status": "failed",
+                "progress_pct": 100,
+                "error_message": str(exc),
+                "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+        ).eq("id", job_id).execute()
 
 
 # ════════════════════════════════════════════════════════════
@@ -1368,6 +2190,109 @@ async def pipeline_metrics(request: PromptRequest):
             return adapt_pipeline_payload(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
+
+
+@app.post("/seo-agent")
+async def seo_agent(request: SEOAgentRequest):
+    ctx = request.context
+    warnings = await _validate_seo_entry(ctx)
+    angle = extract_angle_for_prompt(ctx.gap_context or {})
+    angle_string = angle.get("angle_string") or (ctx.gap_context or {}).get("angle_string") or ""
+    if not angle_string:
+        raise HTTPException(status_code=400, detail={"error": "missing_angle_string", "message": "gap_context.angle_string is required"})
+
+    tss_scores = ctx.tss_scores or {}
+    csi_scores = ctx.csi_scores or {}
+    csi_quality = ctx.csi_quality or {}
+    ctr_label, ctr_score, ctr_degraded = _compute_ctr_signal(ctx.gap_context or {}, csi_scores, csi_quality, tss_scores)
+
+    cat_id = str(tss_scores.get("cat_id") or tss_scores.get("category_id") or "CAT-08")
+    cat_label = str(tss_scores.get("cat_label") or tss_scores.get("category") or "General")
+    blocked_types, face_default = _get_title_config(cat_id)
+
+    competing_titles, paa_questions = await _run_ddgs_scrape(angle_string)
+
+    channel_ctx = (request.channel_context.model_dump() if request.channel_context else None) or {}
+    existing_hashtags = list(channel_ctx.get("existing_hashtags") or [])
+    audience_profile = {
+        "channel_niche": channel_ctx.get("channel_niche"),
+        "subscriber_count": channel_ctx.get("subscriber_count"),
+        "topic": ctx.topic,
+    }
+    prompt = SEO_SYNTHESIS_PROMPT.format(
+        angle_string=angle_string,
+        who=angle.get("who", ""),
+        what=angle.get("what", ""),
+        story_frame=angle.get("story_frame", ""),
+        audience_profile=json.dumps(audience_profile),
+        cat_id=cat_id,
+        cat_label=cat_label,
+        competing_titles=json.dumps(competing_titles),
+        paa_questions=json.dumps(paa_questions),
+        ctr_label=ctr_label,
+        ctr_score=ctr_score,
+        degraded_note="Signal degraded due to CSI quality flags." if ctr_degraded else "Signal quality healthy.",
+        blocked_title_types=json.dumps(blocked_types),
+        ctr_signal_degraded=str(ctr_degraded).lower(),
+    )
+
+    fallback = {
+        "search_intent_type": "educational",
+        "recommended_structure": "problem_solution",
+        "ctr_potential": ctr_label,
+        "ctr_signal_degraded": ctr_degraded,
+        "ctr_score": ctr_score,
+        "justification": "CTR estimated from demand, momentum, and supply openness signals.",
+        "recommended_titles": [],
+        "keyword_clusters": {"primary": [], "secondary": [], "longtail": [], "question_based": paa_questions[:5]},
+        "description_template": {"hook": "", "body_bullets": [], "outro": ""},
+        "thumbnail_brief": [
+            {
+                "concept_type": "data_driven",
+                "text_overlay": "What Changes Next?",
+                "visual_theme": "high-contrast context imagery",
+                "colour_temperature": "high_contrast",
+                "face_recommended": face_default,
+                "rationale": "Fallback thumbnail due to seo synthesis failure.",
+            }
+        ],
+        "hashtags": [],
+        "chapter_structure": [],
+        "key_questions_to_answer": paa_questions[:5],
+    }
+
+    try:
+        raw = await groq_idea_generate([{"role": "user", "content": prompt}], model=GROQ_GENERATION_MODEL)
+        parsed = _parse_json_object(raw)
+    except Exception as exc:
+        print(f"SEO synthesis failed: {exc}")
+        parsed = {}
+
+    merged = {**fallback, **(parsed or {})}
+    merged["search_intent_type"] = _first_allowed_pipe_token(
+        merged.get("search_intent_type"),
+        SEO_INTENT_TYPES,
+        "educational",
+    )
+    merged["recommended_structure"] = _first_allowed_pipe_token(
+        merged.get("recommended_structure"),
+        SEO_STRUCTURES,
+        "problem_solution",
+    )
+    merged["ctr_potential"] = ctr_label
+    merged["ctr_signal_degraded"] = ctr_degraded
+    merged["ctr_score"] = ctr_score
+    merged["recommended_titles"] = _safe_recommended_titles(merged.get("recommended_titles"), blocked_types)
+    deduped = _deduplicate_hashtags(list(merged.get("hashtags") or []), existing_hashtags)
+    merged["hashtags"] = _ensure_hashtag_floor(deduped, ctx.topic, existing_hashtags)
+    merged["chapter_structure"] = _ensure_chapter_structure(merged.get("chapter_structure"))
+    merged["angle"] = angle_string
+    merged["angle_id"] = ctx.selected_angle_id
+    merged["channel_context_unavailable"] = not bool(request.channel_context and request.channel_context.channel_id)
+    merged["warnings"] = warnings
+    merged["key_questions_to_answer"] = list(merged.get("key_questions_to_answer") or paa_questions[:5])[:8]
+
+    return merged
 
 
 # ── /process-topic ───────────────────────────────────────────
@@ -1564,7 +2489,76 @@ async def generate_script(
 ):
     total_start_time = time.time()
     user_id = current_user.id
-    print(f"SCRIPT GENERATION from user ({user_id}): '{request.topic}'")
+    context_mode = request.context is not None
+    topic = (request.topic or "").strip()
+    if request.context is not None:
+        topic = (request.context.topic or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+    print(f"SCRIPT GENERATION from user ({user_id}): '{topic}' (context_mode={context_mode})")
+
+    if context_mode:
+        ctx = request.context
+        assert ctx is not None
+        # Validate early, before credit deduction.
+        warnings = _validate_script_entry(ctx, request.template_key_override)
+        sufficient, wc = assess_context_quality(ctx.db_context or "", ctx.web_context or "")
+        if not sufficient:
+            return {
+                "error": "research_context_insufficient",
+                "word_count": wc,
+                "minimum_required": 100,
+                "credits_deducted": False,
+                "message": "Research context has fewer than 100 substantive words. Credits not deducted.",
+                "mode": "sync" if int(request.duration_minutes or 10) <= 12 else "async",
+            }
+        wpm = get_wpm(str(request.creator_type or ""), request.user_wpm)
+        duration = int(request.duration_minutes or 10)
+        async_mode = duration > 12
+        credits_info = await check_and_deduct_credits(user_id, async_mode=async_mode)
+        if async_mode:
+            job_id = str(uuid4())
+            # Keep async payload JSON-safe (e.g., datetime -> ISO string).
+            request_payload = request.model_dump(mode="json")
+            try:
+                supabase.table("script_jobs").insert(
+                    {
+                        "id": job_id,
+                        "user_id": user_id,
+                        "status": "queued",
+                        "progress_pct": 0,
+                        "request_body": request_payload,
+                        "job_credits_deducted": bool(not credits_info.get("admin")),
+                        "refund_issued": False,
+                        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    }
+                ).execute()
+            except Exception as exc:
+                # if DB insert fails after deduction, refund defensively.
+                if not credits_info.get("admin"):
+                    await issue_refund(user_id, job_id)
+                raise HTTPException(status_code=500, detail=f"Failed to create async script job: {exc}")
+
+            asyncio.create_task(run_script_worker(job_id, request_payload, user_id, wpm))
+            return {
+                "job_id": job_id,
+                "status": "queued",
+                "poll_url": f"/script-status/{job_id}",
+                "estimated_seconds": duration * 4,
+                "mode": "async",
+                "warnings": warnings,
+                "credits_deducted": 0 if credits_info.get("admin") else SCRIPT_CREDIT_COST,
+            }
+
+        result = await run_script_sync_context(request, wpm=wpm)
+        if not credits_info.get("admin"):
+            await deduct_after_success(user_id, int(credits_info.get("credits", 0) or 0))
+        result["credits_deducted"] = 0 if credits_info.get("admin") else SCRIPT_CREDIT_COST
+        result["mode"] = "sync"
+        if warnings:
+            existing = list(result.get("warnings") or [])
+            result["warnings"] = existing + warnings
+        return result
 
     # ── Credit check ─────────────────────────────────────────
     IDEA_COST = 3
@@ -1609,59 +2603,92 @@ async def generate_script(
     )
 
     try:
-        # ── Phase 1: DB + keyword gen in parallel (no sleep) ─
-        print("--- Phase 1: DB lookup + keyword gen in parallel ---")
-        db_results, base_keywords = await asyncio.gather(
-            get_db_context(request.topic),
-            _generate_search_keywords(request.topic),
-        )
-        print(f"--- Phase 1 done: {len(db_results)} DB docs ---")
-
         scraped_urls: set = set()
-
-        # ── Phase 2: Web scrape strategy based on DB quality ──
-        db_count = len(db_results)
-        if db_count >= 5:
-            print(f"--- DB RICH ({db_count} docs): Light news scrape for freshness. ---")
-            new_articles = await get_latest_news_context(request.topic, scraped_urls)
-        elif db_count >= 1:
-            print(f"--- DB PARTIAL ({db_count} docs): Deep scrape to supplement. ---")
-            new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
-        else:
-            print(f"--- DB MISS: Full deep scrape with keywords: {base_keywords} ---")
-            new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
-
-        # ── Step 2: Merge context ─────────────────────────────
         db_context, web_context = "", ""
-        if db_results:
-            db_blocks = [item.get('content', '') for item in db_results]
-            db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, SCRIPT_CONTEXT_MAX_CHARS // 2)
-        if new_articles:
-            web_blocks = [
-                f"Source: {art['title']}\n{art['text']}" for art in new_articles
-            ]
-            web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, SCRIPT_CONTEXT_MAX_CHARS // 2)
-            for article in new_articles:
-                background_tasks.add_task(
-                    add_scraped_data_to_db,
-                    article['title'], article['text'], article['url'],
-                    "",               # category unknown at live-scrape time
-                    request.topic,    # topic from user request
-                    base_keywords,    # use generated keywords as tags proxy
+        if context_mode:
+            ctx = request.context
+            assert ctx is not None
+            stale_h = staleness_hours(ctx.pipeline_assembled_at)
+            if stale_h > 2.0:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "pipeline_context_stale",
+                        "staleness_hours": round(stale_h, 1),
+                        "message": "Re-run from TSS to refresh trend signals.",
+                    },
                 )
+            if ctx.seo_output is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="seo_output is required. Run /seo-agent before /generate-script.",
+                )
+            db_context = str(ctx.db_context or "")
+            web_context = str(ctx.web_context or "")
+        else:
+            # Legacy mode: run script-time research pipeline if context was not provided.
+            print("--- Phase 1: DB lookup + keyword gen in parallel ---")
+            db_results, base_keywords = await asyncio.gather(
+                get_db_context(topic),
+                _generate_search_keywords(topic),
+            )
+            print(f"--- Phase 1 done: {len(db_results)} DB docs ---")
+
+            db_count = len(db_results)
+            if db_count >= 5:
+                print(f"--- DB RICH ({db_count} docs): Light news scrape for freshness. ---")
+                new_articles = await get_latest_news_context(topic, scraped_urls)
+            elif db_count >= 1:
+                print(f"--- DB PARTIAL ({db_count} docs): Deep scrape to supplement. ---")
+                new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
+            else:
+                print(f"--- DB MISS: Full deep scrape with keywords: {base_keywords} ---")
+                new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
+
+            if db_results:
+                db_blocks = [item.get('content', '') for item in db_results]
+                db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, SCRIPT_CONTEXT_MAX_CHARS // 2)
+            if new_articles:
+                web_blocks = [
+                    f"Source: {art['title']}\n{art['text']}" for art in new_articles
+                ]
+                web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, SCRIPT_CONTEXT_MAX_CHARS // 2)
+                for article in new_articles:
+                    background_tasks.add_task(
+                        add_scraped_data_to_db,
+                        article['title'], article['text'], article['url'],
+                        "",
+                        topic,
+                        base_keywords,
+                    )
 
         if not db_context and not web_context:
             return {"error": "Could not find any research material to write the script."}
 
         # ── Step 3: Build & run script prompt ─────────────────
-        WORDS_PER_MINUTE = 130
+        WORDS_PER_MINUTE = min(max(int(request.user_wpm or 130), 80), 200)
         target_duration = request.duration_minutes or 10
         target_word_count = target_duration * WORDS_PER_MINUTE
 
-        requested_structure = request.script_structure or "problem_solution"
+        seo_struct = ""
+        if context_mode and request.context and request.context.seo_output:
+            seo_struct = str((request.context.seo_output or {}).get("recommended_structure") or "")
+        requested_structure = request.script_structure or seo_struct or "problem_solution"
         structure_guidance_text = STRUCTURE_GUIDANCE.get(
             requested_structure, STRUCTURE_GUIDANCE["problem_solution"]
         )
+        seo_guidance = ""
+        if context_mode and request.context and request.context.seo_output:
+            seo = request.context.seo_output or {}
+            primary_kws = (seo.get("keyword_clusters") or {}).get("primary") or []
+            chapter_titles = [str(c.get("title") or "").strip() for c in (seo.get("chapter_structure") or []) if str(c.get("title") or "").strip()]
+            key_qs = seo.get("key_questions_to_answer") or []
+            seo_guidance = f"""
+        **SEO Output Guidance (must integrate naturally):**
+        - Primary Keywords: {primary_kws}
+        - Suggested Chapters: {chapter_titles}
+        - Key Questions to Answer: {key_qs}
+            """
         script_prompt = f"""
         You are a professional YouTube scriptwriter creating natural, engaging, conversational scripts.
 
@@ -1689,8 +2716,9 @@ async def generate_script(
         - Stay close to **{target_word_count} words** (±50).
 
         {structure_guidance_text}
+        {seo_guidance}
 
-        **Main Topic:** "{request.topic}"
+        **Main Topic:** "{topic}"
 
         **Research:**
         FOUNDATIONAL KNOWLEDGE: {db_context}
@@ -1793,6 +2821,24 @@ async def generate_script(
     except Exception as e:
         print(f"SCRIPT GENERATION error: {e}")
         return {"error": "An error occurred during the script generation pipeline."}
+
+
+@app.get("/script-status/{job_id}")
+async def get_script_status(job_id: str, current_user: User = Depends(get_current_user)):
+    if not job_id or str(job_id).strip().lower() in {"null", "none"}:
+        raise HTTPException(status_code=400, detail="Invalid job_id")
+    try:
+        job = supabase.table("script_jobs").select("*").eq("id", job_id).single().execute()
+        data = job.data
+        if not data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if str(data.get("user_id")) != str(current_user.id):
+            raise HTTPException(status_code=403, detail="Access denied")
+        return data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch script job status: {exc}")
 
 
 # ── /payments/create-order ───────────────────────────────────
