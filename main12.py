@@ -1836,6 +1836,114 @@ def compute_chapter_timestamps(script: str, chapter_structure: list[dict[str, An
     return result
 
 
+def _to_section_label(name: str) -> str:
+    raw = re.sub(r"[^a-zA-Z0-9]+", "_", str(name or "").strip()).strip("_")
+    return raw.upper() or "SECTION"
+
+
+def build_script_sections(
+    script: str,
+    chapter_structure: list[dict[str, Any]] | None = None,
+    template_segments: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    text = (script or "").strip()
+    if not text:
+        return []
+
+    words = text.split()
+    total_words = max(len(words), 1)
+    segs = list(template_segments or [])
+    sections: list[dict[str, str]] = []
+
+    # Preferred mode: template-driven segment labels (RAG v2.0).
+    if segs:
+        cumulative_pct = 0.0
+        for idx, seg in enumerate(segs):
+            pct = float(seg.get("pct", 0.0) or 0.0)
+            start = int(cumulative_pct * total_words)
+            if idx == len(segs) - 1:
+                end = total_words
+            else:
+                end = int((cumulative_pct + pct) * total_words)
+            cumulative_pct += pct
+
+            content = " ".join(words[start:end]).strip()
+            if not content:
+                continue
+            segment_name = str(seg.get("name") or f"Segment {idx + 1}").strip()
+            sections.append(
+                {
+                    "section_label": _to_section_label(segment_name),
+                    "heading": segment_name,
+                    "content": content,
+                }
+            )
+        if sections:
+            return sections
+
+    chapters = list(chapter_structure or [])
+
+    if chapters:
+        cumulative_pct = 0.0
+        for idx, ch in enumerate(chapters):
+            pct = float(ch.get("section_pct", 0.0) or 0.0)
+            start = int(cumulative_pct * total_words)
+            if idx == len(chapters) - 1:
+                end = total_words
+            else:
+                end = int((cumulative_pct + pct) * total_words)
+            cumulative_pct += pct
+
+            content = " ".join(words[start:end]).strip()
+            if not content:
+                continue
+            heading = str(ch.get("title") or f"Section {idx + 1}").strip()
+            sections.append(
+                {
+                    "section_label": _to_section_label(heading),
+                    "heading": heading,
+                    "content": content,
+                }
+            )
+        if sections:
+            return sections
+
+    # Fallback when no chapter scaffold exists: split into intro/body/conclusion by ratio.
+    cut_1 = int(0.2 * total_words)
+    cut_2 = int(0.8 * total_words)
+    slices = [
+        ("Introduction", " ".join(words[:cut_1]).strip()),
+        ("Main Analysis", " ".join(words[cut_1:cut_2]).strip()),
+        ("Conclusion", " ".join(words[cut_2:]).strip()),
+    ]
+    for heading, content in slices:
+        if content:
+            sections.append(
+                {
+                    "section_label": _to_section_label(heading),
+                    "heading": heading,
+                    "content": content,
+                }
+            )
+    return sections
+
+
+def render_labeled_script(script_sections: list[dict[str, str]]) -> str:
+    blocks: list[str] = []
+    for sec in script_sections:
+        label = str(sec.get("section_label") or "BODY").strip().upper()
+        heading = str(sec.get("heading") or "Section").strip()
+        content = str(sec.get("content") or "").strip()
+        if not content:
+            continue
+        blocks.append(
+            f"[SECTION: {label}]\n"
+            f"HEADING: {heading}\n"
+            f"CONTENT:\n{content}"
+        )
+    return "\n\n".join(blocks)
+
+
 def assemble_sources(
     db_context: str,
     web_context: str,
@@ -2110,12 +2218,17 @@ News context: {news_summary}
     )
 
     timestamps = compute_chapter_timestamps(script_text, chapters, wpm)
+    template_segments = list(template.get("segments") or [])
+    script_sections = build_script_sections(script_text, chapters, template_segments)
+    script_labeled = render_labeled_script(script_sections)
     sources = assemble_sources(db_ctx, web_ctx, social_data, news_data, [])
     quality_gate_passed = bool((analysis.get("frame_executed", {}) or {}).get("is_executed"))
 
     return {
         "script": script_text,
         "estimated_word_count": len((script_text or "").split()),
+        "script_sections": script_sections,
+        "script_labeled": script_labeled,
         "sources": sources,
         "corrected_chapter_timestamps": timestamps,
         "analysis": {
@@ -2136,12 +2249,17 @@ async def run_script_worker(job_id: str, request_body: dict[str, Any], user_id: 
         supabase.table("script_jobs").update({"status": "running", "progress_pct": 20}).eq("id", job_id).execute()
         req = ScriptRequest.model_validate(request_body)
         result = await run_script_sync_context(req, wpm=wpm)
+        result_analysis = dict(result.get("analysis") or {})
+        if result.get("script_sections"):
+            result_analysis["script_sections"] = result.get("script_sections")
+        if result.get("script_labeled"):
+            result_analysis["script_labeled"] = result.get("script_labeled")
         supabase.table("script_jobs").update(
             {
                 "status": "completed",
                 "progress_pct": 100,
                 "result_script": result.get("script"),
-                "result_analysis": result.get("analysis"),
+                "result_analysis": result_analysis,
                 "result_sources": result.get("sources"),
                 "result_timestamps": result.get("corrected_chapter_timestamps"),
                 "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -2787,6 +2905,8 @@ async def generate_script(
             print(f"Analysis parse error: {e}")
 
         generated_word_count = len(script_text.split())
+        script_sections = build_script_sections(script_text, [])
+        script_labeled = render_labeled_script(script_sections)
         print(f"Generated word count: {generated_word_count}")
         print(f"Total /generate-script time: {time.time() - total_start_time:.2f}s")
 
@@ -2814,6 +2934,8 @@ async def generate_script(
         return {
             "script": script_text,
             "estimated_word_count": generated_word_count,
+            "script_sections": script_sections,
+            "script_labeled": script_labeled,
             "source_urls": list(scraped_urls),
             "analysis": analysis_results,
         }
