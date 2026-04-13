@@ -1154,8 +1154,11 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
 
         # get the seo of the topic
-        selected_idea_id =  random.randint(1,1000)  
-        selected_angle_id = random.randint(1,1000)
+        # selected_idea_id =  random.randint(1,1000)  
+        # selected_angle_id = random.randint(1,1000)
+            # "selected_idea_id": "{selected_idea_id}",
+            # "selected_angle_id": "{selected_angle_id}",
+            # "idea_id": "{selected_idea_id}",
 
 
         json_generation_prompt = f"""
@@ -1173,10 +1176,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         "context": {{
             "topic": "",
             "keywords": [],
-            "selected_idea_id": "{selected_idea_id}",
-            "selected_angle_id": "{selected_angle_id}",
             "selected_idea": {{
-            "idea_id": "{selected_idea_id}",
             "title": ""
             }},
             "gap_context": {{
@@ -1204,7 +1204,12 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         ---
 
         INPUT TOPIC:
-        {request.topic}
+        Topic : {request.topic}
+       Duration:{request.duration_minutes}
+        Tone: {request.emotional_tone}
+        Type: {request.creator_type}
+        Accent : {request.accent}
+       Audience : {request.audience_description}
         """
 
 
