@@ -1205,11 +1205,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
         INPUT TOPIC:
         Topic : {request.topic}
-       Duration:{request.duration_minutes}
-        Tone: {request.emotional_tone}
-        Type: {request.creator_type}
-        Accent : {request.accent}
-       Audience : {request.audience_description}
         """
 
 
@@ -1332,6 +1327,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 #         {structure_guidance_text} 
 
 #         **Main Topic/Idea:** "{request.topic}"
+#         **Structure:** "{structure}"
 
 #         **Research Context:**
 #         FOUNDATIONAL KNOWLEDGE (from database): {db_context}
@@ -1426,8 +1422,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "analysis": analysis_results, # Add the analysis results
             "structure" : structure,
             "seo" : res
-
-
         }
 
     except Exception as e:
