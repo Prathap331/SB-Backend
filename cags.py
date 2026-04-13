@@ -20,7 +20,6 @@ import numpy as np
 __all__ = ["calculate_cags", "collect_corpus_embeddings", "label_youtube_corpus", "tree_interrogation",
            "assess_angle_coverage", "summarise_findings"]
 
-
 def _collect_google_embed_keys() -> list[str]:
     ordered = [
         (os.getenv("GOOGLE_API_KEY1") or "").strip(),

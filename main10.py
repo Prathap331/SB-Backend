@@ -254,6 +254,42 @@ async def get_db_context(topic: str) -> list[dict]:
         return []
     
 
+async def get_structure(content: str) -> dict:
+    try:
+        prompt = f"""
+        You are a strict content classifier.
+
+        Classify the given content into exactly ONE category.
+
+        Return ONLY the category name.
+
+        Categories:
+        - PHILOSOPHY & IDEAS
+        - PSYCHOLOGY & BEHAVIOUR
+        - HISTORY & CIVILISATION
+        - BIOGRAPHY & LEGACY
+        - SCIENCE & TECHNOLOGY
+        - ECONOMICS & SOCIETY
+        - ANALYSIS & BREAKDOWNS
+        - NEWS & CONTEMPORARY EVENTS
+        - THOUGHT LEADERSHIP & DISCUSSION
+        - MOTIVATIONAL & INSPIRATIONAL
+
+        Content:
+        \"\"\"{content}\"\"\"
+        """
+
+        response = await flash_model.generate_content_async(prompt)
+
+        category = response.candidates[0].content.parts[0].text.strip()
+
+        return {"category": category}
+
+    except Exception as e:
+        return {"category": "UNKNOWN", "error": str(e)}    
+
+
+
 
 # --- FastAPI App ---
 app = FastAPI()
@@ -568,6 +604,13 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
     # --- NEW: Credit Check Logic ---
     IDEA_COST = 3 # Define the cost for this specific action
     try:
+
+        content_category = await get_structure(request.topic)  
+        a = content_category["category"]
+        res = supabase.table("documents_structure").select("*").eq("catergory name",a).execute()
+        structure = res.data[0]["Structure"]
+
+
         profile_response = supabase.table('profiles').select('credits_remaining, user_tier').eq('id', user_id).single().execute()
         profile = profile_response.data
         if not profile:
@@ -872,6 +915,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "script":script_response ,
             "estimated_word_count": generated_word_count,
             "source_urls": list(scraped_urls), # Use the correct list
+            "structure" : structure,
             "analysis": analysis_results # Add the analysis results
         }
 

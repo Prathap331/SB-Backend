@@ -15,7 +15,7 @@ UPDATED (plan section 6.3):
   - add_scraped_data_to_db() now tags every row with source_type='web_scrape'
     and metadata including domain + scraped_at.
 """
-
+import uvicorn
 from fastapi import Depends, HTTPException, status, Request, Header, BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -674,6 +674,7 @@ app.add_middleware(
 )
 
 
+
 # ── Pydantic models ──────────────────────────────────────────
 
 class PromptRequest(BaseModel):
@@ -710,6 +711,12 @@ class ResearchBriefInput(BaseModel):
 @app.get("/")
 async def read_root():
     return {"status": "Welcome"}
+
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
 
 
 @app.post("/pipeline-metrics")

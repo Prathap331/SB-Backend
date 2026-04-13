@@ -37,8 +37,6 @@ genai.configure(api_key=api_key)
 
 # Using the models from your working code
 
-
-
 pro_model = genai.GenerativeModel('models/gemini-2.5-flash-preview-09-2025')
 
 flash_model = genai.GenerativeModel('models/gemini-flash-latest')
@@ -159,6 +157,45 @@ async def get_db_context(topic: str) -> list[dict]:
     except Exception as e:
         print(f"--- DB TASK: Error during database search: {e} ---")
         return []
+    
+
+
+async def get_structure(content: str) -> dict:
+    try:
+        prompt = f"""
+        You are a strict content classifier.
+
+        Classify the given content into exactly ONE category.
+
+        Return ONLY the category name.
+
+        Categories:
+        - PHILOSOPHY & IDEAS
+        - PSYCHOLOGY & BEHAVIOUR
+        - HISTORY & CIVILISATION
+        - BIOGRAPHY & LEGACY
+        - SCIENCE & TECHNOLOGY
+        - ECONOMICS & SOCIETY
+        - ANALYSIS & BREAKDOWNS
+        - NEWS & CONTEMPORARY EVENTS
+        - THOUGHT LEADERSHIP & DISCUSSION
+        - MOTIVATIONAL & INSPIRATIONAL
+
+        Content:
+        \"\"\"{content}\"\"\"
+        """
+
+        response = await flash_model.generate_content_async(prompt)
+
+        category = response.candidates[0].content.parts[0].text.strip()
+
+        return {"category": category}
+
+    except Exception as e:
+        return {"category": "UNKNOWN", "error": str(e)}    
+
+
+
 
 # --- FastAPI App ---
 app = FastAPI()
@@ -526,6 +563,11 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
     print(f"Personalization - Duration: {request.duration_minutes} min, Tone: {request.emotional_tone}, Type: {request.creator_type}, Audience: {request.audience_description}, Accent: {request.accent}")
 
     try:
+        content_category = await get_structure(request.topic)  
+        a = content_category["category"]
+        res = supabase.table("documents_structure").select("*").eq("catergory name",a).execute()
+        structure = res.data[0]["Structure"]
+
         # --- Step 1: Gather Context (Unchanged) ---
         db_task = asyncio.create_task(get_db_context(request.topic))
         await asyncio.sleep(11) # Give DB head start
@@ -763,17 +805,12 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         # --- <<< END CREDIT DECREMENT LOGIC >>> ---
 
 
-
-
-
-
-
-
         # --- FINAL RETURN STATEMENT with all the data ---
         return {
             "script":script_response.text ,
             "estimated_word_count": generated_word_count,
-            "source_urls": list(scraped_urls), # Use the correct list
+            "source_urls": list(scraped_urls), # Use the correct list 
+            "structure" : structure,
             "analysis": analysis_results # Add the analysis results
         }
 

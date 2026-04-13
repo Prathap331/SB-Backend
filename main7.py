@@ -29,8 +29,6 @@ genai.configure(api_key=api_key)
 
 # Using the models from your working code
 
-
-
 pro_model = genai.GenerativeModel('models/gemini-2.5-flash-preview-09-2025')
 
 flash_model = genai.GenerativeModel('models/gemini-flash-latest')
@@ -152,6 +150,42 @@ async def get_db_context(topic: str) -> list[dict]:
         print(f"--- DB TASK: Error during database search: {e} ---")
         return []
 
+async def get_structure(content: str) -> dict:
+    try:
+        prompt = f"""
+        You are a strict content classifier.
+
+        Classify the given content into exactly ONE category.
+
+        Return ONLY the category name.
+
+        Categories:
+        - PHILOSOPHY & IDEAS
+        - PSYCHOLOGY & BEHAVIOUR
+        - HISTORY & CIVILISATION
+        - BIOGRAPHY & LEGACY
+        - SCIENCE & TECHNOLOGY
+        - ECONOMICS & SOCIETY
+        - ANALYSIS & BREAKDOWNS
+        - NEWS & CONTEMPORARY EVENTS
+        - THOUGHT LEADERSHIP & DISCUSSION
+        - MOTIVATIONAL & INSPIRATIONAL
+
+        Content:
+        \"\"\"{content}\"\"\"
+        """
+
+        response = await flash_model.generate_content_async(prompt)
+
+        category = response.candidates[0].content.parts[0].text.strip()
+
+        return {"category": category}
+
+    except Exception as e:
+        return {"category": "UNKNOWN", "error": str(e)}    
+
+
+
 # --- FastAPI App ---
 app = FastAPI()
 class PromptRequest(BaseModel):
@@ -235,8 +269,6 @@ async def process_topic(request: PromptRequest, background_tasks: BackgroundTask
         if not db_context and not web_context:
             return {"error": "Could not find any information."}
 
-        
-
         # --- THIS IS THE UPGRADED PROMPT ---
         final_prompt = f"""
         You are an expert YouTube title strategist and scriptwriter.
@@ -306,11 +338,6 @@ async def process_topic(request: PromptRequest, background_tasks: BackgroundTask
         total_end_time = time.time()
         print(f"--- PROFILING: Total request time was {total_end_time - total_start_time:.2f} seconds ---")
         
-
-
-
-
-
 
         # --- THIS IS THE UPDATED RETURN STATEMENT ---
         return {
@@ -419,6 +446,11 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
     print(f"Personalization - Duration: {request.duration_minutes} min, Tone: {request.emotional_tone}, Type: {request.creator_type}, Audience: {request.audience_description}, Accent: {request.accent}")
 
     try:
+        content_category = await get_structure(request.topic)  
+        a = content_category["category"]
+        res = supabase.table("documents_structure").select("*").eq("catergory name",a).execute()
+        structure = res.data[0]["Structure"]
+
         # --- Step 1: Gather Context (Unchanged) ---
         db_task = asyncio.create_task(get_db_context(request.topic))
         await asyncio.sleep(11) # Give DB head start
@@ -613,20 +645,12 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         print(f"Generated script word count: approx. {generated_word_count}")
 
 
-
-
-
-
-
-
-
-
-
         # --- FINAL RETURN STATEMENT with all the data ---
         return {
             "script":script_response.text ,
             "estimated_word_count": generated_word_count,
             "source_urls": list(scraped_urls), # Use the correct list
+             "structure" : structure,
             "analysis": analysis_results # Add the analysis results
         }
 

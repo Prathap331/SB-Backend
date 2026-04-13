@@ -308,9 +308,9 @@ def compute_virality(
     w30d = cohorts.get("w_30d", [])
     w_old = cohorts.get("w_old", [])
 
-    def avg_eng(cohort: list[dict[str, Any]]) -> float:
-        vals = [v["_eng_rate"] for v in cohort if v.get("_eng_valid")]
-        return sum(vals) / len(vals) if vals else 0.0
+    # def avg_eng(cohort: list[dict[str, Any]]) -> float:
+    #     vals = [v["_eng_rate"] for v in cohort if v.get("_eng_valid")]
+    #     return sum(vals) / len(vals) if vals else 0.0
 
     old_baseline = avg_vpd(w_old) or avg_vpd(w30d) or 1.0
     m3_ratio = m3_norm.get("acceleration", 1.0)
