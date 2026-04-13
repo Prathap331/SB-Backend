@@ -29,6 +29,43 @@ import random
 import json
 from datetime import datetime
 from pydantic import BaseModel
+import os
+import re
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from supabase import create_client
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from datetime import datetime, timezone
+from pytrends.request import TrendReq
+from fastapi import FastAPI
+import time
+import schedule
+
+
+
+api_key = os.getenv("apiKey")
+gnews_key = os.getenv("GnewsApi")
+api_key = os.getenv("GOOGLE_API_KEY")
+
+url= os.getenv("SUPABASE_URL")
+key = os.getenv("SUPABASE_KEY")
+
+
+pytrends = TrendReq(hl='en-US', tz=360)
+
+
+supabase = create_client(url, key)
+
+client = genai.configure(api_key=api_key)
+
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+bbc = "https://www.bbc.com/"
+
 
 '''
 
@@ -1152,6 +1189,11 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         res = supabase.table("documents_structure").select("*").eq("catergory name",a).execute()
         structure = res.data[0]["Structure"]
 
+        for item in structure:
+            for segment in item.get("segments", []):
+                segment.pop("brief", None)
+
+        filtered_structure = structure
 
         # get the seo of the topic
         # selected_idea_id =  random.randint(1,1000)  
@@ -1420,7 +1462,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "estimated_word_count": generated_word_count,
             "source_urls": list(scraped_urls), # Use the correct list
             "analysis": analysis_results, # Add the analysis results
-            "structure" : structure,
+            "structure" : filtered_structure,
             "seo" : res
         }
 
@@ -1438,3 +1480,368 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
     # except Exception as e:
     #     print(f"SCRIPT GENERATION: An error occurred: {e}")
     #     return {"error": "An error occurred during the script generation pipeline."}
+
+
+
+
+def ai_itellengence(article, score):
+
+    prompt = f"""System: You are an expert Viral Content Strategist. Your goal is to find the most interesting "story" within a news item and turn it into a high-engagement content plan for social media.
+
+    User:
+    I have a new high-velocity news item. 
+
+    [DATA]
+    Title: {article.get("tittle")}
+    Velocity Score: {score}
+    [/DATA]
+
+    STEP 1: QUALITY FILTER
+    Is this news actually interesting, unique, or impactful? 
+    - If it is routine "filler" news (minor traffic updates, weather reports, or common corporate press releases), respond ONLY with the word "SKIP".
+
+    STEP 2: IF NOT SKIPPED, PROVIDE THE FOLLOWING:
+
+    1. THE HOOK: Create 3 scroll-stopping opening lines for a 60-second video. 
+    - One "Negative/Warning" hook (e.g., "Stop scrolling if you care about...")
+    - One "Curiosity" hook (e.g., "Something strange is happening in...")
+    - One "Direct Value" hook (e.g., "Here is exactly how...")
+
+    2. THE "VIRAL ANGLE": Why will people share this? Identify the emotional trigger (Awe, Anger, Anxiety, or Amusement) and explain the best way to frame the story to get comments and shares.
+
+    3. THE SCRIPT: A punchy, 4-point video outline:
+    - 0-5s: The Hook (Use one from above)
+    - 5-15s: The "Big Reveal" or main news point.
+    - 15-25s: A surprising fact or "did you know" related to this news.
+    - 25-30s: A question to the audience to drive comments.
+
+    4. KEYWORDS & TAGS: 5 trending hashtags to use for this specific story.
+
+    Keep the tone: Engaging, fast-paced, and authoritative.  """
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[prompt]
+        )
+
+        data = {
+           "tittle" : article.get("tittle"),
+           "summary":response.text
+        }
+
+        supabase.table("content_radar").upsert(data,on_conflict="tittle").execute()
+        print("Saved: ai_itellengence")
+        return {"response": response.text}
+    except Exception as e:
+        print(e)
+
+
+
+def clean_keywords(text):
+    stop_words = {
+    "the","is","a","an","in","on","at","to","and","but","says",
+    "did","not","was","were","of","for","with","by","as","from","this","that",
+    "it", "its", "they", "them", "their", "who", "which", "what", "where", "when",
+    "how", "why", "all", "any", "both", "each", "few", "more", "most", "other",
+    "some", "such", "no", "nor", "too", "very", "can", "will", "just", "should",
+    "now", "about", "after", "before", "during", "under", "over", "between", 
+    "into", "through", "breaking", "latest", "report", "update", "watch", "video" 
+    "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", 
+    "yours", "yourself", "yourselves", "he", "him", "his", "himself", "she", 
+    "her", "hers", "herself", "about", "against", "between", "into", "through", 
+    "during", "before", "after", "above", "below", "up", "down", "out", "off", 
+    "over", "under", "again", "further", "then", "once"
+    "today", "yesterday", "tomorrow", "daily", "weekly", "month", "year", "years", 
+    "time", "days", "hours", "minutes", "new", "old", "first", "last", "next", 
+    "recent", "past",
+    "report", "reports", "reported", "breaking", "update", "latest", "exclusive", 
+    "official", "source", "sources", "according", "confirmed", "told", "claims", 
+    "claimed", "details", "video", "watch", "live", "shared", "posted",
+    "it", "its", "they", "them", "their", "who", "whom", "which", "what", "where", 
+    "when", "how", "why", "all", "any", "both", "each", "few", "more", "most", 
+    "other", "some", "such", "no", "nor", "too", "very", "can", "will", "just", 
+    "should", "now"
+       
+   }
+
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+
+    keywords = [w for w in words if w not in stop_words]
+
+    return keywords[:5]
+
+
+LAST_CALL = 0
+MIN_DELAY = 30 
+
+def rate_limit():
+    global LAST_CALL
+    now = time.time()
+    elapsed = now - LAST_CALL
+
+    if elapsed < MIN_DELAY:
+        sleep_time = MIN_DELAY - elapsed + random.uniform(1, 3)
+        print(f"Sleeping {round(sleep_time, 2)}s to avoid rate limit...")
+        time.sleep(sleep_time)
+
+    LAST_CALL = time.time()
+
+
+def fetch_trends(pytrends, kw_list, retries=4):
+    for attempt in range(retries):
+        try:
+            rate_limit()
+
+            pytrends.build_payload(
+                kw_list[:5],
+                cat=0,
+                timeframe='today 12-m',
+                geo='IN',
+                gprop=''
+            )
+
+            df = pytrends.interest_over_time()
+            return df
+
+        except Exception as e:
+            if "429" in str(e):
+                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
+                print(f"429 error. Retry {attempt+1} in {round(wait,2)}s...")
+                time.sleep(wait)
+            else:
+                print("Unexpected error:", e)
+                return None
+
+    return None
+
+
+def calculate_cos(article):
+    created_time = article.get("created_at")
+
+    if not created_time:
+        return
+
+    created_time = datetime.fromisoformat(created_time.replace("Z", "+00:00"))
+
+    now = datetime.now(timezone.utc)
+    delta = now - created_time
+
+    hours_old = round(delta.total_seconds() / 3600)
+    print("Hours:", hours_old)
+
+    text = article.get("tittle", "")
+    kw_list = clean_keywords(text)
+
+    if len(kw_list) == 0:
+        return
+
+    df = fetch_trends(pytrends, kw_list)
+
+    if df is None or df.empty:
+        return
+
+    try:
+        latest = df.iloc[-1].drop("isPartial", errors="ignore")
+        values = latest.values.tolist()
+
+        if not values:
+            return
+
+        score = max(values)
+
+        if hours_old < 2:
+            ai_itellengence(article=article, score=score)
+
+    except Exception as e:
+        print("Processing error:", e)
+
+def getting_and_scroing_articles():
+    res = supabase.table("news").select("*").execute()
+    articles = res.data
+    for article in articles:
+        calculate_cos(article=article)
+
+
+def cosine_similarity(a,b):
+    a = np.array(a)
+    b = np.array(b)
+    return np.dot(a, b) / np.linalg.norm(a) * np.linalg.norm(b)
+
+
+def scrape(url, section_container, inner_section, element, id):
+
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    if id:
+        return
+
+    content = soup.find(section_container, class_=inner_section)
+
+    headlines = content.find_all(element)
+
+    res = supabase.table("news").select("Vectors").execute()
+
+    existing_vectors = []
+
+    for row in res.data:
+        vec = row.get("Vectors")
+        if vec:
+            existing_vectors.append(vec)
+
+    print(f"Loaded {len(existing_vectors)} existing embeddings")
+
+    for title in headlines:
+
+        text = title.get_text(strip=True)
+
+        if not text:
+            continue
+
+        embedding = model.encode(text).tolist()
+
+        is_duplicate = False
+
+        for vec in existing_vectors:
+            try:
+                score = cosine_similarity(embedding, vec)
+
+                if score > 0.85:
+                    print("Duplicate skipped:", text)
+                    is_duplicate = True
+                    break
+            except:
+                continue
+
+        if is_duplicate:
+            continue
+
+        article = {
+            "tittle": text,
+            "Vectors": embedding
+        }
+
+        try:
+            supabase.table("news").upsert(article, on_conflict="tittle").execute()
+            print("Saved:", text)
+            existing_vectors.append(embedding)
+            getting_and_scroing_articles()  
+
+        except Exception as e:
+            print("Failed:", text)
+            print(e)
+
+        print("-" * 80)
+
+
+
+def get_data_via_api():
+
+    articles = []
+    res = requests.get(f"https://newsdata.io/api/1/latest?apikey={api_key}")
+    data = res.json()
+
+    for item in data.get("results", []):
+
+        if not isinstance(item, dict):
+            continue
+
+        title = item.get("tittle")   # FIXED
+
+        if not title:
+            continue
+
+        embedding = model.encode(title).tolist()
+
+        articles.append({
+            "tittle": title,
+            "Vectors": embedding
+        })
+
+    res2 = requests.get(
+        f"https://gnews.io/api/v4/search?q=example&lang=en&country=in&max=10&apikey={gnews_key}"
+    )
+    data2 = res2.json()
+
+    for item in data2.get("articles", []):
+
+        if not isinstance(item, dict):
+            continue
+
+        title = item.get("title")  
+
+        if not title:
+            continue
+
+        embedding = model.encode(title).tolist()
+
+        articles.append({
+            "tittle": title,
+            "Vectors": embedding   
+        })
+    res_db = supabase.table("news").select("Vectors").execute()
+
+    existing_vectors = [
+        row["Vectors"]
+        for row in res_db.data
+        if row.get("Vectors")
+    ]
+
+    THRESHOLD = 0.85
+
+    for article in articles:
+
+        try:
+            embedding = article["Vectors"]
+
+            is_duplicate = False
+
+            for vec in existing_vectors:
+                try:
+                    score = cosine_similarity(embedding, vec)
+
+                    if score > THRESHOLD:
+                        print("Duplicate skipped:", article["tittle"])
+                        is_duplicate = True
+                        break
+                except:
+                    continue
+
+            if is_duplicate:
+                continue
+
+            supabase.table("news").upsert(article, on_conflict="tittle").execute()
+
+            print("Saved:", article["tittle"])
+
+            existing_vectors.append(embedding)
+            getting_and_scroing_articles()  
+
+        except Exception as e:
+            print("Failed:", article["tittle"])
+            print(e)
+
+
+
+@app.get('/trending-data')
+def content_radar():
+    res = supabase.table("content_radar").select("*").execute()
+    return {"message": res.data}
+
+
+def fetch_api():
+    get_data_via_api()
+
+
+def scrape_data():
+    scrape(bbc,section_container='div',inner_section='sc-cd6075cf-0 cJhFtM',element='p',id=False)
+
+schedule.every(24).hours.do(fetch_api)
+schedule.every(2).hours.do(scrape_data)
+
+fetch_api()
+scrape_data()
+
+while True:
+    schedule.run_pending()
+    time.sleep(60)
