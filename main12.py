@@ -89,7 +89,7 @@ RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
 
 api_key = os.getenv("apiKey")
 gnews_key = os.getenv("GnewsApi")
-google_api_key = os.getenv("GOOGLE_API_KEY1")
+google_api_key = os.getenv("GOOGLE_API_KEY")
 
 url= os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
@@ -101,6 +101,8 @@ pytrends = TrendReq(hl='en-US', tz=360)
 supabase = create_client(url, key)
 
 client = genai.Client(api_key=google_api_key)
+
+print(google_api_key)
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -1364,40 +1366,6 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
     return {}
 
 
-def _get_title_config(cat_id: str) -> tuple[list[str], bool]:
-    return BLOCKED_TITLE_TYPES.get(cat_id, []), CAT_FACE_DEFAULTS.get(cat_id, True)
-
-
-async def _validate_seo_entry(ctx: AgentPipelineContext) -> list[str]:
-    warnings: list[str] = []
-    stale_h = staleness_hours(ctx.pipeline_assembled_at)
-    if stale_h > 2.0:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "pipeline_context_stale",
-                "staleness_hours": round(stale_h, 1),
-                "message": "Re-run from TSS to refresh trend signals.",
-            },
-        )
-    if stale_h > 1.0:
-        warnings.append("context_stale_warning")
-
-    if (ctx.selected_idea or {}).get("idea_id") != ctx.selected_idea_id:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "selected_idea_id_mismatch",
-                "provided": ctx.selected_idea_id,
-                "cluster_id": (ctx.selected_idea or {}).get("idea_id"),
-                "message": "selected_idea_id does not match selected_idea.idea_id",
-            },
-        )
-
-    combined_words = len([w for w in f"{ctx.db_context} {ctx.web_context}".split() if len(w) > 3])
-    if combined_words < 50:
-        warnings.append("research_context_thin")
-    return warnings
 
 
 SEO_INTENT_TYPES = {

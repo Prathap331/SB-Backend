@@ -524,41 +524,70 @@ async def seo_agent(request: SEOAgentRequest):
     }
 
     try:
-        raw = await groq_idea_generate([{"role": "user", "content": prompt}], model=GROQ_GENERATION_MODEL)
+        raw = await groq_idea_generate(
+            [{"role": "user", "content": prompt}],
+            model=GROQ_GENERATION_MODEL
+        )
         parsed = _parse_json_object(raw)
     except Exception as exc:
         print(f"SEO synthesis failed: {exc}")
         parsed = {}
 
+    def _clean_keys(d: dict):
+        if not isinstance(d, dict):
+            return {}
+        return {str(k).strip(): v for k, v in d.items()}
+
+    parsed = _clean_keys(parsed)
+    parsed_seo = _clean_keys(parsed.get("seo", {}))
+
     seo = fallback.copy()
+    seo.update(parsed_seo)
 
-    parsed_seo = (parsed or {}).get("seo", {})
-
-    if isinstance(parsed_seo, dict):
-        seo.update(parsed_seo)
-
-    merged = {"seo": seo}
-    merged["search_intent_type"] = _first_allowed_pipe_token(
-        merged.get("search_intent_type"),
+    seo["search_intent_type"] = _first_allowed_pipe_token(
+        seo.get("search_intent_type"),
         SEO_INTENT_TYPES,
         "educational",
     )
-    merged["recommended_structure"] = _first_allowed_pipe_token(
-        merged.get("recommended_structure"),
+
+    seo["recommended_structure"] = _first_allowed_pipe_token(
+        seo.get("recommended_structure"),
         SEO_STRUCTURES,
         "problem_solution",
     )
-    merged["ctr_potential"] = ctr_label
-    merged["ctr_signal_degraded"] = ctr_degraded
-    merged["ctr_score"] = ctr_score
-    merged["recommended_titles"] = _safe_recommended_titles(merged.get("recommended_titles"), blocked_types)
-    deduped = _deduplicate_hashtags(list(merged.get("hashtags") or []), existing_hashtags)
-    merged["hashtags"] = _ensure_hashtag_floor(deduped, ctx.topic, existing_hashtags)
-    merged["chapter_structure"] = _ensure_chapter_structure(merged.get("chapter_structure"))
-    merged["angle"] = angle_string
-    merged["angle_id"] = ctx.selected_angle_id
-    merged["channel_context_unavailable"] = not bool(request.channel_context and request.channel_context.channel_id)
-    # merged["warnings"] = warnings
-    merged["key_questions_to_answer"] = list(merged.get("key_questions_to_answer") or paa_questions[:5])[:8]
 
-    return merged
+    seo["ctr_potential"] = ctr_label
+    seo["ctr_signal_degraded"] = ctr_degraded
+    seo["ctr_score"] = ctr_score
+
+    seo["recommended_titles"] = _safe_recommended_titles(
+        seo.get("recommended_titles"),
+        blocked_types
+    )
+
+    deduped = _deduplicate_hashtags(
+        list(seo.get("hashtags") or []),
+        existing_hashtags
+    )
+
+    seo["hashtags"] = _ensure_hashtag_floor(
+        deduped,
+        ctx.topic,
+        existing_hashtags
+    )
+
+    seo["chapter_structure"] = _ensure_chapter_structure(
+        seo.get("chapter_structure")
+    )
+
+    seo["angle"] = angle_string
+    seo["angle_id"] = ctx.selected_angle_id
+    seo["channel_context_unavailable"] = not bool(
+        request.channel_context and request.channel_context.channel_id
+    )
+
+    seo["key_questions_to_answer"] = list(
+        seo.get("key_questions_to_answer") or paa_questions[:5]
+    )[:8]
+
+    return {"seo": seo} 
