@@ -160,7 +160,7 @@ groq_api_key = os.getenv("GROQ_API_KEY")
 
 
 class context(BaseModel):
-    def __init__(self,topic,keywords,selected_idea_id,selected_angle_id,pipeline_assembled_at: datetime | None = None):
+    def __init__(self,topic,keywords,selected_idea_id=None,selected_angle_id=None,pipeline_assembled_at: datetime | None = None):
         self.topic= topic
         self.keywords =keywords
         self.selected_idea_id = selected_idea_id
@@ -533,6 +533,7 @@ async def seo_agent(request: SEOAgentRequest):
         print(f"SEO synthesis failed: {exc}")
         parsed = {}
 
+    # SAFE CLEAN
     def _clean_keys(d: dict):
         if not isinstance(d, dict):
             return {}

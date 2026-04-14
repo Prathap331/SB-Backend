@@ -28,8 +28,6 @@ from google.genai import types as genai_types
 from seoAgent.seo import seo_agent
 from ddgs import DDGS
 
-# ─────────────────────────────────────────────────────────────
-
 import os
 import asyncio
 import time
@@ -85,7 +83,6 @@ print("NLTK 'punkt' and 'punkt_tab' data checked.")
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
-
 
 api_key = os.getenv("apiKey")
 gnews_key = os.getenv("GnewsApi")
@@ -744,16 +741,16 @@ def add_scraped_data_to_db(
 # Prevents memory exhaustion when multiple requests arrive simultaneously
 _playwright_semaphore = asyncio.Semaphore(3)
 _pipeline_request_semaphore = asyncio.Semaphore(PIPELINE_MAX_CONCURRENCY)
-_process_topic_request_semaphore = asyncio.Semaphore(PROCESS_TOPIC_MAX_CONCURRENCY)
-_request_state_lock = asyncio.Lock()
-_response_cache = {
-    "pipeline_metrics": OrderedDict(),
-    "process_topic": OrderedDict(),
-}
-_inflight_requests = {
-    "pipeline_metrics": {},
-    "process_topic": {},
-}
+# _process_topic_request_semaphore = asyncio.Semaphore(PROCESS_TOPIC_MAX_CONCURRENCY)
+# _request_state_lock = asyncio.Lock()
+# _response_cache = {
+#     "pipeline_metrics": OrderedDict(),
+#     "process_topic": OrderedDict(),
+# }
+# _inflight_requests = {
+#     "pipeline_metrics": {},
+#     "process_topic": {},
+# }
 
 
 def _extract_text_from_html(html: str) -> tuple[str, str]:
