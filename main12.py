@@ -2945,22 +2945,22 @@ async def generate_script(
         return {"error": "An error occurred during the script generation pipeline."}
 
 
-@app.get("/script-status/{job_id}")
-async def get_script_status(job_id: str, current_user: User = Depends(get_current_user)):
-    if not job_id or str(job_id).strip().lower() in {"null", "none"}:
-        raise HTTPException(status_code=400, detail="Invalid job_id")
-    try:
-        job = supabase.table("script_jobs").select("*").eq("id", job_id).single().execute()
-        data = job.data
-        if not data:
-            raise HTTPException(status_code=404, detail="Job not found")
-        if str(data.get("user_id")) != str(current_user.id):
-            raise HTTPException(status_code=403, detail="Access denied")
-        return data
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch script job status: {exc}")
+# @app.get("/script-status/{job_id}")
+# async def get_script_status(job_id: str, current_user: User = Depends(get_current_user)):
+#     if not job_id or str(job_id).strip().lower() in {"null", "none"}:
+#         raise HTTPException(status_code=400, detail="Invalid job_id")
+#     try:
+#         job = supabase.table("script_jobs").select("*").eq("id", job_id).single().execute()
+#         data = job.data
+#         if not data:
+#             raise HTTPException(status_code=404, detail="Job not found")
+#         if str(data.get("user_id")) != str(current_user.id):
+#             raise HTTPException(status_code=403, detail="Access denied")
+#         return data
+#     except HTTPException:
+#         raise
+#     except Exception as exc:
+#         raise HTTPException(status_code=500, detail=f"Failed to fetch script job status: {exc}")
 
 
 # ── /payments/create-order ───────────────────────────────────

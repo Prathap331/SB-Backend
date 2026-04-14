@@ -1572,7 +1572,7 @@ def clean_keywords(text):
 
 
 LAST_CALL = 0
-MIN_DELAY = 30 
+MIN_DELAY = 30
 
 def rate_limit():
     global LAST_CALL
@@ -1823,25 +1823,25 @@ def get_data_via_api():
 
 
 
-@app.get('/trending-data')
-def content_radar():
-    res = supabase.table("content_radar").select("*").execute()
-    return {"message": res.data}
+# @app.get('/trending-data')
+# def content_radar():
+#     res = supabase.table("content_radar").select("*").execute()
+#     return {"message": res.data}
 
 
-def fetch_api():
-    get_data_via_api()
+# def fetch_api():
+#     get_data_via_api()
 
 
-def scrape_data():
-    scrape(bbc,section_container='div',inner_section='sc-cd6075cf-0 cJhFtM',element='p',id=False)
+# def scrape_data():
+#     scrape(bbc,section_container='div',inner_section='sc-cd6075cf-0 cJhFtM',element='p',id=False)
 
-schedule.every(24).hours.do(fetch_api)
-schedule.every(2).hours.do(scrape_data)
+# schedule.every(24).hours.do(fetch_api)
+# schedule.every(2).hours.do(scrape_data)
 
-fetch_api()
-scrape_data()
+# fetch_api()
+# scrape_data()
 
-while True:
-    schedule.run_pending()
-    time.sleep(60)
+# while True:
+#     schedule.run_pending()
+#     time.sleep(60)
