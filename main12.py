@@ -238,32 +238,6 @@ def _topic_cache_key(topic: str) -> str:
     return " ".join((topic or "").strip().lower().split())
 
 
-# def _cache_get(
-#     cache: OrderedDict[str, dict],
-#     key: str,
-#     ttl_seconds: int,
-# ) -> dict | None:
-#     row = cache.get(key)
-#     if not row:
-#         return None
-#     if ttl_seconds <= 0:
-#         cache.pop(key, None)
-#         return None
-#     age = time.time() - float(row.get("ts", 0))
-#     if age > ttl_seconds:
-#         cache.pop(key, None)
-#         return None
-#     cache.move_to_end(key)
-#     return row.get("data")
-
-
-# def _cache_set(cache: OrderedDict[str, dict], key: str, data: dict) -> None:
-#     cache[key] = {"ts": time.time(), "data": data}
-#     cache.move_to_end(key)
-#     while len(cache) > TOPIC_CACHE_MAX_ITEMS:
-#         cache.popitem(last=False)
-
-
 def _parse_utc_datetime(value: Any) -> datetime.datetime | None:
     if not value:
         return None
@@ -406,43 +380,6 @@ async def _lookup_topic_cache(topic: str, cache_client: Any | None = None) -> di
     return db_cached
 
 
-# async def _run_singleflight_cached(
-#     *,
-#     group: str,
-#     topic: str,
-#     ttl_seconds: int,
-#     compute_coro,
-# ) -> tuple[dict, bool]:
-#     key = _topic_cache_key(topic)
-#     async with _request_state_lock:
-#         cache = _response_cache[group]
-#         cached = _cache_get(cache, key, ttl_seconds)
-#         if cached is not None:
-#             return cached, True
-#         task = _inflight_requests[group].get(key)
-#         if task is None:
-#             task = asyncio.create_task(compute_coro())
-#             _inflight_requests[group][key] = task
-#             task_owner = True
-#         else:
-#             task_owner = False
-
-#     try:
-#         result = await task
-#         if task_owner and ttl_seconds > 0:
-#             async with _request_state_lock:
-#                 _cache_set(_response_cache[group], key, result)
-#         return result, False
-#     finally:
-#         async with _request_state_lock:
-#             current = _inflight_requests[group].get(key)
-#             if current is task:
-#                 _inflight_requests[group].pop(key, None)
-
-
-# def _estimate_tokens(text: str) -> int:
-#     # Rough heuristic for English prompts; good enough for routing decisions.
-#     return max(1, len(text) // 4)
 
 
 def _cap_blocks(blocks: list[str], max_blocks: int, max_chars: int) -> str:
@@ -451,46 +388,6 @@ def _cap_blocks(blocks: list[str], max_blocks: int, max_chars: int) -> str:
     if len(merged) > max_chars:
         merged = merged[:max_chars]
     return merged
-
-
-# async def _summarize_context_for_ideas(topic: str, db_context: str, web_context: str) -> tuple[str, str]:
-#     context_blob = (
-#         f"FOUNDATIONAL KNOWLEDGE:\n{db_context}\n\n"
-#         f"LATEST NEWS:\n{web_context}\n"
-#     )
-#     summarize_prompt = f"""
-#     Summarize the research context for YouTube ideation on "{topic}".
-#     Keep only the most important facts, conflicts, timelines, and hooks.
-#     Return plain text with two sections:
-#     1) FOUNDATIONAL KNOWLEDGE
-#     2) LATEST NEWS
-#     Hard limit: 1200 words total.
-#     """
-#     try:
-#         summary = await openrouter_generate(
-#             [
-#                 {"role": "user", "content": summarize_prompt},
-#                 {"role": "user", "content": context_blob[:16000]},
-#             ]
-#         )
-#     except Exception as exc:
-#         print(f"Context summarization failed, using hard-trim fallback: {exc}")
-#         return (
-#             db_context[:PROCESS_TOPIC_SUMMARY_MAX_CHARS // 2],
-#             web_context[:PROCESS_TOPIC_SUMMARY_MAX_CHARS // 2],
-#         )
-
-#     text = summary.strip()
-#     if not text:
-#         return (
-#             db_context[:PROCESS_TOPIC_SUMMARY_MAX_CHARS // 2],
-#             web_context[:PROCESS_TOPIC_SUMMARY_MAX_CHARS // 2],
-#         )
-
-#     # Keep a single compact summary in web section if structure is not parseable.
-#     if "LATEST NEWS" not in text and "FOUNDATIONAL KNOWLEDGE" not in text:
-#         return ("", text[:PROCESS_TOPIC_SUMMARY_MAX_CHARS])
-#     return ("", text[:PROCESS_TOPIC_SUMMARY_MAX_CHARS])
 
 
 def _extract_retry_delay_seconds(error_text: str) -> float | None:
@@ -941,7 +838,6 @@ async def _scrape_with_playwright(url: str) -> tuple[str, str] | None:
         return await loop.run_in_executor(None, lambda: asyncio.run(_run()))
 
 
-# Domains that consistently return junk, non-English content, or block scrapers
 _SCRAPE_BLOCKLIST = {
     'zhidao.baidu.com', 'baidu.com', 'en.cppreference.com', 'cppreference.com',
     'stackoverflow.com', 'github.com', 'reddit.com', 'twitter.com', 'x.com',
@@ -951,10 +847,9 @@ _SCRAPE_BLOCKLIST = {
 
 
 async def scrape_url(
-    client: httpx.AsyncClient,   # kept for signature compatibility
     url: str,
     scraped_urls: set,
-    snippet: str = "",           # Tier 3 fallback text from search result
+    snippet: str = "",           
 ) -> dict | None:
     """
     3-tier scraping with automatic fallback:
@@ -964,7 +859,6 @@ async def scrape_url(
     """
     if url in scraped_urls:
         return None
-    # Skip known junk/non-English/blocked domains immediately
     domain = urlparse(url).netloc.lstrip('www.')
     if any(domain == b or domain.endswith('.' + b) for b in _SCRAPE_BLOCKLIST):
         print(f"  ⊘ Skipped blocklisted domain: {domain}")
@@ -1005,7 +899,7 @@ async def scrape_url(
 
 async def deep_search_and_scrape(keywords: list[str], scraped_urls: set) -> list[dict]:
     print("--- DEEP WEB SCRAPE: Starting full search... ---")
-    urls_to_scrape = []   # list of (url, snippet) tuples
+    urls_to_scrape = []   
 
     def _discover_candidates() -> list[tuple[str, str]]:
         discovered: list[tuple[str, str]] = []
@@ -1013,7 +907,6 @@ async def deep_search_and_scrape(keywords: list[str], scraped_urls: set) -> list
             for keyword in keywords[:DEEP_SCRAPE_MAX_KEYWORDS]:
                 results = list(ddgs.text(keyword, region='wt-wt', max_results=DEEP_SCRAPE_MAX_RESULTS_PER_KEYWORD))
                 if results:
-                    # Take top result; keep snippet for Tier 3 fallback
                     top = results[0]
                     discovered.append((top['href'], top.get('body', '')))
         return discovered
@@ -1027,7 +920,6 @@ async def deep_search_and_scrape(keywords: list[str], scraped_urls: set) -> list
         print(f"--- DEEP WEB SCRAPE: Discovery failed fast: {e} ---")
         return []
 
-    # Deduplicate by URL
     seen = set()
     unique = []
     for url, snippet in urls_to_scrape:
@@ -1236,9 +1128,6 @@ async def get_db_context(topic: str) -> list[dict]:
     return results
 
 
-# ════════════════════════════════════════════════════════════
-# SCRIPT STRUCTURE OPTIONS
-# ════════════════════════════════════════════════════════════
 
 STRUCTURE_GUIDANCE = {
     "problem_solution": """
@@ -1511,72 +1400,6 @@ async def _validate_seo_entry(ctx: AgentPipelineContext) -> list[str]:
     return warnings
 
 
-# def _compute_ctr_signal(
-#     gap_context: dict[str, Any],
-#     csi_scores: dict[str, Any],
-#     csi_quality: dict[str, Any],
-#     tss_scores: dict[str, Any],
-# ) -> tuple[str, float, bool]:
-#     demand = float(csi_scores.get("demand_score", 50) or 50) / 100.0
-#     supply = float(csi_scores.get("supply_score", 50) or 50) / 100.0
-#     openness = 1.0 - supply
-#     momentum = float(tss_scores.get("m1_score", 50) or 50) / 100.0
-
-#     score = (demand * 0.45) + (momentum * 0.30) + (openness * 0.25)
-#     label = "High" if score >= 0.65 else "Medium" if score >= 0.40 else "Low"
-#     degraded = bool(
-#         csi_quality.get("engagement_insufficient")
-#         or csi_quality.get("redundancy_embedding_failed")
-#     )
-#     if degraded:
-#         label = {"High": "Medium", "Medium": "Low", "Low": "Low"}[label]
-#     return label, round(score, 3), degraded
-
-
-# async def _run_ddgs_scrape(angle: str) -> tuple[list[str], list[str]]:
-#     loop = asyncio.get_running_loop()
-#     competing_titles: list[str] = []
-#     paa_questions: list[str] = []
-#     try:
-#         with DDGS(timeout=10) as ddgs:
-#             videos = await loop.run_in_executor(
-#                 None,
-#                 lambda: list(ddgs.videos(angle, region="wt-wt", timelimit="m", max_results=5)),
-#             )
-#             competing_titles = [str(v.get("title") or "").strip() for v in videos if str(v.get("title") or "").strip()]
-#     except Exception:
-#         competing_titles = []
-
-#     try:
-#         with DDGS(timeout=10) as ddgs:
-#             answers = await loop.run_in_executor(
-#                 None,
-#                 lambda: list(ddgs.answers(angle, region="wt-wt")),
-#             )
-#             paa_questions = [str(a.get("question") or "").strip() for a in answers[:5] if str(a.get("question") or "").strip()]
-#     except Exception:
-#         paa_questions = []
-#     return competing_titles, paa_questions
-
-
-# def _deduplicate_hashtags(generated: list[str], existing_channel_hashtags: list[str]) -> list[dict[str, Any]]:
-#     existing_set = {h.lower().lstrip("#") for h in (existing_channel_hashtags or [])}
-#     result: list[dict[str, Any]] = []
-#     for h in generated:
-#         clean = str(h or "").strip()
-#         if not clean:
-#             continue
-#         normalized = clean if clean.startswith("#") else f"#{clean}"
-#         key = normalized.lower().lstrip("#")
-#         strategy = "established" if key in existing_set else "expansion"
-#         result.append({"hashtag": normalized, "strategy": strategy})
-#     result = result[:5]
-#     expansions = [x for x in result if x.get("strategy") == "expansion"]
-#     if len(expansions) < 2:
-#         result.append({"hashtag": None, "strategy": "expansion", "needs_generation": True})
-#     return result
-
-
 SEO_INTENT_TYPES = {
     "educational",
     "entertainment",
@@ -1594,116 +1417,6 @@ SEO_STRUCTURES = {
     "myth_debunking",
     "tech_review",
 }
-
-
-# def _first_allowed_pipe_token(value: Any, allowed: set[str], default: str) -> str:
-#     raw = str(value or "").strip().lower()
-#     if not raw:
-#         return default
-#     tokens = [t.strip() for t in raw.split("|") if t.strip()]
-#     for token in tokens:
-#         if token in allowed:
-#             return token
-#     return default
-
-
-# def _ensure_chapter_structure(chapters: Any, fallback_titles: list[str] | None = None) -> list[dict[str, Any]]:
-#     fallback_titles = fallback_titles or ["Hook", "Context", "Analysis", "Takeaway"]
-#     cleaned: list[dict[str, Any]] = []
-#     if isinstance(chapters, list):
-#         for idx, item in enumerate(chapters):
-#             if not isinstance(item, dict):
-#                 continue
-#             title = str(item.get("title") or "").strip()[:40]
-#             covers = str(item.get("covers") or "").strip()
-#             pct = item.get("section_pct")
-#             try:
-#                 pct_f = float(pct)
-#             except Exception:
-#                 pct_f = 0.0
-#             if not title:
-#                 continue
-#             cleaned.append(
-#                 {
-#                     "index": idx + 1,
-#                     "title": title,
-#                     "covers": covers or "Core discussion",
-#                     "section_pct": pct_f,
-#                 }
-#             )
-#     if len(cleaned) < 3:
-#         cleaned = [
-#             {"index": 1, "title": fallback_titles[0], "covers": "Open with the central tension", "section_pct": 0.18},
-#             {"index": 2, "title": fallback_titles[1], "covers": "Set background and stakeholders", "section_pct": 0.24},
-#             {"index": 3, "title": fallback_titles[2], "covers": "Break down evidence and dynamics", "section_pct": 0.34},
-#             {"index": 4, "title": fallback_titles[3], "covers": "Close with implications and CTA", "section_pct": 0.24},
-#         ]
-#         return cleaned
-#     total = sum(max(float(c.get("section_pct") or 0.0), 0.0) for c in cleaned)
-#     if total <= 0.0:
-#         weight = 1.0 / len(cleaned)
-#         for c in cleaned:
-#             c["section_pct"] = round(weight, 4)
-#     else:
-#         for c in cleaned:
-#             c["section_pct"] = round(max(float(c.get("section_pct") or 0.0), 0.0) / total, 4)
-#     for idx, c in enumerate(cleaned, start=1):
-#         c["index"] = idx
-#     return cleaned
-
-
-# def _ensure_hashtag_floor(
-#     hashtags: list[dict[str, Any]],
-#     topic: str,
-#     existing_channel_hashtags: list[str],
-# ) -> list[dict[str, Any]]:
-#     out = [h for h in hashtags if h.get("hashtag")]
-#     if len(out) >= 3:
-#         return out[:5]
-#     words = [w for w in re.findall(r"[a-zA-Z0-9]+", topic) if len(w) >= 3]
-#     candidates = [f"#{''.join(words[:2])}" if words else "#StoryBitTopic"]
-#     candidates += [f"#{w}" for w in words[:4]]
-#     existing = {str(h.get("hashtag") or "").lower() for h in out}
-#     existing_tags = {f"#{str(h).lstrip('#').lower()}" for h in (existing_channel_hashtags or [])}
-#     for cand in candidates:
-#         key = cand.lower()
-#         if key in existing:
-#             continue
-#         out.append(
-#             {
-#                 "hashtag": cand,
-#                 "strategy": "established" if key in existing_tags else "expansion",
-#             }
-#         )
-#         existing.add(key)
-#         if len(out) >= 5:
-#             break
-#     return out[:5]
-
-
-# def _safe_recommended_titles(raw_titles: Any, blocked_types: list[str]) -> list[dict[str, str]]:
-#     if not isinstance(raw_titles, list):
-#         return []
-#     cleaned: list[dict[str, str]] = []
-#     for item in raw_titles:
-#         if not isinstance(item, dict):
-#             continue
-#         t_type = str(item.get("type") or "").strip()
-#         if not t_type or t_type in blocked_types:
-#             continue
-#         title = str(item.get("title") or "").strip()
-#         if not title:
-#             continue
-#         cleaned.append(
-#             {
-#                 "type": t_type,
-#                 "title": title[:70],
-#                 "rationale": str(item.get("rationale") or "").strip()[:300],
-#             }
-#         )
-#         if len(cleaned) >= 4:
-#             break
-#     return cleaned
 
 
 WPM_BY_CREATOR_TYPE = {
@@ -1870,7 +1583,6 @@ def build_script_sections(
     segs = list(template_segments or [])
     sections: list[dict[str, str]] = []
 
-    # Preferred mode: template-driven segment labels (RAG v2.0).
     if segs:
         cumulative_pct = 0.0
         for idx, seg in enumerate(segs):
@@ -1923,7 +1635,6 @@ def build_script_sections(
         if sections:
             return sections
 
-    # Fallback when no chapter scaffold exists: split into intro/body/conclusion by ratio.
     cut_1 = int(0.2 * total_words)
     cut_2 = int(0.8 * total_words)
     slices = [
@@ -2081,7 +1792,6 @@ async def framecheck_generate_text(prompt: str) -> str:
             return await groq_script_generate(messages)
     if provider == "auto":
         return await generate_script_content(messages)
-    # Default: groq main, openrouter backup.
     try:
         return await groq_script_generate(messages)
     except Exception as exc:
@@ -2300,6 +2010,16 @@ async def read_root():
     return {"status": "Welcome"}
 
 
+@app.post("/token")
+async def token(form_data: OAuth2PasswordRequestForm = Depends()):
+    return await login_user(form_data)
+
+
+@app.post("/refresh-token")
+async def refresh_token(request: RefreshTokenRequest):
+    return await refresh_access_token(request.refresh_token)
+
+
 @app.post("/pipeline-metrics")
 async def pipeline_metrics(request: PromptRequest):
     """
@@ -2498,11 +2218,6 @@ async def generate_ideas_endpoint(
     except Exception as e:
         print(f"Error in /generate-ideas: {e}")
         return {"error": "An error occurred in the idea generation pipeline."}
-
-
-
-
-
 
 
 async def get_structure(content: str) -> dict:
@@ -2832,374 +2547,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         print(f"SCRIPT GENERATION: An error occurred: {e}")
         return {"error": "An error occurred during the script generation pipeline."}
 
-
-
-
-
-# @app.post("/generate-script")
-# async def generate_script(
-#     request: ScriptRequest,
-#     background_tasks: BackgroundTasks,
-#     current_user: User = Depends(get_current_user),
-# ):
-#     total_start_time = time.time()
-#     user_id = current_user.id
-#     context_mode = request.context is not None
-#     topic = (request.topic or "").strip()
-#     if request.context is not None:
-#         topic = (request.context.topic or "").strip()
-#     if not topic:
-#         raise HTTPException(status_code=400, detail="topic is required")
-#     print(f"SCRIPT GENERATION from user ({user_id}): '{topic}' (context_mode={context_mode})")
-
-#     if context_mode:
-#         ctx = request.context
-#         assert ctx is not None
-#         # Validate early, before credit deduction.
-#         warnings = _validate_script_entry(ctx, request.template_key_override)
-#         sufficient, wc = assess_context_quality(ctx.db_context or "", ctx.web_context or "")
-#         if not sufficient:
-#             return {
-#                 "error": "research_context_insufficient",
-#                 "word_count": wc,
-#                 "minimum_required": 100,
-#                 "credits_deducted": False,
-#                 "message": "Research context has fewer than 100 substantive words. Credits not deducted.",
-#                 "mode": "sync" if int(request.duration_minutes or 10) <= 12 else "async",
-#             }
-#         wpm = get_wpm(str(request.creator_type or ""), request.user_wpm)
-#         duration = int(request.duration_minutes or 10)
-#         async_mode = duration > 12
-#         credits_info = await check_and_deduct_credits(user_id, async_mode=async_mode)
-#         if async_mode:
-#             job_id = str(uuid4())
-#             # Keep async payload JSON-safe (e.g., datetime -> ISO string).
-#             request_payload = request.model_dump(mode="json")
-#             try:
-#                 supabase.table("script_jobs").insert(
-#                     {
-#                         "id": job_id,
-#                         "user_id": user_id,
-#                         "status": "queued",
-#                         "progress_pct": 0,
-#                         "request_body": request_payload,
-#                         "job_credits_deducted": bool(not credits_info.get("admin")),
-#                         "refund_issued": False,
-#                         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-#                     }
-#                 ).execute()
-#             except Exception as exc:
-#                 # if DB insert fails after deduction, refund defensively.
-#                 if not credits_info.get("admin"):
-#                     await issue_refund(user_id, job_id)
-#                 raise HTTPException(status_code=500, detail=f"Failed to create async script job: {exc}")
-
-#             asyncio.create_task(run_script_worker(job_id, request_payload, user_id, wpm))
-#             return {
-#                 "job_id": job_id,
-#                 "status": "queued",
-#                 "poll_url": f"/script-status/{job_id}",
-#                 "estimated_seconds": duration * 4,
-#                 "mode": "async",
-#                 "warnings": warnings,
-#                 "credits_deducted": 0 if credits_info.get("admin") else SCRIPT_CREDIT_COST,
-#             }
-
-#         result = await run_script_sync_context(request, wpm=wpm)
-#         if not credits_info.get("admin"):
-#             await deduct_after_success(user_id, int(credits_info.get("credits", 0) or 0))
-#         result["credits_deducted"] = 0 if credits_info.get("admin") else SCRIPT_CREDIT_COST
-#         result["mode"] = "sync"
-#         if warnings:
-#             existing = list(result.get("warnings") or [])
-#             result["warnings"] = existing + warnings
-#         return result
-
-#     # ── Credit check ─────────────────────────────────────────
-#     IDEA_COST = 3
-#     try:
-#         profile_response = (
-#             supabase.table('profiles')
-#             .select('credits_remaining, user_tier')
-#             .eq('id', user_id)
-#             .single()
-#             .execute()
-#         )
-#         profile = profile_response.data
-#         if not profile:
-#             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-#                                 detail="User profile not found.")
-
-#         credits = profile.get('credits_remaining', 0)
-#         user_tier = profile.get('user_tier', 'free')
-
-#         if user_tier != 'admin' and credits < IDEA_COST:
-#             raise HTTPException(
-#                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
-#                 detail=(
-#                     f"Insufficient credits. This action requires {IDEA_COST} credit(s). "
-#                     f"You have {credits}."
-#                 ),
-#             )
-#         print(f"User {user_id} (Tier: {user_tier}) has {credits} credits.")
-#     except APIError as e:
-#         raise HTTPException(status_code=500, detail=f"DB error checking profile: {e.message}")
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         print(f"Unexpected error checking credits: {e}")
-#         raise HTTPException(status_code=500, detail="Error checking profile.")
-#     # ─────────────────────────────────────────────────────────
-
-#     print(
-#         f"Personalization — Duration: {request.duration_minutes}min, "
-#         f"Tone: {request.emotional_tone}, Type: {request.creator_type}, "
-#         f"Audience: {request.audience_description}, Accent: {request.accent}"
-#     )
-
-#     try:
-#         scraped_urls: set = set()
-#         db_context, web_context = "", ""
-#         if context_mode:
-#             ctx = request.context
-#             assert ctx is not None
-#             stale_h = staleness_hours(ctx.pipeline_assembled_at)
-#             if stale_h > 2.0:
-#                 raise HTTPException(
-#                     status_code=409,
-#                     detail={
-#                         "error": "pipeline_context_stale",
-#                         "staleness_hours": round(stale_h, 1),
-#                         "message": "Re-run from TSS to refresh trend signals.",
-#                     },
-#                 )
-#             if ctx.seo_output is None:
-#                 raise HTTPException(
-#                     status_code=400,
-#                     detail="seo_output is required. Run /seo-agent before /generate-script.",
-#                 )
-#             db_context = str(ctx.db_context or "")
-#             web_context = str(ctx.web_context or "")
-#         else:
-#             # Legacy mode: run script-time research pipeline if context was not provided.
-#             print("--- Phase 1: DB lookup + keyword gen in parallel ---")
-#             db_results, base_keywords = await asyncio.gather(
-#                 get_db_context(topic),
-#                 _generate_search_keywords(topic),
-#             )
-#             print(f"--- Phase 1 done: {len(db_results)} DB docs ---")
-
-#             db_count = len(db_results)
-#             if db_count >= 5:
-#                 print(f"--- DB RICH ({db_count} docs): Light news scrape for freshness. ---")
-#                 new_articles = await get_latest_news_context(topic, scraped_urls)
-#             elif db_count >= 1:
-#                 print(f"--- DB PARTIAL ({db_count} docs): Deep scrape to supplement. ---")
-#                 new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
-#             else:
-#                 print(f"--- DB MISS: Full deep scrape with keywords: {base_keywords} ---")
-#                 new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
-
-#             if db_results:
-#                 db_blocks = [item.get('content', '') for item in db_results]
-#                 db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, SCRIPT_CONTEXT_MAX_CHARS // 2)
-#             if new_articles:
-#                 web_blocks = [
-#                     f"Source: {art['title']}\n{art['text']}" for art in new_articles
-#                 ]
-#                 web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, SCRIPT_CONTEXT_MAX_CHARS // 2)
-#                 for article in new_articles:
-#                     background_tasks.add_task(
-#                         add_scraped_data_to_db,
-#                         article['title'], article['text'], article['url'],
-#                         "",
-#                         topic,
-#                         base_keywords,
-#                     )
-
-#         if not db_context and not web_context:
-#             return {"error": "Could not find any research material to write the script."}
-
-#         # ── Step 3: Build & run script prompt ─────────────────
-#         WORDS_PER_MINUTE = min(max(int(request.user_wpm or 130), 80), 200)
-#         target_duration = request.duration_minutes or 10
-#         target_word_count = target_duration * WORDS_PER_MINUTE
-
-#         seo_struct = ""
-#         if context_mode and request.context and request.context.seo_output:
-#             seo_struct = str((request.context.seo_output or {}).get("recommended_structure") or "")
-#         requested_structure = request.script_structure or seo_struct or "problem_solution"
-#         structure_guidance_text = STRUCTURE_GUIDANCE.get(
-#             requested_structure, STRUCTURE_GUIDANCE["problem_solution"]
-#         )
-#         seo_guidance = ""
-#         if context_mode and request.context and request.context.seo_output:
-#             seo = request.context.seo_output or {}
-#             primary_kws = (seo.get("keyword_clusters") or {}).get("primary") or []
-#             chapter_titles = [str(c.get("title") or "").strip() for c in (seo.get("chapter_structure") or []) if str(c.get("title") or "").strip()]
-#             key_qs = seo.get("key_questions_to_answer") or []
-#             seo_guidance = f"""
-#         **SEO Output Guidance (must integrate naturally):**
-#         - Primary Keywords: {primary_kws}
-#         - Suggested Chapters: {chapter_titles}
-#         - Key Questions to Answer: {key_qs}
-#             """
-#         script_prompt = f"""
-#         You are a professional YouTube scriptwriter creating natural, engaging, conversational scripts.
-
-#         **Creator Profile:**
-#         * Creator Type: {request.creator_type}
-#         * Target Audience: {request.audience_description}
-#         * Desired Emotional Tone: {request.emotional_tone}
-#         * Accent/Dialect: {request.accent}
-
-#         **Task:**
-#         Generate a complete YouTube script of approximately **{target_duration} minutes**
-#         (~{target_word_count} words) based on the topic below, using the research context.
-
-#         **Script Style:**
-#         - Output only spoken dialogue — no section titles, stage directions, or metadata.
-#         - Speak directly to the viewer — friendly, confident, slightly spontaneous.
-#         - Short and medium sentences, natural pauses (…) or dashes, occasional repetition.
-#         - Include interjections, rhetorical questions, humor, brief asides.
-#         - Personal anecdotes or opinions ("I remember…", "When I tried this…").
-#         - Visual and emotional imagery ("Imagine this…", "Picture it like…").
-#         - Hook viewers emotionally in first 15-30 seconds.
-#         - Alternate between facts, insights, reactions, short reflections.
-#         - Inclusive language: "you guys", "we all", "my friends".
-#         - Natural pacing as if recording live.
-#         - Stay close to **{target_word_count} words** (±50).
-
-#         {structure_guidance_text}
-#         {seo_guidance}
-
-#         **Main Topic:** "{topic}"
-
-#         **Research:**
-#         FOUNDATIONAL KNOWLEDGE: {db_context}
-#         LATEST NEWS: {web_context}
-
-#         **Notes:**
-#         - Opening: curiosity-driven hook, pulls viewer in within 15-30 seconds.
-#         - Use storytelling: tension, suspense, surprise, moral dilemmas.
-#         - Make historical/technical details immersive, not lecture-like.
-#         - Narrative arc: build curiosity → climax → reflection.
-#         """
-
-#         # Groq-first script generation with OpenRouter fallback.
-#         script_text = await generate_script_content([{"role": "user", "content": script_prompt}])
-
-#         print(f"--- Script generation took {time.time() - total_start_time:.2f}s ---")
-
-#         # ── Step 4: Analyse the script with Groq ─────────────
-#         ANALYSIS_PROMPT = f"""
-#         You are an expert script analyzer. Analyze the provided YouTube script:
-
-#         1. **Real-world Examples:** Count distinct real-world examples/case studies/stories.
-#         2. **Research Facts/Stats:** Count distinct research findings, statistics, data points.
-#         3. **Proverbs/Sayings:** Count common proverbs, idioms, or well-known sayings.
-#         4. **Emotional Depth:** Rate overall emotional engagement: Low, Medium, or High.
-
-#         Return ONLY a JSON object — no explanation, no other text.
-
-#         EXAMPLE OUTPUT:
-#         {{
-#           "examples_count": 3,
-#           "research_facts_count": 5,
-#           "proverbs_count": 1,
-#           "emotional_depth": "Medium"
-#         }}
-
-#         --- SCRIPT ---
-#         {script_text}
-#         --- END ---
-#         """
-
-#         analysis_start = time.time()
-#         analysis_completion = await groq_client.chat.completions.create(
-#             messages=[{"role": "user", "content": ANALYSIS_PROMPT}],
-#             model=GROQ_GENERATION_MODEL,
-#         )
-#         analysis_raw = analysis_completion.choices[0].message.content
-#         print(f"--- Script analysis took {time.time() - analysis_start:.2f}s ---")
-
-#         analysis_results = {
-#             "examples_count": 0,
-#             "research_facts_count": 0,
-#             "proverbs_count": 0,
-#             "emotional_depth": "Unknown",
-#         }
-
-        
-#         try:
-#             clean = analysis_raw.replace("```json", "").replace("```", "").strip()
-#             parsed = json.loads(clean)
-#             analysis_results.update({
-#                 "examples_count": parsed.get("examples_count", 0),
-#                 "research_facts_count": parsed.get("research_facts_count", 0),
-#                 "proverbs_count": parsed.get("proverbs_count", 0),
-#                 "emotional_depth": parsed.get("emotional_depth", "Unknown"),
-#             })
-#         except (json.JSONDecodeError, Exception) as e:
-#             print(f"Analysis parse error: {e}")
-
-#         generated_word_count = len(script_text.split())
-#         script_sections = build_script_sections(script_text, [])
-#         script_labeled = render_labeled_script(script_sections)
-#         print(f"Generated word count: {generated_word_count}")
-#         print(f"Total /generate-script time: {time.time() - total_start_time:.2f}s")
-
-#         # ── Decrement credits ─────────────────────────────────
-#         if user_tier != 'admin':
-#             try:
-#                 new_balance = max(0, credits - IDEA_COST)
-#                 update_result = (
-#                     supabase.table('profiles')
-#                     .update({'credits_remaining': new_balance})
-#                     .eq('id', user_id)
-#                     .execute()
-#                 )
-#                 if update_result.data:
-#                     print(f"Decremented {IDEA_COST} credit(s) for {user_id}. Balance: {new_balance}")
-#                 else:
-#                     print(f"WARN: Credit decrement returned no rows for {user_id}.")
-#             except APIError as e:
-#                 print(f"ERROR: Credit decrement DB error for {user_id}: {e.message}")
-#             except Exception as e:
-#                 print(f"ERROR: Unexpected credit decrement error for {user_id}: {e}")
-#         else:
-#             print(f"Admin user {user_id} — no credits decremented.")
-
-#         return {
-#             "script": script_text,
-#             "estimated_word_count": generated_word_count,
-#             "script_sections": script_sections,
-#             "script_labeled": script_labeled,
-#             "source_urls": list(scraped_urls),
-#             "analysis": analysis_results,
-#         }
-
-#     except Exception as e:
-#         print(f"SCRIPT GENERATION error: {e}")
-#         return {"error": "An error occurred during the script generation pipeline."}
-
-
-# @app.get("/script-status/{job_id}")
-# async def get_script_status(job_id: str, current_user: User = Depends(get_current_user)):
-#     if not job_id or str(job_id).strip().lower() in {"null", "none"}:
-#         raise HTTPException(status_code=400, detail="Invalid job_id")
-#     try:
-#         job = supabase.table("script_jobs").select("*").eq("id", job_id).single().execute()
-#         data = job.data
-#         if not data:
-#             raise HTTPException(status_code=404, detail="Job not found")
-#         if str(data.get("user_id")) != str(current_user.id):
-#             raise HTTPException(status_code=403, detail="Access denied")
-#         return data
-#     except HTTPException:
-#         raise
-#     except Exception as exc:
-#         raise HTTPException(status_code=500, detail=f"Failed to fetch script job status: {exc}")
 
 
 # ── /payments/create-order ───────────────────────────────────
