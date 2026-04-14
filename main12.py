@@ -2260,7 +2260,7 @@ async def get_structure(content: str) -> dict:
 
 
 # ── /generate-script ─────────────────────────────────────────
-# @app.post("/generate-script")
+@app.post("/generate-script")
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
     total_start_time = time.time()
     print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
