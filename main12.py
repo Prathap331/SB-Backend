@@ -2285,15 +2285,6 @@ async def run_script_worker(job_id: str, request_body: dict[str, Any], user_id: 
 async def read_root():
     return {"status": "Welcome"}
 
-@app.post("/token")
-async def token(form_data: OAuth2PasswordRequestForm = Depends()):
-    return await login_user(form_data)
-
-
-@app.post("/refresh-token")
-async def refresh_token(request: RefreshTokenRequest):
-    return await refresh_access_token(request.refresh_token)
-
 
 @app.post("/pipeline-metrics")
 async def pipeline_metrics(request: PromptRequest):
@@ -2308,110 +2299,6 @@ async def pipeline_metrics(request: PromptRequest):
             return adapt_pipeline_payload(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
-
-
-@app.post("/seo-agent")
-async def seo_agent(request: SEOAgentRequest):
-    ctx = request.context
-    warnings = await _validate_seo_entry(ctx)
-    angle = extract_angle_for_prompt(ctx.gap_context or {})
-    angle_string = angle.get("angle_string") or (ctx.gap_context or {}).get("angle_string") or ""
-    if not angle_string:
-        raise HTTPException(status_code=400, detail={"error": "missing_angle_string", "message": "gap_context.angle_string is required"})
-
-    tss_scores = ctx.tss_scores or {}
-    csi_scores = ctx.csi_scores or {}
-    csi_quality = ctx.csi_quality or {}
-    ctr_label, ctr_score, ctr_degraded = _compute_ctr_signal(ctx.gap_context or {}, csi_scores, csi_quality, tss_scores)
-
-    cat_id = str(tss_scores.get("cat_id") or tss_scores.get("category_id") or "CAT-08")
-    cat_label = str(tss_scores.get("cat_label") or tss_scores.get("category") or "General")
-    blocked_types, face_default = _get_title_config(cat_id)
-
-    competing_titles, paa_questions = await _run_ddgs_scrape(angle_string)
-
-    channel_ctx = (request.channel_context.model_dump() if request.channel_context else None) or {}
-    existing_hashtags = list(channel_ctx.get("existing_hashtags") or [])
-    audience_profile = {
-        "channel_niche": channel_ctx.get("channel_niche"),
-        "subscriber_count": channel_ctx.get("subscriber_count"),
-        "topic": ctx.topic,
-    }
-    prompt = SEO_SYNTHESIS_PROMPT.format(
-        angle_string=angle_string,
-        who=angle.get("who", ""),
-        what=angle.get("what", ""),
-        story_frame=angle.get("story_frame", ""),
-        audience_profile=json.dumps(audience_profile),
-        cat_id=cat_id,
-        cat_label=cat_label,
-        competing_titles=json.dumps(competing_titles),
-        paa_questions=json.dumps(paa_questions),
-        ctr_label=ctr_label,
-        ctr_score=ctr_score,
-        degraded_note="Signal degraded due to CSI quality flags." if ctr_degraded else "Signal quality healthy.",
-        blocked_title_types=json.dumps(blocked_types),
-        ctr_signal_degraded=str(ctr_degraded).lower(),
-    )
-
-    fallback = {
-        "search_intent_type": "educational",
-        "recommended_structure": "problem_solution",
-        "ctr_potential": ctr_label,
-        "ctr_signal_degraded": ctr_degraded,
-        "ctr_score": ctr_score,
-        "justification": "CTR estimated from demand, momentum, and supply openness signals.",
-        "recommended_titles": [],
-        "keyword_clusters": {"primary": [], "secondary": [], "longtail": [], "question_based": paa_questions[:5]},
-        "description_template": {"hook": "", "body_bullets": [], "outro": ""},
-        "thumbnail_brief": [
-            {
-                "concept_type": "data_driven",
-                "text_overlay": "What Changes Next?",
-                "visual_theme": "high-contrast context imagery",
-                "colour_temperature": "high_contrast",
-                "face_recommended": face_default,
-                "rationale": "Fallback thumbnail due to seo synthesis failure.",
-            }
-        ],
-        "hashtags": [],
-        "chapter_structure": [],
-        "key_questions_to_answer": paa_questions[:5],
-    }
-
-    try:
-        raw = await groq_idea_generate([{"role": "user", "content": prompt}], model=GROQ_GENERATION_MODEL)
-        parsed = _parse_json_object(raw)
-    except Exception as exc:
-        print(f"SEO synthesis failed: {exc}")
-        parsed = {}
-
-    merged = {**fallback, **(parsed or {})}
-    merged["search_intent_type"] = _first_allowed_pipe_token(
-        merged.get("search_intent_type"),
-        SEO_INTENT_TYPES,
-        "educational",
-    )
-    merged["recommended_structure"] = _first_allowed_pipe_token(
-        merged.get("recommended_structure"),
-        SEO_STRUCTURES,
-        "problem_solution",
-    )
-    merged["ctr_potential"] = ctr_label
-    merged["ctr_signal_degraded"] = ctr_degraded
-    merged["ctr_score"] = ctr_score
-    merged["recommended_titles"] = _safe_recommended_titles(merged.get("recommended_titles"), blocked_types)
-    deduped = _deduplicate_hashtags(list(merged.get("hashtags") or []), existing_hashtags)
-    merged["hashtags"] = _ensure_hashtag_floor(deduped, ctx.topic, existing_hashtags)
-    merged["chapter_structure"] = _ensure_chapter_structure(merged.get("chapter_structure"))
-    merged["angle"] = angle_string
-    merged["angle_id"] = ctx.selected_angle_id
-    merged["channel_context_unavailable"] = not bool(request.channel_context and request.channel_context.channel_id)
-    merged["warnings"] = warnings
-    merged["key_questions_to_answer"] = list(merged.get("key_questions_to_answer") or paa_questions[:5])[:8]
-
-    return merged
-
 
 # ── /process-topic ───────────────────────────────────────────
 
@@ -2892,6 +2779,8 @@ async def generate_script(
             "proverbs_count": 0,
             "emotional_depth": "Unknown",
         }
+
+        
         try:
             clean = analysis_raw.replace("```json", "").replace("```", "").strip()
             parsed = json.loads(clean)
