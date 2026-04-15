@@ -929,7 +929,7 @@ async def deep_search_and_scrape(keywords: list[str], scraped_urls: set) -> list
     async with httpx.AsyncClient() as client:
         tasks = [
             asyncio.wait_for(
-                scrape_url(client, url, scraped_urls, snippet),
+                scrape_url(url, scraped_urls, snippet),
                 timeout=DEEP_SCRAPE_PER_URL_TIMEOUT_SEC,
             )
             for url, snippet in unique
