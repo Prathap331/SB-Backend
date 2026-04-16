@@ -62,7 +62,7 @@ mdurl==0.1.2
 multidict==6.7.0
 multiprocess==0.70.16
 nltk==3.9.2
-numpy==2.3.3
+numpy==1.26.4
 openai==2.2.0
 orjson==3.11.3
 packaging==25.0
@@ -267,7 +267,7 @@ requests
 python-dotenv
 supabase
 sentence-transformers
-numpy
+numpy==1.26.4
 google-genai
 pandas
 lxml
