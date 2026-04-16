@@ -102,7 +102,6 @@ async def ai_itellengence(article):
         }
 
         supabase.table("content_radar").upsert(data,on_conflict="tittle").execute()
-        print(response.text)
         print("Saved: ai_itellengence")
         return {"response": response.text}
     except Exception as e:
@@ -248,9 +247,6 @@ async def scrape(url, section_container, inner_section, element, id):
         vec = row.get("Vectors")
         if vec:
             existing_vectors.append(vec)
-
-    print(f"Loaded {len(existing_vectors)} existing embeddings")
-
 
     for title in headlines:
 
