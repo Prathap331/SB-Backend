@@ -24,7 +24,7 @@ schedule.every(24).hours.do(run_fetch_api)
 schedule.every(2).hours.do(run_scrape)
 
 
-# run_fetch_api()
+run_fetch_api()
 run_scrape()
 
 while True:
