@@ -2,14 +2,13 @@ from bs4 import BeautifulSoup
 from supabase import create_client
 from sentence_transformers import SentenceTransformer
 import numpy as np
-from datetime import datetime, timezone
 from pytrends.request import TrendReq
-import time
 from google import genai
-from google.genai import types as genai_types
 import os
 import re
 import requests
+# from google.genai import types as genai_types
+# import time
 
 gnews_key = os.getenv("GnewsApi")
 newsdata_api_key = os.getenv("Newsdata_api_key")
@@ -26,7 +25,15 @@ supabase = create_client(url, key)
 
 client = genai.Client(api_key=google_api_key)
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
+model = None
+
+def get_model():
+    global model
+    if model is None:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+    return model
+
 
 bbc = "https://www.bbc.com/"
 
@@ -224,6 +231,8 @@ async def scrape(url, section_container, inner_section, element, id):
     response = requests.get(url)
     soup = BeautifulSoup(response.content, 'html.parser')
 
+    m = get_model()
+
     if id:
         return
 
@@ -242,6 +251,7 @@ async def scrape(url, section_container, inner_section, element, id):
 
     print(f"Loaded {len(existing_vectors)} existing embeddings")
 
+
     for title in headlines:
 
         text = title.get_text(strip=True)
@@ -249,7 +259,7 @@ async def scrape(url, section_container, inner_section, element, id):
         if not text:
             continue
 
-        embedding = model.encode(text).tolist()
+        embedding = m.encode(text).tolist()
 
         is_duplicate = False
 
@@ -291,6 +301,8 @@ async def get_data_via_api():
     res = requests.get(f"https://newsdata.io/api/1/latest?apikey={newsdata_api_key}")
     data = res.json()
 
+    m = get_model()
+
     for item in data.get("results", []):
 
         if not isinstance(item, dict):
@@ -301,7 +313,7 @@ async def get_data_via_api():
         if not title:
             continue
 
-        embedding = model.encode(title).tolist()
+        embedding = m.encode(title).tolist()
 
         articles.append({
             "tittle": title,
@@ -323,7 +335,7 @@ async def get_data_via_api():
         if not title:
             continue
 
-        embedding = model.encode(title).tolist()
+        embedding = m.encode(title).tolist()
 
         articles.append({
             "tittle": title,
