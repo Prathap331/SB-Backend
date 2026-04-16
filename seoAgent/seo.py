@@ -167,7 +167,6 @@ class context(BaseModel):
         self.selected_angle_id = selected_angle_id
         self.pipeline_assembled_at = pipeline_assembled_at
 
-
 class ChannelContextInput(BaseModel):
     channel_id: str | None = None
     channel_niche: str | None = None
@@ -175,7 +174,6 @@ class ChannelContextInput(BaseModel):
     top_video_titles: list[str] | None = None
     existing_hashtags: list[str] | None = None
     avg_ctr_pct: float | None = None
-
 
 
 class SEOAgentRequest(BaseModel):

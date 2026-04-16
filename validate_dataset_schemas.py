@@ -39,7 +39,6 @@ from ingest_from_kaggle import (
     analyse_schema,
 )
 
-
 @dataclass
 class FileResult:
     dataset_slug: str

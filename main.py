@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, status, Request, Header, BackgroundTasks
+from fastapi import Depends, HTTPException, Request, Header, BackgroundTasks
 from fastapi import FastAPI
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,10 +10,11 @@ from supabase_auth.types import User
 from openai import AsyncOpenAI
 from auth_dependencies import get_current_user, login_user, refresh_access_token
 from tss_v3 import run_tss
-from pipeline_response_adapter import adapt_pipeline_payload
-from idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas, TOPIC_CACHE
-from social_market_signals import scan_topic as scan_social_topic
-from news_market_signals import scan_topic as scan_news_topic
+from pipeline.pipeline_response_adapter import adapt_pipeline_payload
+from pipeline.idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas, TOPIC_CACHE
+from signals.social_market_signals import scan_topic as scan_social_topic
+from signals.news_market_signals import scan_topic as scan_news_topic
+
 from shared.schemas.pipeline_context import (
     AgentPipelineContext,
     extract_angle_for_prompt,
@@ -34,17 +35,11 @@ import time
 import re
 import json
 import random
-import hmac
-import hashlib
 import httpx
 import nltk
 import razorpay
 import datetime
-from datetime import timezone, timedelta
-from uuid import uuid4
-from collections import OrderedDict
 from typing import Any
-
 from urllib.parse import urlparse
 from datetime import datetime as dt
 from nltk.tokenize import sent_tokenize
@@ -94,7 +89,6 @@ key = os.getenv("SUPABASE_KEY")
 
 pytrends = TrendReq(hl='en-US', tz=360)
 
-
 supabase = create_client(url, key)
 
 client = genai.Client(api_key=google_api_key)
@@ -102,7 +96,6 @@ client = genai.Client(api_key=google_api_key)
 print(google_api_key)
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
-
 
 if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
     print("WARNING: Razorpay API keys not found. Payment endpoints will fail.")
@@ -926,7 +919,7 @@ async def deep_search_and_scrape(keywords: list[str], scraped_urls: set) -> list
             seen.add(url)
             unique.append((url, snippet))
 
-    async with httpx.AsyncClient() as client:
+    # async with httpx.AsyncClient() as client:
         tasks = [
             asyncio.wait_for(
                 scrape_url(url, scraped_urls, snippet),
@@ -1125,8 +1118,6 @@ async def get_db_context(topic: str) -> list[dict]:
     results = list(combined.values())
     print(f"--- DB TASK: Returning {len(results)} total DB docs ---")
     return results
-
-
 
 STRUCTURE_GUIDANCE = {
     "problem_solution": """
@@ -2252,7 +2243,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             # "selected_angle_id": "{selected_angle_id}",
             # "idea_id": "{selected_idea_id}",
 
-
         json_generation_prompt = f"""
         You are an expert YouTube SEO strategist and content ideation assistant.
 
@@ -2557,7 +2547,6 @@ async def create_razorpay_order(
 
 
 # ── /payments/webhook ────────────────────────────────────────
-
 @app.post("/payments/webhook")
 async def razorpay_webhook(
     request: Request,
@@ -2569,7 +2558,6 @@ async def razorpay_webhook(
 
     body = await request.body()
 
-    # Verify signature
     try:
         razorpay_client.utility.verify_webhook_signature(
             body.decode('utf-8'),
@@ -2653,3 +2641,10 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
+
+
+
+@app.get('/trending-data')
+def content_radar():
+    res = supabase.table("content_radar").select("*").execute()
+    return {"message": res.data}

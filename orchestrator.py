@@ -20,7 +20,7 @@ def synthesize_verdict(tss: float, csi: float, top_cags: float) -> dict[str, str
 
 async def run_pipeline(topic: str, region: str = "IN") -> dict[str, Any]:
     try:
-        result = await run_tss(topic, region=region)  # compatibility path if run_tss accepts region
+        result = await run_tss(topic, region=region) 
     except TypeError:
         result = await run_tss(topic)
 

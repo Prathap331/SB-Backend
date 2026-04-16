@@ -17,21 +17,20 @@ import os
 import re
 from pathlib import Path
 from typing import Any
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     load_dotenv = lambda: None
 
-from news_market_signals import (
+from signals.news_market_signals import (
     fetch_newsapi_window,
     fetch_gdelt_artlist,
     get_newsapi_key,
     parse_gdelt_seendate,
 )
-from social_market_signals import scan_topic as scan_social_topic
-from youtube_market_signals import normalize_score as normalize_ratio_score, scan_topic as scan_youtube_topic
+from signals.social_market_signals import scan_topic as scan_social_topic
+from signals.youtube_market_signals import normalize_score as normalize_ratio_score, scan_topic as scan_youtube_topic
 from cags import calculate_cags
 from csi import calculate_csi, CorpusStalenessError
 
