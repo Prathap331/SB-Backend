@@ -9,7 +9,7 @@ from postgrest.exceptions import APIError
 from supabase_auth.types import User
 from openai import AsyncOpenAI
 from auth_dependencies import get_current_user, login_user, refresh_access_token
-from tss_v3 import run_tss
+from researchAgent.tss_v3 import run_tss
 from pipeline.pipeline_response_adapter import adapt_pipeline_payload
 from pipeline.idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas, TOPIC_CACHE
 from signals.social_market_signals import scan_topic as scan_social_topic
