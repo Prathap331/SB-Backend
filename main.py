@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, Request, Header, BackgroundTasks
+from fastapi import Depends, HTTPException, Request, Header, BackgroundTasks,UploadFile, File
 from fastapi import FastAPI
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +28,6 @@ from google import genai
 from google.genai import types as genai_types
 from seoAgent.seo import seo_agent
 from ddgs import DDGS
-
 import os
 import asyncio
 import time
@@ -48,10 +47,11 @@ from ddgs import DDGS
 from readability import Document
 from pytrends.request import TrendReq
 from sentence_transformers import SentenceTransformer
+from channelMemory.channelMemory import process_pdf
+
 
 load_dotenv()
 
-# ── NLTK data ────────────────────────────────────────────────
 project_root = os.path.dirname(os.path.abspath(__file__))
 nltk_data_dir = os.path.join(project_root, 'nltk_data')
 nltk.data.path.insert(0, nltk_data_dir)
@@ -2648,3 +2648,22 @@ async def razorpay_webhook(
 def content_radar():
     res = supabase.table("content_radar").select("*").execute()
     return {"message": res.data}
+
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    file_bytes = await file.read()
+
+    chunks = process_pdf(file_bytes)
+
+    supabase.table('channel_memory').insert(chunks).execute()
+
+    preview_texts = [c["text"] for c in chunks[:3]]
+
+    return {
+        "message": "Uploaded and processed",
+        "preview": preview_texts
+    }   
+
+
+

@@ -455,7 +455,6 @@ def _ensure_chapter_structure(chapters: any, fallback_titles: list[str] | None =
 
 async def seo_agent(request: SEOAgentRequest):
     ctx = get_context(request)
-    # warnings = await _validate_seo_entry(ctx)
     angle = extract_angle_for_prompt(ctx.gap_context or {})
     angle_string = angle.get("angle_string") or (ctx.gap_context or {}).get("angle_string") or ""
     if not angle_string:
