@@ -2571,7 +2571,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
 # ── /payments/create-order ───────────────
 # ────────────────────
-
 @app.post("/payments/create-order")
 async def create_razorpay_order(
     request_data: CreateOrderRequest,
