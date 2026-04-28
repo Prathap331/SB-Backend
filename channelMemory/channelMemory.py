@@ -117,7 +117,6 @@ def process_pdf(file_input):
 
 
 
-
 # if __name__ == "__main__":
 #     chunks = process_pdf("sample_script.pdf")
 #     supabase.table('channel_memory').insert(chunks).execute()

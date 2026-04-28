@@ -14,6 +14,9 @@ from pipeline.pipeline_response_adapter import adapt_pipeline_payload
 from pipeline.idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas, TOPIC_CACHE
 from signals.social_market_signals import scan_topic as scan_social_topic
 from signals.news_market_signals import scan_topic as scan_news_topic
+import requests
+import os
+from openai import OpenAI
 
 from shared.schemas.pipeline_context import (
     AgentPipelineContext,
@@ -85,6 +88,19 @@ google_api_key = os.getenv("GOOGLE_API_KEY")
 
 url= os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
+
+
+Hf_token = os.getenv("Hf_token")
+
+print(Hf_token)
+
+url = "https://router.huggingface.co/v1/chat/completions"
+
+
+headers = {
+        "Authorization": f"Bearer {Hf_token}",
+        "Content-Type": "application/json"
+    }
 
 
 pytrends = TrendReq(hl='en-US', tz=360)
@@ -225,6 +241,14 @@ PROCESS_TOPIC_CACHE_TTL_SEC = max(0, int(os.getenv("PROCESS_TOPIC_CACHE_TTL_SEC"
 TOPIC_CACHE_MAX_ITEMS = max(10, int(os.getenv("TOPIC_CACHE_MAX_ITEMS", "300")))
 IDEA_CACHE_TTL_HOURS = max(1, int(os.getenv("IDEA_CACHE_TTL_HOURS", "48")))
 
+
+deepseek_client = OpenAI(
+    api_key=os.environ.get('DEEPSEEK_API_KEY'),
+    base_url="https://api.deepseek.com")
+
+
+
+print("deepseek", os.environ.get("DEEPSEEK_API_KEY"))
 
 def _topic_cache_key(topic: str) -> str:
     return " ".join((topic or "").strip().lower().split())
@@ -2215,6 +2239,7 @@ async def get_structure(content: str) -> dict:
 
 
 
+
 # ── /generate-script ─────────────────────────────────────────
 @app.post("/generate-script")
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
@@ -2246,24 +2271,20 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         json_generation_prompt = f"""
         You are an expert YouTube SEO strategist and content ideation assistant.
 
-        You will be given a topic. Your task is to generate structured, high-quality SEO and content strategy output for YouTube.
+        Return ONLY valid JSON.
 
-        You must return ONLY valid JSON.
-
-        ---
-
-        OUTPUT FORMAT (STRICT):
+        OUTPUT FORMAT:
 
         {{
         "context": {{
             "topic": "",
             "keywords": [],
             "selected_idea": {{
-            "title": ""
+            "title": "",
+            "idea_id": "{selected_idea_id}"
             }},
-            # "selected_idea_id": "{selected_idea_id}",
-            # "selected_angle_id": "{selected_angle_id}",
-            # "idea_id": "{selected_idea_id}",
+            "selected_idea_id": "{selected_idea_id}",
+            "selected_angle_id": "{selected_angle_id}",
             "gap_context": {{
             "problem": "",
             "insight": "",
@@ -2273,33 +2294,27 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         }}
         }}
 
-        ---
-
         RULES:
-        - Return ONLY valid JSON (no markdown, no explanation)
-        - Everything must be inside "context"
-        - keywords must be SEO-friendly YouTube search queries (8–15 items)
-        - selected_idea_id and selected_angle_id must be used EXACTLY as provided
+        - Return ONLY valid JSON
+        - No markdown, no explanation, no comments
+        - keywords: 8–15 items
         - selected_idea.idea_id MUST match selected_idea_id
-        - gap_context must be:
-        - problem: real misconception people have
-        - insight: correct understanding that fixes the misconception
-        - angle_string: how to frame the video for YouTube (hook style)
 
-        ---
-
-        INPUT TOPIC:
-        Topic : {request.topic}
+        INPUT:
+        Topic: {request.topic}
         """
-
-
-        response = await client.aio.models.generate_content(
-            model="gemini-3-flash-preview",
-            contents=json_generation_prompt
+        response1 = deepseek_client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": "You must return only valid JSON"},
+                {"role": "user", "content": json_generation_prompt},
+            ],
+            stream=False,
+            reasoning_effort="high",
+            extra_body={"thinking": {"type": "enabled"}}
         )
 
-        text = response.candidates[0].content.parts[0].text
-
+        text = response1.choices[0].message.content
         data = json.loads(text) 
 
         request_obj = SEOAgentRequest.model_validate(data)
@@ -2307,6 +2322,11 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         res = await seo_agent(request_obj)
 
         print(res)
+
+        # response = await client.aio.models.generate_content(
+        #     model="gemini-3-flash-preview",
+        #     contents=json_generation_prompt
+        # )
 
         db_task = asyncio.create_task(get_db_context(request.topic))
         await asyncio.sleep(11) 
@@ -2337,8 +2357,24 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             AI replacing software developers
             demand for software engineers 2025
             """
-            response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=keyword_prompt)
-            raw_text = response.text
+            # response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=keyword_prompt)
+
+          
+
+            response2 = deepseek_client.chat.completions.create(
+                model="deepseek-v4-pro",
+                messages=[
+                    {"role": "system", "content": "You must return only valid JSON"},
+                    {"role": "user", "content": keyword_prompt},
+                ],
+                stream=False,
+                reasoning_effort="high",
+                extra_body={"thinking": {"type": "enabled"}}
+            )
+
+            # result2 = res2.json()
+            text2 = response2.choices[0].message.content
+            raw_text = text2
             keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
             if keywords_in_quotes: base_keywords = keywords_in_quotes
             else: base_keywords = [kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()]
@@ -2423,9 +2459,23 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 #         - Emphasize the narrative arc: build curiosity, climax, and reflection for the audience.
 #         - Ensure adaptability: script should feel natural regardless of topic, duration, or target audience.
 #         """
+        
+      
+        response3 = deepseek_client.chat.completions.create(
+                model="deepseek-v4-pro",
+                messages=[
+                    {"role": "system", "content": "You must return only valid JSON"},
+                    {"role": "user", "content": script_prompt},
+                ],
+                stream=False,
+                reasoning_effort="high",
+                extra_body={"thinking": {"type": "enabled"}}
+        )
 
 
-        script_response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=script_prompt)
+        text3 = response3.choices[0].message.content
+
+        # script_response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=script_prompt)
         
         total_end_time = time.time()
         print(f"--- PROFILING: Script generation took {total_end_time - total_start_time:.2f} seconds ---")
@@ -2458,9 +2508,24 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
         print("SCRIPT ANALYSIS: Analyzing generated script...")
         analysis_start_time = time.time()
-        analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=script_response.text)
+        # analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=script_response.text)
+        analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=text3)
         
-        analysis_response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=analysis_prompt_filled)
+        response4 = deepseek_client.chat.completions.create(
+                model="deepseek-v4-pro",
+                messages=[
+                    {"role": "system", "content": "You must return only valid JSON"},
+                    {"role": "user", "content": analysis_prompt_filled},
+                ],
+                stream=False,
+                reasoning_effort="high",
+                extra_body={"thinking": {"type": "enabled"}}
+        )
+
+
+        text4 = response4.choices[0].message.content
+
+        # analysis_response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=analysis_prompt_filled)
         analysis_end_time = time.time()
         print(f"--- PROFILING: Script analysis took {analysis_end_time - analysis_start_time:.2f} seconds ---")
         
@@ -2471,7 +2536,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "emotional_depth": "Unknown"
         }
         try:
-            analysis_data = json.loads(analysis_response.text)
+            analysis_data = json.loads(text4)
             analysis_results["examples_count"] = analysis_data.get("examples_count", 0)
             analysis_results["research_facts_count"] = analysis_data.get("research_facts_count", 0)
             analysis_results["proverbs_count"] = analysis_data.get("proverbs_count", 0)
@@ -2486,11 +2551,11 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         print(f"--- PROFILING: Total /generate-script analysis request time was {total_end_time - total_start_time:.2f} seconds ---")
         
         
-        generated_word_count = len(script_response.text.split())
+        generated_word_count = len(text3.split())
         print(f"Generated script word count: approx. {generated_word_count}")
 
         return {
-            "script":script_response.text ,
+            "script":text3 ,
             "estimated_word_count": generated_word_count,
             "source_urls": list(scraped_urls), 
             "analysis": analysis_results, 
@@ -2504,7 +2569,8 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
 
 
-# ── /payments/create-order ───────────────────────────────────
+# ── /payments/create-order ───────────────
+# ────────────────────
 
 @app.post("/payments/create-order")
 async def create_razorpay_order(
