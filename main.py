@@ -2398,8 +2398,8 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             for article in new_articles:
                 background_tasks.add_task(add_scraped_data_to_db, article['title'], article['text'], article['url'])
 
-        if not db_context and not web_context:
-            return {"error": "Could not find any research material to write the script."}
+        # if not db_context and not web_context:
+        #     return {"error": "Could not find any research material to write the script."}
 
         # --- Step 3: Calculate Word Count & Create Personalized Prompt ---
         print("SCRIPT GENERATION: Generating personalized script...")
