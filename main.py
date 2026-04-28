@@ -2225,18 +2225,21 @@ async def get_structure(content: str) -> dict:
         \"\"\"{content}\"\"\"
         """
 
-        response = await client.aio.models.generate_content(
-            model="gemini-3-flash-preview",
-            contents=prompt
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": "Return only the category name."},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False
         )
 
-        category = response.candidates[0].content.parts[0].text.strip()
+        category = response.choices[0].message.content.strip()
 
         return {"category": category}
 
     except Exception as e:
-        return {"category": "UNKNOWN", "error": str(e)}    
-
+        return {"category": "UNKNOWN", "error": str(e)}
 
 
 
