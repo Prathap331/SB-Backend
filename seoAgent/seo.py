@@ -45,7 +45,7 @@ Return ONLY valid JSON:
     "key_questions_to_answer": [],
     "chapter_structure": [],
     "channel_context_unavailable": false,
-
+    
     "recommended_titles": [
       {{
         "type": "curiosity_gap",
@@ -83,21 +83,13 @@ Return ONLY valid JSON:
     "thumbnail_brief": [
       {{
         "type": "curiosity_gap",
-        "style": "warm",
-        "headline": "",
-        "text_overlay": "",
-        "face_recommended": true,
-        "description": "",
-        "preview_image_url": ""
+        "img_desc": "",
+        "prompt": ""
       }},
       {{
         "type": "data_driven",
-        "style": "cool",
-        "headline": "",
-        "text_overlay": "",
-        "face_recommended": false,
-        "description": "",
-        "preview_image_url": ""
+        "img_desc": "",
+        "prompt": ""
       }}
     ],
 
@@ -111,6 +103,28 @@ Return ONLY valid JSON:
   }}
 }}
 """
+
+
+    # "thumbnail_brief": [
+    #   {{
+    #     "type": "curiosity_gap",
+    #     "style": "warm",
+    #     "headline": "",
+    #     "text_overlay": "",
+    #     "face_recommended": true,
+    #     "description": "",
+    #     "preview_image_url": ""
+    #   }},
+    #   {{
+    #     "type": "data_driven",
+    #     "style": "cool",
+    #     "headline": "",
+    #     "text_overlay": "",
+    #     "face_recommended": false,
+    #     "description": "",
+    #     "preview_image_url": ""
+    #   }}
+    # ],
 
 
 BLOCKED_TITLE_TYPES = {
