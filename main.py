@@ -2506,19 +2506,18 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         - Example: "90% of startups fail", "Studies show..."
 
         3. Proverbs / Sayings:
-        - Common idioms, quotes, or widely known sayings
-        - Example: "Time is money", "Actions speak louder than words"
+        - Common traditional proverbs, idioms, or widely recognized sayings
+        - Must be culturally established phrases, not personal quotes or random sentences
+        - Typically short, fixed expressions used to convey general life wisdom
 
         4. Emotional Depth:
         - LOW → Informational, dry, no emotional hooks
         - MEDIUM → Some engagement, mild storytelling or relatability
         - HIGH → Strong emotional storytelling, persuasive, engaging
 
-        5. Host Facts:
-        - Statements made by the narrator/host explaining facts in their own voice
-        - NOT external research or stats
-        - Usually begins with: "I think", "In my experience", "Let me tell you", "You should know"
-        - Example: "In my experience, consistency beats talent"
+        5. history Facts:
+        - Verified historical events, timelines, or occurrences from the past
+        - Must be factual and time-specific
 
         ----------------------
         PROCESS (MANDATORY)
@@ -2537,7 +2536,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         "examples_count": <number>,
         "research_facts_count": <number>,
         "proverbs_count": <number>,
-        "host_facts":<number>,
+        "history_facts":<number>,
         "emotional_depth": "Low | Medium | High"
         }}
         ----------------------
@@ -2575,7 +2574,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "research_facts_count": 0,
             "proverbs_count": 0,
             "emotional_depth": "Unknown",
-            "host_facts" : 0
+            "history" : 0
         }
         try:
             analysis_data = json.loads(text4)
