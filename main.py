@@ -17,6 +17,8 @@ from signals.news_market_signals import scan_topic as scan_news_topic
 import requests
 import os
 from openai import OpenAI
+import numpy as np
+
 
 from shared.schemas.pipeline_context import (
     AgentPipelineContext,
@@ -88,7 +90,6 @@ google_api_key = os.getenv("GOOGLE_API_KEY")
 
 url= os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
-
 
 Hf_token = os.getenv("Hf_token")
 
@@ -485,36 +486,34 @@ def _block_gemini_embeddings_for(seconds: float = 3600.0) -> None:
     GEMINI_EMBED_BLOCKED_UNTIL_TS = max(GEMINI_EMBED_BLOCKED_UNTIL_TS, time.time() + seconds)
 
 
+
+
 def _embed_with_failover(
     *,
     contents: str | list[str],
-    task_type: str,
-    output_dimensionality: int = 768,
+    task_type: str = None,  # kept for compatibility (not used)
+    output_dimensionality: int = 384,  # MiniLM outputs 384
 ):
-    if _gemini_embeddings_blocked():
-        raise RuntimeError("Gemini embeddings temporarily blocked after quota exhaustion.")
-    last_exc: Exception | None = None
-    for idx, client in enumerate(EMBED_CLIENTS, start=1):
-        try:
-            return client.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=contents,
-                config=genai_types.EmbedContentConfig(
-                    task_type=task_type,
-                    output_dimensionality=output_dimensionality,
-                ),
-            )
-        except Exception as exc:
-            last_exc = exc
-            print(f"Embedding client slot {idx} failed: {exc}")
-            if _is_embedding_quota_error(str(exc)):
-                _block_gemini_embeddings_for(3600.0)
-                break
-            continue
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("No embedding client available.")
+    try:
+        # Normalize input
+        if isinstance(contents, str):
+            contents = [contents]
 
+        embeddings = model.encode(
+            contents,
+            convert_to_numpy=True,
+            normalize_embeddings=True  # good for cosine similarity
+        )
+
+        # Ensure correct shape/output
+        if len(embeddings) == 1:
+            return embeddings[0].tolist()
+
+        return embeddings.tolist()
+
+    except Exception as e:
+        print(f"Local embedding failed: {e}")
+        raise
 
 async def _embed_chunks_with_backoff(chunks: list[str]) -> list[list[float]] | None:
     if not chunks:
@@ -1704,6 +1703,7 @@ Return:
   "examples_count": 0,
   "research_facts_count": 0,
   "proverbs_count": 0,
+  
   "emotional_depth": "Low|Medium|High",
   "frame_executed": {{
     "story_frame_target": "{story_frame}",
@@ -2485,29 +2485,67 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
 
         ANALYSIS_PROMPT_TEMPLATE = """
-        You are an expert script analyzer. Analyze the provided YouTube script based on the following criteria:
+        You are an expert script analyzer.
 
-        1.  **Real-world Examples:** Count how many distinct real-world examples, case studies, or specific stories are mentioned.
-        2.  **Research Facts/Stats:** Count how many distinct research findings, statistics, or specific data points are cited or explained.
-        3.  **Proverbs/Sayings:** Count how many common proverbs, idioms, or well-known sayings are used.
-        4.  **Emotional Depth:** Assess the overall emotional depth and engagement level of the script. Rate it as Low, Medium, or High.
+        Your job is to carefully analyze the YouTube script and IDENTIFY + COUNT specific elements.
 
-        **Your Task:**
-        Read the script below and return ONLY a JSON object with the results. Do not add any explanation or other text.
+        IMPORTANT: Do NOT assume zero unless you are absolutely certain none exist.
 
-        **EXAMPLE OUTPUT FORMAT:**
+        ----------------------
+        DEFINITIONS (STRICT)
+        ----------------------
+
+        1. Real-world Examples:
+        - Any specific story, scenario, case study, or real-life situation
+        - Includes hypothetical but realistic situations
+        - Example: "A student who studies daily will succeed"
+
+        2. Research Facts / Stats:
+        - Any number, percentage, study, data point, or measurable claim
+        - Even approximate values count
+        - Example: "90% of startups fail", "Studies show..."
+
+        3. Proverbs / Sayings:
+        - Common idioms, quotes, or widely known sayings
+        - Example: "Time is money", "Actions speak louder than words"
+
+        4. Emotional Depth:
+        - LOW → Informational, dry, no emotional hooks
+        - MEDIUM → Some engagement, mild storytelling or relatability
+        - HIGH → Strong emotional storytelling, persuasive, engaging
+
+        5. Host Facts:
+        - Statements made by the narrator/host explaining facts in their own voice
+        - NOT external research or stats
+        - Usually begins with: "I think", "In my experience", "Let me tell you", "You should know"
+        - Example: "In my experience, consistency beats talent"
+
+        ----------------------
+        PROCESS (MANDATORY)
+        ----------------------
+
+        Step 1: Extract all matches for each category
+        Step 2: Count them
+        Step 3: Return result
+
+        If unsure → COUNT it (be slightly generous, not strict)
+
+        ----------------------
+        OUTPUT FORMAT (STRICT JSON ONLY)
+        ----------------------
         {{
-        "examples_count": 3,
-        "research_facts_count": 5,
-        "proverbs_count": 1,
-        "emotional_depth": "Medium"
+        "examples_count": <number>,
+        "research_facts_count": <number>,
+        "proverbs_count": <number>,
+        "host_facts":<number>,
+        "emotional_depth": "Low | Medium | High"
         }}
-
-        --- SCRIPT TO ANALYZE ---
+        ----------------------
+        SCRIPT
+        ----------------------
         {script_text}
-        --- END SCRIPT ---
+        ----------------------
         """
-
 
         print("SCRIPT ANALYSIS: Analyzing generated script...")
         analysis_start_time = time.time()
@@ -2536,7 +2574,8 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "examples_count": 0,
             "research_facts_count": 0,
             "proverbs_count": 0,
-            "emotional_depth": "Unknown"
+            "emotional_depth": "Unknown",
+            "host_facts" : 0
         }
         try:
             analysis_data = json.loads(text4)
