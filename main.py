@@ -17,8 +17,6 @@ from signals.news_market_signals import scan_topic as scan_news_topic
 import requests
 import os
 from openai import OpenAI
-import numpy as np
-
 
 from shared.schemas.pipeline_context import (
     AgentPipelineContext,
@@ -30,7 +28,6 @@ from script_templates.selector import select_template_key
 from script_templates.injector import assemble_structure_section, assemble_chapter_scaffold
 
 from google import genai
-from google.genai import types as genai_types
 from seoAgent.seo import seo_agent
 from ddgs import DDGS
 import os
@@ -477,8 +474,8 @@ def _payload_uses_fallback_variants(payload: dict[str, Any] | None) -> bool:
 GEMINI_EMBED_BLOCKED_UNTIL_TS = 0.0
 
 
-def _gemini_embeddings_blocked() -> bool:
-    return time.time() < GEMINI_EMBED_BLOCKED_UNTIL_TS
+# def _gemini_embeddings_blocked() -> bool:
+#     return time.time() < GEMINI_EMBED_BLOCKED_UNTIL_TS
 
 
 def _block_gemini_embeddings_for(seconds: float = 3600.0) -> None:
@@ -996,10 +993,10 @@ async def get_latest_news_context(topic: str, scraped_urls: set) -> list[dict]:
             results = list(ddgs.text(keyword, region='wt-wt', max_results=NEWS_SCRAPE_MAX_RESULTS))
             for r in results:
                 url_snippet_pairs.append((r['href'], r.get('body', '')))
-        async with httpx.AsyncClient() as client:
+        # async with httpx.AsyncClient() as client:
             tasks = [
                 asyncio.wait_for(
-                    scrape_url(client, url, scraped_urls, snippet),
+                    scrape_url(url, scraped_urls, snippet),
                     timeout=DEEP_SCRAPE_PER_URL_TIMEOUT_SEC,
                 )
                 for url, snippet in url_snippet_pairs
@@ -2059,18 +2056,10 @@ async def generate_ideas_endpoint(
     if not topic:
         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
 
-    cache_client = EMBED_CLIENTS[0] if EMBED_CLIENTS else None
-    if not request.force_refresh:
-        cached = await _lookup_topic_cache(topic, cache_client)
-        if cached:
-            cached["source_of_context"] = cached.get("source_of_context", "CACHE")
-            cached["served_from_cache"] = True
-            return cached
 
     try:
         print(f"GENERATE IDEAS for topic: {topic}")
 
-        # Use current TSS/CAGS as the authoritative gap source.
         tss_payload = await asyncio.wait_for(run_tss(topic), timeout=TSS_TIMEOUT_SEC)
         cags_payload = tss_payload.get("cags") or {}
         gap_angles = cags_payload.get("gap_angles") or []
@@ -2079,7 +2068,6 @@ async def generate_ideas_endpoint(
         if not gap_angles or not perspective_tree:
             raise HTTPException(status_code=422, detail="No viable CAGS angles were produced.")
 
-        # Research context used by the depth check and prompt seeding.
         print("--- Idea Gen: DB lookup + keyword gen in parallel ---")
         db_results, base_keywords = await asyncio.gather(
             get_db_context(topic),
@@ -2137,7 +2125,6 @@ async def generate_ideas_endpoint(
         social_data = social_payload.get("sample_posts") or []
         news_data = news_payload.get("sample_articles") or []
 
-        cache_lookup = None if request.force_refresh else TOPIC_CACHE.lookup
         idea_clusters = await generate_cags_aligned_ideas(
             topic=topic,
             gap_angles=gap_angles,
@@ -2150,13 +2137,8 @@ async def generate_ideas_endpoint(
             max_angles=int(request.max_angles or 5),
             ideas_per_angle=int(request.ideas_per_angle or 3),
             used_angle_ids=request.used_angle_ids or [],
-            groq_client=groq_client,
-            groq_generate=groq_idea_generate,
-            gemini_client=EMBED_CLIENTS[0] if EMBED_CLIENTS else None,
-            cache_lookup=cache_lookup,
-            cache_store=None,
+            deepseek_client=deepseek_client,
         )
-
         # Enrich response with the core research signals that produced it.
         idea_clusters["source_of_context"] = source_of_context
         idea_clusters["generated_keywords"] = base_keywords
@@ -2185,9 +2167,6 @@ async def generate_ideas_endpoint(
                 idea_clusters["cache_write_skipped"] = "fallback_variants"
                 print(f"Total /generate-ideas time: {idea_clusters['total_request_time_sec']:.2f}s")
                 return idea_clusters
-            cache_payload = _build_cache_payload(idea_clusters)
-            TOPIC_CACHE.store(topic, cache_payload, cache_client)
-            background_tasks.add_task(_store_topic_cache_db, topic, cache_payload, cache_client)
         else:
             print(f"Skipping cache write for '{topic}' because no ideas were generated.")
 
@@ -2244,7 +2223,7 @@ async def get_structure(content: str) -> dict:
 
 
 # ── /generate-script ─────────────────────────────────────────
-@app.post("/generate-script")
+@app.post("/generate-script") 
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
     total_start_time = time.time()
     print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
