@@ -62,11 +62,22 @@ async def get_intelligence(chunks,userId):
 
         summary = response.choices[0].message.content
 
-        supabase.table("Channel Profile").upsert({
-            "userId": userId,
-            "Summary": summary
-        }).execute()
+        existing = (
+            supabase
+            .table("Channel Profile")
+            .select("userId")
+            .eq("userId", userId)
+            .execute()
+        )
 
+        if not existing.data:
+            supabase.table("Channel Profile").insert({
+                "userId": userId,
+                "Summary": summary
+            }).execute()
+        else:
+            print("User already exists, skipping insert")
+            
     except Exception as e:
         print(e)
 

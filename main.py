@@ -1218,6 +1218,7 @@ class PromptRequest(BaseModel):
 
 class ScriptRequest(BaseModel):
     topic: str | None = None
+    userId : str | None = None
     context: AgentPipelineContext | None = None
     emotional_tone: str | None = "engaging"
     creator_type: str | None = "educator"
@@ -2221,6 +2222,25 @@ async def get_structure(content: str) -> dict:
 
 
 
+
+async def get_channel_profile(userId: str):
+    print(userId)
+    try:
+        channel_profile = (
+            supabase
+            .table("Channel Profile")
+            .select("Summary")
+            .eq("userId", userId)
+            .execute()
+        )
+
+        return channel_profile.data
+
+    except Exception as e:
+        print(e)
+
+
+
 # ── /generate-script ─────────────────────────────────────────
 @app.post("/generate-script") 
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
@@ -2229,6 +2249,9 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
     print(f"Personalization - Duration: {request.duration_minutes} min, Tone: {request.emotional_tone}, Type: {request.creator_type}, Audience: {request.audience_description}, Accent: {request.accent}")
 
     try:
+        channel_profile = await get_channel_profile(request.userId) 
+        summary = channel_profile[0]["Summary"] if channel_profile else None
+        print(summary)        
         content_category = await get_structure(request.topic)  
         print(content_category)
         a = content_category["category"]
@@ -2340,8 +2363,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             """
             # response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=keyword_prompt)
 
-          
-
             response2 = deepseek_client.chat.completions.create(
                 model="deepseek-v4-pro",
                 messages=[
@@ -2404,6 +2425,11 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         * **Accent/Dialect:** {request.accent} (use phrasing natural for this accent)
 
         **Your Task:**
+        You must write the script EXACTLY in this voice, tone, and structure:
+        {summary}
+        Interpret this as the creator's permanent speaking identity. Every line of the script must reflect this style. Do NOT ignore or average it out.
+
+
         Generate a complete YouTube video script of approximately **{target_duration} minutes** (~{target_word_count} words) based on the **main topic** below, using the provided **research context**.
 
         **Script Style & Flow:**
@@ -2590,7 +2616,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
 # ── /payments/create-order ───────────────
 # ────────────────────
-
 @app.post("/payments/create-order")
 async def create_razorpay_order(
     request_data: CreateOrderRequest,
@@ -2743,7 +2768,10 @@ async def upload(file: UploadFile = File(...),userId: str = Form(...)):
 
     chunks = process_pdf(file_bytes,userId)
 
-    supabase.table('channel_memory').insert(chunks).execute()
+    supabase.table('channel_memory').upsert(
+        chunks,
+        on_conflict="userId,text"
+    ).execute()
 
     return {
         "message": "Uploaded and processed",
@@ -2753,4 +2781,4 @@ async def upload(file: UploadFile = File(...),userId: str = Form(...)):
 @app.on_event("startup")
 async def startup_event():
     print("running")
-    await get_chunks_from_db()
+    asyncio.create_task(get_chunks_from_db())
