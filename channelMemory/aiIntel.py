@@ -18,7 +18,7 @@ deepseek_client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
-async def get_intelligence(chunks):
+async def get_intelligence(chunks,userId):
 
     try:
         prompt = f"""
@@ -62,7 +62,8 @@ async def get_intelligence(chunks):
 
         summary = response.choices[0].message.content
 
-        supabase.table("Channel Profile").insert({
+        supabase.table("Channel Profile").upsert({
+            "userId": userId,
             "Summary": summary
         }).execute()
 
@@ -70,11 +71,13 @@ async def get_intelligence(chunks):
         print(e)
 
 async def get_chunks_from_db():
-    response = supabase.table("channel_memory").select("text").execute()
+    response = supabase.table("channel_memory").select("text, userId").execute()
     data = response.data  
 
     all_chunks = [item["text"] for item in data]
 
     combined_text = "\n\n".join(all_chunks)
 
-    await get_intelligence(combined_text)
+    userId = data[0]["userId"] if data else None
+
+    await get_intelligence(combined_text, userId)
