@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any
 import os
 from openai import OpenAI
-import numpy as np
 from dotenv import load_dotenv
 from typing import Any
 

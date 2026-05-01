@@ -5,8 +5,9 @@ import numpy as np
 from langdetect import detect
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
+
 
 load_dotenv()
 
@@ -45,7 +46,7 @@ def chunk_text(text, chunk_size=300, overlap=50):
 
     return chunks
 
-def create_normalised_chunks(chunks, language):
+def create_normalised_chunks(chunks, language,userId):
     result = []
 
     for idx, chunk in enumerate(chunks):
@@ -57,7 +58,8 @@ def create_normalised_chunks(chunks, language):
             "text": chunk,
             "chunk_index": idx,
             "is_canonical": True, 
-            "metadata": {}
+            "metadata": {},
+            "userId" : userId
         })
 
     return result
@@ -89,7 +91,7 @@ def search(query, chunks, top_k=3):
     return scored[:top_k]
 
 
-def process_pdf(file_input):
+def process_pdf(file_input,userId):
     text = ""
 
     if isinstance(file_input, bytes):
@@ -108,7 +110,8 @@ def process_pdf(file_input):
 
     normalised_chunks = create_normalised_chunks(
         chunks=raw_chunks,
-        language=language
+        language=language,
+        userId=userId
     )
 
     embedded_chunks = generate_embeddings(normalised_chunks)
@@ -117,15 +120,3 @@ def process_pdf(file_input):
 
 
 
-# if __name__ == "__main__":
-#     chunks = process_pdf("sample_script.pdf")
-#     supabase.table('channel_memory').insert(chunks).execute()
-#     print("saved in db")
-    
-#     results = search("What is Rahul doing?", chunks)
-
-#     print("\n--- SEARCH RESULTS ---\n")
-#     for score, text in results:
-#         print(f"Score: {score:.4f}")
-#         print(text[:200])
-#         print("------")

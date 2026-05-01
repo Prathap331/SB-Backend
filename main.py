@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, Request, Header, BackgroundTasks,UploadFile, File
+from fastapi import Depends, HTTPException, Request, Header, BackgroundTasks,UploadFile, File,Form
 from fastapi import FastAPI
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +14,6 @@ from pipeline.pipeline_response_adapter import adapt_pipeline_payload
 from pipeline.idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas, TOPIC_CACHE
 from signals.social_market_signals import scan_topic as scan_social_topic
 from signals.news_market_signals import scan_topic as scan_news_topic
-import requests
 import os
 from openai import OpenAI
 
@@ -50,7 +49,7 @@ from readability import Document
 from pytrends.request import TrendReq
 from sentence_transformers import SentenceTransformer
 from channelMemory.channelMemory import process_pdf
-
+from channelMemory.aiIntel import get_chunks_from_db
 
 load_dotenv()
 
@@ -2737,10 +2736,12 @@ def content_radar():
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...),userId: str = Form(...)):
     file_bytes = await file.read()
 
-    chunks = process_pdf(file_bytes)
+    print("USER ID:", userId)
+
+    chunks = process_pdf(file_bytes,userId)
 
     supabase.table('channel_memory').insert(chunks).execute()
 
@@ -2749,4 +2750,7 @@ async def upload(file: UploadFile = File(...)):
     }   
 
 
-
+@app.on_event("startup")
+async def startup_event():
+    print("running")
+    await get_chunks_from_db()
