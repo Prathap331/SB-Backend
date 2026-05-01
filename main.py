@@ -49,7 +49,7 @@ from ddgs import DDGS
 from readability import Document
 from pytrends.request import TrendReq
 from sentence_transformers import SentenceTransformer
-# from channelMemory.channelMemory import process_pdf
+from channelMemory.channelMemory import process_pdf
 
 
 load_dotenv()
@@ -2736,20 +2736,17 @@ def content_radar():
     return {"message": res.data}
 
 
-# @app.post("/upload")
-# async def upload(file: UploadFile = File(...)):
-#     file_bytes = await file.read()
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    file_bytes = await file.read()
 
-#     chunks = process_pdf(file_bytes)
+    chunks = process_pdf(file_bytes)
 
-#     supabase.table('channel_memory').insert(chunks).execute()
+    supabase.table('channel_memory').insert(chunks).execute()
 
-#     preview_texts = [c["text"] for c in chunks[:3]]
-
-#     return {
-#         "message": "Uploaded and processed",
-#         "preview": preview_texts
-#     }   
+    return {
+        "message": "Uploaded and processed",
+    }   
 
 
 
