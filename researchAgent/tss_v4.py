@@ -1,53 +1,313 @@
-#!/usr/bin/env python3
-"""
-Standalone social market-signal scanner.
-
-Implements an M2-style architecture around three interval windows:
-  - past 24 hours
-  - past 48 hours
-  - past 7 days
-
-Primary sources:
-  - X/Twitter API (counts + recent tweets) when TWITTER_BEARER_TOKEN is present
-  - Reddit API (OAuth search) when REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET are present
-  - SerpAPI Google Search fallback
-  - DuckDuckGo text search fallback when no paid provider is available
-
-Usage:
-  python3 social_market_signals.py "AI automation"
-  python3 social_market_signals.py "Israel Iran War" --json
-"""
-
-from __future__ import annotations
-
-import argparse
-import datetime as dt
-import json
+from pytrends.request import TrendReq
+from datetime import datetime, timedelta, timezone
+import requests
 import os
-import re
-import sqlite3
+from dotenv import load_dotenv 
+import datetime as dt
 from pathlib import Path
-from urllib.parse import urlparse
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = lambda: None
+import re
+import json
+import httpx
 
-try:
-    from ddgs import DDGS
-except Exception:  # pragma: no cover - optional runtime dependency
-    DDGS = None
+pytrends = TrendReq()
+
+YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+NEWSAPI_URL        = "https://newsapi.org/v2/everything"
+SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
+
+load_dotenv()
+
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+print(YOUTUBE_API_KEY)
 
 
+SERPAPI_KEY = os.getenv("SERPAPI_API_KEY")
+
+
+def fetch_serpapi_counts(query, start, end):
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": SERPAPI_KEY,
+        "tbs": f"cdr:1,cd_min:{start},cd_max:{end}",
+    }
+
+    resp = httpx.get(SERPAPI_SEARCH_URL, params=params, timeout=20)
+    resp.raise_for_status()
+
+    data = resp.json()
+    return int(data.get("search_information", {}).get("total_results", 0))
+
+
+def get_trends_serpapi(keyword):
+    now = dt.datetime.utcnow()
+
+    last_1d = (now - dt.timedelta(days=1)).strftime("%m/%d/%Y")
+    last_2d = (now - dt.timedelta(days=2)).strftime("%m/%d/%Y")
+    last_7d = (now - dt.timedelta(days=7)).strftime("%m/%d/%Y")
+    last_30d = (now - dt.timedelta(days=30)).strftime("%m/%d/%Y")
+    today = now.strftime("%m/%d/%Y")
+
+    count_24h = fetch_serpapi_counts(keyword, last_1d, today)
+    count_48h = fetch_serpapi_counts(keyword, last_2d, today)
+    count_7d = fetch_serpapi_counts(keyword, last_7d, today)
+    count_30d = fetch_serpapi_counts(keyword, last_30d, today)
+
+    return {
+        "24h": count_24h,
+        "48h": count_48h,
+        "7d": count_7d,
+        "30d": count_30d
+    }
+
+def build_trend_dashboard(data):
+    weekly_total = data["7d"]
+    weekly_avg = data["30d"] / 4 if data["30d"] else weekly_total
+
+    vs_normal = weekly_total / weekly_avg if weekly_avg else 0
+
+    last_week = weekly_avg  
+    wow_growth = ((weekly_total - last_week) / last_week * 100) if last_week else 0
+
+    max_val = max(data["30d"], weekly_total, 1)
+    index_now = int((weekly_total / max_val) * 100)
+    avg_index = (weekly_avg / max_val) * 100
+    last_week_index = (last_week / max_val) * 100
+
+    if vs_normal > 1.2:
+        trend = "Rising"
+    elif vs_normal < 0.8:
+        trend = "Falling"
+    else:
+        trend = "Stable"
+
+    return {
+        "Searches this week": f"{round(weekly_total/1_000_000,1)}M",
+
+        "vs avg / wk": f"{round(weekly_avg/1000)}K",
+
+        "vs normal week": f"{round(vs_normal,1)}×",
+
+        "Week-on-week": f"{round(wow_growth)}%",
+
+        "Trend direction": trend,
+
+        "Index now": index_now,
+
+        "52-week avg index": round(avg_index, 1),
+
+        "Last week index": round(last_week_index, 1),
+    }
+
+
+data = get_trends_serpapi("Trump")
+summary = build_trend_dashboard(data)
+print(summary)
+
+#  yotube 
+CATEGORY_MIN_VIEWS = {
+    "Technology":    100_000,
+    "Entertainment": 200_000,
+    "Politics":       50_000,
+    "Finance":        30_000,
+    "Sports":        150_000,
+    "Fashion":        80_000,
+    "History":        10_000,
+    "General":        50_000,
+}
+
+
+def get_youtube_video_ids(keyword, api_key=YOUTUBE_API_KEY, max_results=10):
+    two_weeks_ago = (datetime.now(timezone.utc) - timedelta(weeks=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params = {
+        "key":           api_key,
+        "q":             keyword,
+        "part":          "id",
+        "type":          "video",
+        "order":         "viewCount",
+        "maxResults":    max_results,
+        "publishedAfter": two_weeks_ago,
+    }
+
+    resp = requests.get(YOUTUBE_SEARCH_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    items = resp.json().get("items", [])
+
+    if not items:
+        four_weeks_ago = (datetime.now(timezone.utc) - timedelta(weeks=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        params["publishedAfter"] = four_weeks_ago
+        resp  = requests.get(YOUTUBE_SEARCH_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+
+    return [item["id"]["videoId"] for item in items]
+
+
+def get_youtube_video_stats(video_ids, api_key=YOUTUBE_API_KEY):
+    if not video_ids:
+        return []
+
+    params = {
+        "key":   api_key,
+        "id":    ",".join(video_ids),
+        "part":  "statistics,snippet",
+    }
+
+    resp = requests.get(YOUTUBE_VIDEOS_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json().get("items", [])
+
+
+def estimate_weekly_views(total_views, age_days):
+    """
+    Derive last-7-day and prior-7-day view estimates from a cumulative total.
+    YouTube doesn't expose per-week view data in the public API.
+    """
+    age_days   = max(age_days, 1)
+    daily_rate = total_views / age_days
+
+    if age_days <= 7:
+        return total_views, 0        
+
+    views_l7d = int(daily_rate * 7)
+    views_p7d = int(daily_rate * 7)  
+    return views_l7d, views_p7d
+
+
+def creator_competition_label(new_videos_7d):
+    if new_videos_7d == 0:   return "None"
+    if new_videos_7d <= 3:   return "Low"
+    if new_videos_7d <= 15:  return "Moderate"
+    if new_videos_7d <= 50:  return "High"
+    return "Very high"
+
+
+def band_for_score(score):
+    if score < 20:  return "Flat"
+    if score < 50:  return "Emerging"
+    if score < 75:  return "Strong"
+    if score < 90:  return "Very strong"
+    return "Peak"
+
+
+def build_youtube_summary(keyword, category="General", api_key=YOUTUBE_API_KEY):
+    """
+    Full YouTube activity scan for a keyword.
+    Returns a dict with all engagement metrics + activity score.
+    """
+    video_ids = get_youtube_video_ids(keyword, api_key)
+    if not video_ids:
+        return {"status": "no_recent_content", "score": 0, "band": "Flat"}
+
+    videos = get_youtube_video_stats(video_ids, api_key)
+    if not videos:
+        return {"status": "no_data", "score": 0, "band": "Flat"}
+
+    now = datetime.now(timezone.utc)
+
+    views_l7d_total  = 0
+    views_p7d_total  = 0
+    likes_total      = 0
+    comments_total   = 0
+    new_videos_7d    = 0
+    channel_ids      = set()
+    valid_videos     = 0
+    all_new          = True
+
+    for v in videos:
+        snippet = v.get("snippet", {})
+        stats   = v.get("statistics", {})
+
+        if snippet.get("liveBroadcastContent") == "live":
+            continue
+
+        if "viewCount" not in stats:
+            continue
+
+        view_count    = int(stats["viewCount"])
+        like_count    = int(stats.get("likeCount",    0))
+        comment_count = int(stats.get("commentCount", 0))
+        channel_id    = snippet.get("channelId", "")
+
+        published_at_str = snippet.get("publishedAt", "")
+        try:
+            published_at = datetime.fromisoformat(published_at_str.replace("Z", "+00:00"))
+            age_days     = max((now - published_at).days, 1)
+        except (ValueError, TypeError):
+            age_days = 30
+
+        l7d, p7d = estimate_weekly_views(view_count, age_days)
+        views_l7d_total += l7d
+        views_p7d_total += p7d
+        likes_total     += like_count
+        comments_total  += comment_count
+
+        if age_days <= 7:
+            new_videos_7d += 1
+        else:
+            all_new = False
+
+        if channel_id:
+            channel_ids.add(channel_id)
+
+        valid_videos += 1
+
+    if valid_videos < 3:
+        return {"status": "insufficient_data", "score": 0, "band": "Flat"}
+
+    wow_ratio       = min(views_l7d_total / max(views_p7d_total, 1), 4.0)
+    engagement_rate = min(
+        (likes_total + comments_total) / max(views_l7d_total, 1),
+        0.25
+    )
+
+    raw_score   = wow_ratio / 4.0 * 100
+    min_vol     = CATEGORY_MIN_VIEWS.get(category, CATEGORY_MIN_VIEWS["General"])
+    low_volume  = views_l7d_total < min_vol
+    if low_volume:
+        raw_score = min(raw_score, 35)
+
+    score            = round(raw_score, 1)
+    distinct_channels = len(channel_ids)
+
+    return {
+        "score":               score,
+        "band":                band_for_score(score),
+        "low_volume":          low_volume,
+        "views_this_week":     views_l7d_total,
+        "views_last_week":     views_p7d_total,
+        "wow_ratio":           round(wow_ratio, 2),
+        "all_new_videos":      all_new,
+        "likes_total":         likes_total,
+        "comments_total":      comments_total,
+        "engagement_rate":     round(engagement_rate, 4),
+        "new_videos_7d":       new_videos_7d,
+        "distinct_channels":   distinct_channels,
+        "creator_competition": creator_competition_label(new_videos_7d),
+        "videos_tracked":      valid_videos,
+        "status":              "live",
+        "updated_at":          datetime.utcnow().isoformat() + "Z",
+    }
+
+
+print(build_youtube_summary("Israel Iran War"))
+
+
+# reddit/socials
 PROJECT_ROOT = Path(__file__).resolve().parent
 CACHE_DIR = PROJECT_ROOT / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
-SNAPSHOT_DB = CACHE_DIR / "social_market_snapshots.sqlite3"
-SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
 TWITTER_COUNTS_URL = "https://api.twitter.com/2/tweets/counts/recent"
 TWITTER_SEARCH_URL = "https://api.twitter.com/2/tweets/search/recent"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 REDDIT_SEARCH_URL = "https://oauth.reddit.com/search"
+SNAPSHOT_DB = CACHE_DIR / "social_market_snapshots.sqlite3"
+PROJECT_ROOT = Path(__file__).resolve().parent
+CACHE_DIR = PROJECT_ROOT / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
 SOCIAL_DOMAINS = (
     "reddit.com",
     "x.com",
@@ -58,6 +318,20 @@ SOCIAL_DOMAINS = (
     "linkedin.com",
 )
 
+
+
+import sqlite3
+from pathlib import Path
+from urllib.parse import urlparse
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = lambda: None
+
+try:
+    from ddgs import DDGS
+except Exception: 
+    DDGS = None
 
 def normalize_score(value: float, cap: float) -> float:
     if cap <= 0:
@@ -252,7 +526,6 @@ def fetch_twitter_counts_and_posts(
     import httpx
     timeout = httpx.Timeout(20.0)
 
-    # One 7d hourly series lets us derive 24h/48h/7d counts consistently.
     count_params = {
         "query": query,
         "start_time": iso_utc(start_7d),
@@ -506,7 +779,6 @@ def compute_interval_metrics(count_24h: int, count_48h: int, count_7d: int) -> d
     accel_48h_vs_7d = round(daily_48h / daily_7d, 2) if daily_7d > 0 else (round(daily_48h, 2) if daily_48h > 0 else 0.0)
     weekly_daily_velocity = round(daily_7d, 2)
 
-    # 24h often undercounts because of timezone/day-part effects. Keep it diagnostic only.
     accel_24_component = 0.0
     accel_48_component = round(0.25 * normalize_score(accel_48h_vs_7d, 3.0), 2)
     weekly_scale_component = round(0.60 * normalize_score(weekly_daily_velocity, 50000.0), 2)
@@ -729,7 +1001,6 @@ def scan_topic(topic: str) -> dict:
             2,
         )
 
-    # M2 diversity: count distinct platforms/subreddits with >=3 posts in 48h.
     subreddit_counts: dict[str, int] = {}
     for post in reddit_posts_48h:
         sub = post.get("subreddit")
@@ -753,7 +1024,6 @@ def scan_topic(topic: str) -> dict:
     diversity_count = max(platform_diversity_count, subreddit_diversity_count)
     m2_diversity = min(diversity_count / 5.0, 1.0) if diversity_count else 0.0
 
-    # Freshness signal for TSS v3 (latest known post timestamp).
     for item in (direct_items or sample_items):
         candidate = parse_api_datetime(item.get("date"))
         if candidate and (latest_post_ts is None or candidate > latest_post_ts):
@@ -808,28 +1078,6 @@ def scan_topic(topic: str) -> dict:
     payload["dashboard"] = build_serpapi_dashboard(payload)
     return payload
 
-def print_human(payload: dict) -> None:
-    # print("=" * 68)
-    print("Social Market Signals")
-    # print("=" * 68)
-    # print(f"Topic:                  {payload['topic']}")
-    # print(f"Provider:               {payload['provider_used']}")
-    # print(f"Mentions past 24h:      {payload['mentions_24h']}")
-    # print(f"Mentions past 48h:      {payload['mentions_48h']}")
-    # print(f"Mentions past 7d:       {payload['mentions_7d']}")
-    # print(f"24h velocity:           {payload['daily_24h_velocity']}")
-    # print(f"48h daily velocity:     {payload['daily_48h_velocity']}")
-    # print(f"7d daily velocity:      {payload['daily_7d_velocity']}")
-    # print(f"24h vs 48h accel:       {payload['accel_24h_vs_48h']}")
-    # print(f"48h vs 7d accel:        {payload['accel_48h_vs_7d']}")
-    # print(f"Source diversity:       {payload['source_diversity']}")
-    # print(f"Snapshot delta 24h:     {payload['snapshot_delta_24h']}")
-    # print(f"M2 score:               {payload['m2_score']}")
-    # print()
-    # print("Sample posts")
-    # for item in payload["sample_posts"][:5]:
-    #     print(f"- {item.get('title')} | {item.get('domain')} | {item.get('url')}")
-
 
 def build_serpapi_dashboard(payload: dict) -> dict:
     mentions_48h = payload.get("mentions_48h", 0)
@@ -838,14 +1086,12 @@ def build_serpapi_dashboard(payload: dict) -> dict:
     daily_avg = mentions_7d / 7 if mentions_7d else max(mentions_48h / 2, 1)
     vs_avg = round((mentions_48h / 2) / daily_avg, 2)
 
-    # communities from domains
     sample = payload.get("sample_posts", [])
     domains = [p.get("domain") for p in sample if p.get("domain")]
     unique_domains = list(set(domains))[:2]
 
     spreading = "spreading" if len(unique_domains) > 3 else "not yet spreading"
 
-    # engagement proxy (search-based)
     engagement_quality = round(
         min((vs_avg * 0.6) + 0.3, 1.2),
         2
@@ -854,44 +1100,389 @@ def build_serpapi_dashboard(payload: dict) -> dict:
     return {
         "Posts in last 48h": mentions_48h,
         "vs daily avg": round(daily_avg, 0),
-
         "Active communities": len(unique_domains),
         "Community status": spreading,
-
-        "Avg comments / post": 0.0,
         "Post sentiment": "Neutral",
-
-        "Reddit posts (48h)": 0,
         "Communities": unique_domains,
-
-        "X posts (48h)": 0,
-        "X signal": "not available in SerpAPI mode",
-
         "vs daily average": f"{vs_avg}×",
-
         "Engagement quality": engagement_quality,
-        "max_scale": "of 1.2 max · moderate",
-
-        "data_source": "serpapi_web_mentions"
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("topic", help="Topic to scan")
-    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
-    args = parser.parse_args()
-
-    payload = scan_topic(args.topic)
-    if args.json:
-        print(json.dumps(payload, indent=2))
-    else:
-        print_human(payload)
-
-
 result = scan_topic("Israel Iran war")
-
 print(result["dashboard"])
 
-if __name__ == "__main__":
-    main()
+
+
+
+
+# news
+
+
+
+ 
+import datetime as dt
+import os
+from urllib.parse import urlparse
+ 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+ 
+try:
+    import httpx
+except ImportError:
+    raise SystemExit("pip install httpx")
+ 
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    DDGS = None
+ 
+ 
+NEWSAPI_URL   = "https://newsapi.org/v2/everything"
+GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+ 
+TIER1_DOMAINS = {
+    "reuters.com", "bbc.com", "apnews.com", "nytimes.com",
+    "wsj.com", "bloomberg.com", "theguardian.com", "ft.com",
+}
+ 
+ 
+# =============================================================================
+# Helpers
+# =============================================================================
+ 
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+ 
+ 
+def gdelt_ts(d: dt.datetime) -> str:
+    return d.strftime("%Y%m%d%H%M%S")
+ 
+ 
+def domain_from_url(url):
+    if not url:
+        return None
+    try:
+        h = urlparse(url).netloc.lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return None
+ 
+ 
+def parse_gdelt_seendate(value):
+    if not value:
+        return None
+    try:
+        return dt.datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+ 
+ 
+def safe_float(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+ 
+ 
+def tone_label(shift: float) -> str:
+    if shift < 1.5:  return "Stable"
+    if shift < 4.0:  return "Escalating"
+    return "Rapidly escalating"
+ 
+ 
+def band_for_score(score: float) -> str:
+    if score < 20: return "Flat"
+    if score < 50: return "Emerging"
+    if score < 75: return "Strong"
+    if score < 90: return "Very strong"
+    return "Peak"
+ 
+ 
+# =============================================================================
+# NewsAPI
+# =============================================================================
+ 
+def fetch_newsapi(topic: str, start: dt.datetime, end: dt.datetime, page_size: int = 100):
+    api_key = (os.getenv("NEWSAPI_KEY") or "").strip()
+    if not api_key:
+        return 0, []
+ 
+    resp = httpx.get(NEWSAPI_URL, params={
+        "apiKey":   api_key,
+        "q":        topic,
+        "language": "en",
+        "sortBy":   "publishedAt",
+        "from":     start.isoformat(),
+        "to":       end.isoformat(),
+        "pageSize": page_size,
+        "page":     1,
+    }, timeout=20.0)
+    resp.raise_for_status()
+    data = resp.json()
+ 
+    articles = [
+        {
+            "title":        a.get("title"),
+            "url":          a.get("url"),
+            "source":       (a.get("source") or {}).get("name"),
+            "domain":       domain_from_url(a.get("url")),
+            "published_at": a.get("publishedAt"),
+        }
+        for a in (data.get("articles") or [])
+    ]
+    return int(data.get("totalResults") or 0), articles
+ 
+ 
+# =============================================================================
+# GDELT  — errors are now PRINTED, not silently swallowed
+# =============================================================================
+ 
+def fetch_gdelt_artlist(topic: str, start: dt.datetime, end: dt.datetime, maxrecords: int = 250) -> list:
+    try:
+        resp = httpx.get(GDELT_DOC_URL, params={
+            "query":         topic,
+            "mode":          "ArtList",
+            "format":        "json",
+            "maxrecords":    maxrecords,
+            "startdatetime": gdelt_ts(start),
+            "enddatetime":   gdelt_ts(end),
+        }, timeout=20.0)
+        resp.raise_for_status()
+        return resp.json().get("articles") or []
+    except Exception as e:
+        print(f"  [GDELT ArtList] {e}")   # visible error — not silent
+        return []
+ 
+ 
+def fetch_gdelt_daily_avg_90d(topic: str, now: dt.datetime) -> float:
+    try:
+        resp = httpx.get(GDELT_DOC_URL, params={
+            "query":         topic,
+            "mode":          "TimelineVolRaw",
+            "format":        "json",
+            "startdatetime": gdelt_ts(now - dt.timedelta(days=90)),
+            "enddatetime":   gdelt_ts(now),
+        }, timeout=20.0)
+        resp.raise_for_status()
+        timeline = resp.json().get("timeline") or []
+        values   = [safe_float(row.get("value")) for row in timeline if row.get("value") is not None]
+        return sum(values) / len(values) if values else 0.0
+    except Exception as e:
+        print(f"  [GDELT Timeline] {e}")  # visible error — not silent
+        return 0.0
+ 
+ 
+# =============================================================================
+# NewsAPI 90-day baseline fallback
+# Used when GDELT is blocked / unavailable
+# =============================================================================
+ 
+def fetch_newsapi_daily_avg_90d(topic: str, now: dt.datetime) -> float:
+    """
+    Fetch 30-day and 7-day NewsAPI counts and derive a rough daily average.
+    NewsAPI free plan only goes back 30 days — we use that as our baseline.
+    """
+    try:
+        start_30d = now - dt.timedelta(days=30)
+        total_30d, _ = fetch_newsapi(topic, start_30d, now, page_size=1)
+        return float(total_30d) / 30.0 if total_30d else 0.0
+    except Exception as e:
+        print(f"  [NewsAPI baseline] {e}")
+        return 0.0
+ 
+ 
+# =============================================================================
+# DuckDuckGo fallback
+# =============================================================================
+ 
+def fetch_ddgs(topic: str, timelimit: str, max_results: int = 50) -> list:
+    if DDGS is None:
+        return []
+    try:
+        with DDGS(timeout=15) as ddgs:
+            results = ddgs.news(topic, timelimit=timelimit, max_results=max_results)
+        return [
+            {
+                "title":        r.get("title"),
+                "url":          r.get("url"),
+                "source":       r.get("source"),
+                "domain":       domain_from_url(r.get("url")),
+                "published_at": r.get("date"),
+            }
+            for r in (results or [])
+        ]
+    except Exception as e:
+        print(f"  [DDGS] {e}")
+        return []
+ 
+ 
+# =============================================================================
+# Main scanner
+# =============================================================================
+ 
+def scan(topic: str) -> dict:
+    now       = utc_now()
+    start_7d  = now - dt.timedelta(days=7)
+    start_24h = now - dt.timedelta(days=1)
+ 
+    # ── NewsAPI (primary) ─────────────────────────────────────────────────────
+    newsapi_total, newsapi_articles = fetch_newsapi(topic, start_7d, now)
+ 
+    if newsapi_total == 0:
+        ddgs_week        = fetch_ddgs(topic, timelimit="w")
+        newsapi_articles = ddgs_week
+        newsapi_total    = len(ddgs_week)
+ 
+    articles_7d = newsapi_total
+    publishers  = len({
+        a.get("source") or a.get("domain")
+        for a in newsapi_articles
+        if a.get("source") or a.get("domain")
+    })
+ 
+    # ── GDELT (best source for baseline + tone) ───────────────────────────────
+    gdelt_7d      = fetch_gdelt_artlist(topic, start_7d, now, maxrecords=250)
+    gdelt_events  = len(gdelt_7d)
+    gdelt_avg_90d = fetch_gdelt_daily_avg_90d(topic, now)
+ 
+    # ── Fallback: use NewsAPI 30-day avg when GDELT is blocked ───────────────
+    gdelt_available = gdelt_avg_90d > 0 or gdelt_events > 0
+    if not gdelt_available:
+        print("  [info] GDELT unavailable — using NewsAPI 30d avg as baseline")
+        gdelt_avg_90d = fetch_newsapi_daily_avg_90d(topic, now)
+ 
+    avg_weekly_baseline = round(gdelt_avg_90d * 7, 1)
+    daily_this_week     = articles_7d / 7.0
+    vs_normal_week      = round(daily_this_week / gdelt_avg_90d, 1) if gdelt_avg_90d > 0 else 0.0
+ 
+    # ── Tone (from GDELT if available, else neutral) ──────────────────────────
+    gdelt_90d     = fetch_gdelt_artlist(topic, now - dt.timedelta(days=90), now, maxrecords=250) if gdelt_available else []
+ 
+    tone_7d_vals  = [safe_float(a.get("tone")) for a in gdelt_7d  if a.get("tone") is not None]
+    tone_90d_vals = [safe_float(a.get("tone")) for a in gdelt_90d if a.get("tone") is not None]
+ 
+    tone_7d_avg  = sum(tone_7d_vals)  / len(tone_7d_vals)  if tone_7d_vals  else 0.0
+    tone_90d_avg = sum(tone_90d_vals) / len(tone_90d_vals) if tone_90d_vals else tone_7d_avg
+    tone_shift   = round(abs(tone_7d_avg - tone_90d_avg), 2)
+ 
+    return {
+        "articles_7d":          articles_7d,
+        "avg_weekly_baseline":  avg_weekly_baseline,
+        "publishers":           publishers,
+        "vs_normal_week":       vs_normal_week,
+        "coverage_tone":        tone_label(tone_shift),
+        "newsapi_articles":     newsapi_total,
+        "gdelt_events":         gdelt_events,
+        "gdelt_available":      gdelt_available,
+        "tone_shift":           tone_shift,
+        "tone_7d_avg":          round(tone_7d_avg,  3),
+        "tone_90d_avg":         round(tone_90d_avg, 3),
+        "gdelt_daily_avg_90d":  round(gdelt_avg_90d, 3),
+        "scan_timestamp":       now.isoformat().replace("+00:00", "Z"),
+        "topic":                topic,
+        "_gdelt_7d":            gdelt_7d,   # reused in build_news_summary
+    }
+ 
+ 
+# =============================================================================
+# CLI
+# =============================================================================
+ 
+def print_human(d: dict) -> None:
+    print("=" * 50)
+    print(f"  {d['topic']}")
+    print("=" * 50)
+    print(f"  Articles / week       {d['articles_7d']:,}  ↑ vs {d['avg_weekly_baseline']:,.0f} avg / week")
+    print(f"  Publishers covering   {d['publishers']}")
+    print(f"  vs normal week        {d['vs_normal_week']}×  above 90-day avg")
+    print(f"  Coverage tone         {d['coverage_tone']}")
+    print(f"  NewsAPI articles      {d['newsapi_articles']:,}  editorial press")
+    print(f"  GDELT events          {d['gdelt_events']:,}  global news events")
+    print(f"  Tone shift            {d['tone_shift']}  {'low · story not escalating' if d['tone_shift'] < 1.5 else 'elevated · story escalating'}")
+    if not d.get("gdelt_available"):
+        print(f"  [baseline source]     NewsAPI 30-day avg (GDELT blocked on this host)")
+    print("=" * 50)
+ 
+ 
+# =============================================================================
+# build_news_summary
+# Single entry point — mirrors build_youtube_summary / build_social_summary
+# =============================================================================
+ 
+CATEGORY_MIN_ARTICLES = {
+    "Technology":    30,
+    "Entertainment": 50,
+    "Politics":      20,
+    "Finance":       15,
+    "Sports":        40,
+    "Fashion":       25,
+    "History":        5,
+    "General":       20,
+}
+ 
+ 
+def build_news_summary(keyword: str, category: str = "General") -> dict:
+    """
+    Full news activity scan for a keyword.
+    Returns a flat dict matching the news sub-object of the platform output schema.
+ 
+    Usage:
+        result = build_news_summary("Israel Iran War", category="Politics")
+        print(result["score"])           # 72.4
+        print(result["articles_7d"])     # 1302
+        print(result["vs_normal_week"])  # 6.8
+        print(result["coverage_tone"])   # "Stable"
+    """
+    raw      = scan(keyword)
+    gdelt_7d = raw.pop("_gdelt_7d", [])
+ 
+    # ── Tier-1 authority ──────────────────────────────────────────────────────
+    tier1_count   = sum(
+        1 for a in gdelt_7d
+        if (domain_from_url(a.get("url")) or "").lower() in TIER1_DOMAINS
+    )
+    total_gdelt   = max(len(gdelt_7d), 1)
+    authority_pct = round(tier1_count / total_gdelt * 100, 1)
+ 
+    # ── Volume floor ──────────────────────────────────────────────────────────
+    min_articles = CATEGORY_MIN_ARTICLES.get(category, CATEGORY_MIN_ARTICLES["General"])
+    low_volume   = raw["articles_7d"] < min_articles
+ 
+    # ── Score (0–100) ─────────────────────────────────────────────────────────
+    raw_score  = min(raw["vs_normal_week"] / 8.0, 1.0) * 100
+    raw_score += authority_pct * 0.1          # up to +10 pts for Tier-1 coverage
+    raw_score  = min(raw_score, 100.0)
+    if low_volume:
+        raw_score = min(raw_score, 35.0)
+ 
+    score = round(raw_score, 1)
+ 
+    return {
+        # score
+        "score":               score,
+        "band":                band_for_score(score),
+        "low_volume":          low_volume,
+        "articles_7d":         raw["articles_7d"],
+        "newsapi_articles":    raw["newsapi_articles"],
+        "gdelt_events":        raw["gdelt_events"],
+        "publishers":          raw["publishers"],
+        "tier1_count":         tier1_count,
+        "authority_pct":       authority_pct,
+        "coverage_tone":       raw["coverage_tone"],
+        # "avg_weekly_baseline": raw["avg_weekly_baseline"],
+        # "vs_normal_week":      raw["vs_normal_week"],
+        # "tone_shift":          raw["tone_shift"],
+        # "tone_7d_avg":         raw["tone_7d_avg"],
+        # "tone_90d_avg":        raw["tone_90d_avg"],
+        "gdelt_available":     raw["gdelt_available"],
+        "status":              "live",
+        "updated_at":          raw["scan_timestamp"],
+    }
+
+
+print(build_news_summary("Israel Iran War", category="Politics"))
