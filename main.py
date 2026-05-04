@@ -17,6 +17,9 @@ from signals.news_market_signals import scan_topic as scan_news_topic
 import os
 from openai import OpenAI
 
+from researchAgent.tss_v4 import get_trends_serpapi,build_trend_dashboard , build_youtube_summary , scan_topic , build_news_summary
+
+
 from shared.schemas.pipeline_context import (
     AgentPipelineContext,
     extract_angle_for_prompt,
@@ -1997,20 +2000,25 @@ async def refresh_token(request: RefreshTokenRequest):
     return await refresh_access_token(request.refresh_token)
 
 
+
 @app.post("/pipeline-metrics")
 async def pipeline_metrics(request: PromptRequest):
-    """
-    Frontend integration endpoint for the new scoring stack.
-    Returns the full run_tss payload:
-      TSS + CSI + CAGS + verdict
-    """
     try:
-        async with _pipeline_request_semaphore:
-            result = await asyncio.wait_for(run_tss(request.topic), timeout=TSS_TIMEOUT_SEC)
-            return adapt_pipeline_payload(result)
+        trends_data = await asyncio.to_thread(get_trends_serpapi, request.topic)
+        trend_dashboard = build_trend_dashboard(trends_data)
+        social_result = await asyncio.to_thread(scan_topic, request.topic)
+        youtube_result = await asyncio.to_thread(build_youtube_summary, request.topic)
+        news_result = await asyncio.to_thread(build_news_summary,request.topic)
+        return {
+            "topic":   request.topic,
+            "trends":  trend_dashboard,
+            "youtube": youtube_result,
+            "social":  social_result["dashboard"],
+            "news_result" : news_result
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
-
 
 
 # ── /process-topic ───────────────────────────────────────────

@@ -276,3 +276,4 @@ schedule
 youtube-transcript-api
 PyMuPDF
 langdetect
+google-search-results

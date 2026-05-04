@@ -102,9 +102,9 @@ def build_trend_dashboard(data):
     }
 
 
-data = get_trends_serpapi("Trump")
-summary = build_trend_dashboard(data)
-print(summary)
+# data = get_trends_serpapi("Trump")
+# summary = build_trend_dashboard(data)
+# print(summary)
 
 #  yotube 
 CATEGORY_MIN_VIEWS = {
@@ -293,7 +293,7 @@ def build_youtube_summary(keyword, category="General", api_key=YOUTUBE_API_KEY):
     }
 
 
-print(build_youtube_summary("Israel Iran War"))
+# print(build_youtube_summary("Israel Iran War"))
 
 
 # reddit/socials
@@ -351,98 +351,98 @@ def normalize_topic_key(topic: str) -> str:
     return re.sub(r"\s+", " ", (topic or "").strip().lower())
 
 
-def init_db() -> None:
-    conn = sqlite3.connect(SNAPSHOT_DB)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS social_market_scans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                topic_key TEXT NOT NULL,
-                topic TEXT NOT NULL,
-                query_used TEXT NOT NULL,
-                provider_used TEXT NOT NULL,
-                scan_timestamp TEXT NOT NULL,
-                mentions_24h INTEGER NOT NULL,
-                mentions_48h INTEGER NOT NULL,
-                mentions_7d INTEGER NOT NULL,
-                accel_24h_vs_48h REAL NOT NULL,
-                accel_48h_vs_7d REAL NOT NULL,
-                weekly_daily_velocity REAL NOT NULL,
-                source_diversity REAL NOT NULL,
-                snapshot_delta_24h REAL,
-                m2_score REAL NOT NULL,
-                raw_payload TEXT
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_social_market_scans_lookup
-            ON social_market_scans(topic_key, scan_timestamp DESC)
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
+# def init_db() -> None:
+#     conn = sqlite3.connect(SNAPSHOT_DB)
+#     try:
+#         cur = conn.cursor()
+#         cur.execute(
+#             """
+#             CREATE TABLE IF NOT EXISTS social_market_scans (
+#                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+#                 topic_key TEXT NOT NULL,
+#                 topic TEXT NOT NULL,
+#                 query_used TEXT NOT NULL,
+#                 provider_used TEXT NOT NULL,
+#                 scan_timestamp TEXT NOT NULL,
+#                 mentions_24h INTEGER NOT NULL,
+#                 mentions_48h INTEGER NOT NULL,
+#                 mentions_7d INTEGER NOT NULL,
+#                 accel_24h_vs_48h REAL NOT NULL,
+#                 accel_48h_vs_7d REAL NOT NULL,
+#                 weekly_daily_velocity REAL NOT NULL,
+#                 source_diversity REAL NOT NULL,
+#                 snapshot_delta_24h REAL,
+#                 m2_score REAL NOT NULL,
+#                 raw_payload TEXT
+#             )
+#             """
+#         )
+#         cur.execute(
+#             """
+#             CREATE INDEX IF NOT EXISTS idx_social_market_scans_lookup
+#             ON social_market_scans(topic_key, scan_timestamp DESC)
+#             """
+#         )
+#         conn.commit()
+#     finally:
+#         conn.close()
 
 
-def load_previous_scan(topic: str) -> dict | None:
-    init_db()
-    conn = sqlite3.connect(SNAPSHOT_DB)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute(
-            """
-            SELECT scan_timestamp, mentions_24h
-            FROM social_market_scans
-            WHERE topic_key = ?
-            ORDER BY scan_timestamp DESC
-            LIMIT 1
-            """,
-            [normalize_topic_key(topic)],
-        ).fetchone()
-    finally:
-        conn.close()
-    return dict(row) if row else None
+# def load_previous_scan(topic: str) -> dict | None:
+#     init_db()
+#     conn = sqlite3.connect(SNAPSHOT_DB)
+#     conn.row_factory = sqlite3.Row
+#     try:
+#         row = conn.execute(
+#             """
+#             SELECT scan_timestamp, mentions_24h
+#             FROM social_market_scans
+#             WHERE topic_key = ?
+#             ORDER BY scan_timestamp DESC
+#             LIMIT 1
+#             """,
+#             [normalize_topic_key(topic)],
+#         ).fetchone()
+#     finally:
+#         conn.close()
+#     return dict(row) if row else None
 
 
-def persist_scan(topic: str, payload: dict) -> None:
-    init_db()
-    conn = sqlite3.connect(SNAPSHOT_DB)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO social_market_scans (
-                topic_key, topic, query_used, provider_used, scan_timestamp,
-                mentions_24h, mentions_48h, mentions_7d,
-                accel_24h_vs_48h, accel_48h_vs_7d, weekly_daily_velocity,
-                source_diversity, snapshot_delta_24h, m2_score, raw_payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                normalize_topic_key(topic),
-                topic,
-                payload["query_used"],
-                payload["provider_used"],
-                payload["scan_timestamp"],
-                payload["mentions_24h"],
-                payload["mentions_48h"],
-                payload["mentions_7d"],
-                payload["accel_24h_vs_48h"],
-                payload["accel_48h_vs_7d"],
-                payload["weekly_daily_velocity"],
-                payload["source_diversity"],
-                payload.get("snapshot_delta_24h"),
-                payload["m2_score"],
-                json.dumps(payload, ensure_ascii=True),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+# def persist_scan(topic: str, payload: dict) -> None:
+#     init_db()
+#     conn = sqlite3.connect(SNAPSHOT_DB)
+#     try:
+#         cur = conn.cursor()
+#         cur.execute(
+#             """
+#             INSERT INTO social_market_scans (
+#                 topic_key, topic, query_used, provider_used, scan_timestamp,
+#                 mentions_24h, mentions_48h, mentions_7d,
+#                 accel_24h_vs_48h, accel_48h_vs_7d, weekly_daily_velocity,
+#                 source_diversity, snapshot_delta_24h, m2_score, raw_payload
+#             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+#             """,
+#             (
+#                 normalize_topic_key(topic),
+#                 topic,
+#                 payload["query_used"],
+#                 payload["provider_used"],
+#                 payload["scan_timestamp"],
+#                 payload["mentions_24h"],
+#                 payload["mentions_48h"],
+#                 payload["mentions_7d"],
+#                 payload["accel_24h_vs_48h"],
+#                 payload["accel_48h_vs_7d"],
+#                 payload["weekly_daily_velocity"],
+#                 payload["source_diversity"],
+#                 payload.get("snapshot_delta_24h"),
+#                 payload["m2_score"],
+#                 json.dumps(payload, ensure_ascii=True),
+#             ),
+#         )
+#         conn.commit()
+#     finally:
+#         conn.close()
 
 
 def build_social_query(topic: str) -> str:
@@ -865,7 +865,6 @@ def scan_topic(topic: str) -> dict:
     query = build_social_query(topic)
     now = utc_now()
     scan_timestamp = iso_utc(now)
-    previous = load_previous_scan(topic)
 
     start_24h = now - dt.timedelta(days=1)
     start_48h = now - dt.timedelta(days=2)
@@ -1030,8 +1029,6 @@ def scan_topic(topic: str) -> dict:
             latest_post_ts = candidate
 
     snapshot_delta_24h = None
-    if previous:
-        snapshot_delta_24h = round(float(count_24h) - float(previous.get("mentions_24h", 0)), 2)
 
     payload = {
         "topic": topic,
@@ -1074,7 +1071,6 @@ def scan_topic(topic: str) -> dict:
     }
 
     payload["reddit_posts_48h_count"] = len(reddit_posts_48h)
-    persist_scan(topic, payload)
     payload["dashboard"] = build_serpapi_dashboard(payload)
     return payload
 
@@ -1109,17 +1105,12 @@ def build_serpapi_dashboard(payload: dict) -> dict:
     }
 
 
-result = scan_topic("Israel Iran war")
-print(result["dashboard"])
-
-
+# result = scan_topic("Israel Iran war")
+# print(result["dashboard"])
 
 
 
 # news
-
-
-
  
 import datetime as dt
 import os
@@ -1455,7 +1446,7 @@ def build_news_summary(keyword: str, category: str = "General") -> dict:
  
     # ── Score (0–100) ─────────────────────────────────────────────────────────
     raw_score  = min(raw["vs_normal_week"] / 8.0, 1.0) * 100
-    raw_score += authority_pct * 0.1          # up to +10 pts for Tier-1 coverage
+    raw_score += authority_pct * 0.1         
     raw_score  = min(raw_score, 100.0)
     if low_volume:
         raw_score = min(raw_score, 35.0)
@@ -1485,4 +1476,4 @@ def build_news_summary(keyword: str, category: str = "General") -> dict:
     }
 
 
-print(build_news_summary("Israel Iran War", category="Politics"))
+# print(build_news_summary("Israel Iran War", category="Politics"))
