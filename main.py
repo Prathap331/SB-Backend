@@ -18,7 +18,7 @@ import os
 from openai import OpenAI
 
 from researchAgent.tss_v4 import get_trends_serpapi,build_trend_dashboard , build_youtube_summary , scan_topic , build_news_summary
-
+from researchAgent.eci import get_google_trends_serpapi,get_youtube_data
 
 from shared.schemas.pipeline_context import (
     AgentPipelineContext,
@@ -2017,6 +2017,18 @@ async def pipeline_metrics(request: PromptRequest):
             "news_result" : news_result
         }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
+
+@app.post("/eci")
+async def eci(request: PromptRequest):
+    try:
+        google_data = await asyncio.to_thread(get_google_trends_serpapi,request.topic)
+        youtube_data = await asyncio.to_thread(get_youtube_data , request.topic)
+        return {
+         "google_data" : google_data,
+         "youtube_data" : youtube_data  
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
 

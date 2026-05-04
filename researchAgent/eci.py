@@ -74,15 +74,13 @@ def get_google_trends_serpapi(topic: str):
     breakout_signal = recent > past * 1.3
 
     return {
-        "demand_score": round(demand_score, 2),
+        "demand_score":    round(demand_score, 2),
         "trend_direction": trend_direction,
-        "volatility": round(volatility, 2),
-        "seasonality": seasonality,
-        "breakout_signal": breakout_signal
+        "volatility":      round(volatility, 2),
+        "seasonality":     bool(seasonality),        
+        "breakout_signal": bool(breakout_signal)    
     }
 
-
-print(get_google_trends_serpapi("westbengal elections"))
 
 
 def get_youtube_data(topic: str, max_results=25):
