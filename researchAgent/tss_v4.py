@@ -83,24 +83,31 @@ def build_trend_dashboard(data):
     else:
         trend = "Stable"
 
+    raw_score = min(vs_normal / 3.0, 1.0) * 70      
+    raw_score += min(index_now / 100.0, 1.0) * 30   
+    score = round(raw_score, 1)
+
+    if score < 20:   band = "Flat"
+    elif score < 50: band = "Emerging"
+    elif score < 75: band = "Strong"
+    elif score < 90: band = "Very strong"
+    else:            band = "Peak"
+
+    status = "live"
+
     return {
-        "Searches this week": f"{round(weekly_total/1_000_000,1)}M",
-
-        "vs avg / wk": f"{round(weekly_avg/1000)}K",
-
-        "vs normal week": f"{round(vs_normal,1)}×",
-
-        "Week-on-week": f"{round(wow_growth)}%",
-
-        "Trend direction": trend,
-
-        "Index now": index_now,
-
-        "52-week avg index": round(avg_index, 1),
-
-        "Last week index": round(last_week_index, 1),
+        "score":               score,
+        "band":                band,
+        "status":              status,
+        "Searches this week":  f"{round(weekly_total/1_000_000,1)}M",
+        "vs avg / wk":         f"{round(weekly_avg/1000)}K",
+        "vs normal week":      f"{round(vs_normal,1)}×",
+        "Week-on-week":        f"{round(wow_growth)}%",
+        "Trend direction":     trend,
+        "Index now":           index_now,
+        "52-week avg index":   round(avg_index, 1),
+        "Last week index":     round(last_week_index, 1),
     }
-
 
 # data = get_trends_serpapi("Trump")
 # summary = build_trend_dashboard(data)
