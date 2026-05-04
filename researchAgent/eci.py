@@ -82,11 +82,11 @@ def get_google_trends_serpapi(topic: str):
     }
 
 
+def get_youtube_data(topic: str, max_results=25,category: str = "General"):
+    from datetime import datetime, timezone
+    import re
 
-def get_youtube_data(topic: str, max_results=25):
     # 1. Search videos
-    search_url = f"{BASE_URL}/search"
-    
     search_params = {
         "part": "snippet",
         "q": topic,
@@ -95,81 +95,182 @@ def get_youtube_data(topic: str, max_results=25):
         "order": "viewCount",
         "key": YOUTUBE_API_KEY
     }
-
-    search_res = requests.get(search_url, params=search_params).json()
-
-    video_ids = [
-        item["id"]["videoId"]
-        for item in search_res.get("items", [])
-    ]
+    search_res = requests.get(f"{BASE_URL}/search", params=search_params).json()
+    video_ids = [item["id"]["videoId"] for item in search_res.get("items", [])]
 
     if not video_ids:
         return None
 
     # 2. Get video stats
-    stats_url = f"{BASE_URL}/videos"
-
     stats_params = {
         "part": "statistics,snippet",
         "id": ",".join(video_ids),
         "key": YOUTUBE_API_KEY
     }
+    stats_res = requests.get(f"{BASE_URL}/videos", params=stats_params).json()
 
-    stats_res = requests.get(stats_url, params=stats_params).json()
-
-    views, likes, comments, ages = [], [], [], []
+    views, likes, comments, ages_days = [], [], [], []
+    titles = []
+    now = datetime.now(timezone.utc)
 
     for item in stats_res.get("items", []):
-        stats = item.get("statistics", {})
+        stats   = item.get("statistics", {})
+        snippet = item.get("snippet", {})
 
-        view = int(stats.get("viewCount", 0))
-        like = int(stats.get("likeCount", 0))
+        view    = int(stats.get("viewCount",    0))
+        like    = int(stats.get("likeCount",    0))
         comment = int(stats.get("commentCount", 0))
 
         views.append(view)
         likes.append(like)
         comments.append(comment)
+        titles.append(snippet.get("title", ""))
+
+        published_at = snippet.get("publishedAt")
+        if published_at:
+            try:
+                pub_dt   = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                age_days = max((now - pub_dt).days, 1)
+            except Exception:
+                age_days = 180
+        else:
+            age_days = 180
+        ages_days.append(age_days)
 
     if not views:
         return None
 
-    # 3. Compute metrics
-    avg_views = sum(views) / len(views)
+    n         = len(views)
+    avg_views = sum(views) / n
 
-    # Engagement rate
-    engagement = [
-        (likes[i] + comments[i]) / (views[i] + 1)
-        for i in range(len(views))
-    ]
-    engagement_rate = sum(engagement) / len(engagement)
+    # ── Engagement rate ───────────────────────────────────────────────────────
+    engagement = [(likes[i] + comments[i]) / (views[i] + 1) for i in range(n)]
+    engagement_rate = sum(engagement) / n
 
-    # Competition (simple proxy)
-    competition_score = min(avg_views / 1_000_000, 1.0)  
+    # ── Competition score ─────────────────────────────────────────────────────
+    competition_score = min(avg_views / 1_000_000, 1.0)
 
-    # Authority (top-heavy dominance)
-    max_views = max(views)
+    # ── Authority score ───────────────────────────────────────────────────────
+    max_views     = max(views)
     authority_score = max_views / (avg_views + 1)
 
-    # Upload frequency proxy (based on count)
-    upload_frequency = len(views) / max_results
+    # ── Upload frequency ──────────────────────────────────────────────────────
+    upload_frequency = n / max_results
 
-    # 4. Final YouTube Score (0–100)
+    # ── Version sensitivity — count version keywords in titles ────────────────
+    version_pattern = re.compile(
+        r'\b(v\d+|\d{4}|version\s*\d+|part\s*\d+|updated?|new|latest|reboot|remake|season\s*\d+)\b',
+        re.IGNORECASE
+    )
+    version_hits = sum(1 for t in titles if version_pattern.search(t))
+    version_sensitivity = version_hits  # raw count; label below
+
+    if version_sensitivity <= 2:
+        version_sensitivity_label = "Low"
+    elif version_sensitivity <= 6:
+        version_sensitivity_label = "Medium"
+    else:
+        version_sensitivity_label = "High"
+
+    # ── Old-to-new view ratio ─────────────────────────────────────────────────
+    old_views = [views[i] for i in range(n) if ages_days[i] > 90]
+    new_views = [views[i] for i in range(n) if ages_days[i] <= 90]
+    old_total  = sum(old_views) or 0
+    new_total  = sum(new_views) or 1
+    old_to_new_ratio = round(old_total / new_total, 2)
+
+    # ── Foundational stability ────────────────────────────────────────────────
+    # True when majority of top videos are older (evergreen content dominates)
+    foundational_stability = old_total > new_total
+
+    # ── Incumbent decay — complaint proxy from comment ratio ──────────────────
+    # High comment-to-view ratio on old videos signals dissatisfaction/churn
+    old_indices    = [i for i in range(n) if ages_days[i] > 90]
+    complaint_rate = 0.0
+    if old_indices:
+        old_comment_ratios = [comments[i] / (views[i] + 1) for i in old_indices]
+        complaint_rate     = sum(old_comment_ratios) / len(old_comment_ratios)
+    incumbent_decay_pct = round(min(complaint_rate * 1000, 100), 1)  # scale to 0–100%
+
+    # ── YouTube score (0–100) ─────────────────────────────────────────────────
     youtube_score = (
         0.4 * (avg_views / 1_000_000) +
         0.3 * engagement_rate +
         0.2 * (1 - competition_score) +
         0.1 * upload_frequency
     )
+    youtube_score = round(max(0, min(youtube_score * 100, 100)), 2)
 
-    youtube_score = max(0, min(youtube_score * 100, 100))
+    CATEGORY_RPM = {
+        "Technology":    {"base": 8.0,  "low": 5.0,  "high": 18.0},
+        "Finance":       {"base": 12.0, "low": 8.0,  "high": 25.0},
+        "Entertainment": {"base": 4.0,  "low": 2.0,  "high": 8.0},
+        "Politics":      {"base": 6.0,  "low": 3.0,  "high": 12.0},
+        "Sports":        {"base": 5.0,  "low": 3.0,  "high": 10.0},
+        "Fashion":       {"base": 6.0,  "low": 3.5,  "high": 12.0},
+        "History":       {"base": 4.0,  "low": 2.0,  "high": 8.0},
+        "General":       {"base": 5.0,  "low": 2.5,  "high": 10.0},
+    }
+
+    rpm_bench = CATEGORY_RPM.get(category, CATEGORY_RPM["General"])
+    base_rpm  = rpm_bench["base"]
+
+    # ── Engagement multiplier ─────────────────────────────────────────────────
+    like_rate      = sum(likes) / (sum(views) + 1)          # overall like rate
+    eng_multiplier = 1.0 + min(like_rate * 10, 1.0)        # 1.0x – 2.0x
+
+    est_rpm        = round(base_rpm * eng_multiplier, 2)
+    rpm_low        = round(rpm_bench["low"]  * eng_multiplier, 2)
+    rpm_high       = round(rpm_bench["high"] * eng_multiplier, 2)
+
+    # ── Revenue at 100K views/month ───────────────────────────────────────────
+    views_per_month   = 100_000
+    ad_revenue_mo     = round((views_per_month / 1000) * est_rpm, 2)
+
+    # Brand deal estimate — category-based flat rate scaled by engagement
+    CATEGORY_BRAND = {
+        "Technology":    800,  "Finance":       1200,
+        "Entertainment": 500,  "Politics":       600,
+        "Sports":        700,  "Fashion":        900,
+        "History":       300,  "General":        500,
+    }
+    brand_base     = CATEGORY_BRAND.get(category, 500)
+    brand_deal_mo  = round(brand_base * eng_multiplier)
+    total_est_mo   = round(ad_revenue_mo + brand_deal_mo)
+
+    # ── Revenue potential score (0–100) ──────────────────────────────────────
+    revenue_score  = round(min((est_rpm / 25.0) * 100, 100), 1)
+
+    # ── Revenue payload ───────────────────────────────────────────────────────
+    revenue_potential = {
+        "revenue_score":     revenue_score,
+        "est_rpm":           est_rpm,
+        "rpm_low":           rpm_low,
+        "rpm_high":          rpm_high,
+        "rpm_range":         f"${rpm_low}–${rpm_high}",
+        "like_rate_pct":     round(like_rate * 100, 2),
+        "engagement_adj":    f"{round(like_rate * 100, 1)}% like rate",
+        "eng_multiplier":    round(eng_multiplier, 2),
+        "ad_revenue_mo":     ad_revenue_mo,
+        "brand_deal_est_mo": brand_deal_mo,
+        "total_est_mo":      total_est_mo,
+        "views_basis":       "100K views/month",
+        "rpm_source":        "YT category benchmark",
+    }
 
     return {
-        "avg_views": int(avg_views),
-        "engagement_rate": round(engagement_rate, 4),
-        "competition_score": round(competition_score, 2),
-        "upload_frequency": round(upload_frequency, 2),
-        "authority_score": round(authority_score, 2),
-        "youtube_score": round(youtube_score, 2)
+        "avg_views":                 int(avg_views),
+        "engagement_rate":           round(engagement_rate, 4),
+        "competition_score":         round(competition_score, 2),
+        "upload_frequency":          round(upload_frequency, 2),
+        "authority_score":           round(authority_score, 2),
+        "youtube_score":             youtube_score,
+        "version_sensitivity":       version_sensitivity,
+        "version_sensitivity_label": version_sensitivity_label,
+        "old_to_new_ratio":          old_to_new_ratio,
+        "foundational_stability":    foundational_stability,
+        "incumbent_decay_pct":       incumbent_decay_pct,
+        "revenue_potential":         revenue_potential,   
     }
 
 
