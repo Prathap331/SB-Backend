@@ -2000,6 +2000,22 @@ async def refresh_token(request: RefreshTokenRequest):
     return await refresh_access_token(request.refresh_token)
 
 
+@app.post("/analyze")
+async def analyze(request: PromptRequest):
+    try:
+        youtube_result = await asyncio.to_thread(
+            build_youtube_summary, request.topic
+        )
+        score = youtube_result.get("score") or youtube_result.get("youtube", {}).get("score", 0)
+        if score == 100:
+            tss_result = await pipeline_metrics(request)
+            return tss_result
+        else:
+            eci_result = await eci(request)
+            return eci_result
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @app.post("/pipeline-metrics")
 async def pipeline_metrics(request: PromptRequest):
@@ -2031,7 +2047,6 @@ async def eci(request: PromptRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
-
 
 # ── /process-topic ───────────────────────────────────────────
 
