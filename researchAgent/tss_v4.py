@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 import datetime as dt
 from pathlib import Path
 import re
-import json
 import httpx
 
 pytrends = TrendReq()
@@ -96,17 +95,14 @@ def build_trend_dashboard(data):
     status = "live"
 
     return {
-        "score":               score,
-        "band":                band,
-        "status":              status,
-        "Searches this week":  f"{round(weekly_total/1_000_000,1)}M",
-        "vs avg / wk":         f"{round(weekly_avg/1000)}K",
-        "vs normal week":      f"{round(vs_normal,1)}×",
-        "Week-on-week":        f"{round(wow_growth)}%",
-        "Trend direction":     trend,
-        "Index now":           index_now,
-        "52-week avg index":   round(avg_index, 1),
-        "Last week index":     round(last_week_index, 1),
+        "score":            score,
+        "band":             band,
+        "status":           status,
+        "searches_per_week": f"{round(weekly_total/1_000_000,1)}M",
+        "vs_avg_week":       f"{round(weekly_avg/1000)}K",
+        "vs_normal_week":    f"{round(vs_normal,1)}×",
+        "week_on_week":      f"+{round(wow_growth)}%" if wow_growth >= 0 else f"{round(wow_growth)}%",
+        "trend_direction":   trend,
     }
 
 # data = get_trends_serpapi("Trump")
@@ -281,24 +277,24 @@ def build_youtube_summary(keyword, category="General", api_key=YOUTUBE_API_KEY):
     distinct_channels = len(channel_ids)
 
     return {
-        "score":               score,
-        "band":                band_for_score(score),
-        "low_volume":          low_volume,
-        "views_this_week":     views_l7d_total,
-        "views_last_week":     views_p7d_total,
-        "wow_ratio":           round(wow_ratio, 2),
-        "all_new_videos":      all_new,
-        "likes_total":         likes_total,
-        "comments_total":      comments_total,
-        "engagement_rate":     round(engagement_rate, 4),
-        "new_videos_7d":       new_videos_7d,
-        "distinct_channels":   distinct_channels,
-        "creator_competition": creator_competition_label(new_videos_7d),
-        "videos_tracked":      valid_videos,
-        "status":              "live",
-        "updated_at":          datetime.utcnow().isoformat() + "Z",
-    }
-
+            "score":               score,
+            "band":                band_for_score(score),
+            "status":              "live",
+            "updated_at":          datetime.utcnow().isoformat() + "Z",
+            "low_volume":          low_volume,
+            "views_this_week":     views_l7d_total,
+            "views_last_week":     views_p7d_total,
+            "view_growth":         f"{round(wow_ratio, 1)}×",
+            "new_videos_7d":       new_videos_7d,
+            "engagement_rate":     f"{round(engagement_rate * 100, 1)}%",
+            "distinct_channels":   distinct_channels,
+            "creator_competition": creator_competition_label(new_videos_7d),
+            "videos_tracked":      valid_videos,
+            "wow_ratio":           round(wow_ratio, 2),
+            "likes_total":         likes_total,
+            "comments_total":      comments_total,
+            "all_new_videos":      all_new,
+        }
 
 # print(build_youtube_summary("Israel Iran War"))
 
@@ -326,8 +322,6 @@ SOCIAL_DOMAINS = (
 )
 
 
-
-import sqlite3
 from pathlib import Path
 from urllib.parse import urlparse
 try:
