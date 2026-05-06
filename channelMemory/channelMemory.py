@@ -5,8 +5,9 @@ import numpy as np
 from langdetect import detect
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
+
 
 load_dotenv()
 
@@ -45,7 +46,7 @@ def chunk_text(text, chunk_size=300, overlap=50):
 
     return chunks
 
-def create_normalised_chunks(chunks, language):
+def create_normalised_chunks(chunks, language,userId):
     result = []
 
     for idx, chunk in enumerate(chunks):
@@ -57,7 +58,8 @@ def create_normalised_chunks(chunks, language):
             "text": chunk,
             "chunk_index": idx,
             "is_canonical": True, 
-            "metadata": {}
+            "metadata": {},
+            "userId" : userId
         })
 
     return result
@@ -93,18 +95,17 @@ def extract_pdf_text(doc):
     text = ""
 
     for page in doc:
-        blocks = page.get_text("blocks")  
+        blocks = page.get_text("blocks") 
 
         page_text = []
         for b in blocks:
-            page_text.append(b[4]) 
+            page_text.append(b[4])  
 
         text += " ".join(page_text) + " "
 
     return text
 
-
-def process_pdf(file_input):
+def process_pdf(file_input,userId):
     text = ""
 
     if isinstance(file_input, bytes):
@@ -122,11 +123,13 @@ def process_pdf(file_input):
 
     normalised_chunks = create_normalised_chunks(
         chunks=raw_chunks,
-        language=language
+        language=language,
+        userId=userId
     )
 
     embedded_chunks = generate_embeddings(normalised_chunks)
 
     return embedded_chunks
+
 
 

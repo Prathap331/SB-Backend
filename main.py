@@ -1195,8 +1195,6 @@ STRUCTURE_GUIDANCE = {
 # ════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ════════════════════════════════════════════════════════════
-
-
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
@@ -2810,8 +2808,6 @@ def content_radar():
 @app.post("/upload")
 async def upload(file: UploadFile = File(...),userId: str = Form(...)):
     file_bytes = await file.read()
-
-    print("USER ID:", userId)
 
     chunks = process_pdf(file_bytes,userId)
 
