@@ -23,11 +23,11 @@ def make_chunk_id(userId, idx, chunk):
     return f"{userId}_{idx}_{hashlib.md5(chunk.encode()).hexdigest()[:10]}"
 
 
-# def clean_text(text: str) -> str:
-#     text = re.sub(r'\n+', ' ', text)
-#     text = re.sub(r'\s+', ' ', text)
-#     text = re.sub(r'#+ ', '', text)  
-#     return text.strip()
+def clean_text(text: str) -> str:
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'#+ ', '', text)  
+    return text.strip()
 
 
 def detect_lang(text: str) -> str:
@@ -52,33 +52,35 @@ def chunk_text(text, chunk_size=300, overlap=50):
 
     return chunks
 
-def create_normalised_chunks(chunks, language,userId):
-    result = []
+def create_single_document_chunk(text, language, userId):
+    """Save entire PDF as one row instead of multiple chunks."""
+    chunk_id = make_chunk_id(userId, 0, text[:500])  
+    
+    return [{
+        "chunk_id": chunk_id,
+        "channel_id": 123,
+        "source_type": "script_upload",
+        "language_code": language,
+        "text": text,                   
+        "chunk_index": 0,
+        "is_canonical": True,
+        "metadata": {},
+        "userId": userId
+    }]
 
-    for idx, chunk in enumerate(chunks):
-        result.append({
-            "chunk_id": make_chunk_id(userId, idx, chunk),
-            "channel_id": 123,  
-            "source_type": "script_upload",
-            "language_code": language,
-            "text": chunk,
-            "chunk_index": idx,
-            "is_canonical": True, 
-            "metadata": {},
-            "userId" : userId
-        })
-
-    return result
 
 
 def generate_embeddings(chunks):
     texts = [c["text"] for c in chunks]
-    embeddings = model.encode(texts)
+    
+    truncated = [t[:1000] for t in texts]
+    embeddings = model.encode(truncated)
 
     for i, emb in enumerate(embeddings):
-        chunks[i]["embedding"] = emb.tolist() 
-    print(chunks[0]["embedding"][:5])
+        chunks[i]["embedding"] = emb.tolist()
     return chunks
+
+
 
 
 def cosine_similarity(a, b):
@@ -110,18 +112,13 @@ def extract_pdf_text(file_input):
 
 def process_pdf(file_input, userId):
     text = extract_pdf_text(file_input)
-
-    # text = clean_text(text)
     language = detect_lang(text)
 
-    raw_chunks = chunk_text(text)
-
-    normalised_chunks = create_normalised_chunks(
-        chunks=raw_chunks,
+    normalised_chunks = create_single_document_chunk(
+        text=text,
         language=language,
         userId=userId
     )
 
     embedded_chunks = generate_embeddings(normalised_chunks)
-
     return embedded_chunks
