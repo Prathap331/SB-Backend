@@ -7,6 +7,8 @@ import os
 from dotenv import load_dotenv
 import hashlib
 import pymupdf4llm
+import fitz
+import tempfile
 
 load_dotenv()
 
@@ -96,9 +98,15 @@ def search(query, chunks, top_k=3):
 
 
 def extract_pdf_text(file_input):
-    text = pymupdf4llm.to_markdown(file_input)
-    return text
+    if isinstance(file_input, bytes):
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            tmp.write(file_input)
+            tmp.flush()
 
+            text = pymupdf4llm.to_markdown(tmp.name)
+            return text
+
+    return pymupdf4llm.to_markdown(file_input)
 
 def process_pdf(file_input, userId):
     text = extract_pdf_text(file_input)
@@ -117,4 +125,3 @@ def process_pdf(file_input, userId):
     embedded_chunks = generate_embeddings(normalised_chunks)
 
     return embedded_chunks
-
