@@ -1196,7 +1196,24 @@ STRUCTURE_GUIDANCE = {
 # FASTAPI APP
 # ════════════════════════════════════════════════════════════
 
-app = FastAPI()
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("running background worker")
+
+    task = asyncio.create_task(get_chunks_from_db())
+
+    try:
+        yield
+    finally:
+        task.cancel()
+        print("shutting down worker")
+
+
+
+app = FastAPI(lifespan=lifespan)
 
 origins = [
     "http://localhost:3000",
@@ -2049,7 +2066,6 @@ async def eci(request: PromptRequest):
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
 
 # ── /process-topic ───────────────────────────────────────────
-
 @app.post("/process-topic")
 async def process_topic(request: PromptRequest, background_tasks: BackgroundTasks):
     topic = (request.topic or "").strip()
@@ -2303,9 +2319,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         # get the seo of the topic
         selected_idea_id =  random.randint(1,1000)  
         selected_angle_id = random.randint(1,1000)
-            # "selected_idea_id": "{selected_idea_id}",
-            # "selected_angle_id": "{selected_angle_id}",
-            # "idea_id": "{selected_idea_id}",
 
         json_generation_prompt = f"""
         You are an expert YouTube SEO strategist and content ideation assistant.
@@ -2409,7 +2422,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
                 extra_body={"thinking": {"type": "enabled"}}
             )
 
-            # result2 = res2.json()
             text2 = response2.choices[0].message.content
             raw_text = text2
             keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
@@ -2813,7 +2825,7 @@ async def upload(file: UploadFile = File(...),userId: str = Form(...)):
     }   
 
 
-@app.on_event("startup")
-async def startup_event():
-    print("running")
-    asyncio.create_task(get_chunks_from_db())
+# @app.on_event("startup")
+# async def startup_event():
+#     print("running")
+#     asyncio.create_task(get_chunks_from_db())

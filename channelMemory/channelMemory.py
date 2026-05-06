@@ -5,9 +5,8 @@ import numpy as np
 from langdetect import detect
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
-import os
 from dotenv import load_dotenv
-
+import os
 
 load_dotenv()
 
@@ -46,7 +45,7 @@ def chunk_text(text, chunk_size=300, overlap=50):
 
     return chunks
 
-def create_normalised_chunks(chunks, language,userId):
+def create_normalised_chunks(chunks, language):
     result = []
 
     for idx, chunk in enumerate(chunks):
@@ -58,8 +57,7 @@ def create_normalised_chunks(chunks, language,userId):
             "text": chunk,
             "chunk_index": idx,
             "is_canonical": True, 
-            "metadata": {},
-            "userId" : userId
+            "metadata": {}
         })
 
     return result
@@ -91,7 +89,22 @@ def search(query, chunks, top_k=3):
     return scored[:top_k]
 
 
-def process_pdf(file_input,userId):
+def extract_pdf_text(doc):
+    text = ""
+
+    for page in doc:
+        blocks = page.get_text("blocks")  
+
+        page_text = []
+        for b in blocks:
+            page_text.append(b[4]) 
+
+        text += " ".join(page_text) + " "
+
+    return text
+
+
+def process_pdf(file_input):
     text = ""
 
     if isinstance(file_input, bytes):
@@ -100,8 +113,7 @@ def process_pdf(file_input,userId):
         doc = fitz.open(file_input)
 
     with doc:
-        for page in doc:
-            text += page.get_text()
+        text = extract_pdf_text(doc)
 
     text = clean_text(text)
     language = detect_lang(text)
@@ -110,13 +122,11 @@ def process_pdf(file_input,userId):
 
     normalised_chunks = create_normalised_chunks(
         chunks=raw_chunks,
-        language=language,
-        userId=userId
+        language=language
     )
 
     embedded_chunks = generate_embeddings(normalised_chunks)
 
     return embedded_chunks
-
 
 
