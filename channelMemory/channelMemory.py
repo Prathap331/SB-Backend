@@ -23,11 +23,11 @@ def make_chunk_id(userId, idx, chunk):
     return f"{userId}_{idx}_{hashlib.md5(chunk.encode()).hexdigest()[:10]}"
 
 
-def clean_text(text: str) -> str:
-    text = re.sub(r'\n+', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'#+ ', '', text)  
-    return text.strip()
+# def clean_text(text: str) -> str:
+#     text = re.sub(r'\n+', ' ', text)
+#     text = re.sub(r'\s+', ' ', text)
+#     text = re.sub(r'#+ ', '', text)  
+#     return text.strip()
 
 
 def detect_lang(text: str) -> str:
@@ -111,7 +111,7 @@ def extract_pdf_text(file_input):
 def process_pdf(file_input, userId):
     text = extract_pdf_text(file_input)
 
-    text = clean_text(text)
+    # text = clean_text(text)
     language = detect_lang(text)
 
     raw_chunks = chunk_text(text)
