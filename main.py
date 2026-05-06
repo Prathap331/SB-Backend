@@ -1199,16 +1199,17 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("running background worker")
-
-    task = asyncio.create_task(get_chunks_from_db())
-
+    print("[Lifespan] Running intelligence pipeline...")
+    
     try:
-        yield
-    finally:
-        task.cancel()
-        print("shutting down worker")
-
+        await get_chunks_from_db()
+        print("[Lifespan] Intelligence pipeline complete.")
+    except Exception as e:
+        print(f"[Lifespan] Pipeline failed: {e}")
+    
+    yield
+    
+    print("[Lifespan] Shutting down.")
 
 
 app = FastAPI(lifespan=lifespan)
