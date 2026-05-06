@@ -1,13 +1,12 @@
-import fitz
 import re
-import uuid
 import numpy as np
 from langdetect import detect
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
 import os
 from dotenv import load_dotenv
-
+import hashlib
+import pymupdf4llm
 
 load_dotenv()
 
@@ -18,9 +17,14 @@ key = os.getenv("SUPABASE_KEY")
 
 supabase = create_client(url, key)
 
+def make_chunk_id(userId, idx, chunk):
+    return f"{userId}_{idx}_{hashlib.md5(chunk.encode()).hexdigest()[:10]}"
+
+
 def clean_text(text: str) -> str:
-    text = text.replace("\n", " ")
+    text = re.sub(r'\n+', ' ', text)
     text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'#+ ', '', text)  
     return text.strip()
 
 
@@ -51,7 +55,7 @@ def create_normalised_chunks(chunks, language,userId):
 
     for idx, chunk in enumerate(chunks):
         result.append({
-            "chunk_id": str(uuid.uuid4()),
+            "chunk_id": make_chunk_id(userId, idx, chunk),
             "channel_id": 123,  
             "source_type": "script_upload",
             "language_code": language,
@@ -91,30 +95,13 @@ def search(query, chunks, top_k=3):
     return scored[:top_k]
 
 
-def extract_pdf_text(doc):
-    text = ""
-
-    for page in doc:
-        blocks = page.get_text("blocks") 
-
-        page_text = []
-        for b in blocks:
-            page_text.append(b[4])  
-
-        text += " ".join(page_text) + " "
-
+def extract_pdf_text(file_input):
+    text = pymupdf4llm.to_markdown(file_input)
     return text
 
-def process_pdf(file_input,userId):
-    text = ""
 
-    if isinstance(file_input, bytes):
-        doc = fitz.open(stream=file_input, filetype="pdf")
-    else:
-        doc = fitz.open(file_input)
-
-    with doc:
-        text = extract_pdf_text(doc)
+def process_pdf(file_input, userId):
+    text = extract_pdf_text(file_input)
 
     text = clean_text(text)
     language = detect_lang(text)
@@ -130,6 +117,4 @@ def process_pdf(file_input,userId):
     embedded_chunks = generate_embeddings(normalised_chunks)
 
     return embedded_chunks
-
-
 
