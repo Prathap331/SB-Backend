@@ -2813,7 +2813,7 @@ async def upload(file: UploadFile = File(...),userId: str = Form(...)):
 
     supabase.table('channel_memory').upsert(
         chunks,
-        on_conflict="userId,text"
+        on_conflict="chunk_id"
     ).execute()
 
     return {
