@@ -16,7 +16,7 @@ from signals.social_market_signals import scan_topic as scan_social_topic
 from signals.news_market_signals import scan_topic as scan_news_topic
 import os
 from openai import OpenAI
-
+from channelMemory.aiIntel import get_intelligence
 from researchAgent.tss_v4 import get_trends_serpapi,build_trend_dashboard , build_youtube_summary , scan_topic , build_news_summary
 from researchAgent.eci import get_google_trends_serpapi,get_youtube_data
 
@@ -1199,18 +1199,9 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[Lifespan] Running intelligence pipeline...")
-    
-    try:
-        await get_chunks_from_db()
-        print("[Lifespan] Intelligence pipeline complete.")
-    except Exception as e:
-        print(f"[Lifespan] Pipeline failed: {e}")
-    
-    yield
-    
+    print("[Lifespan] Server started.")
+    yield 
     print("[Lifespan] Shutting down.")
-
 
 app = FastAPI(lifespan=lifespan)
 
@@ -2806,6 +2797,31 @@ def content_radar():
     return {"message": res.data}
 
 
+async def run_intelligence_for_user(userId: str):
+    """Pull only this user's chunks and build their channel profile."""
+    try:
+        print(f"[Intelligence] Triggered for userId={userId}")
+
+        response = supabase.table("channel_memory") \
+            .select("text") \
+            .eq("userId", userId) \
+            .execute()
+
+        data = response.data
+
+        if not data:
+            print(f"[Intelligence] No chunks found for userId={userId}")
+            return
+
+        combined_text = "\n\n".join(item["text"] for item in data)
+
+        await get_intelligence(combined_text, userId)
+
+    except Exception as e:
+        print(f"[Intelligence] ERROR for userId={userId}: {e}")
+
+
+
 @app.post("/upload")
 async def upload(file: UploadFile = File(...),userId: str = Form(...)):
     file_bytes = await file.read()
@@ -2817,9 +2833,13 @@ async def upload(file: UploadFile = File(...),userId: str = Form(...)):
         on_conflict="chunk_id"
     ).execute()
 
+    asyncio.create_task(run_intelligence_for_user(userId))
+
     return {
         "message": "Uploaded and processed",
     }   
+
+
 
 
 # @app.on_event("startup")
