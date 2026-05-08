@@ -279,3 +279,4 @@ langdetect
 google-search-results
 ollama
 pymupdf4llm
+datasets
