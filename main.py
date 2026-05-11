@@ -60,6 +60,8 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 nltk_data_dir = os.path.join(project_root, 'nltk_data')
 nltk.data.path.insert(0, nltk_data_dir)
 
+print(os.getenv("RAZORPAY_WEBHOOK_SECRET"))
+
 def _ensure_nltk_resource(resource_path: str, download_name: str) -> None:
     try:
         nltk.data.find(resource_path)
@@ -2746,16 +2748,22 @@ async def create_razorpay_order(
         raise HTTPException(status_code=500, detail="Could not create payment order.")
 
 
+print(RAZORPAY_WEBHOOK_SECRET)
 @app.post("/payments/webhook")
 async def razorpay_webhook(
     request: Request,
     x_razorpay_signature: str | None = Header(None),
 ):
+
+    body = await request.body()
+
+    if not x_razorpay_signature:
+        raise HTTPException(status_code=400, detail="Missing signature header.")
+
+
     if not RAZORPAY_WEBHOOK_SECRET or not razorpay_client:
         print("Webhook received but service not configured.")
         return {"status": "Webhook ignored"}
-
-    body = await request.body()
 
     try:
         razorpay_client.utility.verify_webhook_signature(
@@ -2763,10 +2771,12 @@ async def razorpay_webhook(
             x_razorpay_signature,
             RAZORPAY_WEBHOOK_SECRET,
         )
-        print("Webhook signature verified.")
     except razorpay.errors.SignatureVerificationError as e:
         print(f"Webhook signature failed: {e}")
-        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+        print(f"DEBUG secret used: '{RAZORPAY_WEBHOOK_SECRET}'")   
+        print(f"DEBUG signature header: '{x_razorpay_signature}'") 
+        print(f"DEBUG body preview: {body[:200]}")               
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")    
     except Exception as e:
         print(f"Webhook verification error: {e}")
         raise HTTPException(status_code=500, detail="Webhook processing error.")
