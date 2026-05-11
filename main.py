@@ -1232,14 +1232,9 @@ class ScriptRequest(BaseModel):
     topic: str | None = None
     userId : str | None = None
     context: AgentPipelineContext | None = None
-    emotional_tone: str | None = "engaging"
-    creator_type: str | None = "educator"
-    audience_description: str | None = "a general audience interested in learning"
-    accent: str | None = "neutral"
     duration_minutes: int | None = 10
-    script_structure: str | None = None
-    template_key_override: str | None = None
-    user_wpm: int | None = None
+    # template_key_override: str | None = None
+    # user_wpm: int | None = None
 
 
 class CreateOrderRequest(BaseModel):
@@ -2271,7 +2266,7 @@ async def get_channel_profile(userId: str):
     try:
         channel_profile = (
             supabase
-            .table("Channel Profile")
+            .table("Channel_Profile")
             .select("Summary")
             .eq("userId", userId)
             .execute()
@@ -2344,7 +2339,8 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
     # await cut_credits(request.duration_minutes, request.userId)
 
     print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
-    print(f"Personalization - Duration: {request.duration_minutes} min, Tone: {request.emotional_tone}, Type: {request.creator_type}, Audience: {request.audience_description}, Accent: {request.accent}")
+    print(f"Personalization - Duration: {request.duration_minutes} min")
+
 
     try:
         channel_profile = await get_channel_profile(request.userId) 
@@ -2422,11 +2418,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
         print(res)
 
-        # response = await client.aio.models.generate_content(
-        #     model="gemini-3-flash-preview",
-        #     contents=json_generation_prompt
-        # )
-
         db_task = asyncio.create_task(get_db_context(request.topic))
         await asyncio.sleep(11) 
 
@@ -2456,7 +2447,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             AI replacing software developers
             demand for software engineers 2025
             """
-            # response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=keyword_prompt)
 
             response2 = deepseek_client.chat.completions.create(
                 model="deepseek-v4-pro",
@@ -2504,23 +2494,19 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         print(f"Targeting {target_duration} minutes / approx. {target_word_count} words.")
         # --------------------------------------
         
-        requested_structure = request.script_structure if request.script_structure else "problem_solution"
-        structure_guidance_text = STRUCTURE_GUIDANCE.get(requested_structure, STRUCTURE_GUIDANCE["problem_solution"]) # Fallback to default
-        print(f"Using script structure: {requested_structure}")
+        # requested_structure = request.script_structure if request.script_structure else "problem_solution"
+        # structure_guidance_text = STRUCTURE_GUIDANCE.get(requested_structure, STRUCTURE_GUIDANCE["problem_solution"]) # Fallback to default
+        # print(f"Using script structure: {requested_structure}")
         
+        channel_profile = ""
         
         script_prompt = f"""
         You are a professional YouTube scriptwriter who creates natural, engaging, and conversational scripts that feel like a real YouTuber speaking directly to the camera.
 
-        **Creator Profile:**
-        * **Creator Type:** {request.creator_type}
-        * **Target Audience:** {request.audience_description}
-        * **Desired Emotional Tone:** {request.emotional_tone}
-        * **Accent/Dialect:** {request.accent} (use phrasing natural for this accent)
-
         **Your Task:**
         You must write the script EXACTLY in this voice, tone, and structure:
         {summary}
+        
         Interpret this as the creator's permanent speaking identity. Every line of the script must reflect this style. Do NOT ignore or average it out.
 
 
@@ -2544,10 +2530,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         - Stay close to **{target_word_count} words** (±50).
 
         
-#         {structure_guidance_text} 
-
 #         **Main Topic/Idea:** "{request.topic}"
-#         **Structure:** "{structure}"
 
 #         **Research Context:**
 #         FOUNDATIONAL KNOWLEDGE (from database): {db_context}
@@ -2576,8 +2559,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
         text3 = response3.choices[0].message.content
 
-        # script_response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=script_prompt)
-        
         total_end_time = time.time()
         print(f"--- PROFILING: Script generation took {total_end_time - total_start_time:.2f} seconds ---")
 
@@ -2646,7 +2627,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
         print("SCRIPT ANALYSIS: Analyzing generated script...")
         analysis_start_time = time.time()
-        # analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=script_response.text)
         analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=text3)
         
         response4 = deepseek_client.chat.completions.create(
@@ -2663,7 +2643,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
         text4 = response4.choices[0].message.content
 
-        # analysis_response = await client.aio.models.generate_content(model="gemini-3-flash-preview", contents=analysis_prompt_filled)
         analysis_end_time = time.time()
         print(f"--- PROFILING: Script analysis took {analysis_end_time - analysis_start_time:.2f} seconds ---")
         
@@ -2698,7 +2677,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "estimated_word_count": generated_word_count,
             "source_urls": list(scraped_urls), 
             "analysis": analysis_results, 
-            "structure" : filtered_structure,
+            # "structure" : filtered_structure,
             "seo" : res
         }
 
