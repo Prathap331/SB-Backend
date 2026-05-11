@@ -29,11 +29,9 @@ def process_news_dataset():
                 print(f"Reached article limit of {MAX_ARTICLES}. Stopping.")
                 break
                 
-            # This dataset uses 'article' for the main text and 'highlights' for a summary
             text_content = item.get('article', '')
             
             if len(text_content) > 300:
-                # We'll use the first sentence as a proxy for the title
                 first_sentence = text_content.split('.')[0]
                 
                 all_articles_data.append({

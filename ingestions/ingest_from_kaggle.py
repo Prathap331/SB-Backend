@@ -1,6 +1,13 @@
 """
-ingest_from_kaggle.py  — StoryBit Kaggle Ingestion Pipeline v6
+ingest_from_kaggle.py  — StoryBit Kaggle Ingestion Pipeline v7
 ══════════════════════════════════════════════════════════════════════
+Changes from v6:
+  • Gemini embeddings REMOVED — replaced with sentence-transformers
+  • Model: all-MiniLM-L6-v2  (384-dim, runs fully local, no API key)
+  • Vector dimension: 384  (update your Supabase column accordingly)
+  • No rate-limit sleeps, no daily quota errors, no nomic fallback
+  • GOOGLE_API_KEY no longer required
+
 Design:
   • Each CSV row → exactly ONE Supabase document row
   • content     = natural-language sentence built from that row by LLM template
@@ -10,13 +17,13 @@ Design:
     → no manual entry needed; spreadsheet only supplies slugs
   • No Wikipedia fallback — if dataset has no text it is skipped
   • LM Studio schema LLM reads compact stats (fits 2048-token context)
-  • Gemini primary embedder (768-dim), nomic via LM Studio fallback
+  • sentence-transformers all-MiniLM-L6-v2 for embeddings (local, 384-dim)
   • category / topic / source_from are GENERATED columns in Supabase
     → never inserted directly; they are computed from metadata JSONB
 
 Table columns written on insert (writable only):
   content       TEXT          ← sentence built from this CSV row
-  embedding     vector(768)   ← Gemini gemini-embedding-001 or nomic
+  embedding     vector(384)   ← all-MiniLM-L6-v2 (384-dim)
   source_title  TEXT          ← Kaggle dataset name
   source_url    TEXT          ← kaggle.com/datasets/{slug}
   source_type   TEXT          ← reddit | twitter | news | book | youtube |
@@ -38,9 +45,13 @@ Test a single dataset — no spreadsheet needed:
   python ingest_from_kaggle.py --test --slug owner/dataset-name --dry-run
   python ingest_from_kaggle.py --test --slug owner/dataset-name --limit 10
 
+IMPORTANT — Supabase vector column must be 384-dim:
+  ALTER TABLE documents ALTER COLUMN embedding TYPE vector(384);
+  -- or if creating fresh:
+  embedding vector(384)
+
 LM Studio must have loaded:
   1. lfm2.5-1.2b-instruct-thinking-claude-high-reasoning-mlx  (schema + metadata LLM)
-  2. text-embedding-nomic-embed-text-v1.5                       (fallback embedder)
 ══════════════════════════════════════════════════════════════════════
 """
 
@@ -49,13 +60,12 @@ import httpx
 import openpyxl
 import pandas as pd
 import nltk
+import numpy as np
 
 from pathlib import Path
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from google import genai
-from google.genai import types as genai_types
 from nltk.tokenize import sent_tokenize
 
 load_dotenv()
@@ -70,43 +80,54 @@ for resource in ["punkt", "punkt_tab"]:
 # ══════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════
-
 SPREADSHEET_FILE = "Storybit_Database.xlsx"
 PROGRESS_FILE    = "kaggle_progress.log"
 
-GEMINI_MODEL         = "gemini-embedding-001"
-LM_STUDIO_BASE       = "http://127.0.0.1:1234"
-NOMIC_MODEL_ID       = "text-embedding-nomic-embed-text-v1.5"
-NOMIC_EMBED_ENDPOINT = f"{LM_STUDIO_BASE}/v1/embeddings"
-NOMIC_PREFIX         = "search_document: "
+# ── Sentence-transformers embedding ──────────────────────────
+ST_MODEL_NAME    = "all-MiniLM-L6-v2"   # 384-dim, ~90 MB, runs on CPU
+EMBEDDING_DIM    = 384
+ST_BATCH_SIZE    = 64                    # rows per encode() call
 
-BATCH_SIZE       = 100     # rows per embed+insert call
-NOMIC_BATCH_SIZE = 50
-MAX_ROWS_PER_DS  = 2000    # max rows extracted per dataset file
-MIN_ROW_WORDS    = 8       # skip sentences shorter than this
-CHUNK_WORDS      = 250     # target content chunk size (target schema)
-CHUNK_OVERLAP    = 50      # overlap words between chunks
-MAX_CONTENT_CHARS = 4000   # protect DB insert/embedding payload size
-FAILED_ROWS_FILE  = "failed_rows.ndjson"
-FAILED_DATASETS_FILE = "failed_datasets.log"
-_runtime_max_rows_per_ds = MAX_ROWS_PER_DS  # 0 means no cap
+# ── LM Studio (schema + metadata LLM only) ───────────────────
+LM_STUDIO_BASE   = "http://127.0.0.1:1234"
+_LM_CHAT_URL     = f"{LM_STUDIO_BASE}/v1/chat/completions"
+_LM_MODELS       = f"{LM_STUDIO_BASE}/api/v1/models"
 
-_LM_CHAT_URL = f"{LM_STUDIO_BASE}/v1/chat/completions"
-_LM_MODELS   = f"{LM_STUDIO_BASE}/api/v1/models"
+# ── Pipeline tuning ──────────────────────────────────────────
+BATCH_SIZE        = 100     # rows per insert call
+MAX_ROWS_PER_DS   = 2000    # max rows extracted per dataset file
+MIN_ROW_WORDS     = 8       # skip sentences shorter than this
+CHUNK_WORDS       = 250     # target content chunk size
+CHUNK_OVERLAP     = 50      # overlap words between chunks
+MAX_CONTENT_CHARS = 4000    # protect DB insert/embedding payload size
+FAILED_ROWS_FILE      = "failed_rows.ndjson"
+FAILED_DATASETS_FILE  = "failed_datasets.log"
+_runtime_max_rows_per_ds = MAX_ROWS_PER_DS   # 0 means no cap
 
-_use_nomic   = False       # runtime state: switches permanently on Gemini quota hit
+# ── Lazy-loaded sentence-transformer model ───────────────────
+_st_model = None
+
+def _get_st_model():
+    """Load the sentence-transformer model once, then reuse."""
+    global _st_model
+    if _st_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            sys.exit(
+                "✗  sentence-transformers not installed.\n"
+                "   Run:  pip install sentence-transformers"
+            )
+        print(f"  [embedder] Loading {ST_MODEL_NAME} (first call only)...")
+        _st_model = SentenceTransformer(ST_MODEL_NAME)
+        print(f"  [embedder] Model ready — dim={EMBEDDING_DIM}")
+    return _st_model
 
 
 # ══════════════════════════════════════════════════════════════
 # JSON SCHEMAS FOR LM STUDIO STRUCTURED OUTPUT
-#
-# LM Studio requires response_format with type "json_schema"
-# and a full JSON Schema definition inside json_schema.schema.
-# See: https://lmstudio.ai/docs/advanced/structured-output
-# Schema spec: https://json-schema.org/learn/miscellaneous-examples
 # ══════════════════════════════════════════════════════════════
 
-# Schema for dataset metadata generation (category/topic/tags/objective)
 _METADATA_JSON_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
@@ -139,7 +160,6 @@ _METADATA_JSON_SCHEMA = {
     }
 }
 
-# Schema for CSV column classification (schema analysis)
 _SCHEMA_JSON_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
@@ -148,45 +168,19 @@ _SCHEMA_JSON_SCHEMA = {
         "schema": {
             "type": "object",
             "properties": {
-                "primary": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Rich text columns with avg_words >= 8"
-                },
-                "context": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Short label columns used as prefix"
-                },
-                "noise": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "IDs, URLs, usernames, timestamps, scores"
-                },
-                "date_col": {
-                    "type": "string",
-                    "description": "Column holding original publish date, or empty string"
-                },
-                "is_social": {
-                    "type": "boolean",
-                    "description": "Whether this is social media data"
-                },
-                "dataset_type": {
-                    "type": "string",
-                    "description": "Type like reddit_comments, news_articles, general, etc."
-                },
-                "sentence_template": {
-                    "type": "string",
-                    "description": "Template using {column_name} placeholders"
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score 0.0 to 1.0"
-                },
-                "reasoning": {
-                    "type": "string",
-                    "description": "One sentence explanation"
-                }
+                "primary":  {"type": "array", "items": {"type": "string"},
+                             "description": "Rich text columns with avg_words >= 8"},
+                "context":  {"type": "array", "items": {"type": "string"},
+                             "description": "Short label columns used as prefix"},
+                "noise":    {"type": "array", "items": {"type": "string"},
+                             "description": "IDs, URLs, usernames, timestamps, scores"},
+                "date_col": {"type": "string",
+                             "description": "Column holding original publish date, or empty string"},
+                "is_social":         {"type": "boolean"},
+                "dataset_type":      {"type": "string"},
+                "sentence_template": {"type": "string"},
+                "confidence":        {"type": "number"},
+                "reasoning":         {"type": "string"}
             },
             "required": ["primary", "context", "noise", "date_col", "is_social",
                          "dataset_type", "sentence_template", "confidence", "reasoning"],
@@ -195,7 +189,6 @@ _SCHEMA_JSON_SCHEMA = {
     }
 }
 
-# Schema for source type detection
 _SOURCE_TYPE_JSON_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
@@ -206,8 +199,7 @@ _SOURCE_TYPE_JSON_SCHEMA = {
             "properties": {
                 "source_type": {
                     "type": "string",
-                    "enum": ["web_scrape", "news", "wikipedia", "book", "youtube"],
-                    "description": "One of: web_scrape, news, wikipedia, book, youtube"
+                    "enum": ["web_scrape", "news", "wikipedia", "book", "youtube"]
                 }
             },
             "required": ["source_type"],
@@ -231,21 +223,21 @@ def read_spreadsheet(filepath: str) -> list[dict]:
     header = [str(c).strip().lower() if c else "" for c in rows[0]]
     col    = {}
     for i, h in enumerate(header):
-        if "category" in h:                                       col["category"] = i
-        elif "topic"    in h:                                     col["topic"]    = i
+        if "category"  in h:                                      col["category"]  = i
+        elif "topic"   in h:                                      col["topic"]     = i
         elif "objective" in h:                                    col["objective"] = i
-        elif "tag"      in h:                                     col["tags"]     = i
-        elif "vector"   in h or "kaggle" in h or "database" in h: col["db_link"] = i
+        elif "tag"     in h:                                      col["tags"]      = i
+        elif "vector"  in h or "kaggle" in h or "database" in h: col["db_link"]   = i
 
     topics = []
     for r_idx, row in enumerate(rows[1:], start=2):
         if not any(row):
             continue
-        category = str(row[col.get("category", 0)] or "").strip()
-        topic    = str(row[col.get("topic",    1)] or "").strip()
+        category  = str(row[col.get("category",  0)] or "").strip()
+        topic     = str(row[col.get("topic",     1)] or "").strip()
         objective = str(row[col.get("objective", 2)] or "").strip()
-        tags_raw = str(row[col.get("tags",     2)] or "").strip()
-        db_link  = str(row[col.get("db_link",  4)] or "").strip()
+        tags_raw  = str(row[col.get("tags",      2)] or "").strip()
+        db_link   = str(row[col.get("db_link",   4)] or "").strip()
 
         if not category or not topic:
             continue
@@ -261,10 +253,8 @@ def read_spreadsheet(filepath: str) -> list[dict]:
         url = ""
         for line in db_link.splitlines():
             if "kaggle.com" in line.lower():
-                url = line.strip()
-                break
+                url = line.strip(); break
 
-        # If the cell contains a hyperlink but no visible URL text, read link target.
         if not url and "db_link" in col:
             cidx = col["db_link"] + 1
             cell = ws.cell(row=r_idx, column=cidx)
@@ -272,20 +262,14 @@ def read_spreadsheet(filepath: str) -> list[dict]:
                 if "kaggle.com" in cell.hyperlink.target.lower():
                     url = cell.hyperlink.target.strip()
 
-        # Last-chance fallback: scan entire row text for Kaggle URL.
         if not url:
             joined = " ".join(str(x) for x in row if x is not None)
             m = re.search(r"https?://(?:www\.)?kaggle\.com/datasets/[^\s]+", joined, flags=re.IGNORECASE)
             if m:
                 url = m.group(0).strip()
 
-        topics.append({
-            "category": category,
-            "topic": topic,
-            "objective": objective,
-            "tags": tags,
-            "db_link": url
-        })
+        topics.append({"category": category, "topic": topic,
+                        "objective": objective, "tags": tags, "db_link": url})
 
     print(f"Loaded {len(topics)} topics from {filepath}")
     return topics
@@ -300,16 +284,6 @@ def extract_slug(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def parse_huggingface_dataset_id(url_or_id: str) -> str | None:
-    raw = url_or_id.strip()
-    m = re.search(r"huggingface\.co/datasets/([^/\s?#]+/[^/\s?#]+)", raw, flags=re.IGNORECASE)
-    if m:
-        return m.group(1)
-    if not raw.lower().startswith(("http://", "https://")) and raw:
-        return raw.strip("/")
-    return None
-
-
 def download_dataset(slug: str) -> str | None:
     try:
         import kagglehub
@@ -322,21 +296,8 @@ def download_dataset(slug: str) -> str | None:
         return None
 
 
-def download_huggingface_dataset(dataset_id: str) -> str | None:
-    try:
-        from huggingface_hub import snapshot_download
-        print(f"  Downloading Hugging Face dataset: {dataset_id}")
-        path = snapshot_download(repo_id=dataset_id, repo_type="dataset")
-        print(f"  ✓ {path}")
-        return path
-    except Exception as e:
-        print(f"  ✗ Hugging Face download failed: {e}")
-        return None
-
-
 def _extract_archive(filepath: str, outdir: str) -> str | None:
     try:
-        lower = filepath.lower()
         if zipfile.is_zipfile(filepath):
             with zipfile.ZipFile(filepath) as zf:
                 zf.extractall(outdir)
@@ -345,9 +306,10 @@ def _extract_archive(filepath: str, outdir: str) -> str | None:
             with tarfile.open(filepath) as tf:
                 tf.extractall(outdir)
             return outdir
+        lower = filepath.lower()
         if lower.endswith(".gz") and not lower.endswith(".tar.gz"):
-            target = Path(outdir) / Path(filepath).with_suffix("").name
             import gzip
+            target = Path(outdir) / Path(filepath).with_suffix("").name
             with gzip.open(filepath, "rb") as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
             return outdir
@@ -359,11 +321,10 @@ def _extract_archive(filepath: str, outdir: str) -> str | None:
 def download_dataset_from_url(url: str, dataset_id: str = "") -> str | None:
     try:
         parsed = urlparse(url)
-        name = dataset_id or Path(parsed.path).name or "downloaded_dataset"
-        base = Path("/tmp") / "storybit_external_datasets" / hashlib.md5(url.encode()).hexdigest()
+        name   = dataset_id or Path(parsed.path).name or "downloaded_dataset"
+        base   = Path("/tmp") / "storybit_external_datasets" / hashlib.md5(url.encode()).hexdigest()
         base.mkdir(parents=True, exist_ok=True)
         target = base / (name if "." in name else "dataset_download")
-
         print(f"  Downloading URL dataset: {url}")
         with httpx.stream("GET", url, follow_redirects=True, timeout=300) as r:
             r.raise_for_status()
@@ -371,8 +332,7 @@ def download_dataset_from_url(url: str, dataset_id: str = "") -> str | None:
                 for chunk in r.iter_bytes():
                     if chunk:
                         f.write(chunk)
-
-        extracted = _extract_archive(str(target), str(base / "extracted"))
+        extracted  = _extract_archive(str(target), str(base / "extracted"))
         final_path = extracted or str(base)
         print(f"  ✓ {final_path}")
         return final_path
@@ -389,8 +349,7 @@ def find_data_files(dataset_path: str) -> list[str]:
     path  = Path(dataset_path)
     files = []
     for ext in ["*.csv", "*.json", "*.jsonl", "*.ndjson", "*.tsv",
-                "*.parquet", "*.xlsx", "*.xls", "*.txt", "*.md", "*.log",
-                "*.xml"]:
+                "*.parquet", "*.xlsx", "*.xls", "*.txt", "*.md", "*.log", "*.xml"]:
         files.extend(glob.glob(str(path / "**" / ext), recursive=True))
     files = [f for f in files if os.path.getsize(f) < 500 * 1024 * 1024]
     files.sort(key=lambda f: os.path.getsize(f), reverse=True)
@@ -399,11 +358,9 @@ def find_data_files(dataset_path: str) -> list[str]:
 
 def find_media_files(dataset_path: str) -> list[str]:
     path = Path(dataset_path)
-    media_exts = [
-        "*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif", "*.bmp", "*.tif", "*.tiff",
-        "*.mp3", "*.wav", "*.flac", "*.m4a", "*.ogg",
-        "*.mp4", "*.mov", "*.mkv", "*.avi", "*.webm",
-    ]
+    media_exts = ["*.jpg","*.jpeg","*.png","*.webp","*.gif","*.bmp","*.tif","*.tiff",
+                  "*.mp3","*.wav","*.flac","*.m4a","*.ogg",
+                  "*.mp4","*.mov","*.mkv","*.avi","*.webm"]
     files = []
     for ext in media_exts:
         files.extend(glob.glob(str(path / "**" / ext), recursive=True))
@@ -453,7 +410,6 @@ def load_dataframe(filepath: str) -> pd.DataFrame | None:
             return pd.read_parquet(filepath)
 
         elif ext in (".xlsx", ".xls"):
-            # first sheet is enough for ingestion; very large workbooks are trimmed later
             return pd.read_excel(filepath)
 
         elif ext in (".txt", ".md", ".log"):
@@ -488,29 +444,29 @@ def load_dataframe(filepath: str) -> pd.DataFrame | None:
 _schema_cache: dict[str, dict] = {}
 
 _ALWAYS_NOISE = {
-    "id", "post_id", "comment_id", "tweet_id", "user_id", "uuid",
-    "identifier", "record_id", "row_id",
-    "author", "username", "user_name", "screen_name", "handle",
-    "url", "link", "href", "permalink",
-    "score", "votes", "upvote_ratio", "downvote_ratio", "num_comments",
-    "followers", "friends", "favourites", "likes", "ups", "downs",
-    "gilded", "distinguished", "stickied", "is_self", "over_18",
-    "spoiler", "locked", "user_verified", "user_location",
-    "retrieved_at", "inserted_at", "loaded_at", "ingested_at",
-    "unnamed: 0", "row-cell", "row cell", "s.no", "s_no", "logid",
+    "id","post_id","comment_id","tweet_id","user_id","uuid",
+    "identifier","record_id","row_id",
+    "author","username","user_name","screen_name","handle",
+    "url","link","href","permalink",
+    "score","votes","upvote_ratio","downvote_ratio","num_comments",
+    "followers","friends","favourites","likes","ups","downs",
+    "gilded","distinguished","stickied","is_self","over_18",
+    "spoiler","locked","user_verified","user_location",
+    "retrieved_at","inserted_at","loaded_at","ingested_at",
+    "unnamed: 0","row-cell","row cell","s.no","s_no","logid",
 }
-_NOISE_SUBS = ("_id", "_url", "_link", "ratio", "_count", "_votes", "identifier", "unnamed")
+_NOISE_SUBS = ("_id","_url","_link","ratio","_count","_votes","identifier","unnamed")
 
 _DATE_NAMES = {
-    "date", "created_at", "created_utc", "published_at", "publish_date",
-    "timestamp", "post_date", "article_date", "news_date", "time",
-    "created", "updated_at", "pub_date", "publication_date", "datetime",
+    "date","created_at","created_utc","published_at","publish_date",
+    "timestamp","post_date","article_date","news_date","time",
+    "created","updated_at","pub_date","publication_date","datetime",
 }
 
 _BODY_NAMES = {
-    "body", "text", "selftext", "content", "description", "summary",
-    "abstract", "review", "comment", "post", "transcript", "answer",
-    "response", "message", "article", "paragraph", "details",
+    "body","text","selftext","content","description","summary",
+    "abstract","review","comment","post","transcript","answer",
+    "response","message","article","paragraph","details",
 }
 
 
@@ -525,21 +481,20 @@ def _safe_avg_words(series: pd.Series, n: int = 300) -> float:
     try:
         clean = series.dropna().astype(str).str.strip()
         clean = clean[~clean.str.lower().isin(
-            {"", "nan", "none", "null", "n/a", "[removed]", "[deleted]"})]
+            {"","nan","none","null","n/a","[removed]","[deleted]"})]
         return clean.head(n).apply(lambda x: len(x.split())).mean() if not clean.empty else 0.0
     except Exception:
         return 0.0
 
 
 def _is_identifier_like(series: pd.Series, sample_n: int = 400) -> bool:
-    """Heuristic: mostly-unique alphanumeric tokens with little language signal."""
     try:
         s = series.dropna().astype(str).str.strip()
-        s = s[~s.str.lower().isin({"", "nan", "none", "null"})].head(sample_n)
+        s = s[~s.str.lower().isin({"","nan","none","null"})].head(sample_n)
         if s.empty:
             return False
-        uniq_ratio = s.nunique() / max(len(s), 1)
-        avg_words = s.apply(lambda x: len(x.split())).mean()
+        uniq_ratio      = s.nunique() / max(len(s), 1)
+        avg_words       = s.apply(lambda x: len(x.split())).mean()
         alpha_num_ratio = s.apply(
             lambda x: bool(re.search(r"[a-zA-Z]", x)) and bool(re.search(r"\d", x))
         ).mean()
@@ -551,14 +506,14 @@ def _is_identifier_like(series: pd.Series, sample_n: int = 400) -> bool:
 
 def _is_ingestion_col(col: str) -> bool:
     cl = col.lower()
-    return any(t in cl for t in ("retrieved", "inserted", "loaded", "ingested", "etl"))
+    return any(t in cl for t in ("retrieved","inserted","loaded","ingested","etl"))
 
 
 def _is_bad_col_name(col: str) -> bool:
     cl = col.lower().strip()
     return (
         cl.startswith("unnamed")
-        or cl in {"row-cell", "row cell", "s.no", "s_no", "logid", "id", "no.", "no"}
+        or cl in {"row-cell","row cell","s.no","s_no","logid","id","no.","no"}
         or cl.endswith("_id")
     )
 
@@ -575,7 +530,6 @@ def _find_date_col(df: pd.DataFrame) -> str:
 
 
 def _fallback_sentence_cols(df: pd.DataFrame, date_col: str = "", limit: int = 3) -> list[str]:
-    """Pick best-effort columns when LLM/stats produce no primary text fields."""
     scored: list[tuple[float, str]] = []
     for col in df.columns:
         if col == date_col or _is_noise(col) or _is_ingestion_col(col) or _is_bad_col_name(col):
@@ -598,9 +552,9 @@ def _fallback_sentence_cols(df: pd.DataFrame, date_col: str = "", limit: int = 3
         else:
             score += 1.5
 
-        if any(k in cl for k in ("name", "title", "movie", "state", "city", "country", "party", "category", "type")):
+        if any(k in cl for k in ("name","title","movie","state","city","country","party","category","type")):
             score += 2.0
-        if any(k in cl for k in ("gross", "revenue", "amount", "price", "count", "total", "rate", "percent", "score")):
+        if any(k in cl for k in ("gross","revenue","amount","price","count","total","rate","percent","score")):
             score += 1.5
         if _is_identifier_like(s):
             score -= 4.0
@@ -620,18 +574,8 @@ def _fallback_sentence_cols(df: pd.DataFrame, date_col: str = "", limit: int = 3
 
 def _build_content_cols(df: pd.DataFrame, primary: list[str], context: list[str],
                         date_col: str = "", row_source_url_col: str = "") -> list[str]:
-    # Keep every available dataset column in row content so we do not lose context.
-    # The only excluded column is a detected per-row source URL because that is
-    # stored separately in source_url.
-    cols = []
     blocked = {row_source_url_col}
-    for col in df.columns:
-        if col in blocked:
-            continue
-        if col not in df.columns:
-            continue
-        cols.append(col)
-    return cols
+    return [col for col in df.columns if col not in blocked]
 
 
 def _lm_running() -> tuple[bool, str]:
@@ -644,7 +588,7 @@ def _lm_running() -> tuple[bool, str]:
             if d > 4 or mid:
                 return
             if isinstance(obj, dict):
-                for field in ["id", "model_id", "modelId"]:
+                for field in ["id","model_id","modelId"]:
                     v = obj.get(field, "")
                     if isinstance(v, str) and len(v) > 5:
                         mid = v; return
@@ -681,9 +625,9 @@ def generate_dataset_metadata(df: pd.DataFrame, slug: str, hint_objective: str =
         if reason:
             print(f"      [meta] {reason} — using slug-derived fallback")
         return {
-            "category": "General",
-            "topic":    dataset_name.replace("-", " ").title(),
-            "tags":     [w for w in dataset_name.split("-") if len(w) > 2][:4] or ["dataset"],
+            "category":  "General",
+            "topic":     dataset_name.replace("-", " ").title(),
+            "tags":      [w for w in dataset_name.split("-") if len(w) > 2][:4] or ["dataset"],
             "objective": hint_objective or "Learning",
         }
 
@@ -693,16 +637,15 @@ def generate_dataset_metadata(df: pd.DataFrame, slug: str, hint_objective: str =
         _metadata_cache[slug] = meta
         return meta
 
-    cols = list(df.columns)[:20]
-
+    cols      = list(df.columns)[:20]
     text_cols = [
         c for c in cols
         if df[c].dtype in [object, "string"]
-        and not any(sub in c.lower() for sub in ("_id", "_url", "id", "link", "score"))
+        and not any(sub in c.lower() for sub in ("_id","_url","id","link","score"))
     ][:6]
 
     sample_rows = []
-    for ri in [0, len(df)//2, len(df)-1]:
+    for ri in [0, len(df) // 2, len(df) - 1]:
         if ri >= len(df):
             continue
         row   = df.iloc[ri]
@@ -710,7 +653,7 @@ def generate_dataset_metadata(df: pd.DataFrame, slug: str, hint_objective: str =
         for c in text_cols:
             try:
                 v = str(row[c]).strip()
-                if v.lower() not in ("nan", "none", "null", ""):
+                if v.lower() not in ("nan","none","null",""):
                     cells.append(f"{c}={v[:40]}")
             except Exception:
                 continue
@@ -718,31 +661,25 @@ def generate_dataset_metadata(df: pd.DataFrame, slug: str, hint_objective: str =
             sample_rows.append(" | ".join(cells[:4]))
 
     prompt = (
-        f"Dataset: {slug}\n"
-        f"Columns: {cols}\n"
-        f"Sample rows:\n" + "\n".join(sample_rows[:3]) +
-        "\n\nClassify this dataset."
+        f"Dataset: {slug}\nColumns: {cols}\nSample rows:\n"
+        + "\n".join(sample_rows[:3])
+        + "\n\nClassify this dataset."
     )
-
     if len(_META_SYSTEM) + len(prompt) > 3000:
         prompt = prompt[:2800 - len(_META_SYSTEM)]
 
     try:
-        r = httpx.post(
-            _LM_CHAT_URL,
-            json={
-                "model":           model_id,
-                "messages": [
-                    {"role": "system", "content": _META_SYSTEM},
-                    {"role": "user",   "content": prompt},
-                ],
-                "temperature":     0.15,
-                "max_tokens":      180,
-                "stream":          False,
-                "response_format": _METADATA_JSON_SCHEMA,
-            },
-            timeout=90,
-        )
+        r = httpx.post(_LM_CHAT_URL, json={
+            "model":    model_id,
+            "messages": [
+                {"role": "system", "content": _META_SYSTEM},
+                {"role": "user",   "content": prompt},
+            ],
+            "temperature":     0.15,
+            "max_tokens":      180,
+            "stream":          False,
+            "response_format": _METADATA_JSON_SCHEMA,
+        }, timeout=90)
 
         if r.status_code != 200:
             meta = _fallback(f"LM Studio HTTP {r.status_code}")
@@ -761,14 +698,14 @@ def generate_dataset_metadata(df: pd.DataFrame, slug: str, hint_objective: str =
             return meta
 
         meta = json.loads(m.group())
-        meta.setdefault("category", "General")
-        meta.setdefault("topic",    dataset_name.replace("-", " ").title())
-        meta.setdefault("tags",     [dataset_name])
+        meta.setdefault("category",  "General")
+        meta.setdefault("topic",     dataset_name.replace("-", " ").title())
+        meta.setdefault("tags",      [dataset_name])
         meta.setdefault("objective", hint_objective or "Learning")
 
         if not isinstance(meta["tags"], list):
             meta["tags"] = [str(meta["tags"])]
-        meta["tags"] = [str(t).strip() for t in meta["tags"] if str(t).strip()][:6]
+        meta["tags"]      = [str(t).strip() for t in meta["tags"] if str(t).strip()][:6]
         meta["objective"] = str(meta.get("objective", hint_objective or "Learning")).strip() or (hint_objective or "Learning")
 
         print(f"      [meta] category: {meta['category']}")
@@ -801,10 +738,8 @@ Template examples:
   News:    "{source}: {title}. {summary}"
   Books:   "{title} by {authors}: {description}"
   Generic: "{context_col}: {primary_col}"
-Only use primary+context cols in template. Never noise cols."""
-_SCHEMA_SYSTEM += """
-If no rich text columns exist, choose 1-3 most descriptive non-noise columns as primary
-even if short, so each row can still become a meaningful sentence."""
+Only use primary+context cols in template. Never noise cols.
+If no rich text columns exist, choose 1-3 most descriptive non-noise columns as primary."""
 
 
 def _build_schema_prompt(df: pd.DataFrame, detailed: bool = False) -> str:
@@ -812,11 +747,11 @@ def _build_schema_prompt(df: pd.DataFrame, detailed: bool = False) -> str:
 
     rows = ["col|type|fill|uniq|avgW|sample_value"]
     for col in df.columns:
-        s      = df[col]
-        dtype  = str(s.dtype)[:6]
-        fill   = f"{int(s.notna().mean() * 100)}%"
-        first  = s.dropna().iloc[0] if s.notna().any() else None
-        avg_w  = "-"
+        s     = df[col]
+        dtype = str(s.dtype)[:6]
+        fill  = f"{int(s.notna().mean() * 100)}%"
+        first = s.dropna().iloc[0] if s.notna().any() else None
+        avg_w = "-"
         sample = ""
         if s.dtype in [object, "string"] and not isinstance(first, (list, dict)):
             avg_w = f"{_safe_avg_words(s):.0f}"
@@ -825,7 +760,7 @@ def _build_schema_prompt(df: pd.DataFrame, detailed: bool = False) -> str:
                       .replace(["nan","none","null",""], pd.NA)
                       .dropna().head(1).tolist())
                 if v:
-                    sample = v[0][:45].replace("|", " ").replace("\n", " ")
+                    sample = v[0][:45].replace("|"," ").replace("\n"," ")
             except Exception:
                 pass
         uniq = "-"
@@ -840,12 +775,9 @@ def _build_schema_prompt(df: pd.DataFrame, detailed: bool = False) -> str:
 
     text_cols = [
         c for c in df.columns
-        if df[c].dtype in [object, "string"]
+        if df[c].dtype in [object,"string"]
         and not _is_noise(c)
-        and not isinstance(
-            df[c].dropna().iloc[0] if df[c].notna().any() else None,
-            (list, dict)
-        )
+        and not isinstance(df[c].dropna().iloc[0] if df[c].notna().any() else None, (list, dict))
         and _safe_avg_words(df[c]) >= 3
     ][:5]
 
@@ -853,7 +785,7 @@ def _build_schema_prompt(df: pd.DataFrame, detailed: bool = False) -> str:
     remaining = MAX_CHARS - len(schema_block) - 50
     if text_cols and remaining > 200:
         cell_lim = max(25, min(60, remaining // max(len(text_cols), 1) // 3))
-        row_cap = 8 if detailed else 3
+        row_cap  = 8 if detailed else 3
         for ri in range(0, min(len(df), 80), max(1, len(df) // row_cap))[:row_cap]:
             row   = df.iloc[ri]
             cells = []
@@ -876,29 +808,27 @@ def _build_schema_prompt(df: pd.DataFrame, detailed: bool = False) -> str:
     if sample_lines:
         prompt += "\n\nSAMPLE DATA ROWS:\n" + "\n".join(sample_lines)
     prompt += "\n\nNow classify the columns."
-
     return prompt[:MAX_CHARS]
 
 
 def _call_schema_llm(df: pd.DataFrame, model_id: str, detailed: bool = False) -> dict | None:
-    user_prompt = _build_schema_prompt(df, detailed=detailed)
-    total_chars = len(_SCHEMA_SYSTEM) + len(user_prompt)
+    user_prompt  = _build_schema_prompt(df, detailed=detailed)
+    total_chars  = len(_SCHEMA_SYSTEM) + len(user_prompt)
     print(f"      [LM Studio] Prompt {total_chars} chars (~{total_chars//4} tokens)")
 
-    payload = {
-        "model":           model_id,
-        "messages": [
-            {"role": "system", "content": _SCHEMA_SYSTEM},
-            {"role": "user",   "content": user_prompt},
-        ],
-        "temperature":     0.05,
-        "max_tokens":      400 if detailed else 250,
-        "stream":          False,
-        "response_format": _SCHEMA_JSON_SCHEMA,
-    }
-
     try:
-        r = httpx.post(_LM_CHAT_URL, json=payload, timeout=150)
+        r = httpx.post(_LM_CHAT_URL, json={
+            "model":    model_id,
+            "messages": [
+                {"role": "system", "content": _SCHEMA_SYSTEM},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature":     0.05,
+            "max_tokens":      400 if detailed else 250,
+            "stream":          False,
+            "response_format": _SCHEMA_JSON_SCHEMA,
+        }, timeout=150)
+
         if r.status_code != 200:
             print(f"      [LM Studio] HTTP {r.status_code}: {r.text[:200]}")
             return None
@@ -935,11 +865,10 @@ def _validate_schema(result: dict, df: pd.DataFrame) -> dict:
     primary, context, noise = [], [], list(result.get("noise", []))
 
     for col in result.get("primary", []):
-        if col not in valid:
-            continue
+        if col not in valid: continue
         if _is_noise(col) or _is_ingestion_col(col) or _is_identifier_like(df[col]) or _is_bad_col_name(col):
             noise.append(col); continue
-        if df[col].dtype in ["int64", "float64", "int32", "float32"]:
+        if df[col].dtype in ["int64","float64","int32","float32"]:
             context.append(col); continue
         avg_w = _safe_avg_words(df[col])
         if avg_w < 8 and col.lower() not in _BODY_NAMES:
@@ -948,19 +877,17 @@ def _validate_schema(result: dict, df: pd.DataFrame) -> dict:
             primary.append(col)
 
     for col in result.get("context", []):
-        if col not in valid:
-            continue
+        if col not in valid: continue
         if _is_noise(col) or _is_ingestion_col(col) or _is_identifier_like(df[col]) or _is_bad_col_name(col):
             noise.append(col); continue
         context.append(col)
 
     classified = set(primary + context + noise)
     for col in df.columns:
-        if col in classified:
-            continue
+        if col in classified: continue
         if _is_noise(col) or _is_ingestion_col(col) or _is_identifier_like(df[col]) or _is_bad_col_name(col):
             noise.append(col)
-        elif df[col].dtype in ["int64", "float64", "int32", "float32"]:
+        elif df[col].dtype in ["int64","float64","int32","float32"]:
             context.append(col)
         else:
             avg_w = _safe_avg_words(df[col])
@@ -992,17 +919,16 @@ def _validate_schema(result: dict, df: pd.DataFrame) -> dict:
     if date_col:
         primary = [c for c in primary if c != date_col]
         context = [c for c in context if c != date_col]
-        noise.append(date_col) if date_col not in noise else None
+        if date_col not in noise:
+            noise.append(date_col)
 
     row_source_url_col = _find_row_source_url_col(df)
     if row_source_url_col:
         primary = [c for c in primary if c != row_source_url_col]
         context = [c for c in context if c != row_source_url_col]
-        noise.append(row_source_url_col) if row_source_url_col not in noise else None
+        if row_source_url_col not in noise:
+            noise.append(row_source_url_col)
 
-    # Structured/tabular datasets often have short text fields only.
-    # If LLM/stat rules leave us without primary columns, promote a few
-    # context columns so rows can still be converted into searchable text.
     if not primary:
         promoted = [c for c in context if c in set(_fallback_sentence_cols(df, date_col, limit=3))]
         if not promoted:
@@ -1011,43 +937,39 @@ def _validate_schema(result: dict, df: pd.DataFrame) -> dict:
             primary.extend(promoted)
             context = [c for c in context if c not in set(promoted)]
 
-    is_rich_text = any(_safe_avg_words(df[c]) >= 8 or c.lower() in _BODY_NAMES for c in primary)
-    min_words = MIN_ROW_WORDS if is_rich_text else 2
-    content_cols = _build_content_cols(df, primary, context, date_col, row_source_url_col)
+    is_rich_text  = any(_safe_avg_words(df[c]) >= 8 or c.lower() in _BODY_NAMES for c in primary)
+    min_words     = MIN_ROW_WORDS if is_rich_text else 2
+    content_cols  = _build_content_cols(df, primary, context, date_col, row_source_url_col)
 
     return {
         **result,
-        "primary":           list(dict.fromkeys(primary)),
-        "context":           list(dict.fromkeys(context)),
-        "noise":             list(dict.fromkeys(noise)),
-        "sentence_template": tmpl,
-        "date_col":          date_col,
-        "min_words":         min_words,
-        "tabular_mode":      not is_rich_text,
+        "primary":            list(dict.fromkeys(primary)),
+        "context":            list(dict.fromkeys(context)),
+        "noise":              list(dict.fromkeys(noise)),
+        "sentence_template":  tmpl,
+        "date_col":           date_col,
+        "min_words":          min_words,
+        "tabular_mode":       not is_rich_text,
         "row_source_url_col": row_source_url_col,
-        "content_cols":      content_cols,
+        "content_cols":       content_cols,
     }
 
 
 def _stat_fallback(df: pd.DataFrame) -> dict:
-    date_col = _find_date_col(df)
+    date_col           = _find_date_col(df)
     row_source_url_col = _find_row_source_url_col(df)
-    primary, context = [], []
+    primary, context   = [], []
 
     for col in df.columns:
-        if _is_noise(col) or _is_ingestion_col(col) or _is_bad_col_name(col):
-            continue
-        if _is_identifier_like(df[col]):
-            continue
+        if _is_noise(col) or _is_ingestion_col(col) or _is_bad_col_name(col): continue
+        if _is_identifier_like(df[col]): continue
         first = df[col].dropna().iloc[0] if df[col].notna().any() else None
-        if isinstance(first, (list, dict)):
-            continue
-        if col == date_col or col == row_source_url_col:
-            continue
+        if isinstance(first, (list, dict)): continue
+        if col == date_col or col == row_source_url_col: continue
         avg_w = _safe_avg_words(df[col])
         if avg_w >= 8 or col.lower() in _BODY_NAMES:
             primary.append(col)
-        elif avg_w >= 1 or df[col].dtype in ["int64", "float64", "int32", "float32"]:
+        elif avg_w >= 1 or df[col].dtype in ["int64","float64","int32","float32"]:
             context.append(col)
 
     ctx_clean = [c for c in context if c != date_col]
@@ -1056,30 +978,29 @@ def _stat_fallback(df: pd.DataFrame) -> dict:
         pfx  = f"{{{ctx_clean[0]}}}: " if ctx_clean else ""
         tmpl = pfx + ". ".join(f"{{{c}}}" for c in primary[:2])
 
-    # Ensure at least one primary column for structured tables.
     if not primary:
-        primary = _fallback_sentence_cols(df, date_col, limit=3)
+        primary   = _fallback_sentence_cols(df, date_col, limit=3)
         ctx_clean = [c for c in ctx_clean if c not in set(primary)]
 
     is_rich_text = any(_safe_avg_words(df[c]) >= 8 or c.lower() in _BODY_NAMES for c in primary)
-    min_words = MIN_ROW_WORDS if is_rich_text else 2
+    min_words    = MIN_ROW_WORDS if is_rich_text else 2
     content_cols = _build_content_cols(df, primary[:3], ctx_clean[:], date_col, row_source_url_col)
 
     return {
-        "primary":           primary[:3],
-        "context":           ctx_clean[:2],
-        "noise":             [],
-        "date_col":          date_col,
-        "is_social":         False,
-        "dataset_type":      "general",
-        "sentence_template": tmpl,
-        "confidence":        0.5,
-        "reasoning":         "stat fallback — LM Studio offline/failed",
-        "used_llm":          False,
-        "min_words":         min_words,
-        "tabular_mode":      not is_rich_text,
+        "primary":            primary[:3],
+        "context":            ctx_clean[:2],
+        "noise":              [],
+        "date_col":           date_col,
+        "is_social":          False,
+        "dataset_type":       "general",
+        "sentence_template":  tmpl,
+        "confidence":         0.5,
+        "reasoning":          "stat fallback — LM Studio offline/failed",
+        "used_llm":           False,
+        "min_words":          min_words,
+        "tabular_mode":       not is_rich_text,
         "row_source_url_col": row_source_url_col,
-        "content_cols":      content_cols,
+        "content_cols":       content_cols,
     }
 
 
@@ -1109,13 +1030,16 @@ def analyse_schema(df: pd.DataFrame) -> dict:
         print(f"      type={result['dataset_type']}  "
               f"confidence={result['confidence']:.0%}  "
               f"date_col={result['date_col'] or 'none'}")
-        print(f"      template: {result['sentence_template']}")
+        print(f"      template:  {result['sentence_template']}")
         print(f"      reasoning: {result['reasoning']}")
-        print(f"      primary: {result['primary']}")
-        print(f"      context: {result['context']}")
+        print(f"      primary:   {result['primary']}")
+        print(f"      context:   {result['context']}")
 
-        primary_noisey = all(_is_identifier_like(df[c]) for c in result.get("primary", []) if c in df.columns) if result.get("primary") else True
-        if result["confidence"] < 0.65 or primary_noisey:
+        primary_noisy = (
+            all(_is_identifier_like(df[c]) for c in result.get("primary", []) if c in df.columns)
+            if result.get("primary") else True
+        )
+        if result["confidence"] < 0.65 or primary_noisy:
             reason = "low confidence" if result["confidence"] < 0.65 else "weak primary columns"
             print(f"      {reason.title()} — retrying with detailed prompt...")
             r2 = _call_schema_llm(df, model_id, detailed=True)
@@ -1142,13 +1066,12 @@ _BAD     = {"nan","none","null","n/a","na","","[]","{}","unknown",
 def _looks_like_url(value: object) -> bool:
     if value is None:
         return False
-    s = str(value).strip()
-    return bool(re.match(r"^https?://", s, flags=re.IGNORECASE))
+    return bool(re.match(r"^https?://", str(value).strip(), flags=re.IGNORECASE))
 
 
 def _find_row_source_url_col(df: pd.DataFrame) -> str:
-    preferred = ("url", "link", "permalink", "href", "article_url", "source_url", "web_url", "feed_url", "rss")
-    secondary = ("source", "website", "domain", "feed")
+    preferred = ("url","link","permalink","href","article_url","source_url","web_url","feed_url","rss")
+    secondary = ("source","website","domain","feed")
     for names in (preferred, secondary):
         for col in df.columns:
             cl = str(col).lower().strip()
@@ -1180,28 +1103,22 @@ def _get(row: pd.Series, col: str, social: bool = False) -> str:
 
 def build_row_sentence(row: pd.Series, schema: dict) -> str:
     content_cols = schema.get("content_cols", [])
-    social   = schema.get("is_social", False)
-    min_words = int(schema.get("min_words", MIN_ROW_WORDS))
-
-    # Always render the full row as labeled key-value content so every column
-    # survives into the stored text, regardless of what schema selection picked.
-    kv_cols = content_cols or list(row.index)
-    kv = []
+    social       = schema.get("is_social", False)
+    min_words    = int(schema.get("min_words", MIN_ROW_WORDS))
+    kv_cols      = content_cols or list(row.index)
+    kv           = []
     for c in kv_cols:
         v = _get(row, c, social)
         if v:
             kv.append(f"{c}: {v}")
-
     result = " | ".join(kv).strip()
     return result if len(result.split()) >= min_words else ""
 
 
 def chunk_content(text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Sentence-aware chunking toward 250-word target with overlap."""
     base = _clean(text)
     if not base:
         return []
-
     words = base.split()
     if len(words) <= chunk_words:
         return [base]
@@ -1220,16 +1137,14 @@ def chunk_content(text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUN
                 chunk = " ".join(cur).strip()
                 if chunk:
                     chunks.append(chunk)
-                # overlap tail from previous chunk
-                tail = []
-                tail_words = 0
+                tail, tail_words = [], 0
                 for ps in reversed(cur):
                     pw = len(ps.split())
                     if tail_words + pw > overlap and tail:
                         break
                     tail.insert(0, ps)
                     tail_words += pw
-                cur = tail[:]
+                cur       = tail[:]
                 cur_words = sum(len(s.split()) for s in cur)
             cur.append(sent)
             cur_words += sw
@@ -1248,7 +1163,7 @@ def chunk_content(text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUN
 
 
 def _schema_acceptance_check(schema: dict, df: pd.DataFrame) -> tuple[bool, str]:
-    primary = [c for c in schema.get("primary", []) if c in df.columns]
+    primary      = [c for c in schema.get("primary", [])      if c in df.columns]
     content_cols = [c for c in schema.get("content_cols", []) if c in df.columns]
     if content_cols:
         return True, "ok"
@@ -1270,30 +1185,21 @@ def _record_failed_dataset(slug: str, reason: str, file: str = ""):
 def _load_failed_slugs() -> list[str]:
     if not os.path.exists(FAILED_DATASETS_FILE):
         return []
-    slugs = []
+    slugs, seen = [], set()
     with open(FAILED_DATASETS_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
+            if not line: continue
             try:
-                obj = json.loads(line)
-                slug = str(obj.get("slug", "")).strip()
-                if slug:
-                    slugs.append(slug)
+                slug = str(json.loads(line).get("slug", "")).strip()
+                if slug and slug not in seen:
+                    seen.add(slug); slugs.append(slug)
             except Exception:
                 continue
-    seen = set()
-    out = []
-    for s in slugs:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
+    return slugs
 
 
 def _load_retry_slugs_from_validation_report(report_path: str = "") -> list[str]:
-    """Load dataset slugs with warn/error status from schema validation report JSON."""
     try:
         p = Path(report_path).expanduser() if report_path else None
         if p is None or not p.exists():
@@ -1301,23 +1207,13 @@ def _load_retry_slugs_from_validation_report(report_path: str = "") -> list[str]
             if not candidates:
                 return []
             p = candidates[-1]
-
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-        datasets = data.get("datasets", [])
-        slugs = []
-        for d in datasets:
-            st = str(d.get("status", "")).lower()
+        seen, out = set(), []
+        for d in data.get("datasets", []):
             slug = str(d.get("dataset_slug", "")).strip()
-            if slug and st in {"warn", "error"}:
-                slugs.append(slug)
-        # unique preserving order
-        seen = set()
-        out = []
-        for s in slugs:
-            if s not in seen:
-                seen.add(s)
-                out.append(s)
+            if slug and str(d.get("status","")).lower() in {"warn","error"} and slug not in seen:
+                seen.add(slug); out.append(slug)
         return out
     except Exception:
         return []
@@ -1328,19 +1224,16 @@ def _load_retry_slugs_from_validation_report(report_path: str = "") -> list[str]
 # ══════════════════════════════════════════════════════════════
 
 _SOURCE_RULES = [
-    (["movie", "hollywood", "boxoffice", "imdb", "netflix",
-      "streaming", "cinema", "tv-show"],                         "web_scrape"),
-    (["news", "article", "headline", "bbc", "cnn", "reuters",
-      "guardian", "nyt", "times", "press", "journal"],           "news"),
-    (["book", "novel", "literature", "fiction", "goodreads"],    "book"),
-    (["youtube", "video", "channel", "transcript"],              "youtube"),
-    (["reddit", "subreddit", "tweet", "twitter", "x-com",
-      "instagram", "tiktok", "facebook", "linkedin", "social"],  "web_scrape"),
-    (["election", "vote", "ballot", "parliament", "congress"],   "news"),
-    (["wikipedia", "wiki"],                                       "wikipedia"),
+    (["movie","hollywood","boxoffice","imdb","netflix","streaming","cinema","tv-show"], "web_scrape"),
+    (["news","article","headline","bbc","cnn","reuters","guardian","nyt","times","press","journal"], "news"),
+    (["book","novel","literature","fiction","goodreads"], "book"),
+    (["youtube","video","channel","transcript"], "youtube"),
+    (["reddit","subreddit","tweet","twitter","x-com","instagram","tiktok","facebook","linkedin","social"], "web_scrape"),
+    (["election","vote","ballot","parliament","congress"], "news"),
+    (["wikipedia","wiki"], "wikipedia"),
 ]
 _src_cache: dict[str, str] = {}
-_ALLOWED_SOURCE_TYPES = {"web_scrape", "news", "wikipedia", "book", "youtube"}
+_ALLOWED_SOURCE_TYPES = {"web_scrape","news","wikipedia","book","youtube"}
 
 
 def detect_source_type(slug: str) -> str:
@@ -1351,12 +1244,11 @@ def detect_source_type(slug: str) -> str:
         if any(kw in name for kw in keywords):
             _src_cache[slug] = st
             return st
-    # Quick LLM call — now with JSON schema for structured output
     try:
         ok, mid = _lm_running()
         if ok:
             r = httpx.post(_LM_CHAT_URL, json={
-                "model": mid,
+                "model":    mid,
                 "messages": [
                     {"role": "system",
                      "content": "Classify this Kaggle dataset name into a source type. "
@@ -1372,13 +1264,11 @@ def detect_source_type(slug: str) -> str:
             if r.status_code == 200:
                 raw = r.json()["choices"][0]["message"]["content"].strip()
                 try:
-                    parsed = json.loads(raw)
-                    word = parsed.get("source_type", "").strip().lower()
-                except (json.JSONDecodeError, AttributeError):
+                    word = json.loads(raw).get("source_type","").strip().lower()
+                except Exception:
                     word = raw.strip().lower().split()[0].strip(".,;:")
                 if word in _ALLOWED_SOURCE_TYPES:
-                    # Guard against over-predicting "book" on non-book slugs.
-                    if word == "book" and not any(k in name for k in ("book", "novel", "author", "goodreads", "literature")):
+                    if word == "book" and not any(k in name for k in ("book","novel","author","goodreads","literature")):
                         word = "web_scrape"
                     _src_cache[slug] = word
                     return word
@@ -1388,19 +1278,11 @@ def detect_source_type(slug: str) -> str:
     return "web_scrape"
 
 
-def build_source_context(
-    source_id: str,
-    provider: str = "kaggle",
-    source_url: str = "",
-    source_title: str = "",
-) -> dict:
-    dataset_name = source_title or source_id.split("/")[-1]
-    provider_l = provider.lower().strip()
-    provider_label = {
-        "kaggle": "Kaggle",
-        "huggingface": "HuggingFace",
-        "url": "URL",
-    }.get(provider_l, provider.title())
+def build_source_context(source_id: str, provider: str = "kaggle",
+                         source_url: str = "", source_title: str = "") -> dict:
+    dataset_name   = source_title or source_id.split("/")[-1]
+    provider_l     = provider.lower().strip()
+    provider_label = {"kaggle":"Kaggle","huggingface":"HuggingFace","url":"URL"}.get(provider_l, provider.title())
 
     if not source_url:
         if provider_l == "kaggle":
@@ -1412,39 +1294,38 @@ def build_source_context(
 
     source_key = f"{provider_l}_id"
     return {
-        "provider": provider_l,
-        "source_id": source_id,
-        "source_key": source_key,
-        "source_title": dataset_name,
-        "source_url": source_url,
-        "source_from": f"{provider_label}: {dataset_name}",
-        "author_name": source_id.split("/")[0] if "/" in source_id else provider_label,
+        "provider":           provider_l,
+        "source_id":          source_id,
+        "source_key":         source_key,
+        "source_title":       dataset_name,
+        "source_url":         source_url,
+        "source_from":        f"{provider_label}: {dataset_name}",
+        "author_name":        source_id.split("/")[0] if "/" in source_id else provider_label,
         "author_description": f"{provider_label} dataset: {source_id}",
-        "source_type_name": dataset_name,
+        "source_type_name":   dataset_name,
     }
 
 
 # ══════════════════════════════════════════════════════════════
-# DOCUMENT BUILDER  — one per CSV row
+# DOCUMENT BUILDER
 # ══════════════════════════════════════════════════════════════
 
 def _make_doc(sentence: str, row: pd.Series, schema: dict,
               slug: str, fname: str, dataset_meta: dict,
               source_context: dict | None = None) -> dict:
     source_context = source_context or build_source_context(slug, provider="kaggle")
-    dataset_name    = source_context.get("source_title", slug.split("/")[-1])
-    source_from     = source_context.get("source_from", f"Kaggle: {dataset_name}")
-    category        = dataset_meta.get("category", "General")
-    topic           = dataset_meta.get("topic", dataset_name)
-    tags            = dataset_meta.get("tags", [])
-    objective       = dataset_meta.get("objective", "Learning")
+    dataset_name   = source_context.get("source_title", slug.split("/")[-1])
+    source_from    = source_context.get("source_from", f"Kaggle: {dataset_name}")
+    category       = dataset_meta.get("category", "General")
+    topic          = dataset_meta.get("topic", dataset_name)
+    tags           = dataset_meta.get("tags", [])
+    objective      = dataset_meta.get("objective", "Learning")
 
-    embedding_model = NOMIC_MODEL_ID if _use_nomic else GEMINI_MODEL
-
-    published_at = None
-    date_col     = schema.get("date_col", "")
-    row_source_url = ""
+    published_at       = None
+    date_col           = schema.get("date_col", "")
+    row_source_url     = ""
     row_source_url_col = schema.get("row_source_url_col", "")
+
     if date_col and date_col in row.index:
         raw = row[date_col]
         try:
@@ -1453,8 +1334,9 @@ def _make_doc(sentence: str, row: pd.Series, schema: dict,
             is_na = False
         if not is_na:
             v = str(raw).strip()
-            if v and v.lower() not in ("", "nan", "none", "null"):
+            if v and v.lower() not in ("","nan","none","null"):
                 published_at = v
+
     if row_source_url_col and row_source_url_col in row.index:
         raw_url = row[row_source_url_col]
         try:
@@ -1475,7 +1357,7 @@ def _make_doc(sentence: str, row: pd.Series, schema: dict,
         source_context.get("source_key", "kaggle_slug"): slug,
         "dataset_provider": source_context.get("provider", "kaggle"),
         "file":            fname,
-        "embedding_model": embedding_model,
+        "embedding_model": ST_MODEL_NAME,
         "author": {
             "has_credentials": True,
             "name":            source_context.get("author_name", "dataset"),
@@ -1501,21 +1383,19 @@ def _make_doc(sentence: str, row: pd.Series, schema: dict,
 def _make_media_manifest_docs(media_files: list[str], slug: str, dataset_meta: dict,
                               source_context: dict | None = None) -> list[dict]:
     docs = []
-    cap = _runtime_max_rows_per_ds if _runtime_max_rows_per_ds > 0 else len(media_files)
+    cap  = _runtime_max_rows_per_ds if _runtime_max_rows_per_ds > 0 else len(media_files)
     for fp in media_files[:cap]:
-        p = Path(fp)
-        ext = p.suffix.lower().lstrip(".")
-        size = os.path.getsize(fp)
-        size_mb = round(size / (1024 * 1024), 3)
+        p      = Path(fp)
+        ext    = p.suffix.lower().lstrip(".")
+        size_mb = round(os.path.getsize(fp) / (1024 * 1024), 3)
         content = f"Media asset file: {p.name}. Type: {ext}. SizeMB: {size_mb}."
-        row = pd.Series({})
-        schema = {"date_col": "", "is_social": False}
-        doc = _make_doc(content, row, schema, slug, p.name, dataset_meta, source_context=source_context)
+        doc = _make_doc(content, pd.Series({}), {"date_col":"","is_social":False},
+                        slug, p.name, dataset_meta, source_context=source_context)
         md = doc.get("metadata", {})
-        md["ingest_mode"] = "media_manifest"
-        md["media_ext"] = ext
+        md["ingest_mode"]  = "media_manifest"
+        md["media_ext"]    = ext
         md["media_size_mb"] = size_mb
-        doc["metadata"] = md
+        doc["metadata"]    = md
         docs.append(doc)
     return docs
 
@@ -1529,7 +1409,8 @@ def process_dataset(dataset_path: str, slug: str,
                     hint_tags: list[str] | None = None,
                     source_context: dict | None = None) -> list[dict]:
     source_context = source_context or build_source_context(slug, provider="kaggle")
-    files = find_data_files(dataset_path)
+    files          = find_data_files(dataset_path)
+
     if not files:
         print(f"    No structured data files found. Trying media manifest fallback...")
         media_files = find_media_files(dataset_path)
@@ -1538,9 +1419,9 @@ def process_dataset(dataset_path: str, slug: str,
             _record_failed_dataset(slug, "no supported files found")
             return []
         dataset_meta = {
-            "category": hint_category or "General",
-            "topic": hint_topic or slug.split("/")[-1].replace("-", " ").title(),
-            "tags": hint_tags or [slug.split("/")[-1]],
+            "category":  hint_category or "General",
+            "topic":     hint_topic or slug.split("/")[-1].replace("-"," ").title(),
+            "tags":      hint_tags or [slug.split("/")[-1]],
             "objective": hint_objective or "Learning",
         }
         docs = _make_media_manifest_docs(media_files, slug, dataset_meta, source_context=source_context)
@@ -1549,10 +1430,8 @@ def process_dataset(dataset_path: str, slug: str,
 
     print(f"    Files: {[Path(f).name for f in files]}")
 
-    all_docs     = []
-    seen_hashes  = set()
-    total_rows   = 0
-    dataset_meta = None
+    all_docs, seen_hashes = [], set()
+    total_rows, dataset_meta = 0, None
 
     for filepath in files:
         if _runtime_max_rows_per_ds > 0 and total_rows >= _runtime_max_rows_per_ds:
@@ -1568,18 +1447,17 @@ def process_dataset(dataset_path: str, slug: str,
             continue
 
         if _runtime_max_rows_per_ds > 0:
-            rows_left = _runtime_max_rows_per_ds - total_rows
-            df = df.head(rows_left)
+            df = df.head(_runtime_max_rows_per_ds - total_rows)
         print(f"      Shape: {df.shape[0]:,} rows × {df.shape[1]} cols")
 
         if dataset_meta is None:
             print(f"      Generating dataset metadata (LLM)...")
             dataset_meta = generate_dataset_metadata(df, slug, hint_objective=hint_objective)
-            if hint_category and dataset_meta.get("category") in ("", "General"):
+            if hint_category and dataset_meta.get("category") in ("","General"):
                 dataset_meta["category"] = hint_category
-            if hint_topic and dataset_meta.get("topic", "").lower() in ("", "general"):
+            if hint_topic and dataset_meta.get("topic","").lower() in ("","general"):
                 dataset_meta["topic"] = hint_topic
-            if hint_objective and dataset_meta.get("objective", "").strip() == "":
+            if hint_objective and dataset_meta.get("objective","").strip() == "":
                 dataset_meta["objective"] = hint_objective
             if hint_tags:
                 existing = set(dataset_meta.get("tags", []))
@@ -1590,7 +1468,8 @@ def process_dataset(dataset_path: str, slug: str,
         except Exception as e:
             print(f"      Schema analysis failed: {e} — using stats fallback")
             schema = _stat_fallback(df)
-        primary = schema.get("primary", [])
+
+        primary      = schema.get("primary", [])
         content_cols = schema.get("content_cols", [])
 
         if not primary and not content_cols:
@@ -1610,108 +1489,39 @@ def process_dataset(dataset_path: str, slug: str,
             try:
                 sentence = build_row_sentence(row, schema)
                 if not sentence:
-                    skipped_empty += 1
-                    continue
+                    skipped_empty += 1; continue
 
-                chunks = chunk_content(sentence, CHUNK_WORDS, CHUNK_OVERLAP)
-                if not chunks:
-                    skipped_empty += 1
-                    continue
-
-                for chunk in chunks:
+                for chunk in chunk_content(sentence, CHUNK_WORDS, CHUNK_OVERLAP):
                     h = hashlib.md5(chunk.encode()).hexdigest()
                     if h in seen_hashes:
-                        skipped_dup += 1
-                        continue
+                        skipped_dup += 1; continue
                     seen_hashes.add(h)
-
-                    all_docs.append(_make_doc(chunk, row, schema, slug, fname, dataset_meta, source_context=source_context))
+                    all_docs.append(_make_doc(chunk, row, schema, slug, fname,
+                                              dataset_meta, source_context=source_context))
                     added += 1
             except Exception:
                 skipped_empty += 1
 
         total_rows += len(df)
-        print(f"      → {added:,} rows  "
-              f"(skipped: {skipped_empty} empty, {skipped_dup} dup)")
+        print(f"      → {added:,} rows  (skipped: {skipped_empty} empty, {skipped_dup} dup)")
 
     print(f"\n    Total docs: {len(all_docs):,}")
     return all_docs
 
 
 # ══════════════════════════════════════════════════════════════
-# EMBEDDING  — Gemini primary, nomic fallback
+# EMBEDDING  — sentence-transformers (local, no API key needed)
 # ══════════════════════════════════════════════════════════════
 
-class DailyQuotaError(Exception):
-    pass
-
-
-def _parse_retry_delay(err: str) -> float:
-    m = re.search(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s", err)
-    if m: return float(m.group(1)) + 2
-    m = re.search(r"retry in ([\d.]+)s", err, re.IGNORECASE)
-    if m: return float(m.group(1)) + 2
-    return 65.0
-
-
-def _embed_gemini(contents: list[str], gemini_client) -> list:
-    for attempt in range(5):
-        try:
-            resp = gemini_client.models.embed_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=genai_types.EmbedContentConfig(
-                    task_type="RETRIEVAL_DOCUMENT",
-                    output_dimensionality=768,
-                ),
-            )
-            return [list(e.values) for e in resp.embeddings]
-        except Exception as e:
-            err = str(e)
-            if "PerDay" in err or "EmbedContentRequestsPerDayPerUser" in err:
-                raise DailyQuotaError(err)
-            if ("429" in err or "RESOURCE_EXHAUSTED" in err) and attempt < 4:
-                time.sleep(_parse_retry_delay(err))
-            elif attempt < 4:
-                time.sleep(5 * (attempt + 1))
-            else:
-                return []
-    return []
-
-
-def _embed_nomic(contents: list[str]) -> list:
-    prefixed = [NOMIC_PREFIX + c for c in contents]
-    all_emb  = []
-    for i in range(0, len(prefixed), NOMIC_BATCH_SIZE):
-        batch = prefixed[i:i + NOMIC_BATCH_SIZE]
-        try:
-            r = httpx.post(NOMIC_EMBED_ENDPOINT,
-                           json={"model": NOMIC_MODEL_ID, "input": batch},
-                           timeout=120)
-            if r.status_code != 200:
-                print(f"    [nomic] HTTP {r.status_code}")
-                return []
-            items = sorted(r.json()["data"], key=lambda x: x["index"])
-            all_emb.extend(item["embedding"] for item in items)
-        except Exception as e:
-            print(f"    [nomic] Failed: {e}")
-            return []
-    return all_emb
-
-
-def _verify_nomic() -> bool:
-    try:
-        r = httpx.post(NOMIC_EMBED_ENDPOINT,
-                       json={"model": NOMIC_MODEL_ID, "input": ["test"]},
-                       timeout=15)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def _is_timeout_error(err: Exception) -> bool:
-    s = str(err).lower()
-    return "statement timeout" in s or "canceling statement due to statement timeout" in s or "57014" in s
+def _embed_st(contents: list[str]) -> list[list[float]]:
+    """Embed a list of strings using the local sentence-transformer model."""
+    model = _get_st_model()
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(contents), ST_BATCH_SIZE):
+        batch = contents[i:i + ST_BATCH_SIZE]
+        vecs  = model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
+        all_embeddings.extend(v.tolist() for v in vecs)
+    return all_embeddings
 
 
 def _safe_trunc(s: str, lim: int = MAX_CONTENT_CHARS) -> str:
@@ -1720,24 +1530,32 @@ def _safe_trunc(s: str, lim: int = MAX_CONTENT_CHARS) -> str:
 
 
 def _validate_doc_contract(doc: dict) -> tuple[bool, str]:
-    required_top = ["content", "source_title", "source_type", "metadata"]
-    for k in required_top:
+    for k in ["content","source_title","source_type","metadata"]:
         if k not in doc:
             return False, f"missing field: {k}"
     if not isinstance(doc.get("metadata"), dict):
         return False, "metadata must be an object"
-    if str(doc.get("source_type", "")).lower() not in _ALLOWED_SOURCE_TYPES:
+    if str(doc.get("source_type","")).lower() not in _ALLOWED_SOURCE_TYPES:
         return False, "invalid source_type"
-    content = str(doc.get("content", "")).strip()
-    if not content:
+    if not str(doc.get("content","")).strip():
         return False, "empty content"
     md = doc["metadata"]
-    for k in ["category", "topic", "tags", "objective", "kaggle_slug", "file", "embedding_model"]:
+    for k in ["category","topic","tags","objective","file","embedding_model"]:
         if k not in md:
             return False, f"missing metadata field: {k}"
+    # kaggle_slug OR kaggle_id (or huggingface_id) must be present
+    if not any(k in md for k in ("kaggle_slug","kaggle_id","huggingface_id")):
+        return False, "missing metadata slug/id field"
     if not isinstance(md.get("tags"), list):
         return False, "metadata.tags must be an array"
     return True, "ok"
+
+
+def _write_failed_rows(rows: list[dict], reason: str):
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with open(FAILED_ROWS_FILE, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps({"ts": ts, "reason": reason, "row": r}, ensure_ascii=False) + "\n")
 
 
 def _sanitize_for_insert(rows: list[dict]) -> list[dict]:
@@ -1747,30 +1565,21 @@ def _sanitize_for_insert(rows: list[dict]) -> list[dict]:
         if not ok:
             _write_failed_rows([r], f"contract_validation_failed: {reason}")
             continue
-        content = _safe_trunc(str(r.get("content", "")))
+        content = _safe_trunc(str(r.get("content","")))
         if not content:
             continue
-        metadata = r.get("metadata", {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-        source_type = str(r.get("source_type", "web_scrape")).strip().lower()
+        metadata    = r.get("metadata", {})
+        source_type = str(r.get("source_type","web_scrape")).strip().lower()
         if source_type not in _ALLOWED_SOURCE_TYPES:
             source_type = "web_scrape"
-        clean_rows.append({
-            **r,
-            "content": content,
-            "metadata": metadata,
-            "source_type": source_type,
-        })
+        clean_rows.append({**r, "content": content,
+                            "metadata": metadata, "source_type": source_type})
     return clean_rows
 
 
-def _write_failed_rows(rows: list[dict], reason: str):
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-    with open(FAILED_ROWS_FILE, "a", encoding="utf-8") as f:
-        for r in rows:
-            payload = {"ts": ts, "reason": reason, "row": r}
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+def _is_timeout_error(err: Exception) -> bool:
+    s = str(err).lower()
+    return "statement timeout" in s or "canceling statement due to statement timeout" in s or "57014" in s
 
 
 def _insert_rows_resilient(rows: list[dict], supabase: Client, depth: int = 0) -> bool:
@@ -1781,12 +1590,13 @@ def _insert_rows_resilient(rows: list[dict], supabase: Client, depth: int = 0) -
         return True
     except Exception as e:
         if _is_timeout_error(e) and len(rows) > 1:
-            mid = max(1, len(rows) // 2)
+            mid   = max(1, len(rows) // 2)
             left, right = rows[:mid], rows[mid:]
-            print(f"    Insert timeout at {len(rows)} rows — retrying split {len(left)} + {len(right)}")
-            return _insert_rows_resilient(left, supabase, depth + 1) and _insert_rows_resilient(right, supabase, depth + 1)
+            print(f"    Insert timeout — splitting {len(rows)} → {len(left)} + {len(right)}")
+            return (_insert_rows_resilient(left, supabase, depth + 1)
+                    and _insert_rows_resilient(right, supabase, depth + 1))
         if len(rows) == 1:
-            print(f"    ✗ Single-row insert failed — moved to {FAILED_ROWS_FILE}")
+            print(f"    ✗ Single-row insert failed → {FAILED_ROWS_FILE}")
             _write_failed_rows(rows, str(e))
             return True
         print(f"    ✗ Insert failed ({len(rows)} rows): {e}")
@@ -1794,52 +1604,33 @@ def _insert_rows_resilient(rows: list[dict], supabase: Client, depth: int = 0) -
         return False
 
 
-def embed_and_insert(batch: list[dict], supabase: Client, gemini_client) -> bool:
-    global _use_nomic
-    batch = _sanitize_for_insert(batch)
+def embed_and_insert(batch: list[dict], supabase: Client) -> bool:
+    """Embed batch with sentence-transformers, then insert into Supabase."""
+    batch    = _sanitize_for_insert(batch)
     contents = [item["content"] for item in batch]
     if not contents:
         print(f"    ✗ Batch has no valid rows after sanitization")
         return False
 
-    if _use_nomic:
-        print(f"    [nomic] Embedding {len(batch)} rows...")
-        embeddings = _embed_nomic(contents)
-    else:
-        print(f"    [Gemini] Embedding {len(batch)} rows...")
-        try:
-            embeddings = _embed_gemini(contents, gemini_client)
-        except DailyQuotaError:
-            print(f"\n  {'!'*50}")
-            print(f"  Gemini daily quota hit — checking nomic fallback...")
-            if not _verify_nomic():
-                print(f"  ✗ nomic not loaded in LM Studio — aborting")
-                return False
-            print(f"  ✓ nomic available. AUTO-SWITCHING (permanent for this run)")
-            print(f"  {'!'*50}\n")
-            _use_nomic = True
-            embeddings = _embed_nomic(contents)
+    print(f"    [ST] Embedding {len(batch)} rows with {ST_MODEL_NAME}...")
+    embeddings = _embed_st(contents)
 
     if not embeddings:
         print(f"    ✗ Embedding returned empty — skipping batch")
         return False
 
-    if len(embeddings[0]) != 768:
-        print(f"    ✗ Wrong dimension: {len(embeddings[0])} (expected 768)")
+    dim = len(embeddings[0])
+    if dim != EMBEDDING_DIM:
+        print(f"    ✗ Wrong dimension: {dim} (expected {EMBEDDING_DIM})")
         return False
 
     rows = [{**item, "embedding": emb} for item, emb in zip(batch, embeddings)]
 
-    try:
-        print(f"    Inserting {len(rows)} rows...")
-        ok = _insert_rows_resilient(rows, supabase)
-        if not ok:
-            return False
+    print(f"    Inserting {len(rows)} rows...")
+    ok = _insert_rows_resilient(rows, supabase)
+    if ok:
         print(f"    ✓ Inserted.")
-        return True
-    except Exception as e:
-        print(f"    ✗ Insert failed: {e}")
-        return False
+    return ok
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1862,36 +1653,33 @@ def mark_done(slug: str):
 # FULL PIPELINE
 # ══════════════════════════════════════════════════════════════
 
-def run_full_pipeline(
-    gemini_client,
-    supabase: Client,
-    retry_failed_only: bool = False,
-    retry_report: str = "",
-):
+def run_full_pipeline(supabase: Client,
+                      retry_failed_only: bool = False,
+                      retry_report: str = ""):
     topics  = read_spreadsheet(SPREADSHEET_FILE)
     done    = load_progress()
-    batch   = []
+    batch: list[dict] = []
     total   = 0
     skipped = 0
 
-    failed_only = set(_load_failed_slugs()) if retry_failed_only else set()
-    if retry_failed_only and not failed_only:
-        fallback = _load_retry_slugs_from_validation_report(retry_report)
-        failed_only = set(fallback)
+    failed_only: set[str] = set()
     if retry_failed_only:
-        print(f"Retry mode: {len(failed_only)} failed dataset(s) from {FAILED_DATASETS_FILE}")
-        if retry_report:
-            print(f"Retry report: {retry_report}")
-        elif failed_only:
-            print(f"Retry source: failed_datasets.log or latest reports/schema_validation_*.json")
+        failed_only = set(_load_failed_slugs())
+        if not failed_only:
+            failed_only = set(_load_retry_slugs_from_validation_report(retry_report))
+        print(f"Retry mode: {len(failed_only)} failed dataset(s)")
+
     print(f"Topics: {len(topics)} | Done: {len(done)} | Remaining: {len(topics)-len(done)}\n")
 
+    # Pre-load model so first batch doesn't surprise the user mid-run
+    _get_st_model()
+
     for idx, row in enumerate(topics, 1):
-        category = row["category"]
-        topic    = row["topic"]
+        category  = row["category"]
+        topic     = row["topic"]
         objective = row.get("objective", "")
-        tags     = row["tags"]
-        db_link  = row["db_link"]
+        tags      = row["tags"]
+        db_link   = row["db_link"]
 
         print(f"\n{'='*60}")
         print(f"[{idx:02d}/{len(topics)}] {category} → '{topic}'")
@@ -1906,8 +1694,7 @@ def run_full_pipeline(
             skipped += 1; continue
 
         if retry_failed_only and slug not in failed_only:
-            print(f"  ↷ Not in failed list — skipping")
-            continue
+            print(f"  ↷ Not in failed list — skipping"); continue
 
         if slug in done and not retry_failed_only:
             print(f"  ✓ Already ingested"); continue
@@ -1917,10 +1704,8 @@ def run_full_pipeline(
             skipped += 1; continue
 
         docs = process_dataset(path, slug,
-                               hint_category=category,
-                               hint_topic=topic,
-                               hint_objective=objective,
-                               hint_tags=tags)
+                               hint_category=category, hint_topic=topic,
+                               hint_objective=objective, hint_tags=tags)
         if not docs:
             print(f"  ✗ No content extracted")
             mark_done(slug); skipped += 1; continue
@@ -1930,23 +1715,18 @@ def run_full_pipeline(
             batch.append(doc)
             ds_rows += 1
             if len(batch) >= BATCH_SIZE:
-                ok = embed_and_insert(batch, supabase, gemini_client)
+                ok = embed_and_insert(batch, supabase)
                 if not ok:
                     print("  ⚠ Batch failed — logged to failed_rows.ndjson, continuing")
-                    batch = []
-                    continue
                 total += len(batch)
                 batch  = []
-                if not _use_nomic:
-                    print(f"    Waiting 62s (Gemini per-minute rate limit)...")
-                    time.sleep(62)
 
         print(f"  → {ds_rows:,} rows queued")
         mark_done(slug)
 
     if batch:
         print(f"\nFlushing final {len(batch)} rows...")
-        ok = embed_and_insert(batch, supabase, gemini_client)
+        ok = embed_and_insert(batch, supabase)
         if ok:
             total += len(batch)
 
@@ -1959,27 +1739,24 @@ def run_full_pipeline(
 # TEST MODE
 # ══════════════════════════════════════════════════════════════
 
-def run_test_mode(args, gemini_client, supabase):
-    slug    = args.slug
-    dry_run = args.dry_run
-    limit   = args.limit
-
-    hint_topic    = args.topic    if args.topic    != "auto" else ""
-    hint_category = args.category if args.category != "auto" else ""
+def run_test_mode(args, supabase: Client):
+    slug           = args.slug
+    dry_run        = args.dry_run
+    limit          = args.limit
+    hint_topic     = args.topic     if args.topic     != "auto" else ""
+    hint_category  = args.category  if args.category  != "auto" else ""
     hint_objective = args.objective if args.objective != "auto" else ""
-    hint_tags     = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags != "auto" else []
+    hint_tags      = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags != "auto" else []
 
     W = 66
     print(f"\n{'═'*W}")
-    print(f"  StoryBit — Single Dataset Test  (v6)")
+    print(f"  StoryBit — Single Dataset Test  (v7 / sentence-transformers)")
     print(f"{'═'*W}")
-    print(f"  Slug:     {slug}")
-    print(f"  Dry run:  {dry_run}")
-    print(f"  Limit:    {limit if limit > 0 else 'all rows'}")
-    print(f"  Dataset rows cap: {_runtime_max_rows_per_ds if _runtime_max_rows_per_ds > 0 else 'no cap (full dataset)'}")
-    if hint_category or hint_topic or hint_objective or hint_tags:
-        print(f"  Hints:    category={hint_category!r}  topic={hint_topic!r}  objective={hint_objective!r}  tags={hint_tags}")
-    print(f"  Note:     category/topic/tags auto-generated by LLM from data")
+    print(f"  Slug:          {slug}")
+    print(f"  Embedder:      {ST_MODEL_NAME}  ({EMBEDDING_DIM}-dim, local)")
+    print(f"  Dry run:       {dry_run}")
+    print(f"  Limit:         {limit if limit > 0 else 'all rows'}")
+    print(f"  Dataset cap:   {_runtime_max_rows_per_ds if _runtime_max_rows_per_ds > 0 else 'no cap'}")
     print(f"{'═'*W}\n")
 
     print("── Step 1: Download ──────────────────────────────────")
@@ -1987,12 +1764,10 @@ def run_test_mode(args, gemini_client, supabase):
     if not path:
         sys.exit("✗ Download failed")
 
-    print("\n── Step 2: LLM metadata generation + schema analysis ─")
+    print("\n── Step 2: LLM metadata + schema analysis ────────────")
     docs = process_dataset(path, slug,
-                           hint_category=hint_category,
-                           hint_topic=hint_topic,
-                           hint_objective=hint_objective,
-                           hint_tags=hint_tags)
+                           hint_category=hint_category, hint_topic=hint_topic,
+                           hint_objective=hint_objective, hint_tags=hint_tags)
     if not docs:
         sys.exit("✗ No rows extracted — check schema analysis output above")
 
@@ -2000,27 +1775,22 @@ def run_test_mode(args, gemini_client, supabase):
         docs = docs[:limit]
         print(f"\n  (limited to {limit} rows for this test)")
 
-    print(f"\n── Step 3: Preview — exactly what Supabase will store ─")
+    print(f"\n── Step 3: Preview ───────────────────────────────────")
     for i, doc in enumerate(docs[:3]):
-        print(f"\n  ┌─ Row {i+1} {'─'*54}")
-        def pr(label, val):
-            print(f"  │  {label:<14} {str(val)[:80]}")
         m       = doc["metadata"]
         content = doc["content"]
         W2      = 74
-
-        print(f"  │  {'COLUMN':<16} {'VALUE'}")
-        print(f"  │  {'─'*16} {'─'*50}")
-        def pr2(label, val, trunc=70):
-            v = str(val)
+        print(f"\n  ┌─ Row {i+1} {'─'*54}")
+        def pr(label, val, trunc=70):
+            v      = str(val)
             suffix = "…" if len(v) > trunc else ""
             print(f"  │  {label:<16} {v[:trunc]}{suffix}")
-        pr2("content",      content, 80)
-        pr2("source_title", doc["source_title"])
-        pr2("source_url",   doc["source_url"], 72)
-        pr2("source_type",  doc["source_type"])
+        pr("content",      content, 80)
+        pr("source_title", doc["source_title"])
+        pr("source_url",   doc["source_url"], 72)
+        pr("source_type",  doc["source_type"])
         print(f"  │")
-        print(f"  │  {'METADATA (JSONB)':<16}")
+        print(f"  │  METADATA (JSONB)")
         print(f"  │  {'─'*16}")
         print(f"  │    category:       {m.get('category','')}")
         print(f"  │    topic:          {m.get('topic','')}")
@@ -2028,10 +1798,9 @@ def run_test_mode(args, gemini_client, supabase):
         print(f"  │    objective:      {m.get('objective','')}")
         print(f"  │    source_from:    {m.get('source_from','')}")
         print(f"  │    file:           {m.get('file','')}")
-        print(f"  │    kaggle_slug:    {m.get('kaggle_slug','')}")
         print(f"  │    embedding_model:{m.get('embedding_model','')}")
         pa = m.get("published_at")
-        print(f"  │    published_at:   {pa if pa else '(no date column in this dataset)'}")
+        print(f"  │    published_at:   {pa if pa else '(no date column)'}")
         a = m.get("author", {})
         print(f"  │    author.name:    {a.get('name','')}")
         print(f"  └{'─'*W2}")
@@ -2040,12 +1809,11 @@ def run_test_mode(args, gemini_client, supabase):
 
     if dry_run:
         print(f"\n── DRY RUN — nothing written to Supabase ─────────────")
-        print(f"\n  When you run for real, verify with:")
         _print_sql(slug)
         return
 
-    print(f"\n── Step 4: Embed + Insert → Supabase ─────────────────")
-    ok = embed_and_insert(docs, supabase, gemini_client)
+    print(f"\n── Step 4: Embed ({ST_MODEL_NAME}) + Insert → Supabase ──")
+    ok = embed_and_insert(docs, supabase)
     if not ok:
         sys.exit("✗ Insert failed")
 
@@ -2054,10 +1822,10 @@ def run_test_mode(args, gemini_client, supabase):
 
 
 def _print_sql(slug: str):
-    print("  Supabase SQL to verify (using metadata JSONB since generated cols):")
-    safe = slug.replace("'", "''")
+    safe = slug.replace("'","''")
     print(f"""
-  -- View inserted rows
+  Supabase SQL to verify:
+
   SELECT id, content, source_type,
          metadata->>'category'        AS category,
          metadata->>'topic'           AS topic,
@@ -2070,22 +1838,12 @@ def _print_sql(slug: str):
   WHERE metadata->>'kaggle_slug' = '{safe}'
   ORDER BY created_at DESC LIMIT 20;
 
-  -- Count by source_type
-  SELECT source_type, COUNT(*) FROM documents GROUP BY source_type;
+  SELECT COUNT(*) FROM documents;
 
-  -- Check embedding model distribution
-  SELECT metadata->>'embedding_model' AS model, COUNT(*)
-  FROM documents GROUP BY model;
-
-  -- Check published_at coverage
-  SELECT COUNT(*) FILTER (WHERE metadata->>'published_at' IS NOT NULL) AS with_date,
-         COUNT(*) AS total
-  FROM documents WHERE metadata->>'kaggle_slug' = '{safe}';
-
-  -- Delete test rows for this dataset
+  -- Delete test rows
   DELETE FROM documents WHERE metadata->>'kaggle_slug' = '{safe}';
 
-  -- Full wipe (fresh start)
+  -- Full wipe
   TRUNCATE TABLE documents RESTART IDENTITY;
 """)
 
@@ -2095,38 +1853,25 @@ def _print_sql(slug: str):
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="StoryBit Kaggle ingestion — full pipeline + test mode")
-    parser.add_argument("--test",     action="store_true",
-                        help="Test mode: run on one dataset (does not touch progress log)")
-    parser.add_argument("--slug",     default="umerhaddii/world-news-reddit-data-global-event-discussions",
-                        help="[test] Kaggle dataset slug  e.g.  owner/dataset-name")
-    parser.add_argument("--topic",    default="auto",
-                        help="[test] Topic hint (default: auto-generated by LLM)")
-    parser.add_argument("--category", default="auto",
-                        help="[test] Category hint (default: auto-generated by LLM)")
-    parser.add_argument("--objective", default="auto",
-                        help="[test] Objective hint (default: auto-generated by LLM)")
-    parser.add_argument("--tags",     default="auto",
-                        help="[test] Comma-separated tag hints (default: auto-generated by LLM)")
-    parser.add_argument("--dry-run",  action="store_true",
-                        help="[test] Preview rows, do NOT insert to Supabase")
-    parser.add_argument("--limit",    type=int, default=0,
-                        help="[test] Max rows to insert (0 = no limit)")
-    parser.add_argument("--max-rows-per-dataset", type=int, default=MAX_ROWS_PER_DS,
-                        help="[full/test] Max rows to read per dataset (0 = full dataset)")
-    parser.add_argument("--retry-failed-only", action="store_true",
-                        help="[full] Re-run only dataset slugs recorded in failed_datasets.log")
-    parser.add_argument("--retry-report", default="",
-                        help="[full] Optional schema validation report JSON to source warn/error slugs")
+    parser = argparse.ArgumentParser(description="StoryBit Kaggle ingestion v7 — sentence-transformers")
+    parser.add_argument("--test",      action="store_true")
+    parser.add_argument("--slug",      default="umerhaddii/world-news-reddit-data-global-event-discussions")
+    parser.add_argument("--topic",     default="auto")
+    parser.add_argument("--category",  default="auto")
+    parser.add_argument("--objective", default="auto")
+    parser.add_argument("--tags",      default="auto")
+    parser.add_argument("--dry-run",   action="store_true")
+    parser.add_argument("--limit",     type=int, default=0)
+    parser.add_argument("--max-rows-per-dataset", type=int, default=MAX_ROWS_PER_DS)
+    parser.add_argument("--retry-failed-only",    action="store_true")
+    parser.add_argument("--retry-report",         default="")
     args = parser.parse_args()
 
-    google_api_key = os.getenv("GOOGLE_API_KEY")
-    supabase_url   = os.getenv("SUPABASE_URL")
-    supabase_key   = os.getenv("SUPABASE_KEY")
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
 
-    if not google_api_key: sys.exit("✗  GOOGLE_API_KEY missing in .env")
-    if not supabase_url:   sys.exit("✗  SUPABASE_URL missing in .env")
-    if not supabase_key:   sys.exit("✗  SUPABASE_KEY missing in .env")
+    if not supabase_url: sys.exit("✗  SUPABASE_URL missing in .env")
+    if not supabase_key: sys.exit("✗  SUPABASE_KEY missing in .env")
 
     ku = os.getenv("KAGGLE_USERNAME", "")
     kk = os.getenv("KAGGLE_KEY", "")
@@ -2134,20 +1879,17 @@ if __name__ == "__main__":
         os.environ["KAGGLE_USERNAME"] = ku
         os.environ["KAGGLE_KEY"]      = kk
 
-    _gemini = genai.Client(api_key=google_api_key)
-    _supa   = create_client(supabase_url, supabase_key)
+    _supa                    = create_client(supabase_url, supabase_key)
     _runtime_max_rows_per_ds = max(0, args.max_rows_per_dataset)
 
     if args.test or args.dry_run:
-        run_test_mode(args, _gemini, _supa)
+        run_test_mode(args, _supa)
     else:
         print("=" * 60)
-        print("StoryBit Kaggle Ingestion v6  (LLM auto-metadata)")
+        print("StoryBit Kaggle Ingestion v7  (sentence-transformers)")
+        print(f"Embedder: {ST_MODEL_NAME}  ({EMBEDDING_DIM}-dim, fully local)")
         print(f"Spreadsheet: {SPREADSHEET_FILE}")
         print("=" * 60)
-        run_full_pipeline(
-            _gemini,
-            _supa,
-            retry_failed_only=args.retry_failed_only,
-            retry_report=args.retry_report,
-        )
+        run_full_pipeline(_supa,
+                          retry_failed_only=args.retry_failed_only,
+                          retry_report=args.retry_report)

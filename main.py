@@ -2677,7 +2677,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "estimated_word_count": generated_word_count,
             "source_urls": list(scraped_urls), 
             "analysis": analysis_results, 
-            # "structure" : filtered_structure,
+            "structure" : filtered_structure,
             "seo" : res
         }
 
