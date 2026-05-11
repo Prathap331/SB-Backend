@@ -2284,12 +2284,55 @@ async def get_channel_profile(userId: str):
 
 
 
-async def cut_credits(duration , userId):
-    try:
-        print("cuting")
+class UnlockRequest(BaseModel):
+    userId: str
+    duration: int
 
-    except Exception as e :
-        print(e)   
+@app.post("/unlock")
+async def cut_credits(request: UnlockRequest):
+    try:
+        res = supabase.table('profiles') \
+            .select('credits_remaining') \
+            .eq('id', request.userId) \
+            .single() \
+            .execute()
+
+        res2 = supabase.table('subscriptions') \
+            .select('credits') \
+            .eq('userId', request.userId) \
+            .single() \
+            .execute()
+
+        old_credits = res.data["credits_remaining"]
+        subscription_credits = res2.data["credits"]
+
+        if old_credits <= 0 or subscription_credits <= 0:
+            return {"message": "credits not sufficient"}
+
+        if old_credits < request.duration or subscription_credits < request.duration:
+            return {"message": "credits not sufficient"}
+
+        new_credits = old_credits - request.duration
+        new_subscription_credits = subscription_credits - request.duration
+
+        profile_update = supabase.table('profiles') \
+            .update({'credits_remaining': new_credits}) \
+            .eq('id', request.userId) \
+            .execute()
+
+        subscription_update = supabase.table('subscriptions') \
+            .update({'credits': new_subscription_credits}) \
+            .eq('userId', request.userId) \
+            .execute()
+
+        print("profile update:", profile_update.data)
+        print("subscription update:", subscription_update.data)
+
+        return {"message": "success"}
+
+    except Exception as e:
+        print("error:", e)
+        return {"message": "error"}
     
 
 
@@ -2298,8 +2341,7 @@ async def cut_credits(duration , userId):
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
     total_start_time = time.time()
 
-
-    await cut_credits(request.duration_minutes, request.userId)
+    # await cut_credits(request.duration_minutes, request.userId)
 
     print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
     print(f"Personalization - Duration: {request.duration_minutes} min, Tone: {request.emotional_tone}, Type: {request.creator_type}, Audience: {request.audience_description}, Accent: {request.accent}")
@@ -2665,49 +2707,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         return {"error": "An error occurred during the script generation pipeline."}
 
 
-
-# # ── /payments/create-order ───────────────
-# # ────────────────────
-# @app.post("/payments/create-order")
-# async def create_razorpay_order(
-#     request_data: CreateOrderRequest,
-#     current_user: User = Depends(get_current_user),
-# ):
-#     if not razorpay_client:
-#         raise HTTPException(status_code=503, detail="Payment service unavailable.")
-
-#     user_id = current_user.id
-#     amount = request_data.amount
-#     currency = request_data.currency
-
-#     if amount <= 0:
-#         raise HTTPException(status_code=400, detail="Invalid amount.")
-#     if request_data.target_tier not in ['basic', 'pro']:
-#         raise HTTPException(status_code=400, detail="Invalid target tier.")
-
-#     order_data = {
-#         "amount": amount,
-#         "currency": currency,
-#         "receipt": request_data.receipt or f"rec_{int(time.time())}",
-#         "notes": {
-#             "user_id": str(user_id),
-#             "target_tier": request_data.target_tier,
-#         },
-#     }
-#     try:
-#         order = razorpay_client.order.create(data=order_data)
-#         print(f"Created Razorpay order {order['id']} for user {user_id}")
-#         return {
-#             "order_id": order['id'],
-#             "key_id": RAZORPAY_KEY_ID,
-#             "amount": amount,
-#             "currency": currency,
-#         }
-#     except Exception as e:
-#         print(f"Error creating Razorpay order: {e}")
-#         raise HTTPException(status_code=500, detail="Could not create payment order.")
-
-
 @app.post("/payments/create-order")
 async def create_razorpay_order(
     request_data: CreateOrderRequest,
@@ -2781,7 +2780,6 @@ async def razorpay_webhook(
         print(f"Webhook verification error: {e}")
         raise HTTPException(status_code=500, detail="Webhook processing error.")
 
-    # Process event
     try:
         event_data = json.loads(body)
         event_type = event_data.get('event')
@@ -2805,7 +2803,7 @@ async def razorpay_webhook(
                 return {"status": "error", "message": "Missing required order notes."}
 
             plan_config = {
-                'basic': {'credits': 50,  'validity_days': 30},
+                'basic': {'credits': 100,  'validity_days': 30},
                 'pro':   {'credits': 200, 'validity_days': 30},
             }
             config = plan_config.get(target_tier.lower())
@@ -2923,102 +2921,6 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
-
-# ── /payments/webhook ────────────────────────────────────────
-# @app.post("/payments/webhook")
-# async def razorpay_webhook(
-#     request: Request,
-#     x_razorpay_signature: str | None = Header(None),
-# ):
-#     if not RAZORPAY_WEBHOOK_SECRET or not razorpay_client:
-#         print("Webhook received but service not configured.")
-#         return {"status": "Webhook ignored"}
-
-#     body = await request.body()
-
-#     try:
-#         razorpay_client.utility.verify_webhook_signature(
-#             body.decode('utf-8'),
-#             x_razorpay_signature,
-#             RAZORPAY_WEBHOOK_SECRET,
-#         )
-#         print("Webhook signature verified.")
-#     except razorpay.errors.SignatureVerificationError as e:
-#         print(f"Webhook signature failed: {e}")
-#         raise HTTPException(status_code=400, detail="Invalid webhook signature.")
-#     except Exception as e:
-#         print(f"Webhook verification error: {e}")
-#         raise HTTPException(status_code=500, detail="Webhook processing error.")
-
-#     # Process event
-#     try:
-#         event_data = json.loads(body)
-#         event_type = event_data.get('event')
-#         print(f"Received webhook event: {event_type}")
-
-#         if event_type == 'order.paid':
-#             order_entity = event_data['payload']['order']['entity']
-#             order_id   = order_entity.get('id', 'unknown')
-#             payment_id = event_data['payload']['payment']['entity'].get('id', 'unknown')
-#             notes = order_entity.get('notes', {})
-#             user_id = notes.get('user_id')
-#             target_tier = notes.get('target_tier')
-
-#             if not user_id or not target_tier:
-#                 print(f"ERROR: Missing notes in order {order_id}.")
-#                 return {"status": "error", "message": "Missing required order notes."}
-
-#             credits_to_add = 0
-#             if target_tier.lower() == 'basic':
-#                 credits_to_add = 50
-#             elif target_tier.lower() == 'pro':
-#                 credits_to_add = 200
-
-#             try:
-#                 profile_resp = (
-#                     supabase.table('profiles')
-#                     .select('credits_remaining')
-#                     .eq('id', user_id)
-#                     .single()
-#                     .execute()
-#                 )
-#                 current_credits = profile_resp.data.get('credits_remaining', 0) if profile_resp.data else 0
-#                 new_credits = current_credits + credits_to_add
-
-#                 update_result = (
-#                     supabase.table('profiles')
-#                     .update({'user_tier': target_tier, 'credits_remaining': new_credits})
-#                     .eq('id', user_id)
-#                     .execute()
-#                 )
-#                 if update_result.data:
-#                     print(f"Updated user {user_id} → tier '{target_tier}', credits {new_credits}.")
-#                 else:
-#                     print(f"WARN: Failed to update profile for {user_id} after payment {payment_id}.")
-#             except APIError as e:
-#                 print(f"ERROR: Supabase error for {user_id}: {e}")
-#             except Exception as e:
-#                 print(f"ERROR: Unexpected error for {user_id}: {e}")
-
-#         elif event_type == 'payment.captured':
-#             print("Ignoring 'payment.captured' (handled by 'order.paid').")
-
-#         elif event_type == 'payment.failed':
-#             payment_entity = event_data['payload']['payment']['entity']
-#             print(
-#                 f"Payment failed for order {payment_entity.get('order_id')}. "
-#                 f"Reason: {payment_entity.get('error_description')}"
-#             )
-#         else:
-#             print(f"Ignoring unhandled event: {event_type}")
-
-#         return {"status": "Webhook processed successfully"}
-
-#     except json.JSONDecodeError:
-#         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-#     except Exception as e:
-#         print(f"Webhook error: {e}")
-#         raise HTTPException(status_code=500, detail="Internal server error.")
 
 
 
