@@ -18,8 +18,8 @@ deepseek_client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
-async def get_intelligence(chunks,userId):
 
+async def get_intelligence(chunks, userId):
     try:
         prompt = f"""
         Analyze the following script fragments from a single creator. Your goal is to create a "Channel Profile" that allows another AI to perfectly mimic this creator's style.
@@ -64,20 +64,24 @@ async def get_intelligence(chunks,userId):
 
         existing = (
             supabase
-            .table("Channel Profile")
+            .table("Channel_Profile")
             .select("userId")
             .eq("userId", userId)
             .execute()
         )
 
         if not existing.data:
-            supabase.table("Channel Profile").insert({
+            supabase.table("Channel_Profile").insert({
                 "userId": userId,
                 "Summary": summary
             }).execute()
+            print("Channel profile created")
         else:
-            print("User already exists, skipping insert")
-            
+            supabase.table("Channel_Profile").update({  
+                "Summary": summary
+            }).eq("userId", userId).execute()
+            print("Channel profile updated")
+
     except Exception as e:
         print(e)
 

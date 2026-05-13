@@ -2909,52 +2909,38 @@ def content_radar():
     return {"message": res.data}
 
 
-async def run_intelligence_for_user(userId: str):
-    """Pull only this user's chunks and build their channel profile."""
-    try:
-        print(f"[Intelligence] Triggered for userId={userId}")
+async def run_intelligence_for_user(userId):
+    response = (
+        supabase
+        .table("channel_memory")
+        .select("text")
+        .eq("userId", userId)         
+        .execute()
+    )
+    data = response.data
 
-        response = supabase.table("channel_memory") \
-            .select("text") \
-            .eq("userId", userId) \
-            .execute()
+    if not data:
+        print(f"No chunks found for user {userId}")
+        return
 
-        data = response.data
+    combined_text = "\n\n".join(item["text"] for item in data)
 
-        if not data:
-            print(f"[Intelligence] No chunks found for userId={userId}")
-            return
-
-        combined_text = "\n\n".join(item["text"] for item in data)
-
-        await get_intelligence(combined_text, userId)
-
-    except Exception as e:
-        print(f"[Intelligence] ERROR for userId={userId}: {e}")
-
+    await get_intelligence(combined_text, userId)
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...),userId: str = Form(...)):
+async def upload(file: UploadFile = File(...), userId: str = Form(...)):
     file_bytes = await file.read()
 
-    chunks = process_pdf(file_bytes,userId)
+    chunks = process_pdf(file_bytes, userId)
 
     supabase.table('channel_memory').upsert(
         chunks,
         on_conflict="chunk_id"
     ).execute()
 
-    asyncio.create_task(run_intelligence_for_user(userId))
+    asyncio.create_task(run_intelligence_for_user(userId))  
 
-    return {
-        "message": "Uploaded and processed",
-    }   
+    return {"message": "Uploaded and processed"}
 
 
-
-
-# @app.on_event("startup")
-# async def startup_event():
-#     print("running")
-#     asyncio.create_task(get_chunks_from_db())

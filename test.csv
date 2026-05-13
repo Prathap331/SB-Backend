@@ -1,0 +1,4 @@
+text,url,language,language_score,token_count
+"The quick brown fox jumps over the lazy dog.",https://example.com/article1,en,0.98,9
+"Machine learning is transforming industries worldwide.",https://news.site/ml-article,en,0.95,7
+"Python is a versatile programming language used in data science.",https://blog.dev/python,en,0.99,11
