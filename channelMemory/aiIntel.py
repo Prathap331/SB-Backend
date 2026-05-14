@@ -64,20 +64,20 @@ async def get_intelligence(chunks, userId):
 
         existing = (
             supabase
-            .table("Channel_Profile")
+            .table("user_channel_memory_input")
             .select("userId")
             .eq("userId", userId)
             .execute()
         )
 
         if not existing.data:
-            supabase.table("Channel_Profile").insert({
+            supabase.table("user_channel_memory_input").insert({
                 "userId": userId,
                 "Summary": summary
             }).execute()
             print("Channel profile created")
         else:
-            supabase.table("Channel_Profile").update({  
+            supabase.table("user_channel_memory_input").update({  
                 "Summary": summary
             }).eq("userId", userId).execute()
             print("Channel profile updated")
@@ -86,7 +86,7 @@ async def get_intelligence(chunks, userId):
         print(e)
 
 async def get_chunks_from_db():
-    response = supabase.table("channel_memory").select("text, userId").execute()
+    response = supabase.table("user_channel_memory").select("text, userId").execute()
     data = response.data  
 
     all_chunks = [item["text"] for item in data]

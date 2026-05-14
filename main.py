@@ -252,150 +252,150 @@ deepseek_client = OpenAI(
 
 print("deepseek", os.environ.get("DEEPSEEK_API_KEY"))
 
-def _topic_cache_key(topic: str) -> str:
-    return " ".join((topic or "").strip().lower().split())
+# def _topic_cache_key(topic: str) -> str:
+#     return " ".join((topic or "").strip().lower().split())
 
 
-def _parse_utc_datetime(value: Any) -> datetime.datetime | None:
-    if not value:
-        return None
-    if isinstance(value, datetime.datetime):
-        candidate = value
-    else:
-        try:
-            candidate = dt.fromisoformat(str(value).replace("Z", "+00:00"))
-        except Exception:
-            return None
-    if candidate.tzinfo is None:
-        candidate = candidate.replace(tzinfo=datetime.timezone.utc)
-    return candidate.astimezone(datetime.timezone.utc)
+# def _parse_utc_datetime(value: Any) -> datetime.datetime | None:
+#     if not value:
+#         return None
+#     if isinstance(value, datetime.datetime):
+#         candidate = value
+#     else:
+#         try:
+#             candidate = dt.fromisoformat(str(value).replace("Z", "+00:00"))
+#         except Exception:
+#             return None
+#     if candidate.tzinfo is None:
+#         candidate = candidate.replace(tzinfo=datetime.timezone.utc)
+#     return candidate.astimezone(datetime.timezone.utc)
 
 
-def _cache_age_hours(created_at: Any) -> float | None:
-    candidate = _parse_utc_datetime(created_at)
-    if candidate is None:
-        return None
-    return max((datetime.datetime.now(datetime.timezone.utc) - candidate).total_seconds() / 3600.0, 0.0)
+# def _cache_age_hours(created_at: Any) -> float | None:
+#     candidate = _parse_utc_datetime(created_at)
+#     if candidate is None:
+#         return None
+#     return max((datetime.datetime.now(datetime.timezone.utc) - candidate).total_seconds() / 3600.0, 0.0)
 
 
-async def _lookup_topic_cache_db(topic: str) -> dict[str, Any] | None:
-    topic_key = _topic_cache_key(topic)
-    try:
-        response = await asyncio.to_thread(
-            lambda: supabase.table("topic_content_cache")
-            .select("topic_canonical,payload,created_at,updated_at,expires_at")
-            .eq("topic_key", topic_key)
-            .gt("expires_at", datetime.datetime.now(datetime.timezone.utc).isoformat())
-            .limit(1)
-            .execute()
-        )
-        rows = response.data or []
-        if not rows:
-            return None
-        row = rows[0] or {}
-        payload = dict(row.get("payload") or {})
-        if not _payload_has_ideas(payload):
-            return None
-        payload.pop("cags", None)
-        payload["served_from_cache"] = True
-        payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
-        payload["source_of_context"] = payload.get("source_of_context", "CACHE_DB")
-        return payload
-    except Exception as e:
-        print(f"[warn] idea cache DB lookup failed for '{topic}': {e}")
-        return None
+# async def _lookup_topic_cache_db(topic: str) -> dict[str, Any] | None:
+#     topic_key = _topic_cache_key(topic)
+#     try:
+#         response = await asyncio.to_thread(
+#             lambda: supabase.table("topic_content_cache")
+#             .select("topic_canonical,payload,created_at,updated_at,expires_at")
+#             .eq("topic_key", topic_key)
+#             .gt("expires_at", datetime.datetime.now(datetime.timezone.utc).isoformat())
+#             .limit(1)
+#             .execute()
+#         )
+#         rows = response.data or []
+#         if not rows:
+#             return None
+#         row = rows[0] or {}
+#         payload = dict(row.get("payload") or {})
+#         if not _payload_has_ideas(payload):
+#             return None
+#         payload.pop("cags", None)
+#         payload["served_from_cache"] = True
+#         payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
+#         payload["source_of_context"] = payload.get("source_of_context", "CACHE_DB")
+#         return payload
+#     except Exception as e:
+#         print(f"[warn] idea cache DB lookup failed for '{topic}': {e}")
+#         return None
 
 
-async def _lookup_topic_cache_db_semantic(topic: str, cache_client: Any | None = None) -> dict[str, Any] | None:
-    if cache_client is None:
-        return None
-    topic_vector = None
-    try:
-        topic_vector = TOPIC_CACHE._vector_from_client(topic, cache_client)
-    except Exception:
-        topic_vector = None
-    if topic_vector is None:
-        return None
-    try:
-        response = await asyncio.to_thread(
-            lambda: supabase.rpc(
-                "match_topic_content_cache",
-                {
-                    "query_embedding": topic_vector,
-                    "match_threshold": 0.92,
-                    "match_count": 1,
-                },
-            ).execute()
-        )
-        rows = response.data or []
-        if not rows:
-            return None
-        row = rows[0] or {}
-        payload = dict(row.get("payload") or {})
-        if not _payload_has_ideas(payload):
-            return None
-        payload.pop("cags", None)
-        payload["served_from_cache"] = True
-        payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
-        payload["cache_similarity"] = round(float(row.get("similarity") or 0.0), 3)
-        payload["source_of_context"] = payload.get("source_of_context", "CACHE_DB")
-        return payload
-    except Exception as e:
-        print(f"[warn] idea cache semantic DB lookup failed for '{topic}': {e}")
-        return None
+# async def _lookup_topic_cache_db_semantic(topic: str, cache_client: Any | None = None) -> dict[str, Any] | None:
+#     if cache_client is None:
+#         return None
+#     topic_vector = None
+#     try:
+#         topic_vector = TOPIC_CACHE._vector_from_client(topic, cache_client)
+#     except Exception:
+#         topic_vector = None
+#     if topic_vector is None:
+#         return None
+#     try:
+#         response = await asyncio.to_thread(
+#             lambda: supabase.rpc(
+#                 "match_topic_content_cache",
+#                 {
+#                     "query_embedding": topic_vector,
+#                     "match_threshold": 0.92,
+#                     "match_count": 1,
+#                 },
+#             ).execute()
+#         )
+#         rows = response.data or []
+#         if not rows:
+#             return None
+#         row = rows[0] or {}
+#         payload = dict(row.get("payload") or {})
+#         if not _payload_has_ideas(payload):
+#             return None
+#         payload.pop("cags", None)
+#         payload["served_from_cache"] = True
+#         payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
+#         payload["cache_similarity"] = round(float(row.get("similarity") or 0.0), 3)
+#         payload["source_of_context"] = payload.get("source_of_context", "CACHE_DB")
+#         return payload
+#     except Exception as e:
+#         print(f"[warn] idea cache semantic DB lookup failed for '{topic}': {e}")
+#         return None
 
 
-async def _store_topic_cache_db(topic: str, payload: dict[str, Any], cache_client: Any | None = None) -> None:
-    topic_key = _topic_cache_key(topic)
-    expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=IDEA_CACHE_TTL_HOURS)
-    row: dict[str, Any] = {
-        "topic_key": topic_key,
-        "topic_canonical": topic,
-        "payload": payload,
-        "expires_at": expires_at.isoformat(),
-        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-    try:
-        topic_vector = None
-        if cache_client is not None:
-            try:
-                topic_vector = TOPIC_CACHE._vector_from_client(topic, cache_client)
-            except Exception:
-                topic_vector = None
-        if topic_vector is not None:
-            row["topic_vec"] = topic_vector
-        await asyncio.to_thread(
-            lambda: supabase.table("topic_content_cache")
-            .upsert(row, on_conflict="topic_key")
-            .execute()
-        )
-    except Exception as e:
-        print(f"[warn] idea cache DB store failed for '{topic}': {e}")
+# async def _store_topic_cache_db(topic: str, payload: dict[str, Any], cache_client: Any | None = None) -> None:
+#     topic_key = _topic_cache_key(topic)
+#     expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=IDEA_CACHE_TTL_HOURS)
+#     row: dict[str, Any] = {
+#         "topic_key": topic_key,
+#         "topic_canonical": topic,
+#         "payload": payload,
+#         "expires_at": expires_at.isoformat(),
+#         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+#     }
+#     try:
+#         topic_vector = None
+#         if cache_client is not None:
+#             try:
+#                 topic_vector = TOPIC_CACHE._vector_from_client(topic, cache_client)
+#             except Exception:
+#                 topic_vector = None
+#         if topic_vector is not None:
+#             row["topic_vec"] = topic_vector
+#         await asyncio.to_thread(
+#             lambda: supabase.table("topic_content_cache")
+#             .upsert(row, on_conflict="topic_key")
+#             .execute()
+#         )
+#     except Exception as e:
+#         print(f"[warn] idea cache DB store failed for '{topic}': {e}")
 
 
-def _build_cache_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Keep idea cache stable: do not persist volatile trend metrics (TSS/CSI/CAGS)
-    because they are time-sensitive and should be computed fresh.
-    """
-    cached = dict(payload or {})
-    cached.pop("cags", None)
-    return cached
+# def _build_cache_payload(payload: dict[str, Any]) -> dict[str, Any]:
+#     """
+#     Keep idea cache stable: do not persist volatile trend metrics (TSS/CSI/CAGS)
+#     because they are time-sensitive and should be computed fresh.
+#     """
+#     cached = dict(payload or {})
+#     cached.pop("cags", None)
+#     return cached
 
 
-async def _lookup_topic_cache(topic: str, cache_client: Any | None = None) -> dict[str, Any] | None:
-    cached = TOPIC_CACHE.lookup(topic, cache_client)
-    if cached:
-        cached.pop("cags", None)
-        return cached
-    db_semantic = await _lookup_topic_cache_db_semantic(topic, cache_client)
-    if db_semantic:
-        TOPIC_CACHE.store(topic, db_semantic, cache_client)
-        return db_semantic
-    db_cached = await _lookup_topic_cache_db(topic)
-    if db_cached:
-        TOPIC_CACHE.store(topic, db_cached, cache_client)
-    return db_cached
+# async def _lookup_topic_cache(topic: str, cache_client: Any | None = None) -> dict[str, Any] | None:
+#     cached = TOPIC_CACHE.lookup(topic, cache_client)
+#     if cached:
+#         cached.pop("cags", None)
+#         return cached
+#     db_semantic = await _lookup_topic_cache_db_semantic(topic, cache_client)
+#     if db_semantic:
+#         TOPIC_CACHE.store(topic, db_semantic, cache_client)
+#         return db_semantic
+#     db_cached = await _lookup_topic_cache_db(topic)
+#     if db_cached:
+#         TOPIC_CACHE.store(topic, db_cached, cache_client)
+#     return db_cached
 
 
 
@@ -408,26 +408,26 @@ def _cap_blocks(blocks: list[str], max_blocks: int, max_chars: int) -> str:
     return merged
 
 
-def _extract_retry_delay_seconds(error_text: str) -> float | None:
-    if not error_text:
-        return None
-    match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", error_text, flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return float(match.group(1))
-    except Exception:
-        return None
+# def _extract_retry_delay_seconds(error_text: str) -> float | None:
+#     if not error_text:
+#         return None
+#     match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", error_text, flags=re.IGNORECASE)
+#     if not match:
+#         return None
+#     try:
+#         return float(match.group(1))
+#     except Exception:
+#         return None
 
 
-def _is_daily_quota_error(error_text: str) -> bool:
-    t = (error_text or "").lower()
-    return "resource_exhausted" in t and "perday" in t
+# def _is_daily_quota_error(error_text: str) -> bool:
+#     t = (error_text or "").lower()
+#     return "resource_exhausted" in t and "perday" in t
 
 
-def _is_embedding_quota_error(error_text: str) -> bool:
-    t = (error_text or "").lower()
-    return "resource_exhausted" in t or "quota" in t
+# def _is_embedding_quota_error(error_text: str) -> bool:
+#     t = (error_text or "").lower()
+#     return "resource_exhausted" in t or "quota" in t
 
 
 def _is_groq_rate_limit_error(error_text: str) -> bool:
@@ -435,27 +435,27 @@ def _is_groq_rate_limit_error(error_text: str) -> bool:
     return "rate limit" in t or "rate_limit_exceeded" in t or "too many requests" in t
 
 
-def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    if _payload_uses_fallback_variants(payload):
-        return False
-    ideas = payload.get("ideas")
-    if isinstance(ideas, list) and any(str(item).strip() for item in ideas):
-        return True
-    clusters = payload.get("idea_clusters")
-    if not isinstance(clusters, list) or not clusters:
-        return False
-    for cluster in clusters:
-        variants = (cluster or {}).get("idea_variants")
-        if not isinstance(variants, list):
-            continue
-        for variant in variants:
-            title = str((variant or {}).get("title") or "").strip()
-            desc = str((variant or {}).get("description") or "").strip()
-            if title and desc:
-                return True
-    return False
+# def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
+#     if not isinstance(payload, dict):
+#         return False
+#     if _payload_uses_fallback_variants(payload):
+#         return False
+#     ideas = payload.get("ideas")
+#     if isinstance(ideas, list) and any(str(item).strip() for item in ideas):
+#         return True
+#     clusters = payload.get("idea_clusters")
+#     if not isinstance(clusters, list) or not clusters:
+#         return False
+#     for cluster in clusters:
+#         variants = (cluster or {}).get("idea_variants")
+#         if not isinstance(variants, list):
+#             continue
+#         for variant in variants:
+#             title = str((variant or {}).get("title") or "").strip()
+#             desc = str((variant or {}).get("description") or "").strip()
+#             if title and desc:
+#                 return True
+#     return False
 
 
 def _payload_uses_fallback_variants(payload: dict[str, Any] | None) -> bool:
@@ -476,15 +476,6 @@ def _payload_uses_fallback_variants(payload: dict[str, Any] | None) -> bool:
 
 
 GEMINI_EMBED_BLOCKED_UNTIL_TS = 0.0
-
-
-# def _gemini_embeddings_blocked() -> bool:
-#     return time.time() < GEMINI_EMBED_BLOCKED_UNTIL_TS
-
-
-def _block_gemini_embeddings_for(seconds: float = 3600.0) -> None:
-    global GEMINI_EMBED_BLOCKED_UNTIL_TS
-    GEMINI_EMBED_BLOCKED_UNTIL_TS = max(GEMINI_EMBED_BLOCKED_UNTIL_TS, time.time() + seconds)
 
 
 
@@ -516,45 +507,38 @@ def _embed_with_failover(
         print(f"Local embedding failed: {e}")
         raise
 
+
+
+_st_model: SentenceTransformer | None = None
+
+def _get_st_model() -> SentenceTransformer:
+    global _st_model
+    if _st_model is None:
+        _st_model = SentenceTransformer("BAAI/bge-base-en-v1.5")  
+    return _st_model
+
+
 async def _embed_chunks_with_backoff(chunks: list[str]) -> list[list[float]] | None:
     if not chunks:
         return []
+
     batch_size = 20
     vectors: list[list[float]] = []
+    model = _get_st_model()
+
     for start in range(0, len(chunks), batch_size):
-        batch = chunks[start:start + batch_size]
-        attempt = 0
-        while attempt < 4:
-            attempt += 1
-            try:
-                embed_response = _embed_with_failover(
-                    contents=batch,
-                    task_type="RETRIEVAL_DOCUMENT",
-                    output_dimensionality=768,
-                )
-                vectors.extend([e.values for e in embed_response.embeddings])
-                break
-            except Exception as exc:
-                err = str(exc)
-                if _is_daily_quota_error(err):
-                    print("BACKGROUND TASK: Gemini daily embedding quota exhausted; skipping ingest.")
-                    _block_gemini_embeddings_for(3600.0)
-                    return None
-                if _is_embedding_quota_error(err):
-                    print("BACKGROUND TASK: Gemini embedding quota exhausted; skipping ingest.")
-                    _block_gemini_embeddings_for(3600.0)
-                    return None
-                delay = _extract_retry_delay_seconds(err)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    wait = delay if delay is not None else min(2 ** attempt + random.random(), 30)
-                    print(f"BACKGROUND TASK: Embedding throttled. Retrying in {wait:.1f}s...")
-                    await asyncio.sleep(wait)
-                    continue
-                print(f"BACKGROUND TASK: Embedding failed with non-retryable error: {exc}")
-                return None
-        else:
-            print("BACKGROUND TASK: Embedding retries exhausted for one batch.")
+        batch = chunks[start : start + batch_size]
+        try:
+            loop = asyncio.get_event_loop()
+            embeddings = await loop.run_in_executor(
+                None,
+                lambda b=batch: model.encode(b, normalize_embeddings=True).tolist(),
+            )
+            vectors.extend(embeddings)
+        except Exception as exc:
+            print(f"BACKGROUND TASK: Embedding failed: {exc}")
             return None
+
     return vectors
 
 
@@ -722,7 +706,6 @@ def add_scraped_data_to_db(
         domain = urlparse(article_url).netloc.lstrip('www.') if article_url else ""
         scraped_at = dt.now().isoformat()
 
-        # Author/publication credentials — derived from domain
         has_credentials = bool(domain)
         author_info = {
             "has_credentials": has_credentials,
@@ -737,9 +720,9 @@ def add_scraped_data_to_db(
                 "source_title": article_title,
                 "source_url":   article_url,
                 "source_type":  "web_scrape",
+                "topic":      topic,
+                "category":   category,
                 "metadata": {
-                    "category":   category,
-                    "topic":      topic,
                     "tags":       tags,
                     "domain":     domain,
                     "scraped_at": scraped_at,
@@ -748,8 +731,9 @@ def add_scraped_data_to_db(
             }
             for i, chunk in enumerate(chunks)
         ]
-        supabase.table('documents').insert(documents_to_insert).execute()
+        supabase.table('RAG_web_scraped').insert(documents_to_insert).execute()
         print(f"BACKGROUND TASK: Uploaded {len(documents_to_insert)} chunks.")
+        print("scraped data saved in db")
     except Exception as e:
         print(f"BACKGROUND TASK: Failed. Error: {e}")
 
@@ -2266,7 +2250,7 @@ async def get_channel_profile(userId: str):
     try:
         channel_profile = (
             supabase
-            .table("Channel_Profile")
+            .table("user_channel_memory_input")
             .select("Summary")
             .eq("userId", userId)
             .execute()
@@ -2283,46 +2267,55 @@ class UnlockRequest(BaseModel):
     userId: str
     duration: int
 
+
+
 @app.post("/unlock")
 async def cut_credits(request: UnlockRequest):
     try:
-        res = supabase.table('profiles') \
-            .select('credits_remaining') \
+        res = supabase.table('user_profiles') \
+            .select('credits_remaining, user_tier') \
             .eq('id', request.userId) \
-            .single() \
-            .execute()
-
-        res2 = supabase.table('subscriptions') \
-            .select('credits') \
-            .eq('userId', request.userId) \
             .single() \
             .execute()
 
         old_credits = res.data["credits_remaining"]
-        subscription_credits = res2.data["credits"]
+        user_tier = res.data["user_tier"]
 
-        if old_credits <= 0 or subscription_credits <= 0:
+        if old_credits <= 0:
             return {"message": "credits not sufficient"}
 
-        if old_credits < request.duration or subscription_credits < request.duration:
+        if old_credits < request.duration:
             return {"message": "credits not sufficient"}
 
         new_credits = old_credits - request.duration
-        new_subscription_credits = subscription_credits - request.duration
 
-        profile_update = supabase.table('profiles') \
+        supabase.table('user_profiles') \
             .update({'credits_remaining': new_credits}) \
             .eq('id', request.userId) \
             .execute()
 
-        subscription_update = supabase.table('subscriptions') \
-            .update({'credits': new_subscription_credits}) \
-            .eq('userId', request.userId) \
-            .execute()
+        if user_tier != "free":
+            res2 = supabase.table('subscriptions') \
+                .select('credits') \
+                .eq('userId', request.userId) \
+                .single() \
+                .execute()
 
-        print("profile update:", profile_update.data)
-        print("subscription update:", subscription_update.data)
+            subscription_credits = res2.data["credits"]
 
+            if subscription_credits <= 0 or subscription_credits < request.duration:
+                return {"message": "credits not sufficient"}
+
+            new_subscription_credits = subscription_credits - request.duration
+
+            supabase.table('subscriptions') \
+                .update({'credits': new_subscription_credits}) \
+                .eq('userId', request.userId) \
+                .execute()
+
+            print("subscription update done")
+
+        print("profile update done, tier:", user_tier)
         return {"message": "success"}
 
     except Exception as e:
@@ -2330,17 +2323,13 @@ async def cut_credits(request: UnlockRequest):
         return {"message": "error"}
     
 
-
 # ── /generate-script ─────────────────────────────────────────
 @app.post("/generate-script") 
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
     total_start_time = time.time()
 
-    # await cut_credits(request.duration_minutes, request.userId)
-
     print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
     print(f"Personalization - Duration: {request.duration_minutes} min")
-
 
     try:
         channel_profile = await get_channel_profile(request.userId) 
@@ -2350,7 +2339,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         print(content_category)
         a = content_category["category"]
         print(a)
-        res = supabase.table("documents_structure").select("*").eq("catergory name",a).execute()
+        res = supabase.table("script_structures").select("*").eq("catergory name", a).execute()
         structure = res.data[0]["Structure"]
 
         for item in structure:
@@ -2359,9 +2348,8 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
         filtered_structure = structure
 
-        # get the seo of the topic
-        selected_idea_id =  random.randint(1,1000)  
-        selected_angle_id = random.randint(1,1000)
+        selected_idea_id = random.randint(1, 1000)  
+        selected_angle_id = random.randint(1, 1000)
 
         json_generation_prompt = f"""
         You are an expert YouTube SEO strategist and content ideation assistant.
@@ -2398,6 +2386,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         INPUT:
         Topic: {request.topic}
         """
+
         response1 = deepseek_client.chat.completions.create(
             model="deepseek-v4-pro",
             messages=[
@@ -2413,9 +2402,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         data = json.loads(text) 
 
         request_obj = SEOAgentRequest.model_validate(data)
-
         res = await seo_agent(request_obj)
-
         print(res)
 
         db_task = asyncio.create_task(get_db_context(request.topic))
@@ -2435,7 +2422,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             new_articles = await get_latest_news_context(request.topic, scraped_urls)
         else:
             print("--- DB MISS or SLOW: Initiating DEEP web scrape. ---")
-            keyword_prompt =  f"""
+            keyword_prompt = f"""
             Your ONLY task is to generate 3 diverse search engine keyword phrases for the topic: '{request.topic}'.
             Follow these rules STRICTLY:
             1. Return ONLY the 3 phrases.
@@ -2462,8 +2449,10 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             text2 = response2.choices[0].message.content
             raw_text = text2
             keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
-            if keywords_in_quotes: base_keywords = keywords_in_quotes
-            else: base_keywords = [kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()]
+            if keywords_in_quotes:
+                base_keywords = keywords_in_quotes
+            else:
+                base_keywords = [kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()]
             targeted_keywords = [kw for kw in base_keywords] + [f"{kw} site:reddit.com" for kw in base_keywords]
             new_articles = await deep_search_and_scrape(targeted_keywords, scraped_urls)
 
@@ -2472,34 +2461,23 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             db_results = await db_task
             print(f"--- DB task finished. Found {len(db_results)} documents. ---")
 
-        # --- Step 2: Merge Context (Unchanged) ---
+        # ── Build contexts ──────────────────────────────────────────────────────
         db_context, web_context = "", ""
         if db_results:
             db_context = "\n\n".join([item['content'] for item in db_results])
         if new_articles:
             web_context = "\n\n".join([f"Source: {art['title']}\n{art['text']}" for art in new_articles])
-            for article in new_articles:
-                background_tasks.add_task(add_scraped_data_to_db, article['title'], article['text'], article['url'])
 
-        # if not db_context and not web_context:
-        #     return {"error": "Could not find any research material to write the script."}
-
-        # --- Step 3: Calculate Word Count & Create Personalized Prompt ---
+        # ── Generate script ─────────────────────────────────────────────────────
         print("SCRIPT GENERATION: Generating personalized script...")
-        
-        # --- NEW: Calculate target word count ---
+
         WORDS_PER_MINUTE = 130
-        target_duration = request.duration_minutes if request.duration_minutes else 10 # Use default if not provided
+        target_duration = request.duration_minutes if request.duration_minutes else 10
         target_word_count = target_duration * WORDS_PER_MINUTE
         print(f"Targeting {target_duration} minutes / approx. {target_word_count} words.")
-        # --------------------------------------
-        
-        # requested_structure = request.script_structure if request.script_structure else "problem_solution"
-        # structure_guidance_text = STRUCTURE_GUIDANCE.get(requested_structure, STRUCTURE_GUIDANCE["problem_solution"]) # Fallback to default
-        # print(f"Using script structure: {requested_structure}")
-        
+
         channel_profile = ""
-        
+
         script_prompt = f"""
         You are a professional YouTube scriptwriter who creates natural, engaging, and conversational scripts that feel like a real YouTuber speaking directly to the camera.
 
@@ -2509,7 +2487,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         
         Interpret this as the creator's permanent speaking identity. Every line of the script must reflect this style. Do NOT ignore or average it out.
 
-
         Generate a complete YouTube video script of approximately **{target_duration} minutes** (~{target_word_count} words) based on the **main topic** below, using the provided **research context**.
 
         **Script Style & Flow:**
@@ -2517,52 +2494,49 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         - **Do NOT include** section titles, notes, stage directions, or metadata.
         - Speak directly to the viewer — friendly, confident, slightly spontaneous, and off-the-cuff.
         - Use **short and medium-length sentences**, natural pauses (…) or dashes, and occasional repetition for emphasis.
-        - Include interjections, rhetorical questions, playful digressions, humor, and brief asides (“Wait, actually…”, “Can you believe that…?”, “By the way…”).
-        - Include personal anecdotes or opinions (“I remember…”, “When I tried this…”).
-        - Use **visual and emotional imagery** to make scenes vivid (“Imagine this…”, “Picture it like…”).
+        - Include interjections, rhetorical questions, playful digressions, humor, and brief asides ("Wait, actually…", "Can you believe that…?", "By the way…").
+        - Include personal anecdotes or opinions ("I remember…", "When I tried this…").
+        - Use **visual and emotional imagery** to make scenes vivid ("Imagine this…", "Picture it like…").
         - Hook viewers emotionally in the first 15–30 seconds.
         - Alternate between facts, insights, reactions, and short reflections to keep pacing dynamic.
-        - Treat the script as a conversation with the audience — inclusive language like “you guys”, “we all”, “my friends”.
+        - Treat the script as a conversation with the audience — inclusive language like "you guys", "we all", "my friends".
         - Build suspense naturally with rhetorical questions, mini cliffhangers, or curiosity hooks.
         - Use relatable analogies or humor when explaining complex topics.
-        - Occasionally reference the creator’s regional or cultural context for relatability.
+        - Occasionally reference the creator's regional or cultural context for relatability.
         - Maintain natural pacing as if recording live — mix excitement, storytelling, and factual explanation.
         - Stay close to **{target_word_count} words** (±50).
 
-        
-#         **Main Topic/Idea:** "{request.topic}"
+        **Main Topic/Idea:** "{request.topic}"
 
-#         **Research Context:**
-#         FOUNDATIONAL KNOWLEDGE (from database): {db_context}
-#         LATEST NEWS (from web): {web_context}
+        **Research Context:**
+        FOUNDATIONAL KNOWLEDGE (from database): {db_context}
+        LATEST NEWS (from web): {web_context}
 
-#         **Additional Notes:**
-#         - Make the opening a curiosity-driven hook that emotionally pulls the viewer in within 15–30 seconds.
-#         - Use storytelling techniques: tension, suspense, surprise, and moral dilemmas when relevant.
-#         - Make historical or technical details feel immersive and personal, not like a lecture.
-#         - Emphasize the narrative arc: build curiosity, climax, and reflection for the audience.
-#         - Ensure adaptability: script should feel natural regardless of topic, duration, or target audience.
-#         """
-        
-      
+        **Additional Notes:**
+        - Make the opening a curiosity-driven hook that emotionally pulls the viewer in within 15–30 seconds.
+        - Use storytelling techniques: tension, suspense, surprise, and moral dilemmas when relevant.
+        - Make historical or technical details feel immersive and personal, not like a lecture.
+        - Emphasize the narrative arc: build curiosity, climax, and reflection for the audience.
+        - Ensure adaptability: script should feel natural regardless of topic, duration, or target audience.
+        """
+
         response3 = deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
-                messages=[
-                    {"role": "system", "content": "You must return only valid JSON"},
-                    {"role": "user", "content": script_prompt},
-                ],
-                stream=False,
-                reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}}
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": "You must return only valid JSON"},
+                {"role": "user", "content": script_prompt},
+            ],
+            stream=False,
+            reasoning_effort="high",
+            extra_body={"thinking": {"type": "enabled"}}
         )
-
 
         text3 = response3.choices[0].message.content
 
         total_end_time = time.time()
         print(f"--- PROFILING: Script generation took {total_end_time - total_start_time:.2f} seconds ---")
 
-
+        # ── Analyze script ──────────────────────────────────────────────────────
         ANALYSIS_PROMPT_TEMPLATE = """
         You are an expert script analyzer.
 
@@ -2628,30 +2602,29 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         print("SCRIPT ANALYSIS: Analyzing generated script...")
         analysis_start_time = time.time()
         analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=text3)
-        
-        response4 = deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
-                messages=[
-                    {"role": "system", "content": "You must return only valid JSON"},
-                    {"role": "user", "content": analysis_prompt_filled},
-                ],
-                stream=False,
-                reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}}
-        )
 
+        response4 = deepseek_client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": "You must return only valid JSON"},
+                {"role": "user", "content": analysis_prompt_filled},
+            ],
+            stream=False,
+            reasoning_effort="high",
+            extra_body={"thinking": {"type": "enabled"}}
+        )
 
         text4 = response4.choices[0].message.content
 
         analysis_end_time = time.time()
         print(f"--- PROFILING: Script analysis took {analysis_end_time - analysis_start_time:.2f} seconds ---")
-        
+
         analysis_results = {
             "examples_count": 0,
             "research_facts_count": 0,
             "proverbs_count": 0,
             "emotional_depth": "Unknown",
-            "history" : 0
+            "history": 0
         }
         try:
             analysis_data = json.loads(text4)
@@ -2659,32 +2632,87 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             analysis_results["research_facts_count"] = analysis_data.get("research_facts_count", 0)
             analysis_results["proverbs_count"] = analysis_data.get("proverbs_count", 0)
             analysis_results["emotional_depth"] = analysis_data.get("emotional_depth", "Unknown")
+            analysis_results["history"] = analysis_data.get("history_facts", 0)
             print(f"Script Analysis Results: {analysis_results}")
         except json.JSONDecodeError:
             print("SCRIPT ANALYSIS: Failed to parse analysis JSON response from AI.")
         except Exception as e:
-             print(f"SCRIPT ANALYSIS: Error during analysis parsing: {e}")
+            print(f"SCRIPT ANALYSIS: Error during analysis parsing: {e}")
 
         total_end_time = time.time()
         print(f"--- PROFILING: Total /generate-script analysis request time was {total_end_time - total_start_time:.2f} seconds ---")
-        
-        
+
         generated_word_count = len(text3.split())
         print(f"Generated script word count: approx. {generated_word_count}")
 
+        # ── Extract category ────────────────────────────────────────────────────
+        category_prompt = f"""
+        You are a content categorization expert.
+
+        Given the topic and script below, return ONLY valid JSON with the main category and up to 2 subcategories.
+
+        OUTPUT FORMAT:
+        {{
+            "category": "<main category>",
+            "subcategories": ["<subcategory 1>", "<subcategory 2>"]
+        }}
+
+        RULES:
+        - Return ONLY valid JSON, no markdown, no explanation
+        - category: broad genre (e.g. "Technology", "Finance", "Health", "Education", "Entertainment")
+        - subcategories: more specific niches, max 2 (e.g. ["Artificial Intelligence", "Future of Work"])
+        - If only 1 subcategory fits, return a list with 1 item
+
+        TOPIC: {request.topic}
+        SCRIPT (first 500 words): {" ".join(text3.split()[:500])}
+        """
+
+        category_response = deepseek_client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": "You must return only valid JSON"},
+                {"role": "user", "content": category_prompt},
+            ],
+            stream=False
+        )
+
+        script_categories = {"category": "Unknown", "subcategories": []}
+        try:
+            raw_cat = category_response.choices[0].message.content
+            script_categories = json.loads(raw_cat)
+            script_categories["subcategories"] = script_categories.get("subcategories", [])[:2]
+            print(f"Script categories: {script_categories}")
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"Category parsing failed: {e}")
+
+        if new_articles:
+            for article in new_articles:
+                background_tasks.add_task(
+                    add_scraped_data_to_db,
+                    article['title'],
+                    article['text'],
+                    article['url'],
+                    script_categories.get("category", ""),
+                    request.topic,
+                    script_categories.get("subcategories", []),
+                )
+            print(f"BACKGROUND TASKS: Scheduled {len(new_articles)} articles for DB upload.")
+
+        # ── Return ──────────────────────────────────────────────────────────────
         return {
-            "script":text3 ,
+            "script": text3,
             "estimated_word_count": generated_word_count,
-            "source_urls": list(scraped_urls), 
-            "analysis": analysis_results, 
-            "structure" : filtered_structure,
-            "seo" : res
+            "source_urls": list(scraped_urls),
+            "analysis": analysis_results,
+            "structure": filtered_structure,
+            "seo": res,
+            "category": script_categories["category"],
+            "subcategories": script_categories["subcategories"],
         }
 
     except Exception as e:
         print(f"SCRIPT GENERATION: An error occurred: {e}")
         return {"error": "An error occurred during the script generation pipeline."}
-
 
 @app.post("/payments/create-order")
 async def create_razorpay_order(
@@ -2726,7 +2754,6 @@ async def create_razorpay_order(
         raise HTTPException(status_code=500, detail="Could not create payment order.")
 
 
-print(RAZORPAY_WEBHOOK_SECRET)
 @app.post("/payments/webhook")
 async def razorpay_webhook(
     request: Request,
@@ -2798,7 +2825,7 @@ async def razorpay_webhook(
 
             try:
                 profile_resp = (
-                    supabase.table('profiles')
+                    supabase.table('user_profiles')
                     .select('credits_remaining')
                     .eq('id', user_id)
                     .single()
@@ -2811,7 +2838,7 @@ async def razorpay_webhook(
                 new_credits = current_credits + credits_to_add
 
                 update_result = (
-                    supabase.table('profiles')
+                    supabase.table('user_profiles')
                     .update({'user_tier': target_tier, 'credits_remaining': new_credits})
                     .eq('id', user_id)
                     .execute()
@@ -2912,7 +2939,7 @@ def content_radar():
 async def run_intelligence_for_user(userId):
     response = (
         supabase
-        .table("channel_memory")
+        .table("user_channel_memory")
         .select("text")
         .eq("userId", userId)         
         .execute()
@@ -2934,7 +2961,7 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
 
     chunks = process_pdf(file_bytes, userId)
 
-    supabase.table('channel_memory').upsert(
+    supabase.table('user_channel_memory').upsert(
         chunks,
         on_conflict="chunk_id"
     ).execute()
