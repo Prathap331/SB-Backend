@@ -2882,7 +2882,7 @@ def generate_invoice_pdf(
     customer_phone,
     item_name,
     amount,
-    plan,
+    due_date=None,          
     output_dir="invoices",
 ):
     styles = getSampleStyleSheet()
@@ -2981,7 +2981,13 @@ def generate_invoice_pdf(
     elements.append(Spacer(1, 6*mm))
 
     # ── INVOICE META ──
-    due_date = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime('%d %b %Y')
+    if due_date is None:
+        due_date = datetime.datetime.now() + datetime.timedelta(days=7)
+    if isinstance(due_date, str):
+        due_date_str = due_date[:10]  
+        due_date_str = datetime.datetime.fromisoformat(due_date[:19]).strftime('%d %b %Y')
+    else:
+        due_date_str = due_date.strftime('%d %b %Y')
     meta_table = Table([
         [
             Paragraph("INVOICE NO.", section_header_style),
@@ -2991,7 +2997,7 @@ def generate_invoice_pdf(
         [
             Paragraph(f"<b>{invoice_no}</b>", body_bold_style),
             Paragraph(f"<b>{datetime.datetime.now().strftime('%d %b %Y')}</b>", body_bold_style),
-            Paragraph(f"<b>{due_date}</b>", body_bold_style),
+            Paragraph(f"<b>{due_date_str}</b>", body_bold_style),
         ],
     ], colWidths=[W * 0.34, W * 0.33, W * 0.33])
     meta_table.setStyle(TableStyle([
@@ -3255,13 +3261,14 @@ async def razorpay_webhook(
 
 
                         invoice_path = generate_invoice_pdf(
-                            invoice_no=f"INV-{generate_invoice_number()}",
+                            invoice_no=generate_invoice_number(),
                             customer_name=customer_name,
                             customer_address=customer_address,
                             customer_phone=customer_phone,
                             item_name=f"StoryBit {target_tier.title()} Plan",
                             amount=amount_paid,
                             plan=target_tier,
+                            due_date=validity_date
                         )
 
                         storage_path = f"{user_id}/INV-{order_id}.pdf"
