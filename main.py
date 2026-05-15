@@ -2858,17 +2858,12 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
 
 # Generate Invoice Function
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Table,
-    TableStyle,
-    Paragraph,
-    Spacer,
-)
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
-
+from reportlab.lib.units import mm
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 import datetime
 import os
 
@@ -2885,154 +2880,110 @@ def generate_invoice_pdf(
 ):
     styles = getSampleStyleSheet()
 
-    os.makedirs(output_dir, exist_ok=True)
+    brand_style = ParagraphStyle('Brand', parent=styles['Normal'], fontSize=26, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_LEFT)
+    tagline_style = ParagraphStyle('Tagline', parent=styles['Normal'], fontSize=9, fontName='Helvetica', textColor=colors.HexColor('#666666'))
+    invoice_label_style = ParagraphStyle('InvoiceLabel', parent=styles['Normal'], fontSize=13, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_RIGHT)
+    section_header_style = ParagraphStyle('SectionHeader', parent=styles['Normal'], fontSize=8, fontName='Helvetica-Bold', textColor=colors.HexColor('#888888'), spaceAfter=3)
+    body_style = ParagraphStyle('Body', parent=styles['Normal'], fontSize=10, fontName='Helvetica', textColor=colors.HexColor('#1a1a2e'), leading=16)
+    footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=8, fontName='Helvetica', textColor=colors.HexColor('#888888'), alignment=TA_CENTER, leading=13)
+    footer_bold_style = ParagraphStyle('FooterBold', parent=styles['Normal'], fontSize=8, fontName='Helvetica-Bold', textColor=colors.HexColor('#555555'), alignment=TA_CENTER, leading=13)
 
+    os.makedirs(output_dir, exist_ok=True)
     file_path = os.path.join(output_dir, f"{invoice_no}.pdf")
 
-    doc = SimpleDocTemplate(
-        file_path,
-        pagesize=A4,
-        rightMargin=20,
-        leftMargin=20,
-        topMargin=20,
-        bottomMargin=20,
-    )
-
+    doc = SimpleDocTemplate(file_path, pagesize=A4, rightMargin=25*mm, leftMargin=25*mm, topMargin=20*mm, bottomMargin=20*mm)
+    W = A4[0] - 50*mm
     elements = []
 
-    # -----------------------------
     # Header
-    # -----------------------------
-    title = Paragraph(
-        "<b><font size=18>StoryBit</font></b>",
-        styles["Title"],
-    )
+    header_table = Table([[Paragraph("<b>StoryBit</b>", brand_style), Paragraph("TAX INVOICE", invoice_label_style)]], colWidths=[W * 0.6, W * 0.4])
+    header_table.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
+    elements.append(header_table)
+    elements.append(Paragraph("support@storybit.tech", tagline_style))
+    elements.append(Spacer(1, 4*mm))
+    elements.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor('#1a1a2e')))
+    elements.append(Spacer(1, 5*mm))
 
-    company_info = Paragraph(
-        """
-        TAX INVOICE<br/>
-        Contact: support@storybit.gmail.com
-        """,
-        styles["BodyText"],
-    )
-
-    elements.append(title)
-    elements.append(company_info)
-    elements.append(Spacer(1, 15))
-
-    # Invoice Details
-    invoice_data = [
-        ["Invoice #:", invoice_no],
-        ["Invoice Date:", datetime.datetime.now().strftime("%d %b %Y")],
-    ]
-
-    invoice_table = Table(invoice_data, colWidths=[120, 300])
-
-    invoice_table.setStyle(
-        TableStyle(
-            [
-                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 10),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ]
-        )
-    )
-
-    elements.append(invoice_table)
-    elements.append(Spacer(1, 20))
+    # Invoice meta
+    meta_table = Table([
+        [Paragraph("INVOICE NO.", section_header_style), Paragraph("INVOICE DATE", section_header_style)],
+        [Paragraph(f"<b>{invoice_no}</b>", body_style), Paragraph(f"<b>{datetime.datetime.now().strftime('%d %b %Y')}</b>", body_style)],
+    ], colWidths=[W * 0.5, W * 0.5])
+    meta_table.setStyle(TableStyle([('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0), ('BOTTOMPADDING', (0, 0), (-1, -1), 2), ('TOPPADDING', (0, 0), (-1, -1), 2)]))
+    elements.append(meta_table)
+    elements.append(Spacer(1, 6*mm))
 
     # Bill To
-    bill_to = Paragraph(
-        f"""
-        <b>Bill To:</b><br/>
-        {customer_name}<br/>
-        {customer_address}<br/>
-        Phone: {customer_phone}
-        """,
-        styles["BodyText"],
-    )
+    elements.append(Paragraph("BILL TO", section_header_style))
+    elements.append(Paragraph(f"<b>{customer_name}</b>", body_style))
+    elements.append(Paragraph(customer_address, body_style))
+    elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
+    elements.append(Spacer(1, 7*mm))
 
-    elements.append(bill_to)
-    elements.append(Spacer(1, 20))
-
-    # -----------------------------
-    # Item Table
-    # -----------------------------
+    # Items table
     subtotal = amount
-    gst = round(amount * 0.05, 2)
+    gst = round(amount * 0.18, 2)
     grand_total = round(subtotal + gst, 2)
 
-    item_table_data = [
-        ["Item", "Rate", "Qty", "Total"],
-        [item_name, f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],
-    ]
-
     item_table = Table(
-        item_table_data,
-        colWidths=[220, 80, 60, 100],
+        [['ITEM', 'RATE', 'QTY', 'TOTAL'], [item_name, f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"]],
+        colWidths=[W * 0.45, W * 0.18, W * 0.12, W * 0.25],
     )
-
-    item_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.black),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 10),
-                ("GRID", (0, 0), (-1, -1), 1, colors.grey),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 10),
-            ]
-        )
-    )
-
+    item_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 9),
+        ('TOPPADDING', (0, 0), (-1, 0), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('TOPPADDING', (0, 1), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 10),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8f8fb')),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dddddd')),
+        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+        ('ALIGN', (2, 0), (2, -1), 'CENTER'),
+    ]))
     elements.append(item_table)
-    elements.append(Spacer(1, 20))
+    elements.append(Spacer(1, 4*mm))
 
-    # -----------------------------
     # Totals
-    # -----------------------------
-    totals_data = [
-        ["Subtotal:", f"Rs. {subtotal:.2f}"],
-        ["CGST/SGST (5%):", f"Rs. {gst:.2f}"],
-        ["Grand Total:", f"Rs. {grand_total:.2f}"],
-    ]
-
-    totals_table = Table(
-        totals_data,
-        colWidths=[320, 140],
-    )
-
-    totals_table.setStyle(
-        TableStyle(
-            [
-                ("FONTNAME", (0, 0), (-1, -2), "Helvetica"),
-                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 11),
-                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ]
-        )
-    )
-
+    totals_table = Table([
+        ['', 'Subtotal', f"Rs. {subtotal:.2f}"],
+        ['', 'CGST/SGST (18%)', f"Rs. {gst:.2f}"],
+        ['', 'Grand Total', f"Rs. {grand_total:.2f}"],
+    ], colWidths=[W * 0.5, W * 0.28, W * 0.22])
+    totals_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -2), 'Helvetica'),
+        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('LINEABOVE', (1, -1), (2, -1), 1, colors.HexColor('#1a1a2e')),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('TEXTCOLOR', (0, -1), (-1, -1), colors.HexColor('#1a1a2e')),
+    ]))
     elements.append(totals_table)
-    elements.append(Spacer(1, 30))
+    elements.append(Spacer(1, 10*mm))
 
     # Footer
-    footer = Paragraph(
-        """
-        Thank you for using StoryBit!<br/>
-        This is a computer generated invoice.
-        """,
-        styles["BodyText"],
-    )
-
-    elements.append(footer)
+    elements.append(HRFlowable(width="100%", thickness=0.8, color=colors.HexColor('#cccccc')))
+    elements.append(Spacer(1, 4*mm))
+    elements.append(Paragraph("Morpho Technologies Pvt. Ltd.", footer_bold_style))
+    elements.append(Paragraph("Flat no: 502, Plot no. MIG 891, KPHB Phase 3, Kukatpally, Hyderabad, Telangana, India — 500072", footer_style))
+    elements.append(Spacer(1, 2*mm))
+    elements.append(Paragraph("GSTIN: &lt;36AAQCM4860P1ZK&gt;", footer_style))
+    elements.append(Spacer(1, 2*mm))
+    elements.append(Paragraph("This is a computer generated invoice.", footer_style))
 
     doc.build(elements)
-
     return file_path
-
 
 
 @app.post("/payments/create-order")
