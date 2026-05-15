@@ -2920,9 +2920,7 @@ def generate_invoice_pdf(
     elements.append(company_info)
     elements.append(Spacer(1, 15))
 
-    # -----------------------------
     # Invoice Details
-    # -----------------------------
     invoice_data = [
         ["Invoice #:", invoice_no],
         ["Invoice Date:", datetime.datetime.now().strftime("%d %b %Y")],
@@ -2943,9 +2941,7 @@ def generate_invoice_pdf(
     elements.append(invoice_table)
     elements.append(Spacer(1, 20))
 
-    # -----------------------------
     # Bill To
-    # -----------------------------
     bill_to = Paragraph(
         f"""
         <b>Bill To:</b><br/>
@@ -3222,6 +3218,28 @@ async def razorpay_webhook(
                         amount=amount_paid,
                         plan=target_tier,
                     )
+
+
+                    storage_path = f"{user_id}/INV-{order_id}.pdf"
+
+                    with open(invoice_path, "rb") as f:
+                        supabase.storage.from_("invoices").upload(
+                            path=storage_path,
+                            file=f,
+                            file_options={"content-type": "application/pdf"},
+                        )
+
+                    signed = supabase.storage.from_("invoices").create_signed_url(
+                        path=storage_path,
+                        expires_in=60 * 60 * 24 * 365,
+                    )
+                    invoice_url = signed["signedURL"]
+
+                    supabase.table("subscriptions").update(
+                        {"invoice_url": invoice_url}
+                    ).eq("razorpay_order_id", order_id).execute()
+
+                    os.remove(invoice_path)
 
                     print(f"Invoice generated: {invoice_path}")
 
