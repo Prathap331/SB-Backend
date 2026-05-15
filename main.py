@@ -2882,6 +2882,7 @@ def generate_invoice_pdf(
     customer_phone,
     item_name,
     amount,
+    plan,
     due_date=None,          
     output_dir="invoices",
 ):
@@ -3022,16 +3023,17 @@ def generate_invoice_pdf(
     elements.append(Spacer(1, 7*mm))
 
     # ── ITEMS TABLE ──
+    # ── ITEMS TABLE ──
     subtotal = amount
     gst = round(amount * 0.18, 2)
     grand_total = round(subtotal + gst, 2)
 
     item_table = Table(
         [
-            ['ITEM', 'RATE', 'QTY', 'TOTAL'],
-            [item_name, f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],
+            ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],
+            [item_name, plan.title(), f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],
         ],
-        colWidths=[W * 0.46, W * 0.18, W * 0.12, W * 0.24],
+        colWidths=[W * 0.34, W * 0.12, W * 0.18, W * 0.12, W * 0.24],
     )
     item_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
@@ -3049,37 +3051,11 @@ def generate_invoice_pdf(
         ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8f8fb')),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dddddd')),
         ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-        ('ALIGN', (2, 0), (2, -1), 'CENTER'),
+        ('ALIGN', (1, 0), (1, -1), 'CENTER'),   # PLAN col — centred
+        ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),   # RATE, QTY, TOTAL — right
+        ('ALIGN', (3, 0), (3, -1), 'CENTER'),   # QTY — centred
     ]))
     elements.append(item_table)
-    elements.append(Spacer(1, 5*mm))
-
-    # ── TOTALS ──
-    totals_table = Table([
-        ['', 'Subtotal', f"Rs. {subtotal:.2f}"],
-        ['', 'CGST/SGST (18%)', f"Rs. {gst:.2f}"],
-        ['', '', ''],
-        ['', 'Grand Total', f"Rs. {grand_total:.2f}"],
-    ], colWidths=[W * 0.46, W * 0.30, W * 0.24])
-    totals_table.setStyle(TableStyle([
-        ('FONTNAME', (0, 0), (-1, 1), 'Helvetica'),
-        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('FONTSIZE', (1, -1), (2, -1), 11),
-        ('ALIGN', (1, 0), (1, -1), 'LEFT'),
-        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('LEFTPADDING', (0, 0), (-1, -1), 0),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-        ('LINEABOVE', (1, 2), (2, 2), 0.5, colors.HexColor('#cccccc')),
-        ('LINEBELOW', (1, 2), (2, 2), 0.5, colors.HexColor('#cccccc')),
-        ('LINEABOVE', (1, 3), (2, 3), 1.2, colors.HexColor('#1a1a2e')),
-        ('TEXTCOLOR', (1, -1), (2, -1), colors.HexColor('#1a1a2e')),
-    ]))
-    elements.append(totals_table)
-
     doc.build(elements, onFirstPage=draw_footer, onLaterPages=draw_footer)
     return file_path
 
@@ -3139,6 +3115,8 @@ async def razorpay_webhook(
     if not RAZORPAY_WEBHOOK_SECRET or not razorpay_client:
         print("Webhook received but service not configured.")
         return {"status": "Webhook ignored"}
+    
+    invoice_url = None
 
     try:
         razorpay_client.utility.verify_webhook_signature(
@@ -3238,7 +3216,7 @@ async def razorpay_webhook(
                 }
                 sub_result = (
                     supabase.table('subscriptions')
-                    .insert(subscription_row)
+                    .upsert(subscription_row, on_conflict='userId')
                     .execute()
                 )
 
