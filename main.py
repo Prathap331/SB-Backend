@@ -3075,17 +3075,16 @@ async def create_razorpay_order(
         raise HTTPException(status_code=500, detail="Could not create payment order.")
 
 
+
 @app.post("/payments/webhook")
 async def razorpay_webhook(
     request: Request,
     x_razorpay_signature: str | None = Header(None),
 ):
-
     body = await request.body()
 
     if not x_razorpay_signature:
         raise HTTPException(status_code=400, detail="Missing signature header.")
-
 
     if not RAZORPAY_WEBHOOK_SECRET or not razorpay_client:
         print("Webhook received but service not configured.")
@@ -3099,10 +3098,10 @@ async def razorpay_webhook(
         )
     except razorpay.errors.SignatureVerificationError as e:
         print(f"Webhook signature failed: {e}")
-        print(f"DEBUG secret used: '{RAZORPAY_WEBHOOK_SECRET}'")   
-        print(f"DEBUG signature header: '{x_razorpay_signature}'") 
-        print(f"DEBUG body preview: {body[:200]}")               
-        raise HTTPException(status_code=400, detail="Invalid webhook signature.")    
+        print(f"DEBUG secret used: '{RAZORPAY_WEBHOOK_SECRET}'")
+        print(f"DEBUG signature header: '{x_razorpay_signature}'")
+        print(f"DEBUG body preview: {body[:200]}")
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
     except Exception as e:
         print(f"Webhook verification error: {e}")
         raise HTTPException(status_code=500, detail="Webhook processing error.")
@@ -3112,17 +3111,17 @@ async def razorpay_webhook(
         event_type = event_data.get('event')
         print(f"Received webhook event: {event_type}")
 
+        # ORDER PAID
         if event_type == 'order.paid':
-            order_entity = event_data['payload']['order']['entity']
+            order_entity   = event_data['payload']['order']['entity']
             payment_entity = event_data['payload']['payment']['entity']
 
-            order_id   = order_entity.get('id', 'unknown')
-            payment_id = payment_entity.get('id', 'unknown')
-
+            order_id    = order_entity.get('id', 'unknown')
+            payment_id  = payment_entity.get('id', 'unknown')
             amount_paid = order_entity.get('amount', 0) / 100
 
-            notes = order_entity.get('notes', {})
-            user_id = notes.get('user_id')
+            notes       = order_entity.get('notes', {})
+            user_id     = notes.get('user_id')
             target_tier = notes.get('target_tier')
 
             if not user_id or not target_tier:
@@ -3130,7 +3129,7 @@ async def razorpay_webhook(
                 return {"status": "error", "message": "Missing required order notes."}
 
             plan_config = {
-                'basic': {'credits': 100,  'validity_days': 30},
+                'basic': {'credits': 100, 'validity_days': 30},
                 'pro':   {'credits': 200, 'validity_days': 30},
             }
             config = plan_config.get(target_tier.lower())
@@ -3140,10 +3139,10 @@ async def razorpay_webhook(
 
             credits_to_add = config['credits']
             validity_days  = config['validity_days']
+            now            = datetime.datetime.now(datetime.timezone.utc)
+            validity_date  = now + datetime.timedelta(days=validity_days)
 
-            now = datetime.datetime.now(datetime.timezone.utc)
-            validity_date = now + datetime.timedelta(days=validity_days)
-
+            # --- Update user profile ---
             try:
                 profile_resp = (
                     supabase.table('user_profiles')
@@ -3174,6 +3173,7 @@ async def razorpay_webhook(
             except Exception as e:
                 print(f"ERROR: Unexpected profiles error for {user_id}: {e}")
 
+            # --- Insert subscription row ---
             try:
                 subscription_row = {
                     "userId":               user_id,
@@ -3183,7 +3183,7 @@ async def razorpay_webhook(
                     "validity":             validity_date.isoformat(),
                     "credits":              credits_to_add,
                     "payment_status":       "paid",
-                    "rayzorpay_payment_id": payment_id,   
+                    "rayzorpay_payment_id": payment_id,
                     "razorpay_order_id":    order_id,
                 }
                 sub_result = (
@@ -3191,60 +3191,60 @@ async def razorpay_webhook(
                     .insert(subscription_row)
                     .execute()
                 )
+
                 if sub_result.data:
                     print(f"Inserted subscription row for user {user_id}, order {order_id}.")
-                # Generate Invoice
-                try:
-                    profile_data = (
-                        supabase.table("user_profiles")
-                        .select("full_name, phone, billing_address")
-                        .eq("id", user_id)
-                        .single()
-                        .execute()
-                    )
 
-                    profile = profile_data.data or {}
-
-                    customer_name = profile.get("full_name", "Customer")
-                    customer_phone = profile.get("phone", "")
-                    customer_address = profile.get("billing_address", "")
-
-                    invoice_path = generate_invoice_pdf(
-                        invoice_no=f"INV-{order_id}",
-                        customer_name=customer_name,
-                        customer_address=customer_address,
-                        customer_phone=customer_phone,
-                        item_name=f"StoryBit {target_tier.title()} Plan",
-                        amount=amount_paid,
-                        plan=target_tier,
-                    )
-
-
-                    storage_path = f"{user_id}/INV-{order_id}.pdf"
-
-                    with open(invoice_path, "rb") as f:
-                        supabase.storage.from_("invoices").upload(
-                            path=storage_path,
-                            file=f,
-                            file_options={"content-type": "application/pdf"},
+                    # --- Generate & upload invoice ---
+                    try:
+                        profile_data = (
+                            supabase.table("user_profiles")
+                            .select("full_name, phone, billing_address")
+                            .eq("id", user_id)
+                            .single()
+                            .execute()
                         )
 
-                    signed = supabase.storage.from_("invoices").create_signed_url(
-                        path=storage_path,
-                        expires_in=60 * 60 * 24 * 365,
-                    )
-                    invoice_url = signed["signedURL"]
+                        profile          = profile_data.data or {}
+                        customer_name    = profile.get("full_name", "Customer")
+                        customer_phone   = profile.get("phone", "")
+                        customer_address = profile.get("billing_address", "")
 
-                    supabase.table("subscriptions").update(
-                        {"invoice_url": invoice_url}
-                    ).eq("razorpay_order_id", order_id).execute()
+                        invoice_path = generate_invoice_pdf(
+                            invoice_no=f"INV-{order_id}",
+                            customer_name=customer_name,
+                            customer_address=customer_address,
+                            customer_phone=customer_phone,
+                            item_name=f"StoryBit {target_tier.title()} Plan",
+                            amount=amount_paid,
+                            plan=target_tier,
+                        )
 
-                    os.remove(invoice_path)
+                        storage_path = f"{user_id}/INV-{order_id}.pdf"
 
-                    print(f"Invoice generated: {invoice_path}")
+                        with open(invoice_path, "rb") as f:
+                            supabase.storage.from_("invoices").upload(
+                                path=storage_path,
+                                file=f,
+                                file_options={"content-type": "application/pdf"},
+                            )
 
-                except Exception as e:
-                    print(f"ERROR generating invoice for {user_id}: {e}")
+                        signed = supabase.storage.from_("invoices").create_signed_url(
+                            path=storage_path,
+                            expires_in=60 * 60 * 24 * 365,
+                        )
+                        invoice_url = signed["signedURL"]
+
+                        supabase.table("subscriptions").update(
+                            {"invoice_url": invoice_url}
+                        ).eq("razorpay_order_id", order_id).execute()
+
+                        os.remove(invoice_path)
+                        print(f"Invoice uploaded: {invoice_url}")
+
+                    except Exception as e:
+                        print(f"ERROR generating/uploading invoice for {user_id}: {e}")
+
                 else:
                     print(f"WARN: Subscription insert returned no data for order {order_id}.")
 
@@ -3253,21 +3253,20 @@ async def razorpay_webhook(
             except Exception as e:
                 print(f"ERROR: Unexpected subscriptions error for {user_id}: {e}")
 
+        # PAYMENT CAPTURED (ignored)
         elif event_type == 'payment.captured':
             print("Ignoring 'payment.captured' (handled by 'order.paid').")
 
+        # PAYMENT FAILED
         elif event_type == 'payment.failed':
-            payment_entity = event_data['payload']['payment']['entity']
-            failed_order_id = payment_entity.get('order_id', 'unknown')
+            payment_entity   = event_data['payload']['payment']['entity']
+            failed_order_id  = payment_entity.get('order_id', 'unknown')
             failed_payment_id = payment_entity.get('id', 'unknown')
-            error_desc = payment_entity.get('error_description', 'No description')
+            error_desc       = payment_entity.get('error_description', 'No description')
 
-            print(
-                f"Payment failed for order {failed_order_id}. "
-                f"Reason: {error_desc}"
-            )
+            print(f"Payment failed for order {failed_order_id}. Reason: {error_desc}")
 
-            notes = payment_entity.get('notes', {})
+            notes       = payment_entity.get('notes', {})
             user_id     = notes.get('user_id')
             target_tier = notes.get('target_tier')
             amount_paid = payment_entity.get('amount', 0) / 100
@@ -3290,6 +3289,7 @@ async def razorpay_webhook(
                 except Exception as e:
                     print(f"ERROR: Could not log failed payment for user {user_id}: {e}")
 
+        # UNHANDLED
         else:
             print(f"Ignoring unhandled event: {event_type}")
 
@@ -3300,8 +3300,6 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
-
-
 
 
 
