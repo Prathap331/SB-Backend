@@ -2868,6 +2868,11 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 )
  
+
+def generate_invoice_number():
+    random_part = ''.join(random.choices(string.digits, k=6))
+    year = datetime.datetime.now().year
+    return f"INV-{year}-{random_part}"
  
 def generate_invoice_pdf(
     invoice_no,
