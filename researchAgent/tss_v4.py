@@ -8,8 +8,17 @@ from pathlib import Path
 import re
 import httpx
 import time
+from supabase import create_client
+from sentence_transformers import SentenceTransformer
+import json
 
 pytrends = TrendReq()
+
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+url= os.getenv("SUPABASE_URL")
+key = os.getenv("SUPABASE_KEY")
 
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
@@ -22,6 +31,8 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 print(YOUTUBE_API_KEY)
 
+
+supabase = create_client(url, key)
 
 SERPAPI_KEY = os.getenv("SERPAPI_API_KEY")
 
@@ -278,6 +289,9 @@ def build_youtube_summary(keyword, category="General", api_key=YOUTUBE_API_KEY):
     videos = get_youtube_video_stats(video_ids, api_key)
     if not videos:
         return {"status": "no_data", "score": 0, "band": "Flat"}
+
+    # ── Save raw YouTube API response before any calculation ─────────────────
+    save_raw_youtube(keyword, videos)
 
     now = datetime.now(timezone.utc)
 
@@ -1046,6 +1060,10 @@ def scan_topic(topic: str) -> dict:
     }
 
     payload["reddit_posts_48h_count"] = len(reddit_posts_48h)
+
+    # ── Save raw social payload before building dashboard ────────────────────
+    save_raw_social(topic, payload)
+
     payload["dashboard"] = build_serpapi_dashboard(payload)
     return payload
 
@@ -1218,10 +1236,6 @@ def fetch_newsapi(topic: str, start: dt.datetime, end: dt.datetime, page_size: i
     return int(data.get("totalResults") or 0), articles
  
  
-# =============================================================================
-# GDELT  — errors are now PRINTED, not silently swallowed
-# =============================================================================
- 
 def fetch_gdelt_artlist(topic: str, start: dt.datetime, end: dt.datetime, maxrecords: int = 250) -> list:
     try:
         resp = httpx.get(GDELT_DOC_URL, params={
@@ -1235,7 +1249,7 @@ def fetch_gdelt_artlist(topic: str, start: dt.datetime, end: dt.datetime, maxrec
         resp.raise_for_status()
         return resp.json().get("articles") or []
     except Exception as e:
-        print(f"  [GDELT ArtList] {e}")   # visible error — not silent
+        print(f"  [GDELT ArtList] {e}")
         return []
  
  
@@ -1253,20 +1267,11 @@ def fetch_gdelt_daily_avg_90d(topic: str, now: dt.datetime) -> float:
         values   = [safe_float(row.get("value")) for row in timeline if row.get("value") is not None]
         return sum(values) / len(values) if values else 0.0
     except Exception as e:
-        print(f"  [GDELT Timeline] {e}")  # visible error — not silent
+        print(f"  [GDELT Timeline] {e}")
         return 0.0
  
  
-# =============================================================================
-# NewsAPI 90-day baseline fallback
-# Used when GDELT is blocked / unavailable
-# =============================================================================
- 
 def fetch_newsapi_daily_avg_90d(topic: str, now: dt.datetime) -> float:
-    """
-    Fetch 30-day and 7-day NewsAPI counts and derive a rough daily average.
-    NewsAPI free plan only goes back 30 days — we use that as our baseline.
-    """
     try:
         start_30d = now - dt.timedelta(days=30)
         total_30d, _ = fetch_newsapi(topic, start_30d, now, page_size=1)
@@ -1275,10 +1280,6 @@ def fetch_newsapi_daily_avg_90d(topic: str, now: dt.datetime) -> float:
         print(f"  [NewsAPI baseline] {e}")
         return 0.0
  
- 
-# =============================================================================
-# DuckDuckGo fallback
-# =============================================================================
  
 def fetch_ddgs(topic: str, timelimit: str, max_results: int = 50) -> list:
     if DDGS is None:
@@ -1301,16 +1302,11 @@ def fetch_ddgs(topic: str, timelimit: str, max_results: int = 50) -> list:
         return []
  
  
-# =============================================================================
-# Main scanner
-# =============================================================================
- 
 def scan(topic: str) -> dict:
     now       = utc_now()
     start_7d  = now - dt.timedelta(days=7)
     start_24h = now - dt.timedelta(days=1)
  
-    # ── NewsAPI (primary) ─────────────────────────────────────────────────────
     newsapi_total, newsapi_articles = fetch_newsapi(topic, start_7d, now)
  
     if newsapi_total == 0:
@@ -1325,12 +1321,10 @@ def scan(topic: str) -> dict:
         if a.get("source") or a.get("domain")
     })
  
-    # ── GDELT (best source for baseline + tone) ───────────────────────────────
     gdelt_7d      = fetch_gdelt_artlist(topic, start_7d, now, maxrecords=250)
     gdelt_events  = len(gdelt_7d)
     gdelt_avg_90d = fetch_gdelt_daily_avg_90d(topic, now)
  
-    # ── Fallback: use NewsAPI 30-day avg when GDELT is blocked ───────────────
     gdelt_available = gdelt_avg_90d > 0 or gdelt_events > 0
     if not gdelt_available:
         print("  [info] GDELT unavailable — using NewsAPI 30d avg as baseline")
@@ -1340,7 +1334,6 @@ def scan(topic: str) -> dict:
     daily_this_week     = articles_7d / 7.0
     vs_normal_week      = round(daily_this_week / gdelt_avg_90d, 1) if gdelt_avg_90d > 0 else 0.0
  
-    # ── Tone (from GDELT if available, else neutral) ──────────────────────────
     gdelt_90d     = fetch_gdelt_artlist(topic, now - dt.timedelta(days=90), now, maxrecords=250) if gdelt_available else []
  
     tone_7d_vals  = [safe_float(a.get("tone")) for a in gdelt_7d  if a.get("tone") is not None]
@@ -1349,8 +1342,8 @@ def scan(topic: str) -> dict:
     tone_7d_avg  = sum(tone_7d_vals)  / len(tone_7d_vals)  if tone_7d_vals  else 0.0
     tone_90d_avg = sum(tone_90d_vals) / len(tone_90d_vals) if tone_90d_vals else tone_7d_avg
     tone_shift   = round(abs(tone_7d_avg - tone_90d_avg), 2)
- 
-    return {
+
+    result = {
         "articles_7d":          articles_7d,
         "avg_weekly_baseline":  avg_weekly_baseline,
         "publishers":           publishers,
@@ -1365,13 +1358,14 @@ def scan(topic: str) -> dict:
         "gdelt_daily_avg_90d":  round(gdelt_avg_90d, 3),
         "scan_timestamp":       now.isoformat().replace("+00:00", "Z"),
         "topic":                topic,
-        "_gdelt_7d":            gdelt_7d,   # reused in build_news_summary
+        "_gdelt_7d":            gdelt_7d,
     }
+
+    # ── Save raw news data before any scoring ────────────────────────────────
+    save_raw_news(topic, result)
+
+    return result
  
- 
-# =============================================================================
-# CLI
-# =============================================================================
  
 def print_human(d: dict) -> None:
     print("=" * 50)
@@ -1388,11 +1382,6 @@ def print_human(d: dict) -> None:
         print(f"  [baseline source]     NewsAPI 30-day avg (GDELT blocked on this host)")
     print("=" * 50)
  
- 
-# =============================================================================
-# build_news_summary
-# Single entry point — mirrors build_youtube_summary / build_social_summary
-# =============================================================================
  
 CATEGORY_MIN_ARTICLES = {
     "Technology":    30,
@@ -1443,7 +1432,6 @@ def build_news_summary(keyword: str, category: str = "General") -> dict:
     else:
         coverage_tone = "Rapidly escalating"
 
-    # ✅ Fix: show actual baseline or fallback label
     baseline = int(raw["avg_weekly_baseline"]) if raw["avg_weekly_baseline"] > 0 else None
 
     return {
@@ -1464,3 +1452,179 @@ def build_news_summary(keyword: str, category: str = "General") -> dict:
 
 
 # print(build_news_summary("Israel Iran War", category="Politics"))
+
+
+# =============================================================================
+# Supabase raw-data helpers
+# Save the unscored API responses to the `tss` table.
+#
+# Schema:
+#   tss (
+#     id        uuid default gen_random_uuid() primary key,
+#     content   text,          -- JSON string of the raw payload
+#     embedding vector(384),   -- all-MiniLM-L6-v2 normalised embedding
+#     source    text           -- e.g. "youtube:Israel Iran War"
+#   )
+# =============================================================================
+
+def _iso_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _embed(text: str) -> list[float]:
+    """Return a 384-dim normalised embedding as a plain Python list."""
+    return model.encode(text, normalize_embeddings=True).tolist()
+
+
+def _embed_text_for(source_type: str, keyword: str, raw: dict) -> str:
+    """
+    Build a compact human-readable string to embed so that semantically
+    similar topics cluster together in the vector space.
+    """
+    parts = [f"source:{source_type}", f"keyword:{keyword}"]
+
+    if source_type == "youtube":
+        parts += [
+            f"videos:{raw.get('video_count', '')}",
+            f"views_7d:{raw.get('total_views_7d', '')}",
+            f"likes:{raw.get('total_likes', '')}",
+            f"comments:{raw.get('total_comments', '')}",
+        ]
+    elif source_type == "trends_serpapi":
+        parts += [
+            f"24h:{raw.get('count_24h', '')}",
+            f"7d:{raw.get('count_7d', '')}",
+            f"30d:{raw.get('count_30d', '')}",
+        ]
+    elif source_type == "social":
+        parts += [
+            f"mentions_24h:{raw.get('mentions_24h', '')}",
+            f"mentions_7d:{raw.get('mentions_7d', '')}",
+            f"provider:{raw.get('provider_used', '')}",
+        ]
+    elif source_type == "news":
+        parts += [
+            f"articles_7d:{raw.get('newsapi_total', raw.get('newsapi_articles', ''))}",
+            f"gdelt_events:{raw.get('gdelt_events', '')}",
+            f"publishers:{raw.get('publishers', '')}",
+        ]
+
+    return " ".join(str(p) for p in parts)
+
+
+def _upsert_tss(content_str: str, embedding: list[float], source_tag: str) -> dict:
+    """Insert one row into the tss table and return Supabase response data."""
+    row = {
+        "content":   content_str,
+        "embedding": embedding,
+        "source":    source_tag,
+    }
+    response = supabase.table("tss").insert(row).execute()
+    return response.data
+
+
+def save_raw_trends(keyword: str, counts: dict) -> dict:
+    """
+    Persist the raw SerpApi trend counts returned by get_trends_serpapi()
+    before build_trend_dashboard() applies any scoring.
+
+    counts: {"24h": int, "48h": int, "7d": int, "30d": int}
+    """
+    raw = {
+        "keyword":    keyword,
+        "count_24h":  counts.get("24h"),
+        "count_48h":  counts.get("48h"),
+        "count_7d":   counts.get("7d"),
+        "count_30d":  counts.get("30d"),
+        "fetched_at": _iso_now(),
+    }
+    content   = json.dumps(raw, ensure_ascii=False)
+    embed_txt = _embed_text_for("trends_serpapi", keyword, raw)
+    embedding = _embed(embed_txt)
+    return _upsert_tss(content, embedding, source_tag=f"trends_serpapi:{keyword}")
+
+
+def save_raw_youtube(keyword: str, video_items: list[dict]) -> dict:
+    """
+    Persist the raw YouTube API items returned by get_youtube_video_stats()
+    before build_youtube_summary() applies any scoring.
+
+    video_items: list of items with snippet + statistics sub-dicts.
+    """
+    videos = [
+        {
+            "video_id":      v.get("id"),
+            "title":         v.get("snippet", {}).get("title"),
+            "channel_id":    v.get("snippet", {}).get("channelId"),
+            "published_at":  v.get("snippet", {}).get("publishedAt"),
+            "view_count":    v.get("statistics", {}).get("viewCount"),
+            "like_count":    v.get("statistics", {}).get("likeCount"),
+            "comment_count": v.get("statistics", {}).get("commentCount"),
+        }
+        for v in video_items
+    ]
+
+    raw = {
+        "keyword":        keyword,
+        "video_count":    len(videos),
+        "total_views_7d": sum(int(v.get("view_count")    or 0) for v in videos),
+        "total_likes":    sum(int(v.get("like_count")    or 0) for v in videos),
+        "total_comments": sum(int(v.get("comment_count") or 0) for v in videos),
+        "videos":         videos,
+        "fetched_at":     _iso_now(),
+    }
+    content   = json.dumps(raw, ensure_ascii=False)
+    embed_txt = _embed_text_for("youtube", keyword, raw)
+    embedding = _embed(embed_txt)
+    return _upsert_tss(content, embedding, source_tag=f"youtube:{keyword}")
+
+
+def save_raw_social(keyword: str, scan_payload: dict) -> dict:
+    """
+    Persist the raw social scan payload returned by scan_topic()
+    before build_serpapi_dashboard() applies any scoring.
+
+    The pre-computed 'dashboard' key is stripped if present.
+    """
+    raw = {k: v for k, v in scan_payload.items() if k != "dashboard"}
+    raw["keyword"]    = keyword
+    raw["fetched_at"] = _iso_now()
+
+    content   = json.dumps(raw, ensure_ascii=False, default=str)
+    embed_txt = _embed_text_for("social", keyword, raw)
+    embedding = _embed(embed_txt)
+    return _upsert_tss(content, embedding, source_tag=f"social:{keyword}")
+
+
+def save_raw_news(keyword: str, scan_result: dict) -> dict:
+    """
+    Persist the raw news scan result returned by scan()
+    before build_news_summary() applies any scoring.
+
+    GDELT articles are slimmed to url/title/tone/seendate to keep the
+    payload compact; full data is available via GDELT directly.
+    """
+    gdelt_slim = [
+        {
+            "url":      a.get("url"),
+            "title":    a.get("title"),
+            "tone":     a.get("tone"),
+            "seendate": a.get("seendate"),
+        }
+        for a in scan_result.get("_gdelt_7d", [])
+    ]
+
+    raw = {
+        k: v for k, v in scan_result.items() if k != "_gdelt_7d"
+    }
+    raw.update({
+        "keyword":        keyword,
+        "gdelt_articles": gdelt_slim,
+        "newsapi_total":  scan_result.get("newsapi_articles"),
+        "fetched_at":     _iso_now(),
+    })
+
+    content   = json.dumps(raw, ensure_ascii=False, default=str)
+    embed_txt = _embed_text_for("news", keyword, raw)
+    embedding = _embed(embed_txt)
+    return _upsert_tss(content, embedding, source_tag=f"news:{keyword}")

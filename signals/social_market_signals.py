@@ -889,9 +889,6 @@ def main() -> None:
         print_human(payload)
 
 
-result = scan_topic("Israel Iran war")
-
-print(result["dashboard"])
 
 if __name__ == "__main__":
     main()

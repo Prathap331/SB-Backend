@@ -281,3 +281,4 @@ ollama
 pymupdf4llm
 datasets
 kaggle
+reportlab

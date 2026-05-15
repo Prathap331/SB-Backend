@@ -105,26 +105,6 @@ Return ONLY valid JSON:
 """
 
 
-    # "thumbnail_brief": [
-    #   {{
-    #     "type": "curiosity_gap",
-    #     "style": "warm",
-    #     "headline": "",
-    #     "text_overlay": "",
-    #     "face_recommended": true,
-    #     "description": "",
-    #     "preview_image_url": ""
-    #   }},
-    #   {{
-    #     "type": "data_driven",
-    #     "style": "cool",
-    #     "headline": "",
-    #     "text_overlay": "",
-    #     "face_recommended": false,
-    #     "description": "",
-    #     "preview_image_url": ""
-    #   }}
-    # ],
 
 
 BLOCKED_TITLE_TYPES = {

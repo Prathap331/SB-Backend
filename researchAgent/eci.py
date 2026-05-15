@@ -606,7 +606,3 @@ def get_youtube_data(topic: str, max_results=25,category: str = "General"):
 
     }
 
-
-print(
-    get_youtube_data("indian elections")
-)

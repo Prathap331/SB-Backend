@@ -643,7 +643,7 @@ print("Supabase client initialized.")
 # HELPER FUNCTIONS
 # ════════════════════════════════════════════════════════════
 
-def chunk_text(text: str, chunk_size: int = 250, chunk_overlap: int = 50) -> list[str]:
+def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> list[str]:
     try:
         sentences = sent_tokenize(text)
     except LookupError:
@@ -662,7 +662,6 @@ def chunk_text(text: str, chunk_size: int = 250, chunk_overlap: int = 50) -> lis
         chunks.append(current_chunk.strip())
     return chunks
 
-
 def add_scraped_data_to_db(
     article_title: str,
     article_text: str,
@@ -671,71 +670,58 @@ def add_scraped_data_to_db(
     topic: str = "",
     tags: list | None = None,
 ):
-    """
-    Background task: chunk → embed → insert to Supabase.
-
-    Metadata shape (web_scrape):
-      {
-        "category":   str   — from the user's topic request context (empty if unknown)
-        "topic":      str   — the user's searched topic
-        "tags":       list  — tags inferred from topic context
-        "domain":     str   — netloc extracted from article_url
-        "scraped_at": str   — ISO timestamp of when this was scraped
-        "author":     {
-          "has_credentials": bool,
-          "name":            str or null,   — publication/author name from URL/title
-          "description":     str or null,   — short label e.g. "News publication"
-        }
-      }
-    """
     if tags is None:
         tags = []
 
-    print(f"BACKGROUND TASK: Starting upload for '{article_title[:30]}...'")
+    print(f"BACKGROUND TASK: Starting upload for '{article_title[:50]}...'")
     try:
-        raw_chunks = chunk_text(article_text)
-        chunks = [c for c in raw_chunks if c and not c.isspace()]
+        # Chunk the article text properly
+        chunks = chunk_text(article_text, chunk_size=500, chunk_overlap=50)
         if not chunks:
-            print("BACKGROUND TASK: No valid chunks.")
+            print(f"BACKGROUND TASK: No chunks generated for '{article_title[:50]}', skipping.")
             return
 
+        print(f"BACKGROUND TASK: '{article_title[:50]}' → {len(chunks)} chunks to upload.")
+
         embeddings = asyncio.run(_embed_chunks_with_backoff(chunks))
-        if embeddings is None:
+        if embeddings is None or len(embeddings) != len(chunks):
+            print(f"BACKGROUND TASK: Embedding failed or mismatch for '{article_title[:50]}', skipping.")
             return
 
         domain = urlparse(article_url).netloc.lstrip('www.') if article_url else ""
         scraped_at = dt.now().isoformat()
 
-        has_credentials = bool(domain)
         author_info = {
-            "has_credentials": has_credentials,
-            "name": domain if has_credentials else None,
-            "description": "Web publication" if has_credentials else None,
+            "has_credentials": bool(domain),
+            "name": domain if domain else None,
+            "description": "Web publication" if domain else None,
         }
 
-        documents_to_insert = [
-            {
+        rows_to_insert = []
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            rows_to_insert.append({
                 "content":      chunk,
-                "embedding":    embeddings[i],
+                "embedding":    embedding,
                 "source_title": article_title,
                 "source_url":   article_url,
                 "source_type":  "web_scrape",
-                "topic":      topic,
-                "category":   category,
+                "topic":        topic,
+                "category":     category,
                 "metadata": {
-                    "tags":       tags,
-                    "domain":     domain,
-                    "scraped_at": scraped_at,
-                    "author":     author_info,
+                    "tags":        tags,
+                    "domain":      domain,
+                    "scraped_at":  scraped_at,
+                    "author":      author_info,
+                    "chunk_index": i,
+                    "total_chunks": len(chunks),
                 },
-            }
-            for i, chunk in enumerate(chunks)
-        ]
-        supabase.table('RAG_web_scraped').insert(documents_to_insert).execute()
-        print(f"BACKGROUND TASK: Uploaded {len(documents_to_insert)} chunks.")
-        print("scraped data saved in db")
+            })
+
+        supabase.table('RAG_web_scraped').insert(rows_to_insert).execute()
+        print(f"BACKGROUND TASK: Successfully uploaded {len(rows_to_insert)} chunks for '{article_title[:50]}'")
+
     except Exception as e:
-        print(f"BACKGROUND TASK: Failed. Error: {e}")
+        print(f"BACKGROUND TASK: Failed for '{article_title[:50]}'. Error: {e}")
 
 
 # Max 3 concurrent Playwright browsers — each uses ~300MB RAM
@@ -898,51 +884,45 @@ async def scrape_url(
 
 
 async def deep_search_and_scrape(keywords: list[str], scraped_urls: set) -> list[dict]:
-    print("--- DEEP WEB SCRAPE: Starting full search... ---")
-    urls_to_scrape = []   
+    print(f"--- DEEP WEB SCRAPE: Starting with {len(keywords)} keywords... ---")
 
-    def _discover_candidates() -> list[tuple[str, str]]:
-        discovered: list[tuple[str, str]] = []
-        with DDGS(timeout=8) as ddgs:
-            for keyword in keywords[:DEEP_SCRAPE_MAX_KEYWORDS]:
-                results = list(ddgs.text(keyword, region='wt-wt', max_results=DEEP_SCRAPE_MAX_RESULTS_PER_KEYWORD))
-                if results:
-                    top = results[0]
-                    discovered.append((top['href'], top.get('body', '')))
-        return discovered
-
+    # Discover up to 10 unique URLs across all keywords + both search engines
     try:
-        urls_to_scrape = await asyncio.wait_for(
-            asyncio.to_thread(_discover_candidates),
+        url_snippet_pairs = await asyncio.wait_for(
+            asyncio.to_thread(_discover_urls, keywords, DEEP_SCRAPE_MAX_RESULTS_PER_KEYWORD),
             timeout=DEEP_SCRAPE_DISCOVERY_TIMEOUT_SEC,
         )
+    except asyncio.TimeoutError:
+        print("--- DEEP WEB SCRAPE: Discovery timed out ---")
+        return []
     except Exception as e:
-        print(f"--- DEEP WEB SCRAPE: Discovery failed fast: {e} ---")
+        print(f"--- DEEP WEB SCRAPE: Discovery failed: {e} ---")
         return []
 
-    seen = set()
-    unique = []
-    for url, snippet in urls_to_scrape:
-        if url not in seen:
-            seen.add(url)
-            unique.append((url, snippet))
+    if not url_snippet_pairs:
+        print("--- DEEP WEB SCRAPE: No URLs discovered ---")
+        return []
 
-    # async with httpx.AsyncClient() as client:
-        tasks = [
-            asyncio.wait_for(
-                scrape_url(url, scraped_urls, snippet),
-                timeout=DEEP_SCRAPE_PER_URL_TIMEOUT_SEC,
-            )
-            for url, snippet in unique
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        cleaned = []
-        for result in results:
-            if isinstance(result, Exception):
-                continue
-            if result and result.get("text"):
-                cleaned.append(result)
-        return cleaned
+    print(f"--- DEEP WEB SCRAPE: Scraping {len(url_snippet_pairs)} URLs... ---")
+
+    tasks = [
+        asyncio.wait_for(
+            scrape_url(url, scraped_urls, snippet),
+            timeout=DEEP_SCRAPE_PER_URL_TIMEOUT_SEC,
+        )
+        for url, snippet in url_snippet_pairs
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    cleaned = []
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        if r and r.get("text"):
+            cleaned.append(r)
+
+    print(f"--- DEEP WEB SCRAPE: Got {len(cleaned)} valid articles ---")
+    return cleaned
 
 
 async def _generate_search_keywords(topic: str) -> list[str]:
@@ -972,84 +952,156 @@ async def _generate_search_keywords(topic: str) -> list[str]:
     return keywords[:3]
 
 
+NEWS_SCRAPE_MAX_RESULTS         = 10
+DEEP_SCRAPE_MAX_KEYWORDS        = 6
+DEEP_SCRAPE_MAX_RESULTS_PER_KEYWORD = 10  
+DEEP_SCRAPE_PER_URL_TIMEOUT_SEC = 12
+DEEP_SCRAPE_DISCOVERY_TIMEOUT_SEC = 30
+MIN_ARTICLES_THRESHOLD          = 5       
+
+
+def _ddgs_search(keyword: str, max_results: int) -> list[tuple[str, str]]:
+    """Run a single DDGS search, return (url, snippet) pairs."""
+    found = []
+    try:
+        with DDGS(timeout=10) as ddgs:
+            results = list(ddgs.text(keyword, region='wt-wt', max_results=max_results))
+            for r in results:
+                href = r.get('href', '')
+                snippet = r.get('body', '')
+                if href:
+                    found.append((href, snippet))
+    except Exception as e:
+        print(f"    [DDGS] Search failed for '{keyword}': {e}")
+    return found
+
+
+def _google_search(keyword: str, max_results: int) -> list[tuple[str, str]]:
+    """
+    Google search via DDGS backend (uses Google under the hood).
+    Falls back gracefully if unavailable.
+    """
+    found = []
+    try:
+        with DDGS(timeout=10) as ddgs:
+            results = list(ddgs.text(keyword, region='wt-wt', max_results=max_results, backend='google'))
+            for r in results:
+                href = r.get('href', '')
+                snippet = r.get('body', '')
+                if href:
+                    found.append((href, snippet))
+    except Exception as e:
+        print(f"    [Google] Search failed for '{keyword}', falling back to DDGS only: {e}")
+    return found
+
+
+def _discover_urls(keywords: list[str], max_results_per_keyword: int) -> list[tuple[str, str]]:
+    """
+    Search both DDGS and Google for each keyword.
+    Returns up to 10 unique (url, snippet) pairs total across all keywords.
+    """
+    seen_urls: set[str] = set()
+    all_results: list[tuple[str, str]] = []
+
+    for keyword in keywords[:DEEP_SCRAPE_MAX_KEYWORDS]:
+        print(f"    [DISCOVER] Searching: '{keyword}'")
+
+        # Search DDGS
+        ddgs_results = _ddgs_search(keyword, max_results_per_keyword)
+        print(f"        DDGS → {len(ddgs_results)} results")
+
+        # Search Google
+        google_results = _google_search(keyword, max_results_per_keyword)
+        print(f"        Google → {len(google_results)} results")
+
+        # Merge, deduplicate
+        for url, snippet in ddgs_results + google_results:
+            if url not in seen_urls:
+                seen_urls.add(url)
+                all_results.append((url, snippet))
+
+        if len(all_results) >= 10:
+            break  
+
+    print(f"    [DISCOVER] Total unique URLs found: {len(all_results)}")
+    return all_results[:10] 
+
+
 async def get_latest_news_context(topic: str, scraped_urls: set) -> list[dict]:
     print("--- LIGHT WEB SCRAPE: Starting lightweight news search... ---")
     try:
-        keyword = f"{topic} latest news today"
-        url_snippet_pairs = []
-        with DDGS(timeout=10) as ddgs:
-            results = list(ddgs.text(keyword, region='wt-wt', max_results=NEWS_SCRAPE_MAX_RESULTS))
-            for r in results:
-                url_snippet_pairs.append((r['href'], r.get('body', '')))
-        # async with httpx.AsyncClient() as client:
-            tasks = [
-                asyncio.wait_for(
-                    scrape_url(url, scraped_urls, snippet),
-                    timeout=DEEP_SCRAPE_PER_URL_TIMEOUT_SEC,
-                )
-                for url, snippet in url_snippet_pairs
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return [
-                r for r in results
-                if not isinstance(r, Exception) and r and r.get("text")
-            ]
+        keywords = [
+            f"{topic} latest news today",
+            f"{topic} 2025 update",
+        ]
+
+        try:
+            url_snippet_pairs = await asyncio.wait_for(
+                asyncio.to_thread(_discover_urls, keywords, NEWS_SCRAPE_MAX_RESULTS),
+                timeout=DEEP_SCRAPE_DISCOVERY_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            print("--- LIGHT WEB SCRAPE: Discovery timed out ---")
+            return []
+
+        print(f"--- LIGHT WEB SCRAPE: Scraping {len(url_snippet_pairs)} URLs... ---")
+
+        tasks = [
+            asyncio.wait_for(
+                scrape_url(url, scraped_urls, snippet),
+                timeout=DEEP_SCRAPE_PER_URL_TIMEOUT_SEC,
+            )
+            for url, snippet in url_snippet_pairs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        cleaned = [
+            r for r in results
+            if not isinstance(r, Exception) and r and r.get("text")
+        ]
+        print(f"--- LIGHT WEB SCRAPE: Got {len(cleaned)} valid articles ---")
+        return cleaned
+
     except Exception as e:
-        print(f"--- WEB TASK: Error during news scraping: {e} ---")
+        print(f"--- LIGHT WEB SCRAPE: Error: {e} ---")
         return []
 
 
-async def get_db_context(topic: str) -> list[dict]:
-    """
-    Two-stage DB lookup for a topic:
-
-    Stage 1 — HyDE vector search (semantic):
-      Groq generates a hypothetical encyclopedia paragraph for the topic,
-      we embed it and run cosine similarity against all stored chunks.
-      Threshold: 0.55 (relaxed so near-miss topics like "Israel Iran war"
-      still match chunks stored as "Iran-Israel conflict" etc.)
-
-    Stage 2 — Full-text keyword fallback:
-      If vector search returns fewer than 3 results, we also run
-      search_documents() (the tsvector RPC) using the raw topic string.
-      Results are merged and de-duplicated by id.
-
-    Returns up to 8 combined results.
-    """
+async def get_db_context(topic: str, hypothetical_document: str = None) -> list[dict]:
     print("--- DB TASK: Starting two-stage DB search... ---")
-    combined: dict[int, dict] = {}  # id → row, de-duplicated
+    combined: dict[int, dict] = {}
 
     try:
         loop = asyncio.get_running_loop()
 
-        hypothetical_document = topic
-        try:
-            # ── Stage 1: HyDE vector search ──────────────────────
-            hyde_prompt = f"""
-            Write a short, factual, encyclopedia-style paragraph that provides a direct answer
-            to the following topic. Be concise and include key terms.
-
-            Topic: "{topic}"
-            """
-            chat_completion = await groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": hyde_prompt}],
-                model=GROQ_GENERATION_MODEL,
-            )
-            hypothetical_document = chat_completion.choices[0].message.content
-            print(f"--- DB TASK: HyDE doc: {hypothetical_document[:100]}...")
-        except Exception as exc:
-            if _is_groq_rate_limit_error(str(exc)):
-                print(f"--- DB TASK: HyDE rate-limited, falling back to raw topic keyword search: {exc} ---")
-            else:
-                print(f"--- DB TASK: HyDE failed, falling back to raw topic keyword search: {exc} ---")
+        # Use pre-generated HyDE doc if provided, skip regeneration
+        if hypothetical_document is None:
             hypothetical_document = topic
+            try:
+                hyde_prompt = f"""
+                Write a short, factual, encyclopedia-style paragraph that provides a direct answer
+                to the following topic. Be concise and include key terms.
+                Topic: "{topic}"
+                """
+                chat_completion = await groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": hyde_prompt}],
+                    model=GROQ_GENERATION_MODEL,
+                )
+                hypothetical_document = chat_completion.choices[0].message.content
+                print(f"--- DB TASK: HyDE doc generated: {hypothetical_document[:100]}...")
+            except Exception as exc:
+                print(f"--- DB TASK: HyDE failed, falling back to raw topic: {exc} ---")
+                hypothetical_document = topic
 
+        print(f"--- DB TASK: Embedding HyDE document for semantic search ---")
+
+        # Embed the HyDE document 
         try:
             embed_response = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
                     lambda: _embed_with_failover(
-                        contents=hypothetical_document,
+                        contents=hypothetical_document,  
                         task_type="RETRIEVAL_QUERY",
                         output_dimensionality=768,
                     ),
@@ -1057,7 +1109,9 @@ async def get_db_context(topic: str) -> list[dict]:
                 timeout=DB_LOOKUP_TIMEOUT_SEC,
             )
             query_embedding = embed_response.embeddings[0].values
+            print(f"--- DB TASK: Embedding generated, dimension: {len(query_embedding)} ---")
 
+            # Vector search against DB chunks 
             try:
                 vector_response = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -1065,9 +1119,9 @@ async def get_db_context(topic: str) -> list[dict]:
                         lambda: supabase.rpc(
                             'match_documents',
                             {
-                                'query_embedding':  query_embedding,
-                                'match_threshold':  0.55,   # relaxed: was 0.65
-                                'match_count':      8,
+                                'query_embedding': query_embedding,
+                                'match_threshold': 0.55,
+                                'match_count':     8,
                             }
                         ).execute()
                     ),
@@ -1076,29 +1130,31 @@ async def get_db_context(topic: str) -> list[dict]:
                 vector_results = vector_response.data or []
                 for row in vector_results:
                     combined[row['id']] = row
-                print(f"--- DB TASK: Vector search → {len(vector_results)} results ---")
+                print(f"--- DB TASK: Semantic search → {len(vector_results)} chunks retrieved ---")
+                for i, row in enumerate(vector_results):
+                    print(f"    [{i+1}] id={row['id']} | similarity={row.get('similarity', 'N/A'):.3f} | {row.get('content', '')[:80]}...")
+
             except asyncio.TimeoutError:
                 print(f"--- DB TASK: Vector search timed out after {DB_LOOKUP_TIMEOUT_SEC}s ---")
-                vector_results = []
-        except Exception as exc:
-            print(f"--- DB TASK: Vector stage unavailable, using keyword fallback only: {exc} ---")
-            vector_results = []
 
-        # ── Stage 2: Keyword fallback if vector was thin ──────
+        except Exception as exc:
+            print(f"--- DB TASK: Embedding failed: {exc} ---")
+
         if len(combined) < 3:
-            print(f"--- DB TASK: Thin vector results ({len(combined)}), running keyword search... ---")
+            print(f"--- DB TASK: Only {len(combined)} semantic results, running keyword fallback... ---")
             topic_terms = [term for term in re.findall(r"[A-Za-z0-9']+", topic.lower()) if len(term) > 2][:5]
             if not topic_terms:
                 topic_terms = [topic.lower()]
 
+            seen_ids: set = set(combined.keys())
             keyword_rows: list[dict] = []
-            seen_ids: set[Any] = set(combined.keys())
+
             for term in topic_terms:
                 try:
                     response = await asyncio.wait_for(
                         loop.run_in_executor(
                             None,
-                            lambda term=term: supabase.table("documents")
+                            lambda term=term: supabase.table("RAG_web_scraped")
                             .select("id, content, source_title, source_url, metadata, created_at")
                             .or_(f"content.ilike.%{term}%,source_title.ilike.%{term}%")
                             .limit(8)
@@ -1107,25 +1163,28 @@ async def get_db_context(topic: str) -> list[dict]:
                         timeout=DB_LOOKUP_TIMEOUT_SEC,
                     )
                 except Exception as exc:
-                    print(f"--- DB TASK: Keyword table fallback failed for term '{term}': {exc} ---")
+                    print(f"--- DB TASK: Keyword fallback failed for term '{term}': {exc} ---")
                     continue
-                rows = response.data or []
-                for row in rows:
+
+                for row in (response.data or []):
                     row_id = row.get("id")
                     if row_id is None or row_id in seen_ids:
                         continue
                     seen_ids.add(row_id)
                     combined[row_id] = row
                     keyword_rows.append(row)
-            print(f"--- DB TASK: Keyword table search → {len(keyword_rows)} results, total unique: {len(combined)} ---")
+
+            print(f"--- DB TASK: Keyword fallback → {len(keyword_rows)} extra chunks, total unique: {len(combined)} ---")
 
     except Exception as e:
         print(f"--- DB TASK: Error: {e} ---")
         return []
 
     results = list(combined.values())
-    print(f"--- DB TASK: Returning {len(results)} total DB docs ---")
+    print(f"--- DB TASK: Returning {len(results)} total chunks ---")
     return results
+
+
 
 STRUCTURE_GUIDANCE = {
     "problem_solution": """
@@ -1207,7 +1266,6 @@ app.add_middleware(
 
 
 # ── Pydantic models ──────────────────────────────────────────
-
 class PromptRequest(BaseModel):
     topic: str
 
@@ -2201,6 +2259,47 @@ async def generate_ideas_endpoint(
         return {"error": "An error occurred in the idea generation pipeline."}
 
 
+async def pick_best_template(topic: str, templates: list) -> dict:
+    """Uses LLM to pick the best matching template based on topic + each template's 'about' field."""
+    try:
+        options = "\n\n".join([
+            f"Key: {t['key']}\nTitle: {t['tittle']}\nAbout: {t['about']}"
+            for t in templates
+        ])
+
+        prompt = f"""
+        You are a content structure selector.
+
+        Given a video topic, pick the SINGLE best template from the options below.
+        Match based on the topic's nature and the template's 'about' description.
+
+        Return ONLY the key value (e.g. "1" or "2"). Nothing else.
+
+        Topic: \"\"\"{topic}\"\"\"
+
+        Templates:
+        {options}
+                """
+
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": "Return only the key value of the best matching template."},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False
+        )
+
+        best_key = response.choices[0].message.content.strip()
+        matched = next((t for t in templates if str(t["key"]) == best_key), templates[0])
+        return matched
+
+    except Exception as e:
+        print(f"Template selection failed: {e}")
+        return templates[0]  
+
+
+
 async def get_structure(content: str) -> dict:
     try:
         prompt = f"""
@@ -2323,30 +2422,57 @@ async def cut_credits(request: UnlockRequest):
         return {"message": "error"}
     
 
-# ── /generate-script ─────────────────────────────────────────
 @app.post("/generate-script") 
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
     total_start_time = time.time()
-
     print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
-    print(f"Personalization - Duration: {request.duration_minutes} min")
 
     try:
-        channel_profile = await get_channel_profile(request.userId) 
+        channel_profile = await get_channel_profile(request.userId)
         summary = channel_profile[0]["Summary"] if channel_profile else None
-        print(summary)        
-        content_category = await get_structure(request.topic)  
-        print(content_category)
-        a = content_category["category"]
-        print(a)
-        res = supabase.table("script_structures").select("*").eq("catergory name", a).execute()
-        structure = res.data[0]["Structure"]
 
-        for item in structure:
-            for segment in item.get("segments", []):
-                segment.pop("brief", None)
+        # Generate HyDE document FIRST before anything else 
+        hyde_document = request.topic  
+        try:
+            hyde_prompt = f"""
+            Write a short, factual, encyclopedia-style paragraph that provides a direct answer
+            to the following topic. Be concise and include key terms.
+
+            Topic: "{request.topic}"
+            """
+            hyde_completion = await groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": hyde_prompt}],
+                model=GROQ_GENERATION_MODEL,
+            )
+            hyde_document = hyde_completion.choices[0].message.content
+            print(f"--- HyDE DOCUMENT GENERATED ---\n{hyde_document}\n--- END HyDE DOCUMENT ---")
+        except Exception as exc:
+            print(f"--- HyDE generation failed, using raw topic as fallback: {exc} ---")
+
+
+        content_category = await get_structure(request.topic)
+        category = content_category["category"]
+        print(f"Category: {category}")
+
+        res = supabase.table("script_structures").select("*").eq("catergory name", category).execute()
+        all_templates_raw = res.data
+
+        all_templates = []
+        for row in all_templates_raw:
+            for template in row["Structure"]:
+                all_templates.append(template)
+
+        best_template = await pick_best_template(request.topic, all_templates)
+        print(f"Selected template: {best_template['tittle']}")
+
+        structure = best_template.get("segments", [])
 
         filtered_structure = structure
+
+        template_meta = {
+        "title": best_template.get("tittle"),
+        "about": best_template.get("about"),
+        }
 
         selected_idea_id = random.randint(1, 1000)  
         selected_angle_id = random.randint(1, 1000)
@@ -2405,8 +2531,8 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         res = await seo_agent(request_obj)
         print(res)
 
-        db_task = asyncio.create_task(get_db_context(request.topic))
-        await asyncio.sleep(11) 
+        db_task = asyncio.create_task(get_db_context(request.topic, hyde_document))  
+        await asyncio.sleep(11)
 
         db_results = []
         new_articles = []
@@ -2420,41 +2546,55 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         if len(db_results) >= 3:
             print("--- DB HIT: Performing LIGHT web scrape for latest news. ---")
             new_articles = await get_latest_news_context(request.topic, scraped_urls)
+
         else:
             print("--- DB MISS or SLOW: Initiating DEEP web scrape. ---")
-            keyword_prompt = f"""
-            Your ONLY task is to generate 3 diverse search engine keyword phrases for the topic: '{request.topic}'.
-            Follow these rules STRICTLY:
-            1. Return ONLY the 3 phrases.
-            2. DO NOT add numbers, markdown, explanations, or any introductory text.
-            3. Each phrase must be on a new line.
-            EXAMPLE INPUT: Is coding dead?
-            EXAMPLE OUTPUT:
-            future of programming jobs automation
-            AI replacing software developers
-            demand for software engineers 2025
-            """
 
-            response2 = deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
-                messages=[
-                    {"role": "system", "content": "You must return only valid JSON"},
-                    {"role": "user", "content": keyword_prompt},
-                ],
-                stream=False,
-                reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}}
+            base_keywords = [request.topic]  
+            try:
+                keyword_prompt = f"""
+                Your ONLY task is to generate 5 diverse search engine keyword phrases for the topic: '{request.topic}'.
+                Follow these rules STRICTLY:
+                1. Return ONLY the 5 phrases, nothing else.
+                2. DO NOT add numbers, markdown, bullet points, explanations, or any introductory text.
+                3. Each phrase must be on a new line.
+                4. Make them diverse — cover different angles, audiences, and search intents.
+
+                EXAMPLE INPUT: Is coding dead?
+                EXAMPLE OUTPUT:
+                future of programming jobs automation
+                AI replacing software developers
+                demand for software engineers 2025
+                will programmers become obsolete
+                coding careers vs AI tools
+                """
+
+                kw_completion = await groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": keyword_prompt}],
+                    model=GROQ_GENERATION_MODEL,
+                )
+                raw_text = kw_completion.choices[0].message.content.strip()
+                print(f"--- DEEP SCRAPE: Raw keywords from Groq:\n{raw_text} ---")
+
+                keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
+                if keywords_in_quotes:
+                    base_keywords = keywords_in_quotes
+                else:
+                    base_keywords = [kw.strip() for kw in raw_text.split('\n') if kw.strip()]
+
+            except Exception as e:
+                print(f"--- DEEP SCRAPE: Keyword generation failed, using topic as fallback: {e} ---")
+                base_keywords = [request.topic]
+
+            targeted_keywords = (
+                base_keywords +
+                [f"{request.topic} 2025"] +
+                [f"{kw} site:reddit.com" for kw in base_keywords[:3]]
             )
-
-            text2 = response2.choices[0].message.content
-            raw_text = text2
-            keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
-            if keywords_in_quotes:
-                base_keywords = keywords_in_quotes
-            else:
-                base_keywords = [kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()]
-            targeted_keywords = [kw for kw in base_keywords] + [f"{kw} site:reddit.com" for kw in base_keywords]
+            targeted_keywords = list(dict.fromkeys(targeted_keywords))  
+            print(f"--- DEEP SCRAPE: Searching with {len(targeted_keywords)} keywords: {targeted_keywords} ---")
             new_articles = await deep_search_and_scrape(targeted_keywords, scraped_urls)
+
 
         if not db_task.done():
             print("--- Waiting for DB task to complete... ---")
@@ -2705,6 +2845,7 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             "source_urls": list(scraped_urls),
             "analysis": analysis_results,
             "structure": filtered_structure,
+            "template_meta" : template_meta,
             "seo": res,
             "category": script_categories["category"],
             "subcategories": script_categories["subcategories"],
@@ -2713,6 +2854,190 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
     except Exception as e:
         print(f"SCRIPT GENERATION: An error occurred: {e}")
         return {"error": "An error occurred during the script generation pipeline."}
+
+
+
+# Generate Invoice Function
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    Spacer,
+)
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+
+import datetime
+import os
+
+
+def generate_invoice_pdf(
+    invoice_no,
+    customer_name,
+    customer_address,
+    customer_phone,
+    item_name,
+    amount,
+    plan,
+    output_dir="invoices",
+):
+    styles = getSampleStyleSheet()
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    file_path = os.path.join(output_dir, f"{invoice_no}.pdf")
+
+    doc = SimpleDocTemplate(
+        file_path,
+        pagesize=A4,
+        rightMargin=20,
+        leftMargin=20,
+        topMargin=20,
+        bottomMargin=20,
+    )
+
+    elements = []
+
+    # -----------------------------
+    # Header
+    # -----------------------------
+    title = Paragraph(
+        "<b><font size=18>StoryBit</font></b>",
+        styles["Title"],
+    )
+
+    company_info = Paragraph(
+        """
+        TAX INVOICE<br/>
+        Contact: support@storybit.gmail.com
+        """,
+        styles["BodyText"],
+    )
+
+    elements.append(title)
+    elements.append(company_info)
+    elements.append(Spacer(1, 15))
+
+    # -----------------------------
+    # Invoice Details
+    # -----------------------------
+    invoice_data = [
+        ["Invoice #:", invoice_no],
+        ["Invoice Date:", datetime.datetime.now().strftime("%d %b %Y")],
+    ]
+
+    invoice_table = Table(invoice_data, colWidths=[120, 300])
+
+    invoice_table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+
+    elements.append(invoice_table)
+    elements.append(Spacer(1, 20))
+
+    # -----------------------------
+    # Bill To
+    # -----------------------------
+    bill_to = Paragraph(
+        f"""
+        <b>Bill To:</b><br/>
+        {customer_name}<br/>
+        {customer_address}<br/>
+        Phone: {customer_phone}
+        """,
+        styles["BodyText"],
+    )
+
+    elements.append(bill_to)
+    elements.append(Spacer(1, 20))
+
+    # -----------------------------
+    # Item Table
+    # -----------------------------
+    subtotal = amount
+    gst = round(amount * 0.05, 2)
+    grand_total = round(subtotal + gst, 2)
+
+    item_table_data = [
+        ["Item", "Rate", "Qty", "Total"],
+        [item_name, f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],
+    ]
+
+    item_table = Table(
+        item_table_data,
+        colWidths=[220, 80, 60, 100],
+    )
+
+    item_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.black),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("GRID", (0, 0), (-1, -1), 1, colors.grey),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 10),
+            ]
+        )
+    )
+
+    elements.append(item_table)
+    elements.append(Spacer(1, 20))
+
+    # -----------------------------
+    # Totals
+    # -----------------------------
+    totals_data = [
+        ["Subtotal:", f"Rs. {subtotal:.2f}"],
+        ["CGST/SGST (5%):", f"Rs. {gst:.2f}"],
+        ["Grand Total:", f"Rs. {grand_total:.2f}"],
+    ]
+
+    totals_table = Table(
+        totals_data,
+        colWidths=[320, 140],
+    )
+
+    totals_table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -2), "Helvetica"),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 11),
+                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+
+    elements.append(totals_table)
+    elements.append(Spacer(1, 30))
+
+    # Footer
+    footer = Paragraph(
+        """
+        Thank you for using StoryBit!<br/>
+        This is a computer generated invoice.
+        """,
+        styles["BodyText"],
+    )
+
+    elements.append(footer)
+
+    doc.build(elements)
+
+    return file_path
+
+
 
 @app.post("/payments/create-order")
 async def create_razorpay_order(
@@ -2872,6 +3197,36 @@ async def razorpay_webhook(
                 )
                 if sub_result.data:
                     print(f"Inserted subscription row for user {user_id}, order {order_id}.")
+                # Generate Invoice
+                try:
+                    profile_data = (
+                        supabase.table("user_profiles")
+                        .select("full_name, phone, billing_address")
+                        .eq("id", user_id)
+                        .single()
+                        .execute()
+                    )
+
+                    profile = profile_data.data or {}
+
+                    customer_name = profile.get("full_name", "Customer")
+                    customer_phone = profile.get("phone", "")
+                    customer_address = profile.get("billing_address", "")
+
+                    invoice_path = generate_invoice_pdf(
+                        invoice_no=f"INV-{order_id}",
+                        customer_name=customer_name,
+                        customer_address=customer_address,
+                        customer_phone=customer_phone,
+                        item_name=f"StoryBit {target_tier.title()} Plan",
+                        amount=amount_paid,
+                        plan=target_tier,
+                    )
+
+                    print(f"Invoice generated: {invoice_path}")
+
+                except Exception as e:
+                    print(f"ERROR generating invoice for {user_id}: {e}")
                 else:
                     print(f"WARN: Subscription insert returned no data for order {order_id}.")
 
@@ -2927,6 +3282,10 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
+
+
+
+
 
 
 
