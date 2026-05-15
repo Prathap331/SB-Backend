@@ -2857,7 +2857,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
 
 
-# Generate Invoice Function
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -2866,7 +2865,6 @@ from reportlab.lib.units import mm
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 import datetime
 import os
-
 
 def generate_invoice_pdf(
     invoice_no,
@@ -2881,7 +2879,7 @@ def generate_invoice_pdf(
     styles = getSampleStyleSheet()
 
     brand_style = ParagraphStyle('Brand', parent=styles['Normal'], fontSize=26, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_LEFT)
-    tagline_style = ParagraphStyle('Tagline', parent=styles['Normal'], fontSize=9, fontName='Helvetica', textColor=colors.HexColor('#666666'))
+    company_info_style = ParagraphStyle('CompanyInfo', parent=styles['Normal'], fontSize=9, fontName='Helvetica', textColor=colors.HexColor('#444444'), alignment=TA_LEFT, leading=15)
     invoice_label_style = ParagraphStyle('InvoiceLabel', parent=styles['Normal'], fontSize=13, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_RIGHT)
     section_header_style = ParagraphStyle('SectionHeader', parent=styles['Normal'], fontSize=8, fontName='Helvetica-Bold', textColor=colors.HexColor('#888888'), spaceAfter=3)
     body_style = ParagraphStyle('Body', parent=styles['Normal'], fontSize=10, fontName='Helvetica', textColor=colors.HexColor('#1a1a2e'), leading=16)
@@ -2895,32 +2893,53 @@ def generate_invoice_pdf(
     W = A4[0] - 50*mm
     elements = []
 
-    # Header
-    header_table = Table([[Paragraph("<b>StoryBit</b>", brand_style), Paragraph("TAX INVOICE", invoice_label_style)]], colWidths=[W * 0.6, W * 0.4])
-    header_table.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
-    elements.append(header_table)
-    elements.append(Paragraph("support@storybit.tech", tagline_style))
-    elements.append(Spacer(1, 4*mm))
+    elements.append(
+        Table(
+            [[Paragraph("<b>StoryBit</b>", brand_style), Paragraph("TAX INVOICE", invoice_label_style)]],
+            colWidths=[W * 0.58, W * 0.42],
+            style=TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                ('TOPPADDING', (0, 0), (-1, -1), 0),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+            ])
+        )
+    )
+
+    # ── Company info — completely separate, pushed way below title ──
+    elements.append(Spacer(1, 14*mm))
+    elements.append(Paragraph("Flat no. 502, Meenakshi enclave MIG 891", company_info_style))
+    elements.append(Paragraph("KPHB phase 3, Kukatpally, Hyderabad, 500072", company_info_style))
+    elements.append(Paragraph("GSTIN: 36AAQCM4860P1ZK", company_info_style))
+    elements.append(Paragraph("support@storybit.tech", company_info_style))
+
+    elements.append(Spacer(1, 5*mm))
     elements.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor('#1a1a2e')))
     elements.append(Spacer(1, 5*mm))
 
-    # Invoice meta
+    # ── INVOICE META ──
     meta_table = Table([
         [Paragraph("INVOICE NO.", section_header_style), Paragraph("INVOICE DATE", section_header_style)],
         [Paragraph(f"<b>{invoice_no}</b>", body_style), Paragraph(f"<b>{datetime.datetime.now().strftime('%d %b %Y')}</b>", body_style)],
     ], colWidths=[W * 0.5, W * 0.5])
-    meta_table.setStyle(TableStyle([('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0), ('BOTTOMPADDING', (0, 0), (-1, -1), 2), ('TOPPADDING', (0, 0), (-1, -1), 2)]))
+    meta_table.setStyle(TableStyle([
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ('TOPPADDING', (0, 0), (-1, -1), 2),
+    ]))
     elements.append(meta_table)
     elements.append(Spacer(1, 6*mm))
 
-    # Bill To
+    # ── BILL TO ──
     elements.append(Paragraph("BILL TO", section_header_style))
     elements.append(Paragraph(f"<b>{customer_name}</b>", body_style))
     elements.append(Paragraph(customer_address, body_style))
     elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
     elements.append(Spacer(1, 7*mm))
 
-    # Items table
+    # ── ITEMS TABLE ──
     subtotal = amount
     gst = round(amount * 0.18, 2)
     grand_total = round(subtotal + gst, 2)
@@ -2950,7 +2969,7 @@ def generate_invoice_pdf(
     elements.append(item_table)
     elements.append(Spacer(1, 4*mm))
 
-    # Totals
+    # ── TOTALS ──
     totals_table = Table([
         ['', 'Subtotal', f"Rs. {subtotal:.2f}"],
         ['', 'CGST/SGST (18%)', f"Rs. {gst:.2f}"],
@@ -2972,19 +2991,20 @@ def generate_invoice_pdf(
     elements.append(totals_table)
     elements.append(Spacer(1, 10*mm))
 
-    # Footer
+    # ── FOOTER ──
     elements.append(HRFlowable(width="100%", thickness=0.8, color=colors.HexColor('#cccccc')))
     elements.append(Spacer(1, 4*mm))
     elements.append(Paragraph("Morpho Technologies Pvt. Ltd.", footer_bold_style))
-    elements.append(Paragraph("Flat no: 502, Plot no. MIG 891, KPHB Phase 3, Kukatpally, Hyderabad, Telangana, India — 500072", footer_style))
+    elements.append(Paragraph("Flat no: 502, Plot no. MIG 891,", footer_style))
+    elements.append(Paragraph("KPHB Phase 3, Kukatpally,", footer_style))
+    elements.append(Paragraph("Hyderabad, Telangana, India — 500072", footer_style))
     elements.append(Spacer(1, 2*mm))
-    elements.append(Paragraph("GSTIN: &lt;36AAQCM4860P1ZK&gt;", footer_style))
+    elements.append(Paragraph("GSTIN: 36AAQCM4860P1ZK", footer_style))
     elements.append(Spacer(1, 2*mm))
     elements.append(Paragraph("This is a computer generated invoice.", footer_style))
 
     doc.build(elements)
     return file_path
-
 
 @app.post("/payments/create-order")
 async def create_razorpay_order(
@@ -3146,7 +3166,6 @@ async def razorpay_webhook(
                 if sub_result.data:
                     print(f"Inserted subscription row for user {user_id}, order {order_id}.")
 
-                    # --- Generate & upload invoice ---
                     try:
                         profile_data = (
                             supabase.table("user_profiles")
@@ -3192,6 +3211,7 @@ async def razorpay_webhook(
 
                         os.remove(invoice_path)
                         print(f"Invoice uploaded: {invoice_url}")
+
 
                     except Exception as e:
                         print(f"ERROR generating/uploading invoice for {user_id}: {e}")
@@ -3244,7 +3264,7 @@ async def razorpay_webhook(
         else:
             print(f"Ignoring unhandled event: {event_type}")
 
-        return {"status": "Webhook processed successfully"}
+        return {"invoice_url" : invoice_url}
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
