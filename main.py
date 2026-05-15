@@ -2857,24 +2857,18 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
 
 
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
-import datetime
 import os
-import random
-import string
-
-
-def generate_invoice_number():
-    random_part = ''.join(random.choices(string.digits, k=6))
-    year = datetime.datetime.now().year
-    return f"INV-{year}-{random_part}"
-
-
+import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+)
+ 
+ 
 def generate_invoice_pdf(
     invoice_no,
     customer_name,
@@ -2883,137 +2877,112 @@ def generate_invoice_pdf(
     item_name,
     amount,
     plan,
-    due_date=None,          
+    due_date=None,
     output_dir="invoices",
 ):
     styles = getSampleStyleSheet()
-
-    brand_style = ParagraphStyle('Brand', parent=styles['Normal'], fontSize=24, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_LEFT)
-    company_info_style = ParagraphStyle('CompanyInfo', parent=styles['Normal'], fontSize=8.5, fontName='Helvetica', textColor=colors.HexColor('#444444'), alignment=TA_LEFT, leading=14)
-    invoice_label_style = ParagraphStyle('InvoiceLabel', parent=styles['Normal'], fontSize=12, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_RIGHT)
-    section_header_style = ParagraphStyle('SectionHeader', parent=styles['Normal'], fontSize=7.5, fontName='Helvetica-Bold', textColor=colors.HexColor('#888888'), spaceAfter=2)
-    body_style = ParagraphStyle('Body', parent=styles['Normal'], fontSize=10, fontName='Helvetica', textColor=colors.HexColor('#1a1a2e'), leading=15)
-    body_bold_style = ParagraphStyle('BodyBold', parent=styles['Normal'], fontSize=10, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), leading=15)
-
+ 
+    brand_style         = ParagraphStyle('Brand',        parent=styles['Normal'], fontSize=24,  fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_LEFT)
+    company_info_style  = ParagraphStyle('CompanyInfo',  parent=styles['Normal'], fontSize=8.5, fontName='Helvetica',      textColor=colors.HexColor('#444444'), alignment=TA_LEFT, leading=14)
+    invoice_label_style = ParagraphStyle('InvoiceLabel', parent=styles['Normal'], fontSize=12,  fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_RIGHT)
+    section_header_style= ParagraphStyle('SectionHdr',   parent=styles['Normal'], fontSize=7.5, fontName='Helvetica-Bold', textColor=colors.HexColor('#888888'), spaceAfter=2)
+    body_style          = ParagraphStyle('Body',         parent=styles['Normal'], fontSize=10,  fontName='Helvetica',      textColor=colors.HexColor('#1a1a2e'), leading=15)
+    body_bold_style     = ParagraphStyle('BodyBold',     parent=styles['Normal'], fontSize=10,  fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), leading=15)
+ 
     os.makedirs(output_dir, exist_ok=True)
     file_path = os.path.join(output_dir, f"{invoice_no}.pdf")
-
+ 
     PAGE_W, PAGE_H = A4
-    LM = RM = 20*mm
-    TM = 18*mm
-    BM = 18*mm
-    W = PAGE_W - LM - RM
-
-    FOOTER_H = 24*mm
+    LM = RM = 20 * mm
+    TM = 18 * mm
+    BM = 18 * mm
+    W  = PAGE_W - LM - RM
+ 
+    FOOTER_H = 24 * mm
     FOOTER_Y = BM
-
+ 
     def draw_footer(canvas, doc):
         canvas.saveState()
-
-        # ── box ──
         canvas.setStrokeColor(colors.HexColor('#cccccc'))
         canvas.setLineWidth(0.8)
         canvas.roundRect(LM, FOOTER_Y, W, FOOTER_H, 3, stroke=1, fill=0)
-
-        cx = PAGE_W / 2  # centre of page
-
-        y1 = FOOTER_Y + FOOTER_H - 6*mm
-        y2 = FOOTER_Y + FOOTER_H - 11*mm
-        y3 = FOOTER_Y + FOOTER_H - 15.5*mm
-        y4 = FOOTER_Y + FOOTER_H - 19.5*mm
-
+        cx = PAGE_W / 2
+        y1 = FOOTER_Y + FOOTER_H - 6    * mm
+        y2 = FOOTER_Y + FOOTER_H - 11   * mm
+        y3 = FOOTER_Y + FOOTER_H - 15.5 * mm
+        y4 = FOOTER_Y + FOOTER_H - 19.5 * mm
         canvas.setFont('Helvetica-Bold', 8.5)
         canvas.setFillColor(colors.HexColor('#1a1a2e'))
         canvas.drawCentredString(cx, y1, "Details Under GST")
-
-        canvas.setFont('Helvetica-Bold', 8.5)
         canvas.drawCentredString(cx, y2, "Morpho Technologies Pvt. Ltd.")
-
         canvas.setFont('Helvetica', 8)
         canvas.setFillColor(colors.HexColor('#333333'))
-        canvas.drawCentredString(cx, y3, "Flat no: 502, Plot no. MIG 891, KPHB Phase 3, Kukatpally, Hyderabad, Telangana, India — 500072")
-
+        canvas.drawCentredString(cx, y3, "Flat no: 502, Plot no. MIG 891, KPHB Phase 3, Kukatpally, Hyderabad, Telangana, India - 500072")
         canvas.drawCentredString(cx, y4, "GSTIN: 36AAQCM4860P1ZK")
-
-        # ── note below box, centred ──
         canvas.setFont('Helvetica', 7.5)
         canvas.setFillColor(colors.HexColor('#999999'))
-        canvas.drawCentredString(cx, FOOTER_Y - 5*mm, "This is a computer generated invoice.")
-
+        canvas.drawCentredString(cx, FOOTER_Y - 5 * mm, "This is a computer generated invoice.")
         canvas.restoreState()
-
+ 
     doc = SimpleDocTemplate(
-        file_path,
-        pagesize=A4,
-        rightMargin=RM,
-        leftMargin=LM,
-        topMargin=TM,
-        bottomMargin=BM + FOOTER_H + 12*mm,
+        file_path, pagesize=A4,
+        rightMargin=RM, leftMargin=LM,
+        topMargin=TM, bottomMargin=BM + FOOTER_H + 12 * mm,
     )
-
+ 
     elements = []
-
+ 
     # ── TITLE ROW ──
-    elements.append(
-        Table(
-            [[Paragraph("<b>StoryBit</b>", brand_style), Paragraph("TAX INVOICE", invoice_label_style)]],
-            colWidths=[W * 0.55, W * 0.45],
-            style=TableStyle([
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('LEFTPADDING', (0, 0), (-1, -1), 0),
-                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                ('TOPPADDING', (0, 0), (-1, -1), 0),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
-            ])
-        )
-    )
-
-    # 5x push below title
+    elements.append(Table(
+        [[Paragraph("<b>StoryBit</b>", brand_style), Paragraph("TAX INVOICE", invoice_label_style)]],
+        colWidths=[W*0.55, W*0.45],
+        style=TableStyle([
+            ('VALIGN',        (0,0),(-1,-1),'TOP'),
+            ('LEFTPADDING',   (0,0),(-1,-1),0),
+            ('RIGHTPADDING',  (0,0),(-1,-1),0),
+            ('TOPPADDING',    (0,0),(-1,-1),0),
+            ('BOTTOMPADDING', (0,0),(-1,-1),0),
+        ])
+    ))
     elements.append(Spacer(1, 9*mm))
-
+ 
     # ── COMPANY INFO ──
-    elements.append(Paragraph("Flat no. 502, Meenakshi enclave MIG 891", company_info_style))
-    elements.append(Paragraph("KPHB phase 3, Kukatpally, Hyderabad, 500072", company_info_style))
-    elements.append(Paragraph("GSTIN: 36AAQCM4860P1ZK", company_info_style))
-    elements.append(Paragraph("support@storybit.tech", company_info_style))
-
+    for line in [
+        "Flat no. 502, Meenakshi enclave MIG 891",
+        "KPHB phase 3, Kukatpally, Hyderabad, 500072",
+        "GSTIN: 36AAQCM4860P1ZK",
+        "support@storybit.tech",
+    ]:
+        elements.append(Paragraph(line, company_info_style))
+ 
     elements.append(Spacer(1, 5*mm))
     elements.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor('#1a1a2e')))
     elements.append(Spacer(1, 6*mm))
-
+ 
     # ── INVOICE META ──
     if due_date is None:
         due_date = datetime.datetime.now() + datetime.timedelta(days=7)
-    if isinstance(due_date, str):
-        due_date_str = due_date[:10]  
-        due_date_str = datetime.datetime.fromisoformat(due_date[:19]).strftime('%d %b %Y')
-    else:
-        due_date_str = due_date.strftime('%d %b %Y')
+    due_date_str = (
+        datetime.datetime.fromisoformat(due_date[:19]).strftime('%d %b %Y')
+        if isinstance(due_date, str) else due_date.strftime('%d %b %Y')
+    )
     meta_table = Table([
-        [
-            Paragraph("INVOICE NO.", section_header_style),
-            Paragraph("INVOICE DATE", section_header_style),
-            Paragraph("DUE DATE", section_header_style),
-        ],
-        [
-            Paragraph(f"<b>{invoice_no}</b>", body_bold_style),
-            Paragraph(f"<b>{datetime.datetime.now().strftime('%d %b %Y')}</b>", body_bold_style),
-            Paragraph(f"<b>{due_date_str}</b>", body_bold_style),
-        ],
-    ], colWidths=[W * 0.34, W * 0.33, W * 0.33])
+        [Paragraph("INVOICE NO.", section_header_style),  Paragraph("INVOICE DATE", section_header_style), Paragraph("DUE DATE", section_header_style)],
+        [Paragraph(f"<b>{invoice_no}</b>", body_bold_style), Paragraph(f"<b>{datetime.datetime.now().strftime('%d %b %Y')}</b>", body_bold_style), Paragraph(f"<b>{due_date_str}</b>", body_bold_style)],
+    ], colWidths=[W*0.34, W*0.33, W*0.33])
     meta_table.setStyle(TableStyle([
-        ('LEFTPADDING', (0, 0), (-1, -1), 0),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
-        ('TOPPADDING', (0, 0), (-1, -1), 2),
-        ('ALIGN', (1, 0), (1, -1), 'CENTER'),
-        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
+        ('LEFTPADDING',   (0,0),(-1,-1), 0),
+        ('RIGHTPADDING',  (0,0),(-1,-1), 0),
+        ('BOTTOMPADDING', (0,0),(-1,-1), 2),
+        ('TOPPADDING',    (0,0),(-1,-1), 2),
+        ('ALIGN', (1,0),(1,-1),'CENTER'),
+        ('ALIGN', (2,0),(2,-1),'RIGHT'),
     ]))
     elements.append(meta_table)
     elements.append(Spacer(1, 6*mm))
     elements.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#dddddd')))
     elements.append(Spacer(1, 6*mm))
-
+ 
     # ── BILL TO ──
     elements.append(Paragraph("BILL TO", section_header_style))
     elements.append(Spacer(1, 1*mm))
@@ -3021,41 +2990,95 @@ def generate_invoice_pdf(
     elements.append(Paragraph(customer_address, body_style))
     elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
     elements.append(Spacer(1, 7*mm))
-
-    # ── ITEMS TABLE ──
-    # ── ITEMS TABLE ──
-    subtotal = amount
-    gst = round(amount * 0.18, 2)
-    grand_total = round(subtotal + gst, 2)
-
-    item_table = Table(
-        [
-            ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],
-            [item_name, plan.title(), f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],
-        ],
-        colWidths=[W * 0.34, W * 0.12, W * 0.18, W * 0.12, W * 0.24],
-    )
-    item_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 9),
-        ('TOPPADDING', (0, 0), (-1, 0), 9),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 9),
-        ('LEFTPADDING', (0, 0), (-1, -1), 8),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 1), (-1, -1), 10),
-        ('TOPPADDING', (0, 1), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 10),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8f8fb')),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dddddd')),
-        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-        ('ALIGN', (1, 0), (1, -1), 'CENTER'),   # PLAN col — centred
-        ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),   # RATE, QTY, TOTAL — right
-        ('ALIGN', (3, 0), (3, -1), 'CENTER'),   # QTY — centred
-    ]))
-    elements.append(item_table)
+ 
+    # ── AMOUNTS ──
+    subtotal    = round(amount, 2)
+    cgst        = round(amount * 0.09, 2)
+    sgst        = round(amount * 0.09, 2)
+    gst_total   = round(cgst + sgst, 2)
+    grand_total = round(subtotal + gst_total, 2)
+ 
+    # ── COLUMN WIDTHS — shared by item row AND gst summary rows ──
+    # ITEM(0) | PLAN(1) | RATE(2) | QTY(3) | TOTAL(4)
+    CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
+ 
+    def lp(bold=False, tc=colors.HexColor('#1a1a2e')):
+        return ParagraphStyle('_l', parent=styles['Normal'], fontSize=10,
+                              fontName='Helvetica-Bold' if bold else 'Helvetica',
+                              textColor=tc, alignment=TA_LEFT)
+ 
+    def rp(bold=False, tc=colors.HexColor('#1a1a2e')):
+        return ParagraphStyle('_r', parent=styles['Normal'], fontSize=10,
+                              fontName='Helvetica-Bold' if bold else 'Helvetica',
+                              textColor=tc, alignment=TA_RIGHT)
+ 
+    # GST summary rows — cols 0-2 are blank, col 3 = label, col 4 = value
+    gst_defs = [
+        ("Subtotal",        f"Rs. {subtotal:.2f}",    False, colors.HexColor('#f8f8fb'), colors.HexColor('#1a1a2e')),
+        ("CGST (9%)",       f"Rs. {cgst:.2f}",        False, colors.HexColor('#f8f8fb'), colors.HexColor('#1a1a2e')),
+        ("SGST (9%)",       f"Rs. {sgst:.2f}",        False, colors.HexColor('#f8f8fb'), colors.HexColor('#1a1a2e')),
+        ("Total GST (18%)", f"Rs. {gst_total:.2f}",   False, colors.HexColor('#eef0f8'), colors.HexColor('#1a1a2e')),
+        ("Grand Total",     f"Rs. {grand_total:.2f}", True,  colors.HexColor('#1a1a2e'), colors.white),
+    ]
+ 
+    table_data = [
+        ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],                                   # row 0
+        [item_name, plan.title(), f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],   # row 1
+    ]
+    for label, value, bold, bg, tc in gst_defs:
+        table_data.append(["", "", "", Paragraph(label, lp(bold, tc)), Paragraph(value, rp(bold, tc))])
+ 
+    WHITE = colors.white
+ 
+    ts = TableStyle([
+        # header
+        ('BACKGROUND',    (0,0),(-1,0), colors.HexColor('#1a1a2e')),
+        ('TEXTCOLOR',     (0,0),(-1,0), WHITE),
+        ('FONTNAME',      (0,0),(-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',      (0,0),(-1,0), 9),
+        ('TOPPADDING',    (0,0),(-1,0), 9),
+        ('BOTTOMPADDING', (0,0),(-1,0), 9),
+        ('ALIGN',         (0,0),(0,0),  'LEFT'),
+        ('ALIGN',         (1,0),(1,0),  'CENTER'),
+        ('ALIGN',         (2,0),(-1,0), 'RIGHT'),
+        ('ALIGN',         (3,0),(3,0),  'CENTER'),
+        # item row
+        ('BACKGROUND',    (0,1),(-1,1), colors.HexColor('#f8f8fb')),
+        ('FONTNAME',      (0,1),(-1,1), 'Helvetica'),
+        ('FONTSIZE',      (0,1),(-1,1), 10),
+        ('TOPPADDING',    (0,1),(-1,1), 10),
+        ('BOTTOMPADDING', (0,1),(-1,1), 10),
+        ('ALIGN',         (0,1),(0,1),  'LEFT'),
+        ('ALIGN',         (1,1),(1,1),  'CENTER'),
+        ('ALIGN',         (2,1),(-1,1), 'RIGHT'),
+        ('ALIGN',         (3,1),(3,1),  'CENTER'),
+        # grid only for header + item rows
+        ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
+        # global padding
+        ('LEFTPADDING',   (0,0),(-1,-1), 8),
+        ('RIGHTPADDING',  (0,0),(-1,-1), 8),
+        # suppress ALL borders on left 3 cols of gst rows (rows 2+)
+        ('BACKGROUND',    (0,2),(2,-1), WHITE),
+        ('LINEABOVE',     (0,2),(2,-1), 0, WHITE),
+        ('LINEBELOW',     (0,2),(2,-1), 0, WHITE),
+        ('LINEBEFORE',    (0,2),(0,-1), 0, WHITE),
+        ('LINEAFTER',     (2,2),(2,-1), 0, WHITE),
+        ('TOPPADDING',    (0,2),(2,-1), 0),
+        ('BOTTOMPADDING', (0,2),(2,-1), 0),
+    ])
+ 
+    for i, (label, value, bold, bg, tc) in enumerate(gst_defs):
+        r = 2 + i
+        ts.add('BACKGROUND',    (3,r),(4,r), bg)
+        ts.add('GRID',          (3,r),(4,r), 0.5, colors.HexColor('#dddddd'))
+        ts.add('TOPPADDING',    (3,r),(4,r), 6)
+        ts.add('BOTTOMPADDING', (3,r),(4,r), 6)
+ 
+    combined = Table(table_data, colWidths=CW)
+    combined.setStyle(ts)
+    elements.append(combined)
+    elements.append(Spacer(1, 8*mm))
+ 
     doc.build(elements, onFirstPage=draw_footer, onLaterPages=draw_footer)
     return file_path
 
