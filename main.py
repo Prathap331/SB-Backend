@@ -2867,7 +2867,7 @@ from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 )
- 
+import string
 
 def generate_invoice_number():
     random_part = ''.join(random.choices(string.digits, k=6))
