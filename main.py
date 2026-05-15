@@ -2865,6 +2865,15 @@ from reportlab.lib.units import mm
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 import datetime
 import os
+import random
+import string
+
+
+def generate_invoice_number():
+    random_part = ''.join(random.choices(string.digits, k=6))
+    year = datetime.datetime.now().year
+    return f"INV-{year}-{random_part}"
+
 
 def generate_invoice_pdf(
     invoice_no,
@@ -2878,25 +2887,76 @@ def generate_invoice_pdf(
 ):
     styles = getSampleStyleSheet()
 
-    brand_style = ParagraphStyle('Brand', parent=styles['Normal'], fontSize=26, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_LEFT)
-    company_info_style = ParagraphStyle('CompanyInfo', parent=styles['Normal'], fontSize=9, fontName='Helvetica', textColor=colors.HexColor('#444444'), alignment=TA_LEFT, leading=15)
-    invoice_label_style = ParagraphStyle('InvoiceLabel', parent=styles['Normal'], fontSize=13, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_RIGHT)
-    section_header_style = ParagraphStyle('SectionHeader', parent=styles['Normal'], fontSize=8, fontName='Helvetica-Bold', textColor=colors.HexColor('#888888'), spaceAfter=3)
-    body_style = ParagraphStyle('Body', parent=styles['Normal'], fontSize=10, fontName='Helvetica', textColor=colors.HexColor('#1a1a2e'), leading=16)
-    footer_style = ParagraphStyle('Footer', parent=styles['Normal'], fontSize=8, fontName='Helvetica', textColor=colors.HexColor('#888888'), alignment=TA_CENTER, leading=13)
-    footer_bold_style = ParagraphStyle('FooterBold', parent=styles['Normal'], fontSize=8, fontName='Helvetica-Bold', textColor=colors.HexColor('#555555'), alignment=TA_CENTER, leading=13)
+    brand_style = ParagraphStyle('Brand', parent=styles['Normal'], fontSize=24, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_LEFT)
+    company_info_style = ParagraphStyle('CompanyInfo', parent=styles['Normal'], fontSize=8.5, fontName='Helvetica', textColor=colors.HexColor('#444444'), alignment=TA_LEFT, leading=14)
+    invoice_label_style = ParagraphStyle('InvoiceLabel', parent=styles['Normal'], fontSize=12, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_RIGHT)
+    section_header_style = ParagraphStyle('SectionHeader', parent=styles['Normal'], fontSize=7.5, fontName='Helvetica-Bold', textColor=colors.HexColor('#888888'), spaceAfter=2)
+    body_style = ParagraphStyle('Body', parent=styles['Normal'], fontSize=10, fontName='Helvetica', textColor=colors.HexColor('#1a1a2e'), leading=15)
+    body_bold_style = ParagraphStyle('BodyBold', parent=styles['Normal'], fontSize=10, fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), leading=15)
 
     os.makedirs(output_dir, exist_ok=True)
     file_path = os.path.join(output_dir, f"{invoice_no}.pdf")
 
-    doc = SimpleDocTemplate(file_path, pagesize=A4, rightMargin=25*mm, leftMargin=25*mm, topMargin=20*mm, bottomMargin=20*mm)
-    W = A4[0] - 50*mm
+    PAGE_W, PAGE_H = A4
+    LM = RM = 20*mm
+    TM = 18*mm
+    BM = 18*mm
+    W = PAGE_W - LM - RM
+
+    FOOTER_H = 24*mm
+    FOOTER_Y = BM
+
+    def draw_footer(canvas, doc):
+        canvas.saveState()
+
+        # ── box ──
+        canvas.setStrokeColor(colors.HexColor('#cccccc'))
+        canvas.setLineWidth(0.8)
+        canvas.roundRect(LM, FOOTER_Y, W, FOOTER_H, 3, stroke=1, fill=0)
+
+        cx = PAGE_W / 2  # centre of page
+
+        y1 = FOOTER_Y + FOOTER_H - 6*mm
+        y2 = FOOTER_Y + FOOTER_H - 11*mm
+        y3 = FOOTER_Y + FOOTER_H - 15.5*mm
+        y4 = FOOTER_Y + FOOTER_H - 19.5*mm
+
+        canvas.setFont('Helvetica-Bold', 8.5)
+        canvas.setFillColor(colors.HexColor('#1a1a2e'))
+        canvas.drawCentredString(cx, y1, "Details Under GST")
+
+        canvas.setFont('Helvetica-Bold', 8.5)
+        canvas.drawCentredString(cx, y2, "Morpho Technologies Pvt. Ltd.")
+
+        canvas.setFont('Helvetica', 8)
+        canvas.setFillColor(colors.HexColor('#333333'))
+        canvas.drawCentredString(cx, y3, "Flat no: 502, Plot no. MIG 891, KPHB Phase 3, Kukatpally, Hyderabad, Telangana, India — 500072")
+
+        canvas.drawCentredString(cx, y4, "GSTIN: 36AAQCM4860P1ZK")
+
+        # ── note below box, centred ──
+        canvas.setFont('Helvetica', 7.5)
+        canvas.setFillColor(colors.HexColor('#999999'))
+        canvas.drawCentredString(cx, FOOTER_Y - 5*mm, "This is a computer generated invoice.")
+
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        file_path,
+        pagesize=A4,
+        rightMargin=RM,
+        leftMargin=LM,
+        topMargin=TM,
+        bottomMargin=BM + FOOTER_H + 12*mm,
+    )
+
     elements = []
 
+    # ── TITLE ROW ──
     elements.append(
         Table(
             [[Paragraph("<b>StoryBit</b>", brand_style), Paragraph("TAX INVOICE", invoice_label_style)]],
-            colWidths=[W * 0.58, W * 0.42],
+            colWidths=[W * 0.55, W * 0.45],
             style=TableStyle([
                 ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                 ('LEFTPADDING', (0, 0), (-1, -1), 0),
@@ -2907,8 +2967,10 @@ def generate_invoice_pdf(
         )
     )
 
-    # ── Company info — completely separate, pushed way below title ──
-    elements.append(Spacer(1, 14*mm))
+    # 5x push below title
+    elements.append(Spacer(1, 9*mm))
+
+    # ── COMPANY INFO ──
     elements.append(Paragraph("Flat no. 502, Meenakshi enclave MIG 891", company_info_style))
     elements.append(Paragraph("KPHB phase 3, Kukatpally, Hyderabad, 500072", company_info_style))
     elements.append(Paragraph("GSTIN: 36AAQCM4860P1ZK", company_info_style))
@@ -2916,25 +2978,39 @@ def generate_invoice_pdf(
 
     elements.append(Spacer(1, 5*mm))
     elements.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor('#1a1a2e')))
-    elements.append(Spacer(1, 5*mm))
+    elements.append(Spacer(1, 6*mm))
 
     # ── INVOICE META ──
+    due_date = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime('%d %b %Y')
     meta_table = Table([
-        [Paragraph("INVOICE NO.", section_header_style), Paragraph("INVOICE DATE", section_header_style)],
-        [Paragraph(f"<b>{invoice_no}</b>", body_style), Paragraph(f"<b>{datetime.datetime.now().strftime('%d %b %Y')}</b>", body_style)],
-    ], colWidths=[W * 0.5, W * 0.5])
+        [
+            Paragraph("INVOICE NO.", section_header_style),
+            Paragraph("INVOICE DATE", section_header_style),
+            Paragraph("DUE DATE", section_header_style),
+        ],
+        [
+            Paragraph(f"<b>{invoice_no}</b>", body_bold_style),
+            Paragraph(f"<b>{datetime.datetime.now().strftime('%d %b %Y')}</b>", body_bold_style),
+            Paragraph(f"<b>{due_date}</b>", body_bold_style),
+        ],
+    ], colWidths=[W * 0.34, W * 0.33, W * 0.33])
     meta_table.setStyle(TableStyle([
         ('LEFTPADDING', (0, 0), (-1, -1), 0),
         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
         ('TOPPADDING', (0, 0), (-1, -1), 2),
+        ('ALIGN', (1, 0), (1, -1), 'CENTER'),
+        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
     ]))
     elements.append(meta_table)
+    elements.append(Spacer(1, 6*mm))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#dddddd')))
     elements.append(Spacer(1, 6*mm))
 
     # ── BILL TO ──
     elements.append(Paragraph("BILL TO", section_header_style))
-    elements.append(Paragraph(f"<b>{customer_name}</b>", body_style))
+    elements.append(Spacer(1, 1*mm))
+    elements.append(Paragraph(f"<b>{customer_name}</b>", body_bold_style))
     elements.append(Paragraph(customer_address, body_style))
     elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
     elements.append(Spacer(1, 7*mm))
@@ -2945,16 +3021,19 @@ def generate_invoice_pdf(
     grand_total = round(subtotal + gst, 2)
 
     item_table = Table(
-        [['ITEM', 'RATE', 'QTY', 'TOTAL'], [item_name, f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"]],
-        colWidths=[W * 0.45, W * 0.18, W * 0.12, W * 0.25],
+        [
+            ['ITEM', 'RATE', 'QTY', 'TOTAL'],
+            [item_name, f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],
+        ],
+        colWidths=[W * 0.46, W * 0.18, W * 0.12, W * 0.24],
     )
     item_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
         ('FONTSIZE', (0, 0), (-1, 0), 9),
-        ('TOPPADDING', (0, 0), (-1, 0), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+        ('TOPPADDING', (0, 0), (-1, 0), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 9),
         ('LEFTPADDING', (0, 0), (-1, -1), 8),
         ('RIGHTPADDING', (0, 0), (-1, -1), 8),
         ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
@@ -2963,48 +3042,42 @@ def generate_invoice_pdf(
         ('BOTTOMPADDING', (0, 1), (-1, -1), 10),
         ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8f8fb')),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dddddd')),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
         ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
         ('ALIGN', (2, 0), (2, -1), 'CENTER'),
     ]))
     elements.append(item_table)
-    elements.append(Spacer(1, 4*mm))
+    elements.append(Spacer(1, 5*mm))
 
     # ── TOTALS ──
     totals_table = Table([
         ['', 'Subtotal', f"Rs. {subtotal:.2f}"],
         ['', 'CGST/SGST (18%)', f"Rs. {gst:.2f}"],
+        ['', '', ''],
         ['', 'Grand Total', f"Rs. {grand_total:.2f}"],
-    ], colWidths=[W * 0.5, W * 0.28, W * 0.22])
+    ], colWidths=[W * 0.46, W * 0.30, W * 0.24])
     totals_table.setStyle(TableStyle([
-        ('FONTNAME', (0, 0), (-1, -2), 'Helvetica'),
+        ('FONTNAME', (0, 0), (-1, 1), 'Helvetica'),
         ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
         ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('FONTSIZE', (1, -1), (2, -1), 11),
         ('ALIGN', (1, 0), (1, -1), 'LEFT'),
         ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
-        ('TOPPADDING', (0, 0), (-1, -1), 5),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-        ('LINEABOVE', (1, -1), (2, -1), 1, colors.HexColor('#1a1a2e')),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ('LEFTPADDING', (0, 0), (-1, -1), 0),
         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-        ('TEXTCOLOR', (0, -1), (-1, -1), colors.HexColor('#1a1a2e')),
+        ('LINEABOVE', (1, 2), (2, 2), 0.5, colors.HexColor('#cccccc')),
+        ('LINEBELOW', (1, 2), (2, 2), 0.5, colors.HexColor('#cccccc')),
+        ('LINEABOVE', (1, 3), (2, 3), 1.2, colors.HexColor('#1a1a2e')),
+        ('TEXTCOLOR', (1, -1), (2, -1), colors.HexColor('#1a1a2e')),
     ]))
     elements.append(totals_table)
-    elements.append(Spacer(1, 10*mm))
 
-    # ── FOOTER ──
-    elements.append(HRFlowable(width="100%", thickness=0.8, color=colors.HexColor('#cccccc')))
-    elements.append(Spacer(1, 4*mm))
-    elements.append(Paragraph("Morpho Technologies Pvt. Ltd.", footer_bold_style))
-    elements.append(Paragraph("Flat no: 502, Plot no. MIG 891,", footer_style))
-    elements.append(Paragraph("KPHB Phase 3, Kukatpally,", footer_style))
-    elements.append(Paragraph("Hyderabad, Telangana, India — 500072", footer_style))
-    elements.append(Spacer(1, 2*mm))
-    elements.append(Paragraph("GSTIN: 36AAQCM4860P1ZK", footer_style))
-    elements.append(Spacer(1, 2*mm))
-    elements.append(Paragraph("This is a computer generated invoice.", footer_style))
-
-    doc.build(elements)
+    doc.build(elements, onFirstPage=draw_footer, onLaterPages=draw_footer)
     return file_path
+
+
 
 @app.post("/payments/create-order")
 async def create_razorpay_order(
@@ -3180,8 +3253,9 @@ async def razorpay_webhook(
                         customer_phone   = profile.get("phone", "")
                         customer_address = profile.get("billing_address", "")
 
+
                         invoice_path = generate_invoice_pdf(
-                            invoice_no=f"INV-{order_id}",
+                            invoice_no=f"INV-{generate_invoice_number()}",
                             customer_name=customer_name,
                             customer_address=customer_address,
                             customer_phone=customer_phone,
@@ -3272,6 +3346,21 @@ async def razorpay_webhook(
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
 
+
+
+@app.get("/payments/invoice/{order_id}")
+async def get_invoice(order_id: str, current_user: User = Depends(get_current_user)):
+    result = (
+        supabase.table("subscriptions")
+        .select("invoice_url")
+        .eq("razorpay_order_id", order_id)
+        .eq("userId", str(current_user.id))
+        .single()
+        .execute()
+    )
+    if not result.data or not result.data.get("invoice_url"):
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+    return {"invoice_url": result.data["invoice_url"]}
 
 
 
