@@ -2997,47 +2997,42 @@ def generate_invoice_pdf(
     elements.append(Spacer(1, 7*mm))
  
     # ── AMOUNTS ──
-    subtotal    = round(amount, 2)
-    cgst        = round(amount * 0.09, 2)
-    sgst        = round(amount * 0.09, 2)
-    gst_total   = round(cgst + sgst, 2)
-    grand_total = round(subtotal + gst_total, 2)
- 
-    # ── COLUMN WIDTHS — shared by item row AND gst summary rows ──
+    gst_total   = round(amount * 0.18, 2)
+    grand_total = round(amount + gst_total, 2)
+
+    # ── COLUMN WIDTHS — shared by item row AND summary rows ──
     # ITEM(0) | PLAN(1) | RATE(2) | QTY(3) | TOTAL(4)
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
- 
+
     def lp(bold=False, tc=colors.HexColor('#1a1a2e')):
         return ParagraphStyle('_l', parent=styles['Normal'], fontSize=10,
                               fontName='Helvetica-Bold' if bold else 'Helvetica',
                               textColor=tc, alignment=TA_LEFT)
- 
+
     def rp(bold=False, tc=colors.HexColor('#1a1a2e')):
         return ParagraphStyle('_r', parent=styles['Normal'], fontSize=10,
                               fontName='Helvetica-Bold' if bold else 'Helvetica',
                               textColor=tc, alignment=TA_RIGHT)
- 
-    # GST summary rows — cols 0-2 are blank, col 3 = label, col 4 = value
-    gst_defs = [
-        ("Subtotal",        f"Rs. {subtotal:.2f}",    False, colors.HexColor('#f8f8fb'), colors.HexColor('#1a1a2e')),
-        ("CGST (9%)",       f"Rs. {cgst:.2f}",        False, colors.HexColor('#f8f8fb'), colors.HexColor('#1a1a2e')),
-        ("SGST (9%)",       f"Rs. {sgst:.2f}",        False, colors.HexColor('#f8f8fb'), colors.HexColor('#1a1a2e')),
-        ("Total GST (18%)", f"Rs. {gst_total:.2f}",   False, colors.HexColor('#eef0f8'), colors.HexColor('#1a1a2e')),
-        ("Grand Total",     f"Rs. {grand_total:.2f}", True,  colors.HexColor('#1a1a2e'), colors.white),
-    ]
- 
+
+    def cp(bold=False, tc=colors.HexColor('#1a1a2e')):
+        return ParagraphStyle('_c', parent=styles['Normal'], fontSize=10,
+                              fontName='Helvetica-Bold' if bold else 'Helvetica',
+                              textColor=tc, alignment=TA_CENTER)
+
     table_data = [
-        ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],                                   # row 0
-        [item_name, plan.title(), f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],   # row 1
+        ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],                                    # row 0
+        [item_name, plan.title(), f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],    # row 1
+        ["", "", "", Paragraph("Total GST (18%)", lp(False)), Paragraph(f"Rs. {gst_total:.2f}", rp(False))],  # row 2
+        [Paragraph("GRAND TOTAL", cp(True, colors.white)),
+         "", "", "",
+         Paragraph(f"Rs. {grand_total:.2f}", rp(True, colors.white))],               # row 3
     ]
-    for label, value, bold, bg, tc in gst_defs:
-        table_data.append(["", "", "", Paragraph(label, lp(bold, tc)), Paragraph(value, rp(bold, tc))])
- 
+
     WHITE = colors.white
- 
+    DARK  = colors.HexColor('#1a1a2e')
+
     ts = TableStyle([
-        # header
-        ('BACKGROUND',    (0,0),(-1,0), colors.HexColor('#1a1a2e')),
+        ('BACKGROUND',    (0,0),(-1,0), DARK),
         ('TEXTCOLOR',     (0,0),(-1,0), WHITE),
         ('FONTNAME',      (0,0),(-1,0), 'Helvetica-Bold'),
         ('FONTSIZE',      (0,0),(-1,0), 9),
@@ -3047,7 +3042,6 @@ def generate_invoice_pdf(
         ('ALIGN',         (1,0),(1,0),  'CENTER'),
         ('ALIGN',         (2,0),(-1,0), 'RIGHT'),
         ('ALIGN',         (3,0),(3,0),  'CENTER'),
-        # item row
         ('BACKGROUND',    (0,1),(-1,1), colors.HexColor('#f8f8fb')),
         ('FONTNAME',      (0,1),(-1,1), 'Helvetica'),
         ('FONTSIZE',      (0,1),(-1,1), 10),
@@ -3057,28 +3051,30 @@ def generate_invoice_pdf(
         ('ALIGN',         (1,1),(1,1),  'CENTER'),
         ('ALIGN',         (2,1),(-1,1), 'RIGHT'),
         ('ALIGN',         (3,1),(3,1),  'CENTER'),
-        # grid only for header + item rows
         ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
-        # global padding
         ('LEFTPADDING',   (0,0),(-1,-1), 8),
         ('RIGHTPADDING',  (0,0),(-1,-1), 8),
-        # suppress ALL borders on left 3 cols of gst rows (rows 2+)
-        ('BACKGROUND',    (0,2),(2,-1), WHITE),
-        ('LINEABOVE',     (0,2),(2,-1), 0, WHITE),
-        ('LINEBELOW',     (0,2),(2,-1), 0, WHITE),
-        ('LINEBEFORE',    (0,2),(0,-1), 0, WHITE),
-        ('LINEAFTER',     (2,2),(2,-1), 0, WHITE),
-        ('TOPPADDING',    (0,2),(2,-1), 0),
-        ('BOTTOMPADDING', (0,2),(2,-1), 0),
+
+        ('BACKGROUND',    (0,2),(2,2), WHITE),
+        ('LINEABOVE',     (0,2),(2,2), 0, WHITE),
+        ('LINEBELOW',     (0,2),(2,2), 0, WHITE),
+        ('LINEBEFORE',    (0,2),(0,2), 0, WHITE),
+        ('LINEAFTER',     (2,2),(2,2), 0, WHITE),
+        ('TOPPADDING',    (0,2),(2,2), 0),
+        ('BOTTOMPADDING', (0,2),(2,2), 0),
+        ('BACKGROUND',    (3,2),(4,2), colors.HexColor('#eef0f8')),
+        ('GRID',          (3,2),(4,2), 0.5, colors.HexColor('#dddddd')),
+        ('TOPPADDING',    (3,2),(4,2), 6),
+        ('BOTTOMPADDING', (3,2),(4,2), 6),
+
+        ('SPAN',          (0,3),(-1,3)),
+        ('BACKGROUND',    (0,3),(-1,3), DARK),
+        ('GRID',          (0,3),(-1,3), 0.5, colors.HexColor('#dddddd')),
+        ('TOPPADDING',    (0,3),(-1,3), 10),
+        ('BOTTOMPADDING', (0,3),(-1,3), 10),
+        ('ALIGN',         (0,3),(-1,3), 'RIGHT'),
     ])
- 
-    for i, (label, value, bold, bg, tc) in enumerate(gst_defs):
-        r = 2 + i
-        ts.add('BACKGROUND',    (3,r),(4,r), bg)
-        ts.add('GRID',          (3,r),(4,r), 0.5, colors.HexColor('#dddddd'))
-        ts.add('TOPPADDING',    (3,r),(4,r), 6)
-        ts.add('BOTTOMPADDING', (3,r),(4,r), 6)
- 
+
     combined = Table(table_data, colWidths=CW)
     combined.setStyle(ts)
     elements.append(combined)
@@ -3086,7 +3082,6 @@ def generate_invoice_pdf(
  
     doc.build(elements, onFirstPage=draw_footer, onLaterPages=draw_footer)
     return file_path
-
 
 
 @app.post("/payments/create-order")
