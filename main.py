@@ -2856,9 +2856,10 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         return {"error": "An error occurred during the script generation pipeline."}
 
 
-
 import os
+import random
 import datetime
+import string
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
@@ -2867,8 +2868,7 @@ from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 )
-import string
-
+ 
 def generate_invoice_number():
     random_part = ''.join(random.choices(string.digits, k=6))
     year = datetime.datetime.now().year
@@ -2999,53 +2999,78 @@ def generate_invoice_pdf(
     # ── AMOUNTS ──
     gst_total   = round(amount * 0.18, 2)
     grand_total = round(amount + gst_total, 2)
-
+ 
     # ── COLUMN WIDTHS ──
     # ITEM(0) | PLAN(1) | RATE(2) | QTY(3) | TOTAL(4)
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
-
-    WHITE = colors.white
-    DARK  = colors.HexColor('#1a1a2e')
-
-    def cp(bold=False, tc=colors.HexColor('#1a1a2e')):
+ 
+    WHITE     = colors.white
+    DARK      = colors.HexColor('#1a1a2e')
+    LIGHT_GRAY = colors.HexColor('#f0f0f0')   # ← light gray header highlight
+    MID_GRAY  = colors.HexColor('#e8e8e8')    # ← slightly darker for GST row
+    TEXT_DARK = colors.HexColor('#1a1a2e')
+ 
+    def lp(bold=False):
+        return ParagraphStyle('_l', parent=styles['Normal'], fontSize=10,
+                              fontName='Helvetica-Bold' if bold else 'Helvetica',
+                              textColor=TEXT_DARK, alignment=TA_LEFT)
+ 
+    def cp(bold=False, tc=TEXT_DARK):
         return ParagraphStyle('_c', parent=styles['Normal'], fontSize=10,
                               fontName='Helvetica-Bold' if bold else 'Helvetica',
                               textColor=tc, alignment=TA_CENTER)
-
-    def rp(bold=False, tc=colors.HexColor('#1a1a2e')):
+ 
+    def rp(bold=False, tc=TEXT_DARK):
         return ParagraphStyle('_r', parent=styles['Normal'], fontSize=10,
                               fontName='Helvetica-Bold' if bold else 'Helvetica',
                               textColor=tc, alignment=TA_RIGHT)
-
+ 
     # ── TABLE DATA ──
-    # row 0: header        ITEM | PLAN | RATE | QTY | TOTAL
+    # row 0: header
     # row 1: item line
-    # row 2: summary row — [GRAND TOTAL (0-1 span)] | [Total GST (18%)  Rs.X (2-3 span)] | [Rs. grand_total (4)]
+    # row 2: GST row      — [blank(0-3 span)] | [GST (18%)  Rs.X (right-aligned, col4)]
+    # row 3: Grand Total  — [GRAND TOTAL (0-3 span)] | [Rs. grand_total (col4)]
     table_data = [
+        # Row 0 – header (plain strings, styled via TableStyle)
         ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],
+ 
+        # Row 1 – item line
         [item_name, plan.title(), f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],
+ 
+        # Row 2 – GST row
         [
-            Paragraph("GRAND TOTAL", cp(True, WHITE)),
-            "",                                                          # merged with col 0
-            Paragraph(f"Total GST (18%)    Rs. {gst_total:.2f}", cp(False, WHITE)),
-            "",                                                          # merged with col 2
-            Paragraph(f"Rs. {grand_total:.2f}", rp(True, WHITE)),
+            Paragraph("", lp()),
+            "",
+            "",
+            Paragraph("GST (18%)", rp(False, colors.HexColor('#555555'))),
+            Paragraph(f"Rs. {gst_total:.2f}", rp(False, TEXT_DARK)),
+        ],
+ 
+        # Row 3 – Grand Total row
+        [
+            Paragraph("GRAND TOTAL", lp(True)),
+            "",
+            "",
+            "",
+            Paragraph(f"Rs. {grand_total:.2f}", rp(True, TEXT_DARK)),
         ],
     ]
-
+ 
     ts = TableStyle([
-        # header
-        ('BACKGROUND',    (0,0),(-1,0), DARK),
-        ('TEXTCOLOR',     (0,0),(-1,0), WHITE),
+        # ── HEADER ROW (0) ──
+        ('BACKGROUND',    (0,0),(-1,0), LIGHT_GRAY),
+        ('TEXTCOLOR',     (0,0),(-1,0), TEXT_DARK),
         ('FONTNAME',      (0,0),(-1,0), 'Helvetica-Bold'),
         ('FONTSIZE',      (0,0),(-1,0), 9),
         ('TOPPADDING',    (0,0),(-1,0), 9),
         ('BOTTOMPADDING', (0,0),(-1,0), 9),
         ('ALIGN',         (0,0),(0,0),  'LEFT'),
         ('ALIGN',         (1,0),(1,0),  'CENTER'),
-        ('ALIGN',         (2,0),(-1,0), 'RIGHT'),
+        ('ALIGN',         (2,0),(2,0),  'RIGHT'),
         ('ALIGN',         (3,0),(3,0),  'CENTER'),
-        # item row
+        ('ALIGN',         (4,0),(4,0),  'RIGHT'),
+ 
+        # ── ITEM ROW (1) ──
         ('BACKGROUND',    (0,1),(-1,1), colors.HexColor('#f8f8fb')),
         ('FONTNAME',      (0,1),(-1,1), 'Helvetica'),
         ('FONTSIZE',      (0,1),(-1,1), 10),
@@ -3055,25 +3080,32 @@ def generate_invoice_pdf(
         ('ALIGN',         (1,1),(1,1),  'CENTER'),
         ('ALIGN',         (2,1),(-1,1), 'RIGHT'),
         ('ALIGN',         (3,1),(3,1),  'CENTER'),
-        # grid for header + item
+ 
+        # Grid for header + item rows
         ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
-        # global padding
+ 
+        # ── GST ROW (2) ── light gray background
+        ('SPAN',          (0,2),(2,2)),                          # merge cols 0-2 (blank left area)
+        ('BACKGROUND',    (0,2),(-1,2), LIGHT_GRAY),
+        ('TOPPADDING',    (0,2),(-1,2), 8),
+        ('BOTTOMPADDING', (0,2),(-1,2), 8),
+        ('LINEBELOW',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
+        ('LINEABOVE',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
+        ('VALIGN',        (0,2),(-1,2), 'MIDDLE'),
+ 
+        # ── GRAND TOTAL ROW (3) ── slightly darker gray
+        ('SPAN',          (0,3),(3,3)),                          # merge cols 0-3
+        ('BACKGROUND',    (0,3),(-1,3), MID_GRAY),
+        ('TOPPADDING',    (0,3),(-1,3), 10),
+        ('BOTTOMPADDING', (0,3),(-1,3), 10),
+        ('LINEBELOW',     (0,3),(-1,3), 1.0, colors.HexColor('#cccccc')),
+        ('VALIGN',        (0,3),(-1,3), 'MIDDLE'),
+ 
+        # Global padding
         ('LEFTPADDING',   (0,0),(-1,-1), 8),
         ('RIGHTPADDING',  (0,0),(-1,-1), 8),
-
-        # summary row (row 2)
-        ('SPAN',          (0,2),(1,2)),          # GRAND TOTAL: cols 0-1
-        ('SPAN',          (2,2),(3,2)),          # Total GST:   cols 2-3
-        ('BACKGROUND',    (0,2),(-1,2), DARK),
-        ('GRID',          (0,2),(-1,2), 0.5, colors.HexColor('#444466')),
-        ('TOPPADDING',    (0,2),(-1,2), 10),
-        ('BOTTOMPADDING', (0,2),(-1,2), 10),
-        ('VALIGN',        (0,2),(-1,2), 'MIDDLE'),
-        ('ALIGN',         (0,2),(0,2),  'CENTER'),
-        ('ALIGN',         (2,2),(2,2),  'CENTER'),
-        ('ALIGN',         (4,2),(4,2),  'RIGHT'),
     ])
-
+ 
     combined = Table(table_data, colWidths=CW)
     combined.setStyle(ts)
     elements.append(combined)
@@ -3083,7 +3115,6 @@ def generate_invoice_pdf(
     return file_path
 
 
-    
 @app.post("/payments/create-order")
 async def create_razorpay_order(
     request_data: CreateOrderRequest,
