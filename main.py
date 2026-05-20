@@ -3000,7 +3000,6 @@ def generate_invoice_pdf(
     gst_total   = round(amount * 0.18, 2)
     grand_total = round(amount + gst_total, 2)
  
-    # ── COLUMN WIDTHS ──
     # ITEM(0) | PLAN(1) | RATE(2) | QTY(3) | TOTAL(4)
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
  
@@ -3129,7 +3128,7 @@ async def create_razorpay_order(
 
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount.")
-    if request_data.target_tier not in ['basic', 'pro']:
+    if request_data.target_tier not in ['Plus', 'pro']:
         raise HTTPException(status_code=400, detail="Invalid target tier.")
 
     order_data = {
@@ -3211,7 +3210,7 @@ async def razorpay_webhook(
                 return {"status": "error", "message": "Missing required order notes."}
 
             plan_config = {
-                'basic': {'credits': 100, 'validity_days': 30},
+                'Plus': {'credits': 100, 'validity_days': 30},
                 'pro':   {'credits': 200, 'validity_days': 30},
             }
             config = plan_config.get(target_tier.lower())
