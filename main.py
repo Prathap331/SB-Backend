@@ -3128,7 +3128,7 @@ async def create_razorpay_order(
 
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount.")
-    if request_data.target_tier not in ['Plus', 'pro']:
+    if request_data.target_tier not in ['plus', 'pro']:
         raise HTTPException(status_code=400, detail="Invalid target tier.")
 
     order_data = {
@@ -3210,7 +3210,7 @@ async def razorpay_webhook(
                 return {"status": "error", "message": "Missing required order notes."}
 
             plan_config = {
-                'Plus': {'credits': 100, 'validity_days': 30},
+                'plus': {'credits': 100, 'validity_days': 30},
                 'pro':   {'credits': 200, 'validity_days': 30},
             }
             config = plan_config.get(target_tier.lower())
@@ -3386,21 +3386,19 @@ async def razorpay_webhook(
 
 
 
-@app.get("/payments/invoice/{order_id}")
-async def get_invoice(order_id: str, current_user: User = Depends(get_current_user)):
-    result = (
-        supabase.table("subscriptions")
-        .select("invoice_url")
-        .eq("razorpay_order_id", order_id)
-        .eq("userId", str(current_user.id))
-        .single()
-        .execute()
-    )
-    if not result.data or not result.data.get("invoice_url"):
-        raise HTTPException(status_code=404, detail="Invoice not found.")
-    return {"invoice_url": result.data["invoice_url"]}
-
-
+# @app.get("/payments/invoice/{order_id}")
+# async def get_invoice(order_id: str, current_user: User = Depends(get_current_user)):
+#     result = (
+#         supabase.table("subscriptions")
+#         .select("invoice_url")
+#         .eq("razorpay_order_id", order_id)
+#         .eq("userId", str(current_user.id))
+#         .single()
+#         .execute()
+#     )
+#     if not result.data or not result.data.get("invoice_url"):
+#         raise HTTPException(status_code=404, detail="Invoice not found.")
+#     return {"invoice_url": result.data["invoice_url"]}
 
 
 @app.get('/trending-data')
