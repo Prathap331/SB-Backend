@@ -3132,7 +3132,7 @@ async def create_razorpay_order(
         raise HTTPException(status_code=400, detail="Invalid target tier.")
 
     order_data = {
-        "amount": amount,
+        "amount": int(amount * 100),
         "currency": currency,
         "receipt": request_data.receipt or f"rec_{int(time.time())}",
         "notes": {
@@ -3385,20 +3385,6 @@ async def razorpay_webhook(
         raise HTTPException(status_code=500, detail="Internal server error.")
 
 
-
-# @app.get("/payments/invoice/{order_id}")
-# async def get_invoice(order_id: str, current_user: User = Depends(get_current_user)):
-#     result = (
-#         supabase.table("subscriptions")
-#         .select("invoice_url")
-#         .eq("razorpay_order_id", order_id)
-#         .eq("userId", str(current_user.id))
-#         .single()
-#         .execute()
-#     )
-#     if not result.data or not result.data.get("invoice_url"):
-#         raise HTTPException(status_code=404, detail="Invoice not found.")
-#     return {"invoice_url": result.data["invoice_url"]}
 
 
 @app.get('/trending-data')
