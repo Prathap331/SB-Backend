@@ -3269,7 +3269,7 @@ async def razorpay_webhook(
                 }
                 sub_result = (
                     supabase.table('subscriptions')
-                    .upsert(subscription_row, on_conflict='userId')
+                    .insert(subscription_row)
                     .execute()
                 )
 
