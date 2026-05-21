@@ -1177,7 +1177,6 @@ async def run_tss(keyword: str) -> dict[str, Any]:
     primary_weights = WEIGHT_MATRIX[regime][category_id]
     w1, w2, w3, w4 = primary_weights
 
-    # Step 4 weight blending modes
     if regime_result["method"] in ("clash_blend", "clash_category") and regime_result["second_regime"]:
         secondary_weights = WEIGHT_MATRIX[regime_result["second_regime"]][category_id]
         if regime_result["method"] == "clash_blend":
@@ -1191,14 +1190,13 @@ async def run_tss(keyword: str) -> dict[str, Any]:
         w3 = primary_alpha * w3 + secondary_alpha * secondary_weights[2]
         w4 = primary_alpha * w4 + secondary_alpha * secondary_weights[3]
     elif regime != "R1" and regime_result["confidence"] < 1.0:
-        # Soft-threshold blend toward R1 when confidence is below 1.0.
         r1_weights = WEIGHT_MATRIX["R1"][category_id]
         alpha = clamp(regime_result["confidence"], 0.35, 1.0)
         w1 = alpha * w1 + (1.0 - alpha) * r1_weights[0]
         w2 = alpha * w2 + (1.0 - alpha) * r1_weights[1]
         w3 = alpha * w3 + (1.0 - alpha) * r1_weights[2]
         w4 = alpha * w4 + (1.0 - alpha) * r1_weights[3]
-    # redistribute failed methods
+
     if m1["status"] != "ok":
         w1 = 0.0
     if m2["status"] != "ok":
@@ -1268,8 +1266,11 @@ async def run_tss(keyword: str) -> dict[str, Any]:
         "m3_norm": normalise_m3(m3),
         "m4_norm": normalise_m4(m4),
     }
+
     gemini_client = get_gemini_client()
     groq_client = get_groq_client()
+
+    # ── CSI: only needs videos, gracefully skipped if none ───────────────────
     if m3.get("videos"):
         try:
             csi_result = calculate_csi(
@@ -1286,11 +1287,15 @@ async def run_tss(keyword: str) -> dict[str, Any]:
             )
             payload["csi"] = csi_result
         except CorpusStalenessError as exc:
-            payload["csi_error"] = str(exc)
-        except Exception as exc:  # pragma: no cover - best-effort wrapper
-            payload["csi_error"] = str(exc)
+            print(f"[run_tss] CSI staleness for '{keyword}': {exc}")
+            payload["csi"] = {"csi": 50, "error": str(exc)}
+        except Exception as exc:
+            print(f"[run_tss] CSI failed for '{keyword}': {exc}")
+            payload["csi"] = {"csi": 50, "error": str(exc)}
     else:
-        payload["csi"] = {"error": "insufficient youtube corpus"}
+        payload["csi"] = {"csi": 50, "error": "no_youtube_corpus"}
+
+    # ── Normalise social posts ────────────────────────────────────────────────
     social_posts = m2.get("source_payload") or []
     if isinstance(social_posts, dict):
         social_posts = social_posts.get("sample_posts") or social_posts.get("posts") or []
@@ -1299,43 +1304,65 @@ async def run_tss(keyword: str) -> dict[str, Any]:
     normalized_social_posts: list[dict[str, Any]] = []
     for post in social_posts:
         if isinstance(post, dict):
-            normalized_social_posts.append(
-                {
-                    "title": str(post.get("title") or post.get("headline") or ""),
-                    "body": str(post.get("body") or post.get("snippet") or post.get("text") or ""),
-                }
-            )
+            normalized_social_posts.append({
+                "title": str(post.get("title") or post.get("headline") or ""),
+                "body":  str(post.get("body") or post.get("snippet") or post.get("text") or ""),
+            })
         else:
             normalized_social_posts.append({"title": "", "body": str(post)})
     social_posts = normalized_social_posts
-    if not social_posts:
-        social_posts = []
+
     news_articles = m4.get("serpapi_sample_7d") or []
-    corpus = m3.get("videos", [])
+    corpus = m3.get("videos") or []
     corpus_embeddings = payload.get("csi", {}).get("embeddings")
-    if len(corpus) >= 3:
-        try:
-            cags_result = await calculate_cags(
-                topic=keyword,
-                corpus=corpus,
-                corpus_embeddings=corpus_embeddings,
-                social_data=social_posts,
-                news_data=news_articles,
-                tss_score=payload["tss"],
-                groq_client=groq_client,
-                gemini_client=gemini_client,
-            )
-            payload["cags"] = cags_result
-        except Exception as exc:
-            payload["cags"] = {"cags_error": str(exc), "topic": keyword}
-    else:
-        payload["cags"] = {
-            "cags_error": "corpus_too_small",
-            "topic": keyword,
-        }
+
+    # ── CAGS: always attempt regardless of corpus size ────────────────────────
+    # Niche/new topics often have 0-2 YouTube videos but CAGS can still
+    # produce angles from social + news signals alone. Removing the >= 3
+    # gate prevents the "corpus_too_small" → empty gap_angles → 422 chain.
+    try:
+        cags_result = await calculate_cags(
+            topic=keyword,
+            corpus=corpus,
+            corpus_embeddings=corpus_embeddings,
+            social_data=social_posts,
+            news_data=news_articles,
+            tss_score=payload["tss"],
+            groq_client=groq_client,
+            gemini_client=gemini_client,
+        )
+        payload["cags"] = cags_result if isinstance(cags_result, dict) else {}
+    except Exception as exc:
+        print(f"[run_tss] CAGS failed for '{keyword}': {exc}")
+        payload["cags"] = {"cags_error": str(exc), "topic": keyword}
+
+    # ── Guarantee gap_angles + perspective_tree are never empty ──────────────
+    # Even if CAGS fails or returns partial data, downstream /generate-ideas
+    # must always receive something it can work with.
+    cags = payload["cags"]
+    if not cags.get("gap_angles"):
+        print(f"[run_tss] gap_angles empty for '{keyword}', injecting fallback angles")
+        cags["gap_angles"] = [
+            {"id": "fallback-1", "angle": keyword,
+             "rationale": "Fallback: low signal coverage for this topic", "cags_score": 50},
+            {"id": "fallback-2", "angle": f"{keyword} latest developments",
+             "rationale": "Fallback: recency angle", "cags_score": 45},
+            {"id": "fallback-3", "angle": f"why {keyword} matters",
+             "rationale": "Fallback: impact angle", "cags_score": 40},
+        ]
+    if not cags.get("perspective_tree"):
+        cags["perspective_tree"] = [
+            {"perspective": "General",        "sub_angles": [keyword]},
+            {"perspective": "Current Events", "sub_angles": [f"latest {keyword}"]},
+        ]
+    if not cags.get("briefs"):
+        cags["briefs"] = []
+    payload["cags"] = cags
+
+    # ── Verdict ───────────────────────────────────────────────────────────────
     tss_score = float(payload.get("tss", 0) or 0)
-    csi_score = float(payload.get("csi", {}).get("csi", 50) or 50)
-    gap_angles = payload.get("cags", {}).get("gap_angles", []) or []
+    csi_score = float((payload.get("csi") or {}).get("csi", 50) or 50)
+    gap_angles = payload["cags"].get("gap_angles") or []
     top_cags = max((float(a.get("cags_score", 0) or 0) for a in gap_angles), default=0.0)
 
     if tss_score > 30 and csi_score < 65 and top_cags > 40:
@@ -1354,8 +1381,8 @@ async def run_tss(keyword: str) -> dict[str, Any]:
     payload["verdict"] = {"verdict": verdict, "reason": reason}
     if category_layer == 2:
         payload["category_confidence"] = category_conf
-    return payload
 
+    return payload
 
 def main() -> None:
     parser = argparse.ArgumentParser()
