@@ -2880,7 +2880,7 @@ def generate_invoice_pdf(
     customer_address,
     customer_phone,
     item_name,
-    amount,
+    amount,          # ← this is already the GRAND TOTAL (e.g. 1.18)
     plan,
     due_date=None,
     output_dir="invoices",
@@ -2997,17 +2997,21 @@ def generate_invoice_pdf(
     elements.append(Spacer(1, 7*mm))
  
     # ── AMOUNTS ──
-    gst_total   = round(amount * 0.18, 2)
-    grand_total = round(amount + gst_total, 2)
+    # amount = grand total paid (e.g. 118)
+    # base_price = amount / 1.18  (price before GST)
+    # gst = grand_total - base_price
+    grand_total = round(amount, 2)
+    base_price  = round(amount / 1.18, 2)
+    gst_amount  = round(grand_total - base_price, 2)
  
     # ITEM(0) | PLAN(1) | RATE(2) | QTY(3) | TOTAL(4)
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
  
-    WHITE     = colors.white
-    DARK      = colors.HexColor('#1a1a2e')
-    LIGHT_GRAY = colors.HexColor('#f0f0f0')   # ← light gray header highlight
-    MID_GRAY  = colors.HexColor('#e8e8e8')    # ← slightly darker for GST row
-    TEXT_DARK = colors.HexColor('#1a1a2e')
+    WHITE      = colors.white
+    DARK       = colors.HexColor('#1a1a2e')
+    LIGHT_GRAY = colors.HexColor('#f0f0f0')
+    MID_GRAY   = colors.HexColor('#e8e8e8')
+    TEXT_DARK  = colors.HexColor('#1a1a2e')
  
     def lp(bold=False):
         return ParagraphStyle('_l', parent=styles['Normal'], fontSize=10,
@@ -3025,16 +3029,12 @@ def generate_invoice_pdf(
                               textColor=tc, alignment=TA_RIGHT)
  
     # ── TABLE DATA ──
-    # row 0: header
-    # row 1: item line
-    # row 2: GST row      — [blank(0-3 span)] | [GST (18%)  Rs.X (right-aligned, col4)]
-    # row 3: Grand Total  — [GRAND TOTAL (0-3 span)] | [Rs. grand_total (col4)]
     table_data = [
-        # Row 0 – header (plain strings, styled via TableStyle)
+        # Row 0 – header
         ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],
  
-        # Row 1 – item line
-        [item_name, plan.title(), f"Rs. {amount:.2f}", "1", f"Rs. {amount:.2f}"],
+        # Row 1 – item line  (RATE and TOTAL show base_price, not grand_total)
+        [item_name, plan.title(), f"Rs. {base_price:.2f}", "1", f"Rs. {base_price:.2f}"],
  
         # Row 2 – GST row
         [
@@ -3042,7 +3042,7 @@ def generate_invoice_pdf(
             "",
             "",
             Paragraph("GST (18%)", rp(False, colors.HexColor('#555555'))),
-            Paragraph(f"Rs. {gst_total:.2f}", rp(False, TEXT_DARK)),
+            Paragraph(f"Rs. {gst_amount:.2f}", rp(False, TEXT_DARK)),
         ],
  
         # Row 3 – Grand Total row
@@ -3083,8 +3083,8 @@ def generate_invoice_pdf(
         # Grid for header + item rows
         ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
  
-        # ── GST ROW (2) ── light gray background
-        ('SPAN',          (0,2),(2,2)),                          # merge cols 0-2 (blank left area)
+        # ── GST ROW (2) ──
+        ('SPAN',          (0,2),(2,2)),
         ('BACKGROUND',    (0,2),(-1,2), LIGHT_GRAY),
         ('TOPPADDING',    (0,2),(-1,2), 8),
         ('BOTTOMPADDING', (0,2),(-1,2), 8),
@@ -3092,8 +3092,8 @@ def generate_invoice_pdf(
         ('LINEABOVE',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
         ('VALIGN',        (0,2),(-1,2), 'MIDDLE'),
  
-        # ── GRAND TOTAL ROW (3) ── slightly darker gray
-        ('SPAN',          (0,3),(3,3)),                          # merge cols 0-3
+        # ── GRAND TOTAL ROW (3) ──
+        ('SPAN',          (0,3),(3,3)),
         ('BACKGROUND',    (0,3),(-1,3), MID_GRAY),
         ('TOPPADDING',    (0,3),(-1,3), 10),
         ('BOTTOMPADDING', (0,3),(-1,3), 10),
