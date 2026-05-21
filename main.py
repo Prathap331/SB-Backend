@@ -1280,7 +1280,7 @@ class ScriptRequest(BaseModel):
 
 
 class CreateOrderRequest(BaseModel):
-    amount: int
+    amount: float
     currency: str = "INR"
     receipt: str | None = None
     target_tier: str
