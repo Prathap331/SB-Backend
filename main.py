@@ -2371,14 +2371,57 @@ class UnlockRequest(BaseModel):
 @app.post("/unlock")
 async def cut_credits(request: UnlockRequest):
     try:
-        res = supabase.table('user_profiles') \
-            .select('credits_remaining, user_tier') \
+        # First check if user has any subscription rows
+        sub_res = supabase.table('subscriptions') \
+            .select('id, credits, purchased_date') \
+            .eq('userId', request.userId) \
+            .order('purchased_date', desc=True) \
+            .limit(1) \
+            .execute()
+
+        # =========================
+        # IF SUBSCRIPTION EXISTS
+        # =========================
+        if sub_res.data and len(sub_res.data) > 0:
+
+            latest_subscription = sub_res.data[0]
+
+            subscription_id = latest_subscription["id"]
+            subscription_credits = latest_subscription["credits"]
+
+            if subscription_credits <= 0:
+                return {"message": "credits not sufficient"}
+
+            if subscription_credits < request.duration:
+                return {"message": "credits not sufficient"}
+
+            new_subscription_credits = subscription_credits - request.duration
+
+            supabase.table('subscriptions') \
+                .update({
+                    'credits': new_subscription_credits
+                }) \
+                .eq('id', subscription_id) \
+                .execute()
+
+            print("subscription credits updated")
+
+            return {
+                "message": "success",
+                "source": "subscription",
+                "remaining_credits": new_subscription_credits
+            }
+
+        # =========================
+        # IF NO SUBSCRIPTION
+        # =========================
+        profile_res = supabase.table('user_profiles') \
+            .select('credits_remaining') \
             .eq('id', request.userId) \
             .single() \
             .execute()
 
-        old_credits = res.data["credits_remaining"]
-        user_tier = res.data["user_tier"]
+        old_credits = profile_res.data["credits_remaining"]
 
         if old_credits <= 0:
             return {"message": "credits not sufficient"}
@@ -2389,39 +2432,25 @@ async def cut_credits(request: UnlockRequest):
         new_credits = old_credits - request.duration
 
         supabase.table('user_profiles') \
-            .update({'credits_remaining': new_credits}) \
+            .update({
+                'credits_remaining': new_credits
+            }) \
             .eq('id', request.userId) \
             .execute()
 
-        if user_tier != "free":
-            res2 = supabase.table('subscriptions') \
-                .select('credits') \
-                .eq('userId', request.userId) \
-                .single() \
-                .execute()
+        print("profile credits updated")
 
-            subscription_credits = res2.data["credits"]
-
-            if subscription_credits <= 0 or subscription_credits < request.duration:
-                return {"message": "credits not sufficient"}
-
-            new_subscription_credits = subscription_credits - request.duration
-
-            supabase.table('subscriptions') \
-                .update({'credits': new_subscription_credits}) \
-                .eq('userId', request.userId) \
-                .execute()
-
-            print("subscription update done")
-
-        print("profile update done, tier:", user_tier)
-        return {"message": "success"}
+        return {
+            "message": "success",
+            "source": "profile",
+            "remaining_credits": new_credits
+        }
 
     except Exception as e:
         print("error:", e)
-        return {"message": "error"}
-    
+        raise HTTPException(status_code=500, detail=str(e))
 
+        
 @app.post("/generate-script") 
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
     total_start_time = time.time()
