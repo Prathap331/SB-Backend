@@ -3132,7 +3132,7 @@ async def create_razorpay_order(
         raise HTTPException(status_code=400, detail="Invalid target tier.")
 
     order_data = {
-        "amount": int(amount * 100),
+        "amount": int(float(amount) * 100),
         "currency": currency,
         "receipt": request_data.receipt or f"rec_{int(time.time())}",
         "notes": {
