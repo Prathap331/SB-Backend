@@ -10,8 +10,8 @@ import json
 from openai import AsyncOpenAI
 import re
 from datetime import datetime
-import os
-
+from openai import OpenAI
+import os 
 
 
 SEO_SYNTHESIS_PROMPT = """
@@ -275,14 +275,34 @@ GROQ_IDEA_KEYS = _build_groq_key_pool(
     groq_api_key,
 )
 
-GROQ_GENERATION_MODEL = "llama-3.1-8b-instant"
-GROQ_IDEA_CLIENTS = [AsyncOpenAI(api_key=key, base_url="https://api.groq.com/openai/v1") for key in GROQ_IDEA_KEYS]
 
 
-async def groq_idea_generate(messages: list, model: str = GROQ_GENERATION_MODEL) -> str:
-    return await _groq_generate_with_slots(messages, GROQ_IDEA_CLIENTS, model, "idea")
+deepseek_client = OpenAI(
+    api_key=os.environ.get('DEEPSEEK_API_KEY'),
+    base_url="https://api.deepseek.com")
 
 
+
+# GROQ_GENERATION_MODEL = "llama-3.1-8b-instant"
+# GROQ_IDEA_CLIENTS = [AsyncOpenAI(api_key=key, base_url="https://api.groq.com/openai/v1") for key in GROQ_IDEA_KEYS]
+
+
+# async def groq_idea_generate(messages: list, model: str = GROQ_GENERATION_MODEL) -> str:
+#     return await _groq_generate_with_slots(messages, GROQ_IDEA_CLIENTS, model, "idea")
+
+
+
+def deepseek_idea_generate(messages: list) -> str:
+    resp = deepseek_client.chat.completions.create(
+        model="deepseek-v4-pro",
+        messages=[
+            {"role": "system", "content": "Return only valid JSON."},
+            *messages,
+        ],
+        stream=False,
+    )
+    return resp.choices[0].message.content.strip()
+    
 
 def _safe_recommended_titles(raw_titles: any, blocked_types: list[str]) -> list[dict[str, str]]:
     if not isinstance(raw_titles, list):
@@ -511,9 +531,8 @@ async def seo_agent(request: SEOAgentRequest):
     }
 
     try:
-        raw = await groq_idea_generate(
+        raw = deepseek_idea_generate(
             [{"role": "user", "content": prompt}],
-            model=GROQ_GENERATION_MODEL
         )
         parsed = _parse_json_object(raw)
     except Exception as exc:

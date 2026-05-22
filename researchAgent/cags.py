@@ -14,11 +14,26 @@ import json
 import asyncio
 import os
 from typing import Any, Iterable, Sequence, cast
-
+from openai import OpenAI
 import numpy as np
-
+import os
 __all__ = ["calculate_cags", "collect_corpus_embeddings", "label_youtube_corpus", "tree_interrogation",
            "assess_angle_coverage", "summarise_findings"]
+
+
+
+
+
+deepseek_client = OpenAI(
+    api_key=os.environ.get('DEEPSEEK_API_KEY'),
+    base_url="https://api.deepseek.com")
+
+
+
+
+
+
+
 
 def _collect_google_embed_keys() -> list[str]:
     ordered = [
@@ -235,21 +250,23 @@ async def tree_interrogation(
     ) or "(no news signals available)"
 
     try:
-        r1 = await groq_client.chat.completions.create(
-            messages=[
-                {
-                    'role': 'user',
-                    'content': STEP_1_PROMPT.format(
-                        topic=topic,
-                        social_lines=social_lines,
-                        news_lines=news_lines,
-                    ),
-                }
-            ],
-            model='llama-3.1-8b-instant',
-            response_format={'type': 'json_object'},
-        )
-        stakeholders = json.loads(r1.choices[0].message.content).get('stakeholders', [])
+        r1 = deepseek_client.chat.completions.create(
+        model="deepseek-v4-pro",
+        messages=[
+            {"role": "system", "content": "Return only valid JSON."},
+            {
+                "role": "user",
+                "content": STEP_1_PROMPT.format(
+                    topic=topic,
+                    social_lines=social_lines,
+                    news_lines=news_lines,
+                ),
+            },
+        ],
+        stream=False,
+    )
+        stakeholders = json.loads(r1.choices[0].message.content.strip()).get("stakeholders", [])
+
     except Exception as exc:
         print(f'CAGS Step 1 error: {exc}', flush=True)
         stakeholders = [
@@ -275,22 +292,23 @@ async def tree_interrogation(
         [f'ID: {s["id"]} | {s["label"]}: {s.get("relevance","")}' for s in stakeholders]
     )
     try:
-        r2 = await groq_client.chat.completions.create(
+        r2 = deepseek_client.chat.completions.create(
+            model="deepseek-v4-pro",
             messages=[
+                {"role": "system", "content": "Return only valid JSON."},
                 {
-                    'role': 'user',
-                    'content': STEP_2_BATCH_PROMPT.format(
+                    "role": "user",
+                    "content": STEP_2_BATCH_PROMPT.format(
                         topic=topic,
                         stakeholder_block=stakeholder_block,
                     ),
-                }
+                },
             ],
-            model='llama-3.1-8b-instant',
-            response_format={'type': 'json_object'},
+            stream=False,
         )
         assignments = {
             a['id']: a.get('lenses', ['economics'])
-            for a in json.loads(r2.choices[0].message.content).get('assignments', [])
+            for a in json.loads(r2.choices[0].message.content.strip()).get('assignments', [])
         }
     except Exception as exc:
         print(f'CAGS Step 2 error: {exc}', flush=True)
@@ -309,23 +327,24 @@ async def tree_interrogation(
         [f"INDEX {i}: WHO={n['who']} | WHAT={n['what']}" for i, n in enumerate(nodes)]
     )
     try:
-        r3 = await groq_client.chat.completions.create(
+        r3 = deepseek_client.chat.completions.create(
+            model="deepseek-v4-pro",
             messages=[
+                {"role": "system", "content": "Return only valid JSON."},
                 {
-                    'role': 'user',
-                    'content': STEPS_3_TO_6_PROMPT.format(
+                    "role": "user",
+                    "content": STEPS_3_TO_6_PROMPT.format(
                         topic=topic,
                         indexed_nodes=indexed,
                     ),
-                }
+                },
             ],
-            model='llama-3.1-8b-instant',
-            response_format={'type': 'json_object'},
+            stream=False,
         )
         completions = {
             a['index']: a
-            for a in json.loads(r3.choices[0].message.content).get('angles', [])
-        }
+            for a in json.loads(r3.choices[0].message.content.strip()).get('angles', [])
+        }    
     except Exception as exc:
         print(f'CAGS Step 3 error: {exc}', flush=True)
         completions = {}
@@ -508,15 +527,13 @@ async def generate_briefs(
                 "}\n"
                 "publish_urgency must be exactly one of: now | within_1_week | within_1_month | anytime"
             )
-            resp = await groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+            resp = deepseek_client.chat.completions.create(
+                model="deepseek-v4-pro",
                 messages=[
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
+                    {"role": "system", "content": "Return only valid JSON."},
+                    {"role": "user", "content": prompt},
                 ],
-                response_format={"type": "json_object"},
+                stream=False,
             )
             data = _safe_groq_parse(resp)
             urgency = str(data.get("publish_urgency") or "").strip()

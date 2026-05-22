@@ -130,8 +130,8 @@ groq_client = AsyncOpenAI(
     api_key=groq_api_key,
     base_url="https://api.groq.com/openai/v1",
 )
-GROQ_GENERATION_MODEL = "llama-3.1-8b-instant"
-GROQ_SCRIPT_MODEL = os.getenv("GROQ_SCRIPT_MODEL", GROQ_GENERATION_MODEL).strip() or GROQ_GENERATION_MODEL
+# GROQ_GENERATION_MODEL = "llama-3.1-8b-instant"
+# GROQ_SCRIPT_MODEL = os.getenv("GROQ_SCRIPT_MODEL", GROQ_GENERATION_MODEL).strip() or GROQ_GENERATION_MODEL
 SCRIPT_FRAMECHECK_PROVIDER = (os.getenv("SCRIPT_FRAMECHECK_PROVIDER") or "groq").strip().lower()
 
 # ── Google GenAI client(s) (NEW SDK) ─────────────────────────
@@ -615,17 +615,30 @@ async def _groq_generate_with_slots(
     raise Exception(f"All Groq {label} slots exhausted. Last error: {last_error}")
 
 
-async def groq_idea_generate(messages: list, model: str = GROQ_GENERATION_MODEL) -> str:
-    return await _groq_generate_with_slots(messages, GROQ_IDEA_CLIENTS, model, "idea")
+# async def groq_idea_generate(messages: list, model: str = GROQ_GENERATION_MODEL) -> str:
+#     return await _groq_generate_with_slots(messages, GROQ_IDEA_CLIENTS, model, "idea")
 
 
-async def groq_script_generate(messages: list, model: str = GROQ_SCRIPT_MODEL) -> str:
-    return await _groq_generate_with_slots(messages, GROQ_SCRIPT_CLIENTS, model, "script")
+# async def groq_script_generate(messages: list, model: str = GROQ_SCRIPT_MODEL) -> str:
+#     return await _groq_generate_with_slots(messages, GROQ_SCRIPT_CLIENTS, model, "script")
+
+
+def deepseek_script_generate(messages: list) -> str:
+    resp = deepseek_client.chat.completions.create(
+        model="deepseek-v4-pro",
+        messages=[
+            {"role": "system", "content": "Return only valid JSON."},
+            *messages,
+        ],
+        stream=False,
+    )
+    return resp.choices[0].message.content.strip()
+
 
 
 async def generate_script_content(messages: list) -> str:
     try:
-        return await groq_script_generate(messages)
+        return await deepseek_script_generate(messages)
     except Exception as exc:
         print(f"Groq script generation failed, falling back to OpenRouter: {exc}")
         return await openrouter_generate(messages)
@@ -940,17 +953,19 @@ async def _generate_search_keywords(topic: str) -> list[str]:
     AI replacing software developers
     demand for software engineers 2025
     """
-    chat_completion = await groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": keyword_prompt}],
-        model=GROQ_GENERATION_MODEL,
+    chat_completion = deepseek_client.chat.completions.create(
+        model="deepseek-v4-pro",
+        messages=[
+            {"role": "user", "content": keyword_prompt},
+        ],
+        stream=False,
     )
-    raw_text = chat_completion.choices[0].message.content
+    raw_text = chat_completion.choices[0].message.content.strip()
     keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
     keywords = keywords_in_quotes if keywords_in_quotes else [
         kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()
     ]
     return keywords[:3]
-
 
 NEWS_SCRAPE_MAX_RESULTS         = 10
 DEEP_SCRAPE_MAX_KEYWORDS        = 6
@@ -1083,11 +1098,14 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
                 to the following topic. Be concise and include key terms.
                 Topic: "{topic}"
                 """
-                chat_completion = await groq_client.chat.completions.create(
-                    messages=[{"role": "user", "content": hyde_prompt}],
-                    model=GROQ_GENERATION_MODEL,
+                chat_completion = deepseek_client.chat.completions.create(
+                    model="deepseek-v4-pro",
+                    messages=[
+                        {"role": "user", "content": hyde_prompt},
+                    ],
+                    stream=False,
                 )
-                hypothetical_document = chat_completion.choices[0].message.content
+                hypothetical_document = chat_completion.choices[0].message.content.strip()
                 print(f"--- DB TASK: HyDE doc generated: {hypothetical_document[:100]}...")
             except Exception as exc:
                 print(f"--- DB TASK: HyDE failed, falling back to raw topic: {exc} ---")
@@ -1766,10 +1784,20 @@ Return:
 }}
 """
 
+def deepseek_idea_generate(messages: list) -> str:
+    resp = deepseek_client.chat.completions.create(
+        model="deepseek-v4-pro",
+        messages=[
+            {"role": "system", "content": "Return only valid JSON."},
+            *messages,
+        ],
+        stream=False,
+    )
+    return resp.choices[0].message.content.strip()
 
 async def analyse_script_v2(script: str, angle: dict[str, Any]) -> dict[str, Any]:
     try:
-        raw = await groq_idea_generate(
+        raw = deepseek_idea_generate(
             [
                 {
                     "role": "user",
@@ -1780,7 +1808,6 @@ async def analyse_script_v2(script: str, angle: dict[str, Any]) -> dict[str, Any
                     ),
                 }
             ],
-            model=GROQ_GENERATION_MODEL,
         )
         parsed = _parse_json_object(raw)
         if parsed:
@@ -1815,11 +1842,11 @@ async def framecheck_generate_text(prompt: str) -> str:
             return await openrouter_generate(messages)
         except Exception as exc:
             print(f"Framecheck OpenRouter failed, falling back to Groq: {exc}")
-            return await groq_script_generate(messages)
+            return await deepseek_script_generate(messages)
     if provider == "auto":
         return await generate_script_content(messages)
     try:
-        return await groq_script_generate(messages)
+        return await deepseek_script_generate(messages)
     except Exception as exc:
         print(f"Framecheck Groq failed, falling back to OpenRouter: {exc}")
         return await openrouter_generate(messages)
@@ -2469,11 +2496,14 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
             Topic: "{request.topic}"
             """
-            hyde_completion = await groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": hyde_prompt}],
-                model=GROQ_GENERATION_MODEL,
+            hyde_completion = deepseek_client.chat.completions.create(
+                model="deepseek-v4-pro",
+                messages=[
+                    {"role": "user", "content": hyde_prompt},
+                ],
+                stream=False,
             )
-            hyde_document = hyde_completion.choices[0].message.content
+            hyde_document = hyde_completion.choices[0].message.content.strip()
             print(f"--- HyDE DOCUMENT GENERATED ---\n{hyde_document}\n--- END HyDE DOCUMENT ---")
         except Exception as exc:
             print(f"--- HyDE generation failed, using raw topic as fallback: {exc} ---")
@@ -2598,13 +2628,15 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
                 coding careers vs AI tools
                 """
 
-                kw_completion = await groq_client.chat.completions.create(
-                    messages=[{"role": "user", "content": keyword_prompt}],
-                    model=GROQ_GENERATION_MODEL,
+                kw_completion = deepseek_client.chat.completions.create(
+                    model="deepseek-v4-pro",
+                    messages=[
+                        {"role": "user", "content": keyword_prompt},
+                    ],
+                    stream=False,
                 )
                 raw_text = kw_completion.choices[0].message.content.strip()
-                print(f"--- DEEP SCRAPE: Raw keywords from Groq:\n{raw_text} ---")
-
+                print(f"--- DEEP SCRAPE: Raw keywords from DeepSeek:\n{raw_text} ---")
                 keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
                 if keywords_in_quotes:
                     base_keywords = keywords_in_quotes
