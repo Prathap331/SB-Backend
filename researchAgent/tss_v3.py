@@ -1162,12 +1162,26 @@ def classify_band(score: float) -> str:
     return "saturating"
 
 
+
+from openai import OpenAI
+
+deepseek_client = OpenAI(
+    api_key=os.environ.get('DEEPSEEK_API_KEY'),
+    base_url="https://api.deepseek.com")
+
+
+
 async def run_tss(keyword: str) -> dict[str, Any]:
     category_id, category_conf, category_layer = classify_keyword(keyword)
-    m1 = compute_m1(keyword)
-    m2 = compute_m2(keyword)
-    m3 = compute_m3(keyword)
-    m4 = compute_m4(keyword)
+
+    # ── Run all 4 signal fetches in parallel ──────────────────────────────────
+    loop = asyncio.get_running_loop()
+    m1, m2, m3, m4 = await asyncio.gather(
+        loop.run_in_executor(None, compute_m1, keyword),
+        loop.run_in_executor(None, compute_m2, keyword),
+        loop.run_in_executor(None, compute_m3, keyword),
+        loop.run_in_executor(None, compute_m4, keyword),
+    )
 
     rs, scan_mean = compute_relative_signals(m1, m2, m3, m4)
     regime_result = detect_regime(rs, m1, m2, m3, m4, category_id)
@@ -1267,92 +1281,128 @@ async def run_tss(keyword: str) -> dict[str, Any]:
         "m4_norm": normalise_m4(m4),
     }
 
-    gemini_client = get_gemini_client()
-    groq_client = get_groq_client()
-
-    # ── CSI: only needs videos, gracefully skipped if none ───────────────────
-    if m3.get("videos"):
-        try:
-            csi_result = calculate_csi(
-                corpus=m3["videos"],
-                corpus_fetched_at=_ensure_datetime(m3.get("fetched_at")),
-                total_results=int(m3.get("total_results", len(m3.get("videos", [])))),
-                tss_search_score=payload["methods"]["m1"]["score"],
-                m1_norm=payload["m1_norm"],
-                m3_norm=payload["m3_norm"],
-                m4_norm=payload["m4_norm"],
-                gemini_client=gemini_client,
-                region_code=get_region_code(),
-                language_code=get_language_code(),
-            )
-            payload["csi"] = csi_result
-        except CorpusStalenessError as exc:
-            print(f"[run_tss] CSI staleness for '{keyword}': {exc}")
-            payload["csi"] = {"csi": 50, "error": str(exc)}
-        except Exception as exc:
-            print(f"[run_tss] CSI failed for '{keyword}': {exc}")
-            payload["csi"] = {"csi": 50, "error": str(exc)}
-    else:
-        payload["csi"] = {"csi": 50, "error": "no_youtube_corpus"}
-
     # ── Normalise social posts ────────────────────────────────────────────────
-    social_posts = m2.get("source_payload") or []
-    if isinstance(social_posts, dict):
-        social_posts = social_posts.get("sample_posts") or social_posts.get("posts") or []
-    if not isinstance(social_posts, list):
-        social_posts = []
-    normalized_social_posts: list[dict[str, Any]] = []
-    for post in social_posts:
+    social_posts_raw = m2.get("source_payload") or []
+    if isinstance(social_posts_raw, dict):
+        social_posts_raw = social_posts_raw.get("sample_posts") or social_posts_raw.get("posts") or []
+    if not isinstance(social_posts_raw, list):
+        social_posts_raw = []
+    social_posts: list[dict[str, Any]] = []
+    for post in social_posts_raw:
         if isinstance(post, dict):
-            normalized_social_posts.append({
+            social_posts.append({
                 "title": str(post.get("title") or post.get("headline") or ""),
-                "body":  str(post.get("body") or post.get("snippet") or post.get("text") or ""),
+                "body": str(post.get("body") or post.get("snippet") or post.get("text") or ""),
             })
         else:
-            normalized_social_posts.append({"title": "", "body": str(post)})
-    social_posts = normalized_social_posts
+            social_posts.append({"title": "", "body": str(post)})
 
     news_articles = m4.get("serpapi_sample_7d") or []
     corpus = m3.get("videos") or []
-    corpus_embeddings = payload.get("csi", {}).get("embeddings")
 
-    # ── CAGS: always attempt regardless of corpus size ────────────────────────
-    # Niche/new topics often have 0-2 YouTube videos but CAGS can still
-    # produce angles from social + news signals alone. Removing the >= 3
-    # gate prevents the "corpus_too_small" → empty gap_angles → 422 chain.
-    try:
-        cags_result = await calculate_cags(
-            topic=keyword,
-            corpus=corpus,
-            corpus_embeddings=corpus_embeddings,
-            social_data=social_posts,
-            news_data=news_articles,
-            tss_score=payload["tss"],
-            groq_client=groq_client,
-            gemini_client=gemini_client,
-        )
-        payload["cags"] = cags_result if isinstance(cags_result, dict) else {}
-    except Exception as exc:
-        print(f"[run_tss] CAGS failed for '{keyword}': {exc}")
-        payload["cags"] = {"cags_error": str(exc), "topic": keyword}
+    # ── CSI (no gemini_client — uses MiniLM internally) ──────────────────────
+    async def _run_csi() -> dict:
+        if not corpus:
+            return {"csi": 50, "error": "no_youtube_corpus"}
+        try:
+            return await loop.run_in_executor(
+                None,
+                lambda: calculate_csi(
+                    corpus=corpus,
+                    corpus_fetched_at=_ensure_datetime(m3.get("fetched_at")),
+                    total_results=int(m3.get("total_results", len(corpus))),
+                    tss_search_score=payload["methods"]["m1"]["score"],
+                    m1_norm=payload["m1_norm"],
+                    m3_norm=payload["m3_norm"],
+                    m4_norm=payload["m4_norm"],
+                ),
+            )
+        except CorpusStalenessError as exc:
+            print(f"[run_tss] CSI staleness for '{keyword}': {exc}")
+            return {"csi": 50, "error": str(exc)}
+        except Exception as exc:
+            print(f"[run_tss] CSI failed for '{keyword}': {exc}")
+            return {"csi": 50, "error": str(exc)}
+
+    # ── CAGS (no groq_client / gemini_client — uses deepseek_client internally) ──
+    async def _run_cags(corpus_embeddings: Any) -> dict:
+        try:
+            result = await calculate_cags(
+                topic=keyword,
+                corpus=corpus,
+                corpus_embeddings=corpus_embeddings,
+                social_data=social_posts,
+                news_data=news_articles,
+                tss_score=payload["tss"],
+            )
+            return result if isinstance(result, dict) else {}
+        except Exception as exc:
+            print(f"[run_tss] CAGS failed for '{keyword}': {exc}")
+            return {"cags_error": str(exc), "topic": keyword}
+
+    # CSI must finish first — CAGS reuses its embeddings
+    csi_result = await _run_csi()
+    payload["csi"] = csi_result
+    corpus_embeddings = csi_result.get("embeddings")
+
+    cags_result = await _run_cags(corpus_embeddings)
+    payload["cags"] = cags_result
 
     # ── Guarantee gap_angles + perspective_tree are never empty ──────────────
-    # Even if CAGS fails or returns partial data, downstream /generate-ideas
-    # must always receive something it can work with.
     cags = payload["cags"]
+    # In run_tss, fix the fallback gap_angles keys:
     if not cags.get("gap_angles"):
         print(f"[run_tss] gap_angles empty for '{keyword}', injecting fallback angles")
         cags["gap_angles"] = [
-            {"id": "fallback-1", "angle": keyword,
-             "rationale": "Fallback: low signal coverage for this topic", "cags_score": 50},
-            {"id": "fallback-2", "angle": f"{keyword} latest developments",
-             "rationale": "Fallback: recency angle", "cags_score": 45},
-            {"id": "fallback-3", "angle": f"why {keyword} matters",
-             "rationale": "Fallback: impact angle", "cags_score": 40},
+            {
+                "angle_id": "fallback-1",          # ← was "id", must be "angle_id"
+                "angle": keyword,
+                "angle_string": keyword,            # ← add this too
+                "rationale": "Fallback: low signal coverage for this topic",
+                "cags_score": 50,
+                "coverage_label": "NOT_COVERED",
+                "who": "General Audience",
+                "what": [],
+                "when": "present",
+                "scale": "national",
+                "how": "cause_effect",
+                "who_benefits": "who_gains_loses",
+                "story_frame": "hidden_angle",
+            },
+            {
+                "angle_id": "fallback-2",
+                "angle": f"{keyword} latest developments",
+                "angle_string": f"{keyword} latest developments",
+                "rationale": "Fallback: recency angle",
+                "cags_score": 45,
+                "coverage_label": "NOT_COVERED",
+                "who": "General Audience",
+                "what": [],
+                "when": "present",
+                "scale": "national",
+                "how": "cause_effect",
+                "who_benefits": "who_gains_loses",
+                "story_frame": "hidden_angle",
+            },
+            {
+                "angle_id": "fallback-3",
+                "angle": f"why {keyword} matters",
+                "angle_string": f"why {keyword} matters",
+                "rationale": "Fallback: impact angle",
+                "cags_score": 40,
+                "coverage_label": "NOT_COVERED",
+                "who": "General Audience",
+                "what": [],
+                "when": "present",
+                "scale": "national",
+                "how": "cause_effect",
+                "who_benefits": "who_gains_loses",
+                "story_frame": "hidden_angle",
+            },
         ]
     if not cags.get("perspective_tree"):
         cags["perspective_tree"] = [
-            {"perspective": "General",        "sub_angles": [keyword]},
+            {"perspective": "General", "sub_angles": [keyword]},
             {"perspective": "Current Events", "sub_angles": [f"latest {keyword}"]},
         ]
     if not cags.get("briefs"):
@@ -1383,6 +1433,7 @@ async def run_tss(keyword: str) -> dict[str, Any]:
         payload["category_confidence"] = category_conf
 
     return payload
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()

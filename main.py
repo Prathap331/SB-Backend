@@ -430,10 +430,6 @@ def _cap_blocks(blocks: list[str], max_blocks: int, max_chars: int) -> str:
 #     return "resource_exhausted" in t or "quota" in t
 
 
-def _is_groq_rate_limit_error(error_text: str) -> bool:
-    t = (error_text or "").lower()
-    return "rate limit" in t or "rate_limit_exceeded" in t or "too many requests" in t
-
 
 # def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
 #     if not isinstance(payload, dict):
@@ -479,35 +475,35 @@ GEMINI_EMBED_BLOCKED_UNTIL_TS = 0.0
 
 
 
+from dataclasses import dataclass
+
+@dataclass
+class _EmbeddingValue:
+    values: list[float]
+
+@dataclass
+class _EmbedResponse:
+    embeddings: list[_EmbeddingValue]
+
 
 def _embed_with_failover(
     *,
     contents: str | list[str],
-    task_type: str = None,  # kept for compatibility (not used)
-    output_dimensionality: int = 384,  # MiniLM outputs 384
-):
-    try:
-        # Normalize input
-        if isinstance(contents, str):
-            contents = [contents]
+    task_type: str = None,
+    output_dimensionality: int = 384,
+) -> _EmbedResponse:
+    if isinstance(contents, str):
+        contents = [contents]
 
-        embeddings = model.encode(
-            contents,
-            convert_to_numpy=True,
-            normalize_embeddings=True  # good for cosine similarity
-        )
+    embeddings = model.encode(
+        contents,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
 
-        # Ensure correct shape/output
-        if len(embeddings) == 1:
-            return embeddings[0].tolist()
-
-        return embeddings.tolist()
-
-    except Exception as e:
-        print(f"Local embedding failed: {e}")
-        raise
-
-
+    return _EmbedResponse(
+        embeddings=[_EmbeddingValue(values=vec.tolist()) for vec in embeddings]
+    )
 
 _st_model: SentenceTransformer | None = None
 
@@ -1081,6 +1077,8 @@ async def get_latest_news_context(topic: str, scraped_urls: set) -> list[dict]:
         print(f"--- LIGHT WEB SCRAPE: Error: {e} ---")
         return []
 
+EMBED_TIMEOUT_SEC = 10   # local MiniLM is fast, 10s is generous
+DB_QUERY_TIMEOUT_SEC = 5
 
 async def get_db_context(topic: str, hypothetical_document: str = None) -> list[dict]:
     print("--- DB TASK: Starting two-stage DB search... ---")
@@ -1089,47 +1087,33 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
     try:
         loop = asyncio.get_running_loop()
 
-        # Use pre-generated HyDE doc if provided, skip regeneration
+        # ── 1. HyDE generation (skipped if already provided) ────────────────
+        # NOTE: since _embed_with_failover uses local MiniLM, HyDE generation
+        # via deepseek adds latency with minimal benefit. Pass topic directly
+        # and skip the LLM call unless a pre-built doc is provided by caller.
         if hypothetical_document is None:
-            hypothetical_document = topic
-            try:
-                hyde_prompt = f"""
-                Write a short, factual, encyclopedia-style paragraph that provides a direct answer
-                to the following topic. Be concise and include key terms.
-                Topic: "{topic}"
-                """
-                chat_completion = deepseek_client.chat.completions.create(
-                    model="deepseek-v4-pro",
-                    messages=[
-                        {"role": "user", "content": hyde_prompt},
-                    ],
-                    stream=False,
-                )
-                hypothetical_document = chat_completion.choices[0].message.content.strip()
-                print(f"--- DB TASK: HyDE doc generated: {hypothetical_document[:100]}...")
-            except Exception as exc:
-                print(f"--- DB TASK: HyDE failed, falling back to raw topic: {exc} ---")
-                hypothetical_document = topic
+            hypothetical_document = topic   # skip LLM, embed topic directly
+            print(f"--- DB TASK: Using raw topic as query (no HyDE) ---")
+        else:
+            print(f"--- DB TASK: Using pre-built HyDE doc: {hypothetical_document[:80]}... ---")
 
-        print(f"--- DB TASK: Embedding HyDE document for semantic search ---")
-
-        # Embed the HyDE document 
+        # ── 2. Embedding + vector search ─────────────────────────────────────
+        print("--- DB TASK: Embedding query for semantic search ---")
         try:
             embed_response = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
                     lambda: _embed_with_failover(
-                        contents=hypothetical_document,  
+                        contents=hypothetical_document,
                         task_type="RETRIEVAL_QUERY",
-                        output_dimensionality=768,
+                        output_dimensionality=384,   # match your MiniLM model
                     ),
                 ),
-                timeout=DB_LOOKUP_TIMEOUT_SEC,
+                timeout=EMBED_TIMEOUT_SEC,
             )
             query_embedding = embed_response.embeddings[0].values
             print(f"--- DB TASK: Embedding generated, dimension: {len(query_embedding)} ---")
 
-            # Vector search against DB chunks 
             try:
                 vector_response = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -1139,11 +1123,11 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
                             {
                                 'query_embedding': query_embedding,
                                 'match_threshold': 0.55,
-                                'match_count':     8,
+                                'match_count': 8,
                             }
                         ).execute()
                     ),
-                    timeout=DB_LOOKUP_TIMEOUT_SEC,
+                    timeout=DB_QUERY_TIMEOUT_SEC,
                 )
                 vector_results = vector_response.data or []
                 for row in vector_results:
@@ -1153,46 +1137,54 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
                     print(f"    [{i+1}] id={row['id']} | similarity={row.get('similarity', 'N/A'):.3f} | {row.get('content', '')[:80]}...")
 
             except asyncio.TimeoutError:
-                print(f"--- DB TASK: Vector search timed out after {DB_LOOKUP_TIMEOUT_SEC}s ---")
+                print(f"--- DB TASK: Vector search timed out after {DB_QUERY_TIMEOUT_SEC}s ---")
+            except Exception as exc:
+                print(f"--- DB TASK: Vector search failed: {type(exc).__name__}: {exc} ---")
 
+        except asyncio.TimeoutError:
+            print(f"--- DB TASK: Embedding timed out after {EMBED_TIMEOUT_SEC}s ---")
         except Exception as exc:
-            print(f"--- DB TASK: Embedding failed: {exc} ---")
+            print(f"--- DB TASK: Embedding failed: {type(exc).__name__}: {exc} ---")
 
+        # ── 3. Keyword fallback — single batched query ────────────────────────
         if len(combined) < 3:
             print(f"--- DB TASK: Only {len(combined)} semantic results, running keyword fallback... ---")
-            topic_terms = [term for term in re.findall(r"[A-Za-z0-9']+", topic.lower()) if len(term) > 2][:5]
+            topic_terms = [
+                term for term in re.findall(r"[A-Za-z0-9']+", topic.lower())
+                if len(term) > 2
+            ][:5]
             if not topic_terms:
                 topic_terms = [topic.lower()]
 
-            seen_ids: set = set(combined.keys())
-            keyword_rows: list[dict] = []
+            or_filters = ",".join(
+                f"content.ilike.%{term}%,source_title.ilike.%{term}%"
+                for term in topic_terms
+            )
 
-            for term in topic_terms:
-                try:
-                    response = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            None,
-                            lambda term=term: supabase.table("RAG_web_scraped")
+            try:
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: supabase.table("RAG_web_scraped")
                             .select("id, content, source_title, source_url, metadata, created_at")
-                            .or_(f"content.ilike.%{term}%,source_title.ilike.%{term}%")
-                            .limit(8)
+                            .or_(or_filters)
+                            .limit(20)
                             .execute()
-                        ),
-                        timeout=DB_LOOKUP_TIMEOUT_SEC,
-                    )
-                except Exception as exc:
-                    print(f"--- DB TASK: Keyword fallback failed for term '{term}': {exc} ---")
-                    continue
-
+                    ),
+                    timeout=DB_QUERY_TIMEOUT_SEC,
+                )
+                keyword_rows = []
                 for row in (response.data or []):
                     row_id = row.get("id")
-                    if row_id is None or row_id in seen_ids:
-                        continue
-                    seen_ids.add(row_id)
-                    combined[row_id] = row
-                    keyword_rows.append(row)
+                    if row_id is not None and row_id not in combined:
+                        combined[row_id] = row
+                        keyword_rows.append(row)
+                print(f"--- DB TASK: Keyword fallback → {len(keyword_rows)} extra chunks, total unique: {len(combined)} ---")
 
-            print(f"--- DB TASK: Keyword fallback → {len(keyword_rows)} extra chunks, total unique: {len(combined)} ---")
+            except asyncio.TimeoutError:
+                print(f"--- DB TASK: Keyword fallback timed out after {DB_QUERY_TIMEOUT_SEC}s ---")
+            except Exception as exc:
+                print(f"--- DB TASK: Keyword fallback failed: {type(exc).__name__}: {exc} ---")
 
     except Exception as e:
         print(f"--- DB TASK: Error: {e} ---")
@@ -1201,8 +1193,6 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
     results = list(combined.values())
     print(f"--- DB TASK: Returning {len(results)} total chunks ---")
     return results
-
-
 
 STRUCTURE_GUIDANCE = {
     "problem_solution": """
@@ -2153,21 +2143,28 @@ async def generate_ideas_endpoint(
     request: GenerateIdeasRequest,
     background_tasks: BackgroundTasks,
 ):
-    """
-    CAGS-aligned idea generation endpoint.
-    Uses the TSS/CAGS output as the gap source and applies the new
-    idea-cluster pipeline with diversity, depth checks, and cache support.
-    """
     total_start_time = time.time()
     topic = request.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
 
-
     try:
         print(f"GENERATE IDEAS for topic: {topic}")
 
-        tss_payload = await asyncio.wait_for(run_tss(topic), timeout=TSS_TIMEOUT_SEC)
+        # ── STAGE 1: TSS + DB lookup + keyword gen ALL in parallel ────────────
+        # Previously: TSS finished (~15-20s), THEN DB+keywords started.
+        # Now all three run simultaneously.
+        print("--- Stage 1: TSS + DB lookup + keyword gen in parallel ---")
+        tss_task = asyncio.create_task(
+            asyncio.wait_for(run_tss(topic), timeout=TSS_TIMEOUT_SEC)
+        )
+        db_task = asyncio.create_task(get_db_context(topic))
+        kw_task = asyncio.create_task(_generate_search_keywords(topic))
+
+        tss_payload, db_results, base_keywords = await asyncio.gather(
+            tss_task, db_task, kw_task
+        )
+
         cags_payload = tss_payload.get("cags") or {}
         gap_angles = cags_payload.get("gap_angles") or []
         briefs = cags_payload.get("briefs") or []
@@ -2175,45 +2172,26 @@ async def generate_ideas_endpoint(
         if not gap_angles or not perspective_tree:
             raise HTTPException(status_code=422, detail="No viable CAGS angles were produced.")
 
-        print("--- Idea Gen: DB lookup + keyword gen in parallel ---")
-        db_results, base_keywords = await asyncio.gather(
-            get_db_context(topic),
-            _generate_search_keywords(topic),
-        )
+        # ── STAGE 2: Web scrape + social/news scans in parallel ───────────────
+        # Previously: scrape finished, THEN social+news started.
+        # Now all three run simultaneously.
+        print("--- Stage 2: Web scrape + social + news scans in parallel ---")
         scraped_urls: set = set()
         db_count = len(db_results)
+
         if db_count >= 5:
             source_of_context = "DATABASE_RICH"
-            new_articles = await get_latest_news_context(topic, scraped_urls)
-        elif db_count >= 1:
-            source_of_context = "DATABASE_PARTIAL"
-            new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
+            scrape_coro = get_latest_news_context(topic, scraped_urls)
         else:
-            source_of_context = "DEEP_SCRAPE"
-            new_articles = await deep_search_and_scrape(base_keywords, scraped_urls)
+            source_of_context = "DATABASE_PARTIAL" if db_count >= 1 else "DEEP_SCRAPE"
+            scrape_coro = deep_search_and_scrape(base_keywords, scraped_urls)
 
-        db_context, web_context = "", ""
-        source_urls: list[str] = []
-        if db_results:
-            db_blocks = [item.get("content", "") for item in db_results]
-            db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
-            source_urls.extend(list(set([item["source_url"] for item in db_results if item.get("source_url")])))
-        if new_articles:
-            web_blocks = [f"Source: {art['title']}\n{art['text']}" for art in new_articles]
-            web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
-            source_urls.extend([art["url"] for art in new_articles])
-            for article in new_articles:
-                background_tasks.add_task(
-                    add_scraped_data_to_db,
-                    article["title"],
-                    article["text"],
-                    article["url"],
-                    "",
-                    topic,
-                    base_keywords,
-                )
-
-        social_payload, news_payload = await asyncio.gather(
+        (
+            new_articles,
+            social_payload,
+            news_payload,
+        ) = await asyncio.gather(
+            scrape_coro,
             _safe_scan_topic_signals(
                 label="social",
                 scanner=scan_social_topic,
@@ -2229,9 +2207,38 @@ async def generate_ideas_endpoint(
                 fallback_key="sample_articles",
             ),
         )
+
+        # ── Build context blocks ──────────────────────────────────────────────
+        db_context, web_context = "", ""
+        source_urls: list[str] = []
+
+        if db_results:
+            db_blocks = [item.get("content", "") for item in db_results]
+            db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
+            source_urls.extend([
+                item["source_url"] for item in db_results if item.get("source_url")
+            ])
+
+        if new_articles:
+            web_blocks = [f"Source: {art['title']}\n{art['text']}" for art in new_articles]
+            web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
+            source_urls.extend([art["url"] for art in new_articles])
+            for article in new_articles:
+                background_tasks.add_task(
+                    add_scraped_data_to_db,
+                    article["title"],
+                    article["text"],
+                    article["url"],
+                    "",
+                    topic,
+                    base_keywords,
+                )
+
         social_data = social_payload.get("sample_posts") or []
         news_data = news_payload.get("sample_articles") or []
 
+        # ── STAGE 3: Idea generation ──────────────────────────────────────────
+        print("--- Stage 3: Generating ideas ---")
         idea_clusters = await generate_cags_aligned_ideas(
             topic=topic,
             gap_angles=gap_angles,
@@ -2246,7 +2253,8 @@ async def generate_ideas_endpoint(
             used_angle_ids=request.used_angle_ids or [],
             deepseek_client=deepseek_client,
         )
-        # Enrich response with the core research signals that produced it.
+
+        # ── Enrich + flatten response ─────────────────────────────────────────
         idea_clusters["source_of_context"] = source_of_context
         idea_clusters["generated_keywords"] = base_keywords
         idea_clusters["source_urls"] = list(set(source_urls))
@@ -2255,8 +2263,8 @@ async def generate_ideas_endpoint(
             "csi": (tss_payload.get("csi") or {}).get("csi"),
             "total_angles": len(gap_angles),
         }
-        final_ideas = []
-        final_descriptions = []
+
+        final_ideas, final_descriptions = [], []
         for cluster in idea_clusters.get("idea_clusters") or []:
             for variant in cluster.get("idea_variants") or []:
                 title = str(variant.get("title") or "").strip()
@@ -2264,26 +2272,29 @@ async def generate_ideas_endpoint(
                 if title and description:
                     final_ideas.append(title)
                     final_descriptions.append(description)
+
         idea_clusters["ideas"] = final_ideas
         idea_clusters["descriptions"] = final_descriptions
         idea_clusters["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
         idea_clusters["total_request_time_sec"] = round(time.time() - total_start_time, 2)
+
         if len(final_ideas) > 0:
             if _payload_uses_fallback_variants(idea_clusters):
                 print(f"Skipping cache write for '{topic}' because fallback variants were used.")
                 idea_clusters["cache_write_skipped"] = "fallback_variants"
-                print(f"Total /generate-ideas time: {idea_clusters['total_request_time_sec']:.2f}s")
-                return idea_clusters
         else:
             print(f"Skipping cache write for '{topic}' because no ideas were generated.")
 
         print(f"Total /generate-ideas time: {idea_clusters['total_request_time_sec']:.2f}s")
         return idea_clusters
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error in /generate-ideas: {e}")
         return {"error": "An error occurred in the idea generation pipeline."}
+    
+
 
 
 async def pick_best_template(topic: str, templates: list) -> dict:

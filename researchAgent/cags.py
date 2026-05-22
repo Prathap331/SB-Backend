@@ -29,9 +29,25 @@ deepseek_client = OpenAI(
     base_url="https://api.deepseek.com")
 
 
+from sentence_transformers import SentenceTransformer as _ST
+import numpy as _np
+from dataclasses import dataclass as _dataclass
 
+@_dataclass
+class _EmbVal:
+    values: list[float]
 
+@_dataclass  
+class _EmbResp:
+    embeddings: list[_EmbVal]
 
+_local_model = _ST("all-MiniLM-L6-v2")
+
+def _embed_local(contents: str | list[str]) -> _EmbResp:
+    if isinstance(contents, str):
+        contents = [contents]
+    vecs = _local_model.encode(contents, convert_to_numpy=True, normalize_embeddings=True)
+    return _EmbResp(embeddings=[_EmbVal(values=v.tolist()) for v in vecs])
 
 
 
@@ -231,10 +247,7 @@ async def tree_interrogation(
     topic: str,
     social_data: list[dict[str, Any]],
     news_data: list[dict[str, Any]],
-    groq_client: Any,
 ) -> list[dict[str, Any]]:
-    if groq_client is None:
-        raise ValueError('groq_client is None')
 
     social_lines = "\n".join(
         [
@@ -495,40 +508,36 @@ def score_all_angles(
     return scored
 
 
+
 async def generate_briefs(
     scored_angles: list[dict[str, Any]],
     topic: str,
-    groq_client: Any | None,
+    groq_client: Any | None = None,  # unused, kept for compat
     top_n: int = 3,
 ) -> list[dict[str, Any]]:
-    """Stage 5: briefs for the top gap angles."""
-    # COVERED_WELL angles never receive briefs.
     gap_angles = [
-        entry
-        for entry in scored_angles
+        entry for entry in scored_angles
         if entry.get("coverage_label") in {"NOT_COVERED", "COVERED_LOW_QUALITY"}
     ]
     briefs: list[dict[str, Any]] = []
     for entry in gap_angles[:top_n]:
-        brief_fields = {"suggested_title": "", "hook_sentence": "", "publish_urgency": "anytime"}
-        if groq_client:
-            prompt = (
-                f"Topic: \"{topic}\"\n"
-                f"Content angle: {entry.get('angle_string', '')}\n"
-                f"Coverage status: {entry.get('coverage_label', '')}\n"
-                f"Closest existing video: {entry.get('best_video')}\n\n"
-                "Write a YouTube video brief for this exact angle.\n"
-                "You MUST provide non-empty string values for all fields.\n\n"
-                "Return JSON with exactly these three string fields:\n"
-                "{\n"
-                "  \"suggested_title\": \"a specific compelling YouTube title\",\n"
-                "  \"hook_sentence\": \"opening sentence that hooks viewers in 15 seconds\",\n"
-                "  \"publish_urgency\": \"now\"\n"
-                "}\n"
-                "publish_urgency must be exactly one of: now | within_1_week | within_1_month | anytime"
-            )
+        prompt = (
+            f"Topic: \"{topic}\"\n"
+            f"Content angle: {entry.get('angle_string', '')}\n"
+            f"Coverage status: {entry.get('coverage_label', '')}\n"
+            f"Closest existing video: {entry.get('best_video')}\n\n"
+            "Write a YouTube video brief for this exact angle.\n"
+            "Return JSON with exactly these three string fields:\n"
+            "{\n"
+            "  \"suggested_title\": \"a specific compelling YouTube title\",\n"
+            "  \"hook_sentence\": \"opening sentence that hooks viewers in 15 seconds\",\n"
+            "  \"publish_urgency\": \"now\"\n"
+            "}\n"
+            "publish_urgency must be exactly one of: now | within_1_week | within_1_month | anytime"
+        )
+        try:
             resp = deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
+                model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": "Return only valid JSON."},
                     {"role": "user", "content": prompt},
@@ -536,22 +545,22 @@ async def generate_briefs(
                 stream=False,
             )
             data = _safe_groq_parse(resp)
-            urgency = str(data.get("publish_urgency") or "").strip()
-            if urgency not in {"now", "within_1_week", "within_1_month", "anytime"}:
-                urgency = "anytime"
-            brief_fields = {
-                "suggested_title": str(data.get("suggested_title") or "").strip(),
-                "hook_sentence": str(data.get("hook_sentence") or "").strip(),
-                "publish_urgency": urgency,
-            }
-        if not brief_fields["suggested_title"]:
-            brief_fields["suggested_title"] = f"{entry.get('who', 'Audience')} vs status quo: {topic}"
-        if not brief_fields["hook_sentence"]:
-            brief_fields["hook_sentence"] = f"What everyone is missing about {topic} from the {entry.get('who', 'stakeholder')} perspective."
-        brief = {**entry, **brief_fields}
-        briefs.append(brief)
-    return briefs
+        except Exception as exc:
+            print(f"CAGS brief generation failed: {exc}", flush=True)
+            data = {}
 
+        urgency = str(data.get("publish_urgency") or "").strip()
+        if urgency not in {"now", "within_1_week", "within_1_month", "anytime"}:
+            urgency = "anytime"
+        brief_fields = {
+            "suggested_title": str(data.get("suggested_title") or "").strip()
+                or f"{entry.get('who', 'Audience')} vs status quo: {topic}",
+            "hook_sentence": str(data.get("hook_sentence") or "").strip()
+                or f"What everyone is missing about {topic} from the {entry.get('who', 'stakeholder')} perspective.",
+            "publish_urgency": urgency,
+        }
+        briefs.append({**entry, **brief_fields})
+    return briefs
 
 class EmbeddingError(RuntimeError):
     pass
@@ -562,128 +571,39 @@ def _build_corpus_embed_input(video: dict[str, Any]) -> str:
     desc = str(video.get("description") or "").strip()[:240]
     return f"{title}. {desc}" if desc else title
 
-
 def _embed_corpus_for_cags(
     corpus: list[dict[str, Any]],
-    gemini_client: Any | None,
 ) -> np.ndarray | None:
     texts = [_build_corpus_embed_input(v) for v in corpus]
     if not texts:
         return None
-    clients = _iter_embedding_clients(gemini_client)
-    if not clients:
+    try:
+        resp = _embed_local(contents=texts)
+        vecs = [e.values for e in resp.embeddings]
+        return np.asarray(vecs, dtype=np.float32)
+    except Exception as exc:
+        print(f"CAGS corpus embedding failed: {exc}", flush=True)
         return None
-    for slot_idx, client in enumerate(clients, start=1):
-        try:
-            models = getattr(client, "models", None)
-            if models is None or not hasattr(models, "embed_content"):
-                continue
-            config = None
-            try:
-                from google.genai import types as gt
 
-                config = gt.EmbedContentConfig(
-                    task_type="SEMANTIC_SIMILARITY",
-                    output_dimensionality=768,
-                )
-            except Exception:
-                config_cls = getattr(models, "EmbedContentConfig", None)
-                if config_cls:
-                    config = config_cls(
-                        task_type="SEMANTIC_SIMILARITY",
-                        output_dimensionality=768,
-                    )
-            resp = models.embed_content(
-                model="gemini-embedding-001",
-                contents=texts,
-                config=config,
-            )
-            vecs = [list(e.values) for e in getattr(resp, "embeddings", []) or []]
-            if len(vecs) != len(texts):
-                continue
-            if any(len(vec) != 768 for vec in vecs):
-                continue
-            return np.asarray(vecs, dtype=np.float32)
-        except Exception as exc:
-            print(f"CAGS corpus embedding client slot {slot_idx} failed: {exc}", flush=True)
-            continue
-    return None
 
 
 def embed_landscape(
     angles: list[dict[str, Any]],
-    gemini_client: Any | None,
 ) -> np.ndarray:
-    """Stage 2: embed angle strings with semantic task_type."""
     texts = [angle.get("angle_string") or "" for angle in angles]
     if not texts:
-        return np.zeros((0, 768), dtype=np.float32)
+        return np.zeros((0, 384), dtype=np.float32)
+    try:
+        resp = _embed_local(contents=texts)
+        vecs = [e.values for e in resp.embeddings]
+        arr = np.asarray(vecs, dtype=np.float32)
+        if arr.shape != (len(texts), 384):
+            raise EmbeddingError(f"Unexpected shape: {arr.shape}")
+        return arr
+    except Exception as exc:
+        raise EmbeddingError(f"Embedding failed: {exc}") from exc
+    
 
-    embeddings = None
-    clients = _iter_embedding_clients(gemini_client)
-    for slot_idx, client in enumerate(clients, start=1):
-        try:
-            models = getattr(client, "models", None)
-            if models is None or not hasattr(models, "embed_content"):
-                continue
-            config = None
-            try:
-                from google.genai import types as gt
-                config = gt.EmbedContentConfig(
-                    task_type="SEMANTIC_SIMILARITY",
-                    output_dimensionality=768,
-                )
-            except Exception:
-                config_cls = getattr(models, "EmbedContentConfig", None)
-                if config_cls:
-                    config = config_cls(
-                        task_type="SEMANTIC_SIMILARITY",
-                        output_dimensionality=768,
-                    )
-            resp = models.embed_content(
-                model="gemini-embedding-001",
-                contents=texts,
-                config=config,
-            )
-            embeddings = np.array(
-                [list(e.values) for e in getattr(resp, "embeddings", []) or []],
-                dtype=np.float32,
-            )
-            if embeddings.shape != (len(texts), 768):
-                raise EmbeddingError("Gemini returned unexpected shape")
-            break
-        except Exception as exc:
-            print(f"CAGS angle embedding client slot {slot_idx} failed: {exc}", flush=True)
-            embeddings = None
-    lm_enabled = os.getenv("LM_STUDIO_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-    is_render = bool(os.getenv("RENDER"))
-
-    if embeddings is None and lm_enabled and not is_render:
-        try:
-            import httpx
-
-            resp = httpx.post(
-                os.getenv("LMSTUDIO_EMBEDDINGS_URL", "http://127.0.0.1:1234/v1/embeddings"),
-                json={
-                    "model": os.getenv("LMSTUDIO_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5"),
-                    "input": texts,
-                },
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            data = payload.get("data") or []
-            vecs = [item.get("embedding") for item in data if item.get("embedding")]
-            if not vecs:
-                raise EmbeddingError("LM Studio returned no embeddings")
-            embeddings = np.array(vecs, dtype=np.float32)
-            if embeddings.shape != (len(texts), 768):
-                raise EmbeddingError("LM Studio returned unexpected shape")
-        except Exception as exc:
-            raise EmbeddingError(f"Embedding fallback failed: {exc}") from exc
-    elif embeddings is None:
-        raise EmbeddingError("Gemini embedding failed and LM Studio fallback disabled in this environment")
-    return embeddings
 
 
 async def calculate_cags(
@@ -693,15 +613,14 @@ async def calculate_cags(
     social_data: list[dict[str, Any]],
     news_data: list[dict[str, Any]],
     tss_score: float,
-    groq_client: Any | None,
-    gemini_client: Any | None,
+    groq_client: Any | None = None,   
+    gemini_client: Any | None = None, 
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Entry point for Module 03."""
     cags_warnings: list[str] = []
 
     if corpus_embeddings is None:
-        corpus_embeddings = _embed_corpus_for_cags(corpus, gemini_client)
+        corpus_embeddings = _embed_corpus_for_cags(corpus)
     if corpus_embeddings is None:
         cags_warnings.append("corpus_embeddings_unavailable")
 
@@ -711,39 +630,29 @@ async def calculate_cags(
         expected_rows = len(corpus)
         invalid_shape = (
             corpus_embeddings_arr.ndim != 2
-            or corpus_embeddings_arr.shape[1] != 768
             or corpus_embeddings_arr.shape[0] != expected_rows
         )
         if invalid_shape:
-            # CSI can occasionally hand over vectors with an unexpected shape.
-            # Rebuild corpus embeddings here to keep CAGS resilient.
-            rebuilt = _embed_corpus_for_cags(corpus, gemini_client)
+            rebuilt = _embed_corpus_for_cags(corpus)
             if rebuilt is not None:
                 corpus_embeddings_arr = np.asarray(rebuilt, dtype=np.float32)
-                invalid_shape = (
-                    corpus_embeddings_arr.ndim != 2
-                    or corpus_embeddings_arr.shape[1] != 768
-                    or corpus_embeddings_arr.shape[0] != expected_rows
-                )
+                invalid_shape = corpus_embeddings_arr.shape[0] != expected_rows
             if invalid_shape:
                 cags_warnings.append("corpus_embeddings_invalid_shape")
                 corpus_embeddings_arr = None
 
-    perspective_tree = await tree_interrogation(topic, social_data, news_data, groq_client)
+    # groq_client passed as None — tree_interrogation uses deepseek_client directly
+    perspective_tree = await tree_interrogation(topic, social_data, news_data, None)
     labelled: list[dict[str, Any]] = []
     if corpus_embeddings_arr is not None:
         try:
-            angle_vectors = embed_landscape(perspective_tree, gemini_client)
+            angle_vectors = embed_landscape(perspective_tree)
             angle_vectors = np.asarray(angle_vectors)
             avg_views = float(
                 sum(float(v.get("view_count", 0) or 0) for v in corpus) / max(len(corpus), 1)
             )
             labelled = label_youtube_corpus(
-                corpus,
-                corpus_embeddings_arr,
-                angle_vectors,
-                perspective_tree,
-                avg_views,
+                corpus, corpus_embeddings_arr, angle_vectors, perspective_tree, avg_views,
             )
         except Exception as exc:
             print(f"CAGS labelling fallback activated: {exc}", flush=True)
@@ -751,11 +660,10 @@ async def calculate_cags(
 
     scored_angles = score_all_angles(perspective_tree, labelled, social_data, tss_score)
     gap_angles = [
-        entry
-        for entry in scored_angles
+        entry for entry in scored_angles
         if entry.get("coverage", {}).get("coverage_label") in {"NOT_COVERED", "COVERED_LOW_QUALITY"}
     ]
-    briefs = await generate_briefs(gap_angles, topic, groq_client)
+    briefs = await generate_briefs(gap_angles, topic, True)  # truthy — deepseek always available
 
     payload = {
         "topic": topic,

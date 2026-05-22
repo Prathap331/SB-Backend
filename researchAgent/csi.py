@@ -133,7 +133,7 @@ def calculate_csi(
     m1_norm: dict[str, Any],
     m3_norm: dict[str, Any],
     m4_norm: dict[str, Any],
-    gemini_client: Any,
+    gemini_client: Any = None,       
     region_code: str = "US",
     language_code: str = "en",
     creator_subs: int | None = None,
@@ -496,13 +496,35 @@ def _embed_via_lm_studio(texts: list[str]) -> list[list[float]] | None:
         return None
 
 
+
+from sentence_transformers import SentenceTransformer as _ST
+import numpy as _np
+from dataclasses import dataclass as _dataclass
+
+@_dataclass
+class _EmbVal:
+    values: list[float]
+
+@_dataclass  
+class _EmbResp:
+    embeddings: list[_EmbVal]
+
+_local_model = _ST("all-MiniLM-L6-v2") 
+
+def _embed_local(contents: str | list[str]) -> _EmbResp:
+    if isinstance(contents, str):
+        contents = [contents]
+    vecs = _local_model.encode(contents, convert_to_numpy=True, normalize_embeddings=True)
+    return _EmbResp(embeddings=[_EmbVal(values=v.tolist()) for v in vecs])
+
 def compute_redundancy_score(
     corpus: list[dict[str, Any]],
-    gemini_client: Any,
-    embedding_model: str,
-    data_quality: dict[str, Any],
+    gemini_client: Any = None,  # unused, kept for signature compat
+    embedding_model: str = "",  # unused, kept for signature compat
+    data_quality: dict[str, Any] = None,
 ) -> dict[str, Any]:
-    global _GEMINI_LAST_CALL_TS, _GEMINI_BLOCKED_UNTIL_TS
+    if data_quality is None:
+        data_quality = {}
 
     def build_embed_input(video: dict[str, Any]) -> str:
         desc = (video.get("description") or "")[:200].strip()
@@ -513,66 +535,21 @@ def compute_redundancy_score(
         return {"score": 50.0, "avg_cosine_similarity": 0.0, "embeddings": None}
 
     inputs = [build_embed_input(v) for v in corpus]
-    embeddings: list[list[float]] | None = None
-    cache_keys = [_embed_cache_key(text) for text in inputs]
-    cached_vectors = [_EMBED_CACHE.get(k) for k in cache_keys]
-    if all(vec is not None for vec in cached_vectors):
-        embeddings = [list(vec or []) for vec in cached_vectors]
 
-    # Try Gemini first
-    if gemini_client and embeddings is None and time.time() >= _GEMINI_BLOCKED_UNTIL_TS:
-        attempts = 3
-        for attempt in range(1, attempts + 1):
-            try:
-                with _GEMINI_EMBED_LOCK:
-                    now = time.time()
-                    sleep_for = _GEMINI_MIN_INTERVAL_SEC - (now - _GEMINI_LAST_CALL_TS)
-                    if sleep_for > 0:
-                        time.sleep(sleep_for)
-                    _GEMINI_LAST_CALL_TS = time.time()
-                    embeddings = _embed_texts_with_gemini_batches(
-                        gemini_client,
-                        embedding_model,
-                        inputs,
-                        task_type="SEMANTIC_SIMILARITY",
-                        output_dimensionality=768,
-                    )
-                if len(embeddings) < 2:
-                    raise ValueError("insufficient embeddings")
+    try:
+        resp = _embed_local(contents=inputs)
+        embeddings = [e.values for e in resp.embeddings]
+    except Exception as exc:
+        print(f"CSI redundancy embedding failed: {exc}", flush=True)
+        data_quality["redundancy_embedding_failed"] = True
+        data_quality["redundancy_used_fallback"] = True
+        return {"score": 50.0, "avg_cosine_similarity": 0.0, "embeddings": None}
 
-                for key, vec in zip(cache_keys, embeddings):
-                    if len(_EMBED_CACHE) >= _EMBED_CACHE_MAX:
-                        _EMBED_CACHE.clear()
-                    _EMBED_CACHE[key] = vec
-                break
-            except Exception as exc:
-                error_text = str(exc)
-                if _is_daily_quota_error(error_text):
-                    _GEMINI_BLOCKED_UNTIL_TS = time.time() + 3600.0
-                    embeddings = None
-                    break
-                if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
-                    delay = _extract_retry_delay_seconds(error_text)
-                    if delay is None:
-                        delay = min(2 ** attempt + random.random(), 30.0)
-                    time.sleep(delay)
-                    continue
-                embeddings = None
-                break
+    avg_sim = _average_cosine_similarity(embeddings)
+    normalised = (0.90 - avg_sim) / 0.60
+    score = max(0.0, min(normalised * 100.0, 100.0))
+    return {"score": round(score, 1), "avg_cosine_similarity": avg_sim, "embeddings": embeddings}
 
-    if embeddings is None:
-        embeddings = _embed_via_lm_studio(inputs)
-
-    if embeddings:
-        avg_sim = _average_cosine_similarity(embeddings)
-        normalised = (0.90 - avg_sim) / 0.60
-        # Inline clamp to avoid any accidental name shadowing / import weirdness.
-        score = max(0.0, min(normalised * 100.0, 100.0))
-        return {"score": round(score, 1), "avg_cosine_similarity": avg_sim, "embeddings": embeddings}
-
-    data_quality["redundancy_embedding_failed"] = True
-    data_quality["redundancy_used_fallback"] = True
-    return {"score": 50.0, "avg_cosine_similarity": 0.0, "embeddings": None}
 
 
 def calculate_csi_score(S: float, D: float, F: float, R: float, V: float, QG: float) -> float:
