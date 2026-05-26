@@ -14,6 +14,9 @@ from openai import OpenAI
 import os 
 
 
+     
+    
+
 SEO_SYNTHESIS_PROMPT = """
 You are an expert YouTube SEO Analyst and Title Strategist.
 

@@ -252,153 +252,6 @@ deepseek_client = OpenAI(
 
 print("deepseek", os.environ.get("DEEPSEEK_API_KEY"))
 
-# def _topic_cache_key(topic: str) -> str:
-#     return " ".join((topic or "").strip().lower().split())
-
-
-# def _parse_utc_datetime(value: Any) -> datetime.datetime | None:
-#     if not value:
-#         return None
-#     if isinstance(value, datetime.datetime):
-#         candidate = value
-#     else:
-#         try:
-#             candidate = dt.fromisoformat(str(value).replace("Z", "+00:00"))
-#         except Exception:
-#             return None
-#     if candidate.tzinfo is None:
-#         candidate = candidate.replace(tzinfo=datetime.timezone.utc)
-#     return candidate.astimezone(datetime.timezone.utc)
-
-
-# def _cache_age_hours(created_at: Any) -> float | None:
-#     candidate = _parse_utc_datetime(created_at)
-#     if candidate is None:
-#         return None
-#     return max((datetime.datetime.now(datetime.timezone.utc) - candidate).total_seconds() / 3600.0, 0.0)
-
-
-# async def _lookup_topic_cache_db(topic: str) -> dict[str, Any] | None:
-#     topic_key = _topic_cache_key(topic)
-#     try:
-#         response = await asyncio.to_thread(
-#             lambda: supabase.table("topic_content_cache")
-#             .select("topic_canonical,payload,created_at,updated_at,expires_at")
-#             .eq("topic_key", topic_key)
-#             .gt("expires_at", datetime.datetime.now(datetime.timezone.utc).isoformat())
-#             .limit(1)
-#             .execute()
-#         )
-#         rows = response.data or []
-#         if not rows:
-#             return None
-#         row = rows[0] or {}
-#         payload = dict(row.get("payload") or {})
-#         if not _payload_has_ideas(payload):
-#             return None
-#         payload.pop("cags", None)
-#         payload["served_from_cache"] = True
-#         payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
-#         payload["source_of_context"] = payload.get("source_of_context", "CACHE_DB")
-#         return payload
-#     except Exception as e:
-#         print(f"[warn] idea cache DB lookup failed for '{topic}': {e}")
-#         return None
-
-
-# async def _lookup_topic_cache_db_semantic(topic: str, cache_client: Any | None = None) -> dict[str, Any] | None:
-#     if cache_client is None:
-#         return None
-#     topic_vector = None
-#     try:
-#         topic_vector = TOPIC_CACHE._vector_from_client(topic, cache_client)
-#     except Exception:
-#         topic_vector = None
-#     if topic_vector is None:
-#         return None
-#     try:
-#         response = await asyncio.to_thread(
-#             lambda: supabase.rpc(
-#                 "match_topic_content_cache",
-#                 {
-#                     "query_embedding": topic_vector,
-#                     "match_threshold": 0.92,
-#                     "match_count": 1,
-#                 },
-#             ).execute()
-#         )
-#         rows = response.data or []
-#         if not rows:
-#             return None
-#         row = rows[0] or {}
-#         payload = dict(row.get("payload") or {})
-#         if not _payload_has_ideas(payload):
-#             return None
-#         payload.pop("cags", None)
-#         payload["served_from_cache"] = True
-#         payload["cache_age_hours"] = round(_cache_age_hours(row.get("created_at")) or 0.0, 3)
-#         payload["cache_similarity"] = round(float(row.get("similarity") or 0.0), 3)
-#         payload["source_of_context"] = payload.get("source_of_context", "CACHE_DB")
-#         return payload
-#     except Exception as e:
-#         print(f"[warn] idea cache semantic DB lookup failed for '{topic}': {e}")
-#         return None
-
-
-# async def _store_topic_cache_db(topic: str, payload: dict[str, Any], cache_client: Any | None = None) -> None:
-#     topic_key = _topic_cache_key(topic)
-#     expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=IDEA_CACHE_TTL_HOURS)
-#     row: dict[str, Any] = {
-#         "topic_key": topic_key,
-#         "topic_canonical": topic,
-#         "payload": payload,
-#         "expires_at": expires_at.isoformat(),
-#         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-#     }
-#     try:
-#         topic_vector = None
-#         if cache_client is not None:
-#             try:
-#                 topic_vector = TOPIC_CACHE._vector_from_client(topic, cache_client)
-#             except Exception:
-#                 topic_vector = None
-#         if topic_vector is not None:
-#             row["topic_vec"] = topic_vector
-#         await asyncio.to_thread(
-#             lambda: supabase.table("topic_content_cache")
-#             .upsert(row, on_conflict="topic_key")
-#             .execute()
-#         )
-#     except Exception as e:
-#         print(f"[warn] idea cache DB store failed for '{topic}': {e}")
-
-
-# def _build_cache_payload(payload: dict[str, Any]) -> dict[str, Any]:
-#     """
-#     Keep idea cache stable: do not persist volatile trend metrics (TSS/CSI/CAGS)
-#     because they are time-sensitive and should be computed fresh.
-#     """
-#     cached = dict(payload or {})
-#     cached.pop("cags", None)
-#     return cached
-
-
-# async def _lookup_topic_cache(topic: str, cache_client: Any | None = None) -> dict[str, Any] | None:
-#     cached = TOPIC_CACHE.lookup(topic, cache_client)
-#     if cached:
-#         cached.pop("cags", None)
-#         return cached
-#     db_semantic = await _lookup_topic_cache_db_semantic(topic, cache_client)
-#     if db_semantic:
-#         TOPIC_CACHE.store(topic, db_semantic, cache_client)
-#         return db_semantic
-#     db_cached = await _lookup_topic_cache_db(topic)
-#     if db_cached:
-#         TOPIC_CACHE.store(topic, db_cached, cache_client)
-#     return db_cached
-
-
-
 
 def _cap_blocks(blocks: list[str], max_blocks: int, max_chars: int) -> str:
     selected = [b.strip() for b in blocks if b and b.strip()][:max_blocks]
@@ -406,52 +259,6 @@ def _cap_blocks(blocks: list[str], max_blocks: int, max_chars: int) -> str:
     if len(merged) > max_chars:
         merged = merged[:max_chars]
     return merged
-
-
-# def _extract_retry_delay_seconds(error_text: str) -> float | None:
-#     if not error_text:
-#         return None
-#     match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", error_text, flags=re.IGNORECASE)
-#     if not match:
-#         return None
-#     try:
-#         return float(match.group(1))
-#     except Exception:
-#         return None
-
-
-# def _is_daily_quota_error(error_text: str) -> bool:
-#     t = (error_text or "").lower()
-#     return "resource_exhausted" in t and "perday" in t
-
-
-# def _is_embedding_quota_error(error_text: str) -> bool:
-#     t = (error_text or "").lower()
-#     return "resource_exhausted" in t or "quota" in t
-
-
-
-# def _payload_has_ideas(payload: dict[str, Any] | None) -> bool:
-#     if not isinstance(payload, dict):
-#         return False
-#     if _payload_uses_fallback_variants(payload):
-#         return False
-#     ideas = payload.get("ideas")
-#     if isinstance(ideas, list) and any(str(item).strip() for item in ideas):
-#         return True
-#     clusters = payload.get("idea_clusters")
-#     if not isinstance(clusters, list) or not clusters:
-#         return False
-#     for cluster in clusters:
-#         variants = (cluster or {}).get("idea_variants")
-#         if not isinstance(variants, list):
-#             continue
-#         for variant in variants:
-#             title = str((variant or {}).get("title") or "").strip()
-#             desc = str((variant or {}).get("description") or "").strip()
-#             if title and desc:
-#                 return True
-#     return False
 
 
 def _payload_uses_fallback_variants(payload: dict[str, Any] | None) -> bool:
@@ -583,41 +390,6 @@ async def openrouter_generate(messages: list) -> str:
                     break
 
     raise Exception(f"All OpenRouter slots exhausted. Last error: {last_error}")
-
-async def _groq_generate_with_slots(
-    messages: list,
-    clients: list[AsyncOpenAI],
-    model: str,
-    label: str,
-) -> str:
-    last_error = None
-    for slot_idx, client in enumerate(clients, start=1):
-        for attempt in range(2):
-            try:
-                completion = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                )
-                return completion.choices[0].message.content
-            except Exception as exc:
-                last_error = exc
-                err_text = str(exc).lower()
-                is_rate_limit = "429" in err_text or "rate" in err_text
-                if is_rate_limit and attempt == 0:
-                    await asyncio.sleep(1)
-                    continue
-                print(f"Groq {label} slot {slot_idx} failed on attempt {attempt + 1}: {exc}")
-                break
-    raise Exception(f"All Groq {label} slots exhausted. Last error: {last_error}")
-
-
-# async def groq_idea_generate(messages: list, model: str = GROQ_GENERATION_MODEL) -> str:
-#     return await _groq_generate_with_slots(messages, GROQ_IDEA_CLIENTS, model, "idea")
-
-
-# async def groq_script_generate(messages: list, model: str = GROQ_SCRIPT_MODEL) -> str:
-#     return await _groq_generate_with_slots(messages, GROQ_SCRIPT_CLIENTS, model, "script")
-
 
 def deepseek_script_generate(messages: list) -> str:
     resp = deepseek_client.chat.completions.create(
@@ -1081,24 +853,22 @@ EMBED_TIMEOUT_SEC = 10   # local MiniLM is fast, 10s is generous
 DB_QUERY_TIMEOUT_SEC = 5
 
 async def get_db_context(topic: str, hypothetical_document: str = None) -> list[dict]:
-    print("--- DB TASK: Starting two-stage DB search... ---")
-    combined: dict[int, dict] = {}
+    print("--- DB TASK: Starting two-stage DB search (books + web)... ---")
+    combined: dict[str, dict] = {}   # keyed by "table:id" to avoid collisions
 
     try:
         loop = asyncio.get_running_loop()
 
-        # ── 1. HyDE generation (skipped if already provided) ────────────────
-        # NOTE: since _embed_with_failover uses local MiniLM, HyDE generation
-        # via deepseek adds latency with minimal benefit. Pass topic directly
-        # and skip the LLM call unless a pre-built doc is provided by caller.
+        # ── 1. HyDE ───────────────────────────────────────────────────────────
         if hypothetical_document is None:
-            hypothetical_document = topic   # skip LLM, embed topic directly
-            print(f"--- DB TASK: Using raw topic as query (no HyDE) ---")
+            hypothetical_document = topic
+            print("--- DB TASK: Using raw topic as query (no HyDE) ---")
         else:
             print(f"--- DB TASK: Using pre-built HyDE doc: {hypothetical_document[:80]}... ---")
 
-        # ── 2. Embedding + vector search ─────────────────────────────────────
+        # ── 2. Embedding ──────────────────────────────────────────────────────
         print("--- DB TASK: Embedding query for semantic search ---")
+        query_embedding = None
         try:
             embed_response = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -1106,7 +876,7 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
                     lambda: _embed_with_failover(
                         contents=hypothetical_document,
                         task_type="RETRIEVAL_QUERY",
-                        output_dimensionality=384,   # match your MiniLM model
+                        output_dimensionality=384,
                     ),
                 ),
                 timeout=EMBED_TIMEOUT_SEC,
@@ -1114,6 +884,13 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
             query_embedding = embed_response.embeddings[0].values
             print(f"--- DB TASK: Embedding generated, dimension: {len(query_embedding)} ---")
 
+        except asyncio.TimeoutError:
+            print(f"--- DB TASK: Embedding timed out after {EMBED_TIMEOUT_SEC}s ---")
+        except Exception as exc:
+            print(f"--- DB TASK: Embedding failed: {type(exc).__name__}: {exc} ---")
+
+        # ── 3. Vector search — RAG_web_scraped ───────────────────────────────
+        if query_embedding is not None:
             try:
                 vector_response = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -1129,26 +906,51 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
                     ),
                     timeout=DB_QUERY_TIMEOUT_SEC,
                 )
-                vector_results = vector_response.data or []
-                for row in vector_results:
-                    combined[row['id']] = row
-                print(f"--- DB TASK: Semantic search → {len(vector_results)} chunks retrieved ---")
-                for i, row in enumerate(vector_results):
-                    print(f"    [{i+1}] id={row['id']} | similarity={row.get('similarity', 'N/A'):.3f} | {row.get('content', '')[:80]}...")
+                web_results = vector_response.data or []
+                for row in web_results:
+                    combined[f"web:{row['id']}"] = {**row, "_source_table": "web"}
+                print(f"--- DB TASK: Web semantic search → {len(web_results)} chunks ---")
+                for i, row in enumerate(web_results):
+                    print(f"    [web {i+1}] id={row['id']} similarity={row.get('similarity', 'N/A'):.3f} | {row.get('content','')[:80]}...")
 
             except asyncio.TimeoutError:
-                print(f"--- DB TASK: Vector search timed out after {DB_QUERY_TIMEOUT_SEC}s ---")
+                print(f"--- DB TASK: Web vector search timed out after {DB_QUERY_TIMEOUT_SEC}s ---")
             except Exception as exc:
-                print(f"--- DB TASK: Vector search failed: {type(exc).__name__}: {exc} ---")
+                print(f"--- DB TASK: Web vector search failed: {type(exc).__name__}: {exc} ---")
 
-        except asyncio.TimeoutError:
-            print(f"--- DB TASK: Embedding timed out after {EMBED_TIMEOUT_SEC}s ---")
-        except Exception as exc:
-            print(f"--- DB TASK: Embedding failed: {type(exc).__name__}: {exc} ---")
+        # ── 4. Vector search — rag_libgen (books) ────────────────────────────
+        if query_embedding is not None:
+            try:
+                book_vector_response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: supabase.rpc(
+                            'match_book_documents',          # RPC for rag_libgen — see note below
+                            {
+                                'query_embedding': query_embedding,
+                                'match_threshold': 0.55,
+                                'match_count': 8,
+                            }
+                        ).execute()
+                    ),
+                    timeout=DB_QUERY_TIMEOUT_SEC,
+                )
+                book_results = book_vector_response.data or []
+                for row in book_results:
+                    combined[f"book:{row['id']}"] = {**row, "_source_table": "book"}
+                print(f"--- DB TASK: Book semantic search → {len(book_results)} chunks ---")
+                for i, row in enumerate(book_results):
+                    print(f"    [book {i+1}] id={row['id']} similarity={row.get('similarity', 'N/A'):.3f} | title={row.get('source_title','')[:40]} | {row.get('content','')[:80]}...")
 
-        # ── 3. Keyword fallback — single batched query ────────────────────────
+            except asyncio.TimeoutError:
+                print(f"--- DB TASK: Book vector search timed out after {DB_QUERY_TIMEOUT_SEC}s ---")
+            except Exception as exc:
+                print(f"--- DB TASK: Book vector search failed: {type(exc).__name__}: {exc} ---")
+
+        # ── 5. Keyword fallback — both tables if still thin ──────────────────
         if len(combined) < 3:
-            print(f"--- DB TASK: Only {len(combined)} semantic results, running keyword fallback... ---")
+            print(f"--- DB TASK: Only {len(combined)} semantic results — running keyword fallback on both tables... ---")
+
             topic_terms = [
                 term for term in re.findall(r"[A-Za-z0-9']+", topic.lower())
                 if len(term) > 2
@@ -1161,30 +963,60 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
                 for term in topic_terms
             )
 
+            # Keyword fallback — RAG_web_scraped
             try:
-                response = await asyncio.wait_for(
+                web_kw_response = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
                         lambda: supabase.table("RAG_web_scraped")
                             .select("id, content, source_title, source_url, metadata, created_at")
                             .or_(or_filters)
-                            .limit(20)
+                            .limit(10)
                             .execute()
                     ),
                     timeout=DB_QUERY_TIMEOUT_SEC,
                 )
-                keyword_rows = []
-                for row in (response.data or []):
-                    row_id = row.get("id")
-                    if row_id is not None and row_id not in combined:
-                        combined[row_id] = row
-                        keyword_rows.append(row)
-                print(f"--- DB TASK: Keyword fallback → {len(keyword_rows)} extra chunks, total unique: {len(combined)} ---")
+                web_kw_rows = 0
+                for row in (web_kw_response.data or []):
+                    key = f"web:{row['id']}"
+                    if key not in combined:
+                        combined[key] = {**row, "_source_table": "web"}
+                        web_kw_rows += 1
+                print(f"--- DB TASK: Web keyword fallback → {web_kw_rows} extra chunks ---")
 
             except asyncio.TimeoutError:
-                print(f"--- DB TASK: Keyword fallback timed out after {DB_QUERY_TIMEOUT_SEC}s ---")
+                print(f"--- DB TASK: Web keyword fallback timed out ---")
             except Exception as exc:
-                print(f"--- DB TASK: Keyword fallback failed: {type(exc).__name__}: {exc} ---")
+                print(f"--- DB TASK: Web keyword fallback failed: {type(exc).__name__}: {exc} ---")
+
+            try:
+                book_kw_response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: supabase.table("rag_libgen")
+                            .select("id, content, source_title, source_url, metadata")
+                            .or_(or_filters)
+                            .limit(10)
+                            .execute()
+                    ),
+                    timeout=DB_QUERY_TIMEOUT_SEC,
+                )
+                book_kw_rows = 0
+                for row in (book_kw_response.data or []):
+                    key = f"book:{row['id']}"
+                    if key not in combined:
+                        combined[key] = {**row, "_source_table": "book"}
+                        book_kw_rows += 1
+                print(f"--- DB TASK: Book keyword fallback → {book_kw_rows} extra chunks ---")
+
+            except asyncio.TimeoutError:
+                print(f"--- DB TASK: Book keyword fallback timed out ---")
+            except Exception as exc:
+                print(f"--- DB TASK: Book keyword fallback failed: {type(exc).__name__}: {exc} ---")
+
+        web_count  = sum(1 for v in combined.values() if v.get("_source_table") == "web")
+        book_count = sum(1 for v in combined.values() if v.get("_source_table") == "book")
+        print(f"--- DB TASK: Total unique chunks: {len(combined)} (web={web_count}, books={book_count}) ---")
 
     except Exception as e:
         print(f"--- DB TASK: Error: {e} ---")
@@ -1193,6 +1025,7 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
     results = list(combined.values())
     print(f"--- DB TASK: Returning {len(results)} total chunks ---")
     return results
+
 
 STRUCTURE_GUIDANCE = {
     "problem_solution": """
@@ -2399,11 +2232,9 @@ async def get_channel_profile(userId: str):
         print(e)
 
 
-
 class UnlockRequest(BaseModel):
     userId: str
     duration: int
-
 
 
 @app.post("/unlock")
