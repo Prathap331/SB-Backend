@@ -3275,16 +3275,3 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
     return {"message": "Uploaded and processed"}
 
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-@app.post("/generate-embeddings")
-async def generate_embeddings(contents: List[str]):
-    embeddings = model.encode(
-        contents,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-
-    return {
-        "embeddings": embeddings.tolist()
-    }
