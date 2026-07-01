@@ -1,21 +1,12 @@
-"""
-book_downloader_torrent.py
-──────────────────────────
-Downloads books from Anna's Archive, stores chunks + embeddings in Supabase.
 
-Download priority per book:
-  1. Torrent / magnet link  (libtorrent, found on MD5 page)
-  2. Direct file URL        (requests, found on MD5 page)
-  3. Slow-download page     → repeat 1 & 2 with links found there
-"""
-
-import os, re, sys, time, shutil, subprocess
+import os, re, sys, time, shutil, subprocess, html as html_mod
 import urllib.request
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse, unquote
 
 import requests
 import pandas as pd
-import fitz  # PyMuPDF
+import fitz
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
 
@@ -25,11 +16,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
-
-# ── libtorrent (optional) ─────────────────────────────────────────────────────
-
-
-
 
 try:
     import libtorrent as lt
@@ -42,13 +28,11 @@ except ImportError:
     print("          Ubuntu/Debian : sudo apt install python3-libtorrent")
     print("          pip           : pip install python-libtorrent")
 
-# ── config ────────────────────────────────────────────────────────────────────
 CSV_FILE            = "english_books.csv"
 OUTPUT_DIR          = os.path.abspath("downloaded_books")
 NUM_BOOKS           = 15
 
 PAGE_LOAD_TIMEOUT   = 60
-
 SLOW_PAGE_WAIT      = 30
 DELAY_BETWEEN_BOOKS = 10
 
@@ -64,21 +48,18 @@ DOWNLOAD_POLL       = 1
 TORRENT_TIMEOUT     = 300
 TORRENT_POLL        = 5
 
-# ── Supabase ──────────────────────────────────────────────────────────────────
 _sb_url = os.getenv("SUPABASE_URL")
 _sb_key = os.getenv("SUPABASE_KEY")
 if not _sb_url or not _sb_key:
     sys.exit("[ERROR] SUPABASE_URL and SUPABASE_KEY env vars must be set.")
 supabase = create_client(_sb_url, _sb_key)
 
-# ── embedding model ───────────────────────────────────────────────────────────
 print("Loading embedding model…")
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")   # 384-dim — matches Supabase column
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 print("Model loaded.\n")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ── shared HTTP session (reuses cookies & headers across books) ───────────────
 _http = requests.Session()
 _http.headers.update({
     "User-Agent": (
@@ -92,9 +73,6 @@ _http.headers.update({
 })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Chrome driver  (only used for page scraping, NOT for downloads)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_driver():
     opts = Options()
@@ -106,25 +84,16 @@ def make_driver():
     opts.add_argument("--window-size=1280,900")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-
-    # ── FIX: auto-download to OUTPUT_DIR without save dialog ──────────────────
     prefs = {
-        # Set the default download directory
         "download.default_directory": OUTPUT_DIR,
-        # Disable the "Ask where to save each file before downloading" prompt
         "download.prompt_for_download": False,
-        # Allow automatic downloads (do not require user gesture)
         "download.directory_upgrade": True,
-        # Disable the PDF viewer so PDFs are downloaded instead of opened
         "plugins.always_open_pdf_externally": True,
-        # Suppress the download bubble / shelf UI
         "download.open_pdf_in_system_reader": False,
         "profile.default_content_settings.popups": 0,
         "profile.default_content_setting_values.automatic_downloads": 1,
     }
     opts.add_experimental_option("prefs", prefs)
-    # ──────────────────────────────────────────────────────────────────────────
-
     drv = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
         options=opts,
@@ -135,27 +104,15 @@ def make_driver():
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
     )
-
-    # ── FIX: enable headless-safe downloads via CDP ───────────────────────────
     drv.execute_cdp_cmd(
         "Page.setDownloadBehavior",
         {"behavior": "allow", "downloadPath": OUTPUT_DIR},
     )
-    # ──────────────────────────────────────────────────────────────────────────
-
     return drv
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Wait for a Chrome-triggered download to complete in OUTPUT_DIR
-# ─────────────────────────────────────────────────────────────────────────────
 
 def wait_for_chrome_download(timeout=DOWNLOAD_MAX_WAIT, poll=DOWNLOAD_POLL):
-    """
-    Block until no .crdownload / .part temp files remain in OUTPUT_DIR
-    and at least one new complete file has appeared.
-    Returns the path of the newest file, or None on timeout.
-    """
     print(f"  [dl] Waiting up to {timeout}s for Chrome download to finish…")
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -168,21 +125,14 @@ def wait_for_chrome_download(timeout=DOWNLOAD_MAX_WAIT, poll=DOWNLOAD_POLL):
             and os.path.isfile(os.path.join(OUTPUT_DIR, f))
         ]
         if complete and not in_flight:
-            # Return the most-recently modified complete file
-            newest = max(
-                complete,
-                key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)),
-            )
-            fpath = os.path.join(OUTPUT_DIR, newest)
+            newest = max(complete, key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)))
+            fpath  = os.path.join(OUTPUT_DIR, newest)
             print(f"  [dl] Download complete: {newest}")
             return fpath
     print("  [!] Download timed out")
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Safe Selenium navigation
-# ─────────────────────────────────────────────────────────────────────────────
 
 def safe_get(driver, url, retries=MAX_RETRIES):
     for attempt in range(1, retries + 1):
@@ -201,44 +151,25 @@ def safe_get(driver, url, retries=MAX_RETRIES):
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Direct HTTP download via requests  (handles pdf, fb2, epub — any type)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def download_direct(url, title_hint="book"):
-    """
-    Stream a file from *url* into OUTPUT_DIR using requests.
-    Returns the saved file path, or None on failure.
-    """
     print(f"  [http] Downloading: {url[:90]}")
     try:
-        # Follow redirects to get final URL and headers
         head      = _http.head(url, allow_redirects=True, timeout=30)
         final_url = head.url
-
-        # 1. Try Content-Disposition for filename
-        fname = None
-        cd    = head.headers.get("Content-Disposition", "")
-        # pattern handles both filename= and filename*=UTF-8''...
-        cd_match = re.search(
-            r"filename\*?=(?:UTF-8'')?[\"']?([^\"';\r\n]+)",
-            cd, re.IGNORECASE
+        fname     = None
+        cd        = head.headers.get("Content-Disposition", "")
+        cd_match  = re.search(
+            r"filename\*?=(?:UTF-8'')?[\"']?([^\"';\r\n]+)", cd, re.IGNORECASE
         )
         if cd_match:
             fname = unquote(cd_match.group(1)).strip().strip('"').strip("'")
-
-        # 2. Fall back to URL path
         if not fname:
             fname = unquote(urlparse(final_url).path.split("/")[-1]) or "book"
-
-        # 3. Sanitise
         fname = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", fname)
         if not os.path.splitext(fname)[1]:
-            fname += ".pdf"     # assume pdf if no extension
-
+            fname += ".pdf"
         dest = os.path.join(OUTPUT_DIR, fname)
-
-        # Stream to disk
         with _http.get(final_url, stream=True, timeout=180) as r:
             r.raise_for_status()
             total = int(r.headers.get("Content-Length", 0))
@@ -256,7 +187,6 @@ def download_direct(url, title_hint="book"):
                             )
         print(f"\n  [http] Saved {done//1024} KB → {dest}")
         return dest
-
     except requests.RequestException as exc:
         print(f"  [!] HTTP download failed: {exc}")
         return None
@@ -265,13 +195,142 @@ def download_direct(url, title_hint="book"):
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# File post-processing
-# ─────────────────────────────────────────────────────────────────────────────
 
-def convert_fb2_to_pdf(fb2_path):
+def _fb2_extract_text(fb2_path: str) -> str:
+    """
+    Parse FB2 XML and return plain text.
+    FB2 body paragraphs live in <body><section><p> elements.
+    Namespace-aware — handles both bare and namespaced FB2 files.
+    """
+    try:
+        tree = ET.parse(fb2_path)
+        root = tree.getroot()
+    except ET.ParseError:
+        with open(fb2_path, "rb") as fh:
+            raw = fh.read()
+        raw = re.sub(rb'<\?xml[^?]*\?>', b'', raw, count=1)
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as e:
+            print(f"  [!] FB2 XML parse failed: {e}")
+            return ""
+
+    ns_match = re.match(r'\{[^}]+\}', root.tag)
+    ns       = ns_match.group(0) if ns_match else ""
+
+    lines = []
+    for body in root.iter(f"{ns}body"):
+        for elem in body.iter():
+            tag = elem.tag.replace(ns, "")
+            if tag in ("p", "v"):                     
+                text = (elem.text or "").strip()
+                if text:
+                    lines.append(html_mod.unescape(text))
+            elif tag in ("title", "subtitle", "epigraph"):
+                text = "".join(t for t in elem.itertext()).strip()
+                if text:
+                    lines.append("\n" + html_mod.unescape(text).upper() + "\n")
+            elif tag == "empty-line":
+                lines.append("")
+    return "\n".join(lines)
+
+
+def _fb2_to_pdf_native(fb2_path: str, pdf_path: str) -> bool:
+    """Convert FB2 → PDF using reportlab without Calibre."""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+        from reportlab.lib.enums import TA_JUSTIFY
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        print("  [!] reportlab not installed — pip install reportlab")
+        return False
+
+    print("  [fb2→pdf] Extracting text from FB2…")
+    text = _fb2_extract_text(fb2_path)
+    if not text.strip():
+        print("  [!] No text extracted from FB2")
+        return False
+
+    print(f"  [fb2→pdf] Building PDF ({len(text):,} chars)…")
+
+    font_name = "Helvetica"
+    for candidate in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ]:
+        if os.path.exists(candidate):
+            try:
+                pdfmetrics.registerFont(TTFont("BookFont", candidate))
+                font_name = "BookFont"
+                print(f"  [fb2→pdf] Using font: {candidate}")
+            except Exception:
+                pass
+            break
+
+    styles    = getSampleStyleSheet()
+    body_style = ParagraphStyle(
+        "BookBody",
+        fontName=font_name,
+        fontSize=11,
+        leading=16,
+        alignment=TA_JUSTIFY,
+        spaceAfter=4,
+    )
+    head_style = ParagraphStyle(
+        "BookHead",
+        fontName=font_name,
+        fontSize=13,
+        leading=18,
+        spaceBefore=12,
+        spaceAfter=6,
+        textColor="#222222",
+    )
+
+    doc   = SimpleDocTemplate(
+        pdf_path,
+        pagesize=A4,
+        leftMargin=2.5*cm, rightMargin=2.5*cm,
+        topMargin=2.5*cm,  bottomMargin=2.5*cm,
+    )
+    story = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            story.append(Spacer(1, 6))
+            continue
+        if line == line.upper() and len(line) < 120 and len(line) > 2:
+            safe = html_mod.escape(line)
+            story.append(Paragraph(safe, head_style))
+        else:
+            safe = html_mod.escape(line)
+            story.append(Paragraph(safe, body_style))
+
+    try:
+        doc.build(story)
+        print(f"  [fb2→pdf] PDF saved: {pdf_path}")
+        return True
+    except Exception as exc:
+        print(f"  [!] reportlab build failed: {exc}")
+        return False
+
+
+def convert_fb2_to_pdf(fb2_path: str) -> str | None:
+    """
+    Convert FB2 to PDF.
+    Strategy:
+      1. Calibre ebook-convert  (best quality)
+      2. Native reportlab       (no external deps)
+    Returns PDF path on success, None on failure.
+    """
     pdf_path = os.path.splitext(fb2_path)[0] + ".pdf"
     print(f"  Converting FB2 → PDF: {os.path.basename(fb2_path)}")
+
     try:
         result = subprocess.run(
             ["ebook-convert", fb2_path, pdf_path],
@@ -280,18 +339,26 @@ def convert_fb2_to_pdf(fb2_path):
         if result.returncode == 0 and os.path.exists(pdf_path):
             try: os.remove(fb2_path)
             except Exception: pass
-            print(f"  [✓] Converted: {pdf_path}")
+            print(f"  [✓] Calibre conversion done: {os.path.basename(pdf_path)}")
             return pdf_path
-        print(f"  [!] Conversion failed (exit {result.returncode})")
+        print(f"  [!] Calibre exited {result.returncode} — trying native fallback…")
     except FileNotFoundError:
-        print("  [!] Calibre not found — https://calibre-ebook.com/download")
+        print("  [~] Calibre not found — using native FB2→PDF fallback…")
     except subprocess.TimeoutExpired:
-        print("  [!] Conversion timed out")
+        print("  [!] Calibre timed out — trying native fallback…")
     except Exception as exc:
-        print(f"  [!] Conversion error: {exc}")
+        print(f"  [!] Calibre error: {exc} — trying native fallback…")
+
+    if _fb2_to_pdf_native(fb2_path, pdf_path):
+        try: os.remove(fb2_path)
+        except Exception: pass
+        return pdf_path
+
+    print("  [✗] All FB2→PDF methods failed")
     try: os.remove(fb2_path)
     except Exception: pass
     return None
+
 
 
 def handle_downloaded_file(fpath):
@@ -305,6 +372,26 @@ def handle_downloaded_file(fpath):
     elif ext == ".fb2":
         print("  [~] FB2 — converting to PDF…")
         return convert_fb2_to_pdf(fpath)
+    elif ext in (".epub", ".mobi", ".azw3", ".djvu"):
+        pdf_path = os.path.splitext(fpath)[0] + ".pdf"
+        print(f"  [~] {ext.upper()} — trying Calibre conversion…")
+        try:
+            result = subprocess.run(
+                ["ebook-convert", fpath, pdf_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180,
+            )
+            if result.returncode == 0 and os.path.exists(pdf_path):
+                try: os.remove(fpath)
+                except Exception: pass
+                print(f"  [✓] Converted: {os.path.basename(pdf_path)}")
+                return pdf_path
+        except FileNotFoundError:
+            print(f"  [!] Calibre not found — cannot convert {ext}")
+        except Exception as exc:
+            print(f"  [!] Conversion error: {exc}")
+        try: os.remove(fpath)
+        except Exception: pass
+        return None
     else:
         print(f"  [!] Unsupported format ({ext}) — deleting")
         try: os.remove(fpath)
@@ -313,7 +400,6 @@ def handle_downloaded_file(fpath):
 
 
 def flatten_torrent_file_to_output(path):
-    """Move file from any torrent subfolder up into OUTPUT_DIR root."""
     fname = os.path.basename(path)
     dst   = os.path.join(OUTPUT_DIR, fname)
     if os.path.abspath(path) == os.path.abspath(dst):
@@ -330,9 +416,6 @@ def flatten_torrent_file_to_output(path):
     return dst
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PDF → Supabase pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 
 def extract_text_from_pdf(pdf_path):
     doc  = fitz.open(pdf_path)
@@ -392,47 +475,35 @@ def process_pdf(pdf_path, title, source_url):
     save_chunks_to_db(chunks, title, source_url)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Selenium page scrapers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _scan_page(driver):
-    """Return (direct_url, magnet, torrent_url) from current page HTML."""
     try:
         html = driver.page_source
     except Exception:
         return None, None, None
-
     direct_url = None
     for pat in [r'https://[^"\'<>\s]+\.pdf', r'https://[^"\'<>\s]+\.fb2']:
         m = re.search(pat, html)
         if m:
             direct_url = m.group(0)
             break
-
     magnet = None
     m = re.search(r'magnet:\?[^"\'<>\s]+', html)
     if m:
         magnet = m.group(0)
-
     torrent_url = None
     m = re.search(r'https://[^"\'<>\s]+\.torrent', html)
     if m:
         torrent_url = m.group(0)
-
     return direct_url, magnet, torrent_url
 
 
 def get_md5_page_links(driver, md5):
-    """
-    Open the MD5 page once; return (slow_url, direct_url, magnet, torrent_url).
-    """
     url = f"{BASE_URL}/md5/{md5}"
     print(f"  Opening MD5 page: {url}")
     if not safe_get(driver, url):
         return None, None, None, None
     time.sleep(5)
-
     slow_url = None
     for link in driver.find_elements(By.TAG_NAME, "a"):
         try:
@@ -442,27 +513,18 @@ def get_md5_page_links(driver, md5):
                 break
         except Exception:
             continue
-
     direct_url, magnet, torrent_url = _scan_page(driver)
     return slow_url, direct_url, magnet, torrent_url
 
 
 def scrape_slow_page(driver, slow_url):
-    """
-    Open slow-download page, wait for JS countdown to finish,
-    click any revealed download buttons, then harvest links.
-    Returns (direct_url, magnet, torrent_url).
-    """
     print("  Opening slow-download page…")
     if not safe_get(driver, slow_url):
         return None, None, None
-
-    slow_domain = urlparse(slow_url).netloc  # e.g. "annas-archive.pk"
-
-    file_exts = re.compile(r'\.(pdf|fb2|epub|djvu|mobi|azw3)', re.IGNORECASE)
+    slow_domain = urlparse(slow_url).netloc
+    file_exts   = re.compile(r'\.(pdf|fb2|epub|djvu|mobi|azw3)', re.IGNORECASE)
 
     def _harvest():
-        """Scan current page for download links without navigating away."""
         direct_url  = None
         magnet      = None
         torrent_url = None
@@ -481,7 +543,6 @@ def scrape_slow_page(driver, slow_url):
                 pass
         return direct_url, magnet, torrent_url
 
-    # ── Phase 1: poll every 2s up to SLOW_PAGE_WAIT; capture link immediately ──
     print(f"  Waiting up to {SLOW_PAGE_WAIT}s for download links to appear…")
     deadline = time.time() + SLOW_PAGE_WAIT
     while time.time() < deadline:
@@ -491,7 +552,6 @@ def scrape_slow_page(driver, slow_url):
             print(f"  [slow] Link found: direct={d and d[:80]} magnet={bool(m)} torrent={bool(t)}")
             return d, m, t
 
-    # ── Phase 2: no link yet — try clicking buttons/anchors that stay on page ──
     print("  [slow] No links yet — trying button clicks…")
     click_keywords = {"download", "get", "slow", "click", "partner", "libgen"}
     for btn in driver.find_elements(By.TAG_NAME, "button"):
@@ -507,12 +567,10 @@ def scrape_slow_page(driver, slow_url):
         except Exception:
             pass
 
-    # Only click <a> tags that point OUTSIDE the archive (i.e. actual mirror links)
     for a in driver.find_elements(By.TAG_NAME, "a"):
         try:
-            href = (a.get_attribute("href") or "")
+            href        = (a.get_attribute("href") or "")
             link_domain = urlparse(href).netloc
-            # Skip links that go back to the archive itself
             if slow_domain in link_domain or not link_domain:
                 continue
             text = (a.text or "").lower()
@@ -526,20 +584,15 @@ def scrape_slow_page(driver, slow_url):
         except Exception:
             pass
 
-    # ── Phase 3: last resort — regex scan on raw page source ────────────────────
     print("  [slow] No links via DOM — falling back to page source scan…")
     return _scan_page(driver)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Torrent downloader
-# ─────────────────────────────────────────────────────────────────────────────
 
 def download_via_torrent(source, title_hint="book"):
     if not LIBTORRENT_AVAILABLE:
         print("  [!] libtorrent unavailable — skipping")
         return None
-
     print(f"  [torrent] Starting: {title_hint}")
     settings = {
         "listen_interfaces": "0.0.0.0:6881,[::]:6881",
@@ -547,7 +600,6 @@ def download_via_torrent(source, title_hint="book"):
     }
     ses    = lt.session(settings)
     handle = None
-
     try:
         if source.startswith("magnet:"):
             print(f"  [torrent] Magnet: {source[:80]}…")
@@ -582,9 +634,7 @@ def download_via_torrent(source, title_hint="book"):
             return None
         print(" OK")
 
-        info = handle.get_torrent_info()
-        print(f"  [torrent] '{info.name()}' — {info.num_files()} file(s)")
-
+        info       = handle.get_torrent_info()
         priorities = []
         targets    = []
         for idx in range(info.num_files()):
@@ -602,7 +652,6 @@ def download_via_torrent(source, title_hint="book"):
             return None
 
         handle.prioritize_files(priorities)
-
         elapsed = 0
         while elapsed < TORRENT_TIMEOUT:
             s = handle.status()
@@ -626,7 +675,6 @@ def download_via_torrent(source, title_hint="book"):
             return None
 
         ses.remove_torrent(handle)
-
         for idx in targets:
             rel      = info.files().file_path(idx)
             abs_path = os.path.join(OUTPUT_DIR, rel)
@@ -635,7 +683,6 @@ def download_via_torrent(source, title_hint="book"):
 
         print("  [!] Torrent done but file not on disk")
         return None
-
     except Exception as exc:
         print(f"  [!] Torrent error: {exc}")
         if handle:
@@ -644,20 +691,10 @@ def download_via_torrent(source, title_hint="book"):
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Attempt download from a set of (direct_url, magnet, torrent_url)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def try_download(direct_url, magnet, torrent_url, title):
-    """
-    Given links, try in order:
-      1. torrent / magnet   (libtorrent)
-      2. direct file URL    (requests)
-    Returns final PDF path or None.
-    """
     final_pdf  = None
     source_ref = None
-
     torrent_src = magnet or torrent_url
     if torrent_src:
         print("  [→] Trying torrent/magnet…")
@@ -665,20 +702,15 @@ def try_download(direct_url, magnet, torrent_url, title):
         if dl:
             final_pdf  = handle_downloaded_file(dl)
             source_ref = torrent_src
-
     if not final_pdf and direct_url:
         print("  [→] Trying direct HTTP download…")
         dl = download_direct(direct_url, title_hint=title)
         if dl:
             final_pdf  = handle_downloaded_file(dl)
             source_ref = direct_url
-
     return final_pdf, source_ref
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     df   = pd.read_csv(CSV_FILE)
@@ -701,7 +733,6 @@ def main():
             print(f"[{i+1}/{len(rows)}] {title}")
             print(f"  MD5: {md5}\n")
 
-            # ── 1. Read MD5 page ──────────────────────────────────────────────
             try:
                 slow_url, direct_url, magnet, torrent_url = get_md5_page_links(driver, md5)
             except Exception as exc:
@@ -713,10 +744,8 @@ def main():
             print(f"  Direct  : {direct_url or '—'}")
             print(f"  Slow    : {slow_url or '—'}\n")
 
-            # ── 2. Try links found directly on MD5 page ───────────────────────
             final_pdf, source_ref = try_download(direct_url, magnet, torrent_url, title)
 
-            # ── 3. Fall back to slow-download page ────────────────────────────
             if not final_pdf and slow_url:
                 print("  [→] Nothing on MD5 page — opening slow-download page…")
                 try:
@@ -730,16 +759,12 @@ def main():
                 print(f"  Slow-page Torrent : {sd_torrent or '—'}\n")
 
                 if sd_direct or sd_magnet or sd_torrent:
-                    final_pdf, source_ref = try_download(
-                        sd_direct, sd_magnet, sd_torrent, title
-                    )
+                    final_pdf, source_ref = try_download(sd_direct, sd_magnet, sd_torrent, title)
 
-            # ── 4. Result ─────────────────────────────────────────────────────
             if not final_pdf:
                 print("  [!] All methods failed — skipping this book")
                 continue
 
-            # ── 5. Chunk, embed, store ────────────────────────────────────────
             try:
                 process_pdf(final_pdf, title, source_ref or "unknown")
             except Exception as exc:
@@ -758,9 +783,7 @@ def main():
     print("DONE")
 
 
-
-
-import shutil, psutil
+import psutil
 
 def show_stats():
     ram  = psutil.virtual_memory()
@@ -769,7 +792,6 @@ def show_stats():
     print(f"  Disk — used: {disk.used/1e9:.1f} GB / {disk.total/1e9:.1f} GB  ({disk.used/disk.total*100:.1f}%)")
 
 
-show_stats()
-
 if __name__ == "__main__":
+    show_stats()
     main()

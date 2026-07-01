@@ -1075,8 +1075,8 @@ app = FastAPI(lifespan=lifespan)
 
 origins = [
     "http://localhost:3000",
-    "https://www.storybit.tech",
-    "https://storybit.tech",
+    "https://www.storio.tech",
+    "https://storio.tech",
 ]
 
 app.add_middleware(
@@ -3273,3 +3273,18 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
     asyncio.create_task(run_intelligence_for_user(userId))
 
     return {"message": "Uploaded and processed"}
+
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+@app.post("/generate-embeddings")
+async def generate_embeddings(contents: List[str]):
+    embeddings = model.encode(
+        contents,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+
+    return {
+        "embeddings": embeddings.tolist()
+    }
