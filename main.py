@@ -1099,10 +1099,6 @@ class RefreshTokenRequest(BaseModel):
 
 class GenerateIdeasRequest(BaseModel):
     topic: str
-    max_angles: int | None = 5
-    ideas_per_angle: int | None = 3
-    used_angle_ids: list[str] | None = None
-    force_refresh: bool | None = False
 
 
 class ChannelContextInput(BaseModel):
@@ -1914,30 +1910,30 @@ async def eci(request: PromptRequest):
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
 
 
-@app.post("/process-topic")
-async def process_topic(request: PromptRequest, background_tasks: BackgroundTasks):
-    topic = (request.topic or "").strip()
-    if not topic:
-        raise HTTPException(status_code=400, detail="topic must be a non-empty string")
+# @app.post("/process-topic")
+# async def process_topic(request: PromptRequest, background_tasks: BackgroundTasks):
+#     topic = (request.topic or "").strip()
+#     if not topic:
+#         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
 
-    print("Received /process-topic request; forwarding to /generate-ideas pipeline.")
-    gen_request = GenerateIdeasRequest(
-        topic=topic,
-        max_angles=4,
-        ideas_per_angle=3,
-        used_angle_ids=[],
-        force_refresh=False,
-    )
-    try:
-        payload = await generate_ideas_endpoint(gen_request, background_tasks)
-        if isinstance(payload, dict):
-            payload["legacy_route"] = "process-topic"
-        return payload
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error in /process-topic: {e}")
-        return {"error": "An error occurred in the processing pipeline."}
+#     print("Received /process-topic request; forwarding to /generate-ideas pipeline.")
+#     gen_request = GenerateIdeasRequest(
+#         topic=topic,
+#         max_angles=4,
+#         ideas_per_angle=3,
+#         used_angle_ids=[],
+#         force_refresh=False,
+#     )
+#     try:
+#         payload = await generate_ideas_endpoint(gen_request, background_tasks)
+#         if isinstance(payload, dict):
+#             payload["legacy_route"] = "process-topic"
+#         return payload
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         print(f"Error in /process-topic: {e}")
+#         return {"error": "An error occurred in the processing pipeline."}
 
 
 
@@ -2006,6 +2002,8 @@ async def save_ideas(data: SaveIdeasRequest):
         "total_ideas": len(data.ideas),
         "row_id": result.data[0]["id"] if result.data else None,
     }
+
+
 
 
 
@@ -2235,6 +2233,110 @@ def _sparse_cosine(query_sparse: dict, doc_sparse: dict) -> float:
     return sum(query_sparse[k] * doc_sparse[k] for k in shared_keys)
 
 
+# NEW: pgvector literal formatter
+def to_pgvector(embedding) -> str:
+    """Format a numpy/list embedding as a pgvector literal string, e.g. '[0.1,0.2,...]'."""
+    return "[" + ",".join(str(float(x)) for x in embedding) + "]"
+
+
+# NEW: SEMANTIC MATCH AGAINST PREVIOUSLY SAVED IDEAS
+
+TOPIC_SIMILARITY_THRESHOLD = 0.55     
+SUMMARY_SIMILARITY_THRESHOLD = 0.45  
+RPC_RAW_FETCH_THRESHOLD = 0.0         
+
+async def get_similar_saved_ideas(
+    topic: str,
+    hyde_doc: str,
+    match_count: int = 10,
+    topic_threshold: float = TOPIC_SIMILARITY_THRESHOLD,
+    summary_threshold: float = SUMMARY_SIMILARITY_THRESHOLD,
+) -> list[dict]:
+    """
+    Semantic match against the `saved_ideas` table (topic_embeddings /
+    summary_embeddings columns, both plain vector(1024)).
+ 
+    A saved idea counts as a "match" if EITHER:
+      - topic_similarity >= topic_threshold, OR
+      - summary_similarity >= summary_threshold
+ 
+    This OR logic matters because `topic` (short) vs saved topic (short)
+    and `hyde_doc` (long, narrow expansion) vs saved topic_summary (short,
+    broad synthesis) are fundamentally different comparisons with
+    different natural score ranges. Requiring both to clear the same bar
+    silently kills valid matches.
+    """
+    print(f"[MATCH] Searching saved_ideas for topic: '{topic}'")
+ 
+    model = _get_st_model()
+    topic_embedding, summary_query_embedding = await asyncio.to_thread(
+        lambda: model.encode(
+            [topic, hyde_doc],
+            normalize_embeddings=True,
+        )
+    )
+ 
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.rpc(
+                "match_saved_ideas",
+                {
+                    "query_topic_embedding": to_pgvector(topic_embedding),
+                    "query_summary_embedding": to_pgvector(summary_query_embedding),
+                    "match_count": match_count,
+                    # Pull raw candidates back; do NOT filter inside the RPC.
+                    # If your SQL function doesn't support 0 / disabling the
+                    # filter, temporarily edit it to default the threshold
+                    # param to 0 so this call returns everything ranked.
+                    "similarity_threshold": RPC_RAW_FETCH_THRESHOLD,
+                },
+            ).execute()
+        )
+    except Exception as e:
+        print(f"[MATCH] saved_ideas RPC call FAILED (not just 'no matches'): {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+ 
+    candidates = result.data or []
+    print(f"[MATCH] RPC returned {len(candidates)} raw candidates (unfiltered)")
+ 
+    # Log every raw candidate's scores BEFORE filtering so you can see
+    # exactly what's being compared and why something does/doesn't pass.
+    for i, row in enumerate(candidates, start=1):
+        t_sim = row.get("topic_similarity", row.get("similarity"))
+        s_sim = row.get("summary_similarity")
+        print(
+            f"  [RAW-{i}] topic='{row.get('topic')}' "
+            f"topic_similarity={t_sim} summary_similarity={s_sim}"
+        )
+ 
+    matches = []
+    for row in candidates:
+        t_sim = row.get("topic_similarity", row.get("similarity")) or 0.0
+        s_sim = row.get("summary_similarity") or 0.0
+ 
+        if t_sim >= topic_threshold or s_sim >= summary_threshold:
+            matches.append(row)
+ 
+    matches.sort(
+        key=lambda r: max(
+            r.get("topic_similarity", r.get("similarity")) or 0.0,
+            r.get("summary_similarity") or 0.0,
+        ),
+        reverse=True,
+    )
+ 
+    print(f"[MATCH] {len(matches)}/{len(candidates)} candidates passed OR-threshold filter")
+    for i, row in enumerate(matches, start=1):
+        t_sim = row.get("topic_similarity", row.get("similarity"))
+        s_sim = row.get("summary_similarity")
+        print(f"  [MATCH-{i}] topic='{row.get('topic')}' topic_sim={t_sim} summary_sim={s_sim}")
+ 
+    return matches
+
+
+
 # ============================================================
 # DB RETRIEVAL (dense ANN via SQL + sparse rerank in Python)
 # ============================================================
@@ -2449,12 +2551,6 @@ def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> st
     return "\n\n".join(parts) if parts else "No additional context available."
 
 
-# ============================================================
-# PARSING: split the LLM's raw output into an "ideas" block and
-# a "topic summary" block BEFORE parsing ideas out of it. This is
-# what prevents the last idea's description from swallowing the
-# entire topic summary section.
-# ============================================================
 
 _SPLIT_ON_SUMMARY_HEADER = re.compile(
     r"\n\s*(?:#+\s*)?(?:\*\*)?"
@@ -2464,11 +2560,6 @@ _SPLIT_ON_SUMMARY_HEADER = re.compile(
     re.IGNORECASE,
 )
 
-# Label matchers are written to tolerate ** wrapping in any combination:
-#   Title:                **Title:**                **1) Title:**
-#   1. Title:              1) **Title:**             **1. Title**:
-# i.e. bold markers may sit before/after the number, before/after the
-# word itself, and before/after the colon — all independently optional.
 _TITLE_LABEL_CORE = r"\**\s*(?:#+\s*)?(?:\d+[\.\)]\s*)?\**\s*Title\**\s*:?\**"
 _DESC_LABEL_CORE = r"\**\s*(?:\d+[\.\)]\s*)?\**\s*Description\**\s*:?\**"
 
@@ -2552,7 +2643,6 @@ def _parse_ideas_markdown(raw: str) -> list[dict]:
 
 def _clean_summary_text(text: str) -> str:
     text = text.strip()
-    # strip stray markdown emphasis/backticks and any leftover heading fragments
     text = re.sub(r"^\s*(?:#+\s*)?(?:\*\*)?(?:Output\s*2\b.*?)?(?:\*\*)?:?\s*", "", text, flags=re.IGNORECASE)
     text = text.strip("*_ \n")
     return text.strip()
@@ -2675,6 +2765,8 @@ async def generate_ideas_endpoint(
         print(f"[HYDE] {hyde_doc}")
 
         db_task = asyncio.create_task(get_context_from_db(topic, hyde_doc))
+        # NEW: run the saved_ideas semantic match concurrently with DB retrieval
+        similar_task = asyncio.create_task(get_similar_saved_ideas(topic, hyde_doc))
 
         # FIX: previously always slept the full 11s even if the DB task
         # finished much sooner. asyncio.wait returns as soon as the task
@@ -2709,6 +2801,16 @@ async def generate_ideas_endpoint(
                 print(f"[MAIN] DB task raised an error on late check: {e}")
                 db_results = []
 
+        # NEW: resolve the saved_ideas semantic match (won't block long, cheap RPC)
+        try:
+            similar_saved_ideas = await asyncio.wait_for(similar_task, timeout=5)
+        except asyncio.TimeoutError:
+            print("[MAIN] similar_task timed out, proceeding without semantic matches.")
+            similar_saved_ideas = []
+        except Exception as e:
+            print(f"[MAIN] similar_task raised an error: {e}")
+            similar_saved_ideas = []
+
         print("-" * 60)
         print("[MAIN] Generating ideas from combined context")
         result = await generate_ideas_from_context(topic, db_results, new_articles)
@@ -2717,12 +2819,14 @@ async def generate_ideas_endpoint(
 
         print("=" * 60)
         print(f"GENERATE IDEAS complete: {len(ideas)} ideas returned, summary present: {bool(topic_summary)}")
+        print(f"Similar saved topics found: {len(similar_saved_ideas)}")
         print("=" * 60)
 
         return {
             "topic": topic,
             "topic_summary": topic_summary,
             "ideas": ideas,
+            "similar_past_ideas": similar_saved_ideas,
         }
 
     except HTTPException:
@@ -2732,8 +2836,6 @@ async def generate_ideas_endpoint(
         print(f"[ERROR] /generate-ideas failed: {e}")
         traceback.print_exc()
         return {"error": "An error occurred in the idea generation pipeline.", "detail": str(e)}
-
-
 
 
 
