@@ -442,10 +442,6 @@ async def add_scraped_data_to_db(
     topic: str = "",
     tags: list | None = None,
 ):
-    """
-    Async background task — no asyncio.run() needed since FastAPI
-    background tasks run in the async context already.
-    """
     if tags is None:
         tags = []
 
@@ -503,9 +499,6 @@ async def add_scraped_data_to_db(
     except Exception as e:
         print(f"BACKGROUND TASK: Failed for '{article_title[:50]}'. Error: {e}")
 
-
-# Max 2 concurrent Playwright browsers — each uses ~300MB RAM
-# Reduced from 3 to 2 to save memory on constrained instances
 _playwright_semaphore = asyncio.Semaphore(2)
 _pipeline_request_semaphore = asyncio.Semaphore(PIPELINE_MAX_CONCURRENCY)
 
@@ -1957,10 +1950,18 @@ from fastapi import HTTPException, BackgroundTasks
 import os
 from openai import OpenAI
 
+# NOTE: package was renamed from `duckduckgo_search` to `ddgs`.
+# This tries the new name first and falls back to the old one so the
+# import doesn't break depending on what's installed.
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS
+
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 HASH_FEATURES = 2**18
-MAX_WEB_SOURCES = 10  
+MAX_WEB_SOURCES = 10
 
 TABLES = [
     "duplicate_RAG_Entrepreneurship",
@@ -1971,90 +1972,127 @@ TABLES = [
 IDEAS_SYSTEM_PROMPT = """
 You are a YouTube Content Ideation Engine.
 
-Input:
-- User Topic
-- 7-10 retrieved knowledge chunks
+## Inputs
+1. User Topic
+2. Retrieved knowledge chunks
 
-Goal:
-Generate 8-10 unique, high-potential YouTube video ideas by synthesizing information across all retrieved chunks.
+## Objective
+Synthesize all retrieved knowledge to generate high-quality YouTube video ideas.
 
-Do NOT summarize the chunks.
-Instead, discover the most interesting stories, questions, conflicts, insights, and perspectives hidden within them.
+Do NOT summarize individual chunks.
+Instead, identify hidden stories, unanswered questions, conflicts, surprising insights, patterns, and opportunities that emerge only after combining information across multiple chunks.
 
-For every idea, reason across:
+Reason across dimensions such as:
+- Historical evolution
+- Current landscape
+- Future implications
+- Timeline of events
+- People & organizations
+- Winners & losers
+- Political factors
+- Economic consequences
+- Scientific & technological significance
+- Social & cultural impact
+- Human stories
+- Hidden incentives
+- Power dynamics
+- Ethical debates
+- Myths vs Facts
+- Unanswered questions
+- Ripple effects
+- Global & regional perspectives
 
-• Historical background
-• Current situation
-• Future implications
-• Timeline of important events
-• Key stakeholders
-• Winners and losers
-• Political influence
-• Economic impact
-• Scientific or technological significance
-• Social and cultural effects
-• Human stories
-• Hidden incentives
-• Power dynamics
-• Ethical dilemmas
-• Myths vs facts
-• Unanswered questions
-• Ripple effects
-• Global and regional perspectives
+Each idea must focus on ONE compelling narrative angle.
 
-Each idea should focus on ONE compelling angle rather than covering everything.
-
-Vary the storytelling style naturally across ideas. Mix formats such as:
+Diversify storytelling styles naturally across ideas, including:
 - Documentary
-- Explainer
-- Mystery
-- Investigation
 - Historical Story
+- Investigation
+- Mystery
+- Explainer
 - Business Analysis
-- Psychology
 - Science
-- "What If"
+- Psychology
 - Timeline
 - Case Study
 - Behind the Scenes
-- Future Predictions
+- Future Prediction
 - Myth Busting
 - Unexpected Facts
+- What If
 
-Prioritize ideas that maximize:
-- Curiosity
+Prioritize ideas with:
+- High curiosity
 - Emotional engagement
-- Shareability
+- Strong storytelling potential
 - Educational value
 - Broad audience appeal
-- Strong storytelling potential
+- Shareability
 
 Avoid:
-- Repeated angles
 - Generic summaries
+- Repeated angles
 - Unsupported speculation
 - Clickbait
-- Nearly identical ideas
+- Duplicate ideas
 
-Output exactly 8-10 ideas.
+Creativity:
+- Temperature target: 0.7
+- Be imaginative while remaining grounded in the provided evidence.
 
-For each idea provide:
+## Output
 
-Title:
-A compelling YouTube title (8-15 words).
+### Output 1 — Video Ideas
+Generate exactly **10** ranked ideas (best first). Never generate fewer than 10.
 
-Description:
-70-100 words describing:
-- the central story or question,
-- the primary stakeholders,
-- why it matters,
-- the historical and current context,
-- future implications when relevant,
-- and what viewers will learn.
+For each idea provide a Title and a Description.
 
-Descriptions should inspire creators to build a complete YouTube script while remaining grounded in the provided knowledge.
+**Title**
+- 8-15 words
+- Natural, curiosity-driven YouTube title
 
-Order ideas from highest audience potential to lowest.
+**Description**
+70-100 words explaining:
+- Central story or question
+- Main stakeholders
+- Why it matters
+- Historical and current context
+- Future implications (if relevant)
+- What viewers will discover
+
+STRICT FORMATTING RULES — follow these exactly, with no deviation:
+- Use plain text labels "Title:" and "Description:" — do not bold them, do not wrap the item number together with the label (e.g. never write "**1) Title:**").
+- The title text must appear on the SAME line as "Title:", never on a separate line.
+- The description text must appear on the SAME line as "Description:" (it may wrap naturally, but do not insert a blank line or line break between the label and the text).
+- Number each idea with a plain "1." at the very start of the Title line, nothing bolded.
+- Do not use any markdown bold (**), italics, or headers inside an idea's title or description text itself.
+- Separate each idea from the next with exactly one blank line.
+
+Output each idea in EXACTLY this format (this is a literal template — match it character for character, only replacing the placeholder text):
+
+1. Title: <title text here>
+Description: <description text here>
+
+2. Title: <title text here>
+Description: <description text here>
+
+(continue through idea 10)
+
+### Output 2 — Topic Summary
+
+Write a concise **30-40 word** synthesis of the overall topic by combining insights from the user query and all retrieved chunks.
+
+The summary should:
+- Capture the core theme
+- Highlight the biggest underlying narrative
+- Avoid mentioning individual chunks
+- Be suitable as a high-level overview for downstream content generation.
+
+Output this section EXACTLY as:
+
+Topic Summary: <summary text here>
+
+Do not add any other headings, section titles, preambles, or closing remarks anywhere in the response. Output only the two sections above, in order, in the exact format specified.
 
 """
 
@@ -2344,34 +2382,78 @@ def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> st
     return "\n\n".join(parts) if parts else "No additional context available."
 
 
+# ============================================================
+# PARSING: split the LLM's raw output into an "ideas" block and
+# a "topic summary" block BEFORE parsing ideas out of it. This is
+# what prevents the last idea's description from swallowing the
+# entire topic summary section.
+# ============================================================
+
+_SPLIT_ON_SUMMARY_HEADER = re.compile(
+    r"\n\s*(?:#+\s*)?(?:\*\*)?"
+    r"(?:Output\s*2\s*[-–—]?\s*)?"
+    r"Topic\s*Summary"
+    r"(?:\*\*)?:?\s*",
+    re.IGNORECASE,
+)
+
+# Label matchers are written to tolerate ** wrapping in any combination:
+#   Title:                **Title:**                **1) Title:**
+#   1. Title:              1) **Title:**             **1. Title**:
+# i.e. bold markers may sit before/after the number, before/after the
+# word itself, and before/after the colon — all independently optional.
+_TITLE_LABEL_CORE = r"\**\s*(?:#+\s*)?(?:\d+[\.\)]\s*)?\**\s*Title\**\s*:?\**"
+_DESC_LABEL_CORE = r"\**\s*(?:\d+[\.\)]\s*)?\**\s*Description\**\s*:?\**"
 
 _IDEA_PATTERN = re.compile(
-    r"(?:^|\n)\s*(?:#+\s*)?(?:\d+[\.\)]\s*)?\**Title\**:?\s*"
+    r"(?:^|\n)\s*" + _TITLE_LABEL_CORE + r"\s*"
     r"(?P<title>.+?)\s*\n+"
-    r"\s*(?:\**Description\**):?\s*(?P<description>.+?)"
-    r"(?=\n+\s*(?:#+\s*)?(?:\d+[\.\)]\s*)?\**Title\**:?|\Z)",
+    r"\s*" + _DESC_LABEL_CORE + r"\s*"
+    r"(?P<description>.+?)"
+    r"(?=\n+\s*" + _TITLE_LABEL_CORE + r"|\Z)",
     re.DOTALL | re.IGNORECASE,
 )
- 
+
 
 def _clean_idea_text(text: str) -> str:
-    text = re.sub(r"\n?-{2,}\s*$", "", text)  
+    text = re.sub(r"\n?-{2,}\s*$", "", text)
+    text = re.sub(r"^\s*(?:#+\s*)?(?:\*\*)?Output\s*1\b.*?\n", "", text, flags=re.IGNORECASE)
     text = text.strip("*_ \n")
     return text.strip()
- 
+
+
+def _split_ideas_and_summary(raw: str) -> tuple[str, str]:
+    """
+    Splits the raw LLM output into (ideas_block, summary_block).
+    If no summary header is found, summary_block is empty and the
+    whole raw text is treated as the ideas block (old behavior,
+    used as a safe fallback).
+    """
+    parts = _SPLIT_ON_SUMMARY_HEADER.split(raw, maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+
+    print("[IDEAS] no 'Topic Summary' header found, summary will be empty")
+    return raw.strip(), ""
+
 
 def _parse_ideas_markdown(raw: str) -> list[dict]:
     """
     Parses ideas in either format:
     Title: ...
     Description: ...
- 
+
     or
- 
+
     **Title**: ...
     **Description**: ...
- 
+
     (repeated, separated by --- , blank lines, or numbering)
+
+    NOTE: `raw` here should already be the ideas-only block
+    (i.e. with the Topic Summary section stripped off by
+    `_split_ideas_and_summary`), otherwise the last idea's
+    description will swallow the summary text.
     """
     ideas = []
     for match in _IDEA_PATTERN.finditer(raw):
@@ -2379,10 +2461,10 @@ def _parse_ideas_markdown(raw: str) -> list[dict]:
         description = _clean_idea_text(match.group("description"))
         if title and description:
             ideas.append({"title": title, "description": description})
- 
+
     if ideas:
         return ideas
- 
+
     print("[IDEAS] structured parse found nothing, attempting fallback split")
     blocks = re.split(r"\n\s*\n+", raw.strip())
     buffer_title = None
@@ -2397,12 +2479,21 @@ def _parse_ideas_markdown(raw: str) -> list[dict]:
         if buffer_title:
             ideas.append({"title": buffer_title, "description": _clean_idea_text(block)})
             buffer_title = None
- 
+
     return ideas
- 
 
 
-async def generate_ideas_from_context(topic: str, db_results: list[dict], new_articles: list[dict]) -> list[dict]:
+def _clean_summary_text(text: str) -> str:
+    text = text.strip()
+    # strip stray markdown emphasis/backticks and any leftover heading fragments
+    text = re.sub(r"^\s*(?:#+\s*)?(?:\*\*)?(?:Output\s*2\b.*?)?(?:\*\*)?:?\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip("*_ \n")
+    return text.strip()
+
+
+async def generate_ideas_from_context(
+    topic: str, db_results: list[dict], new_articles: list[dict]
+) -> dict:
     print(f"[IDEAS] Building context block ({len(db_results)} DB chunks, {len(new_articles)} news articles)")
     context_block = _build_ideas_context(db_results, new_articles)
 
@@ -2425,7 +2516,10 @@ Content Chunks:
 
     raw = res.choices[0].message.content.strip()
 
-    ideas = _parse_ideas_markdown(raw)
+    ideas_block, summary_block = _split_ideas_and_summary(raw)
+
+    ideas = _parse_ideas_markdown(ideas_block)
+    topic_summary = _clean_summary_text(summary_block) if summary_block else ""
 
     if ideas:
         print(f"[IDEAS] Parsed {len(ideas)} ideas successfully")
@@ -2433,11 +2527,16 @@ Content Chunks:
         print("[IDEAS] failed to parse any ideas from markdown format")
         print(f"[IDEAS] raw output was: {raw}")
 
+    if topic_summary:
+        print(f"[IDEAS] Parsed topic summary: {topic_summary}")
+    else:
+        print("[IDEAS] no topic summary parsed")
+
     for i, idea in enumerate(ideas, start=1):
         print(f"  [IDEA-{i}] {idea.get('title')}")
         print(f"    {idea.get('description')}")
 
-    return ideas
+    return {"ideas": ideas, "topic_summary": topic_summary}
 
 
 # ============================================================
@@ -2496,7 +2595,10 @@ async def generate_ideas_endpoint(
         The output will be embedded and matched against a vector database to retrieve semantically relevant documents for generating high-quality YouTube documentary scripts. Optimize for semantic recall while maintaining precise topic relevance.
 
         """
-        res = openai_client.chat.completions.create(
+        # FIX: this was a blocking sync call inside an async endpoint,
+        # stalling the event loop for the duration of the request.
+        res = await asyncio.to_thread(
+            openai_client.chat.completions.create,
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": hyde_prompt}],
             stream=False,
@@ -2506,47 +2608,53 @@ async def generate_ideas_endpoint(
         print(f"[HYDE] {hyde_doc}")
 
         db_task = asyncio.create_task(get_context_from_db(topic, hyde_doc))
-        await asyncio.sleep(11)
+
+        # FIX: previously always slept the full 11s even if the DB task
+        # finished much sooner. asyncio.wait returns as soon as the task
+        # completes, or after the timeout — whichever comes first.
+        done, pending = await asyncio.wait({db_task}, timeout=11)
 
         db_results = []
         new_articles = []
         scraped_urls = set()
 
-        if db_task.done():
-            db_results = db_task.result()
-            print(f"[MAIN] DB task finished within timeout. Found {len(db_results)} documents.")
+        if db_task in done:
+            try:
+                db_results = db_task.result()
+                print(f"[MAIN] DB task finished within timeout. Found {len(db_results)} documents.")
+            except Exception as e:
+                print(f"[MAIN] DB task raised an error: {e}")
+                db_results = []
         else:
             print("[MAIN] DB task still running after 11s timeout, proceeding without it for now.")
 
         print("[MAIN] Performing web search (mandatory, regardless of DB result count).")
         new_articles = await get_ddgs_news_context(topic, scraped_urls)
 
-        if not db_results:
-            if db_task.done():
-                late_results = db_task.result()
-                if late_results:
-                    print(f"[MAIN] DB task finished late (during web search). Using {len(late_results)} documents.")
-                    db_results = late_results
-            else:
-                try:
-                    db_results = await asyncio.wait_for(asyncio.shield(db_task), timeout=5)
-                    print(f"[MAIN] DB task finished after extra wait. Found {len(db_results)} documents.")
-                except asyncio.TimeoutError:
-                    print("[MAIN] DB task still not done after extra wait, proceeding without DB results.")
-                    db_results = []
-                except Exception as e:
-                    print(f"[MAIN] DB task raised an error on late check: {e}")
-                    db_results = []
+        if not db_results and db_task not in done:
+            try:
+                db_results = await asyncio.wait_for(asyncio.shield(db_task), timeout=5)
+                print(f"[MAIN] DB task finished after extra wait. Found {len(db_results)} documents.")
+            except asyncio.TimeoutError:
+                print("[MAIN] DB task still not done after extra wait, proceeding without DB results.")
+                db_results = []
+            except Exception as e:
+                print(f"[MAIN] DB task raised an error on late check: {e}")
+                db_results = []
 
         print("-" * 60)
         print("[MAIN] Generating ideas from combined context")
-        ideas = await generate_ideas_from_context(topic, db_results, new_articles)
+        result = await generate_ideas_from_context(topic, db_results, new_articles)
+        ideas = result["ideas"]
+        topic_summary = result["topic_summary"]
+
         print("=" * 60)
-        print(f"GENERATE IDEAS complete: {len(ideas)} ideas returned")
+        print(f"GENERATE IDEAS complete: {len(ideas)} ideas returned, summary present: {bool(topic_summary)}")
         print("=" * 60)
 
         return {
             "topic": topic,
+            "topic_summary": topic_summary,
             "ideas": ideas,
         }
 
@@ -2562,6 +2670,7 @@ async def generate_ideas_endpoint(
 
 
 
+        
 # import hashlib
 # import re
 # import asyncio
@@ -3509,8 +3618,10 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
 
         text = seo_response.choices[0].message.content
         data = json.loads(text)
+        print(data)
 
         request_obj = SEOAgentRequest.model_validate(data)
+        print(request_obj)
         seo_res = await seo_agent(request_obj)
         print(seo_res)
 
