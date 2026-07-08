@@ -114,11 +114,6 @@ print(google_api_key)
 _st_model = None
 
 def _get_st_model():
-    """
-    Lazy-load a single SentenceTransformer model.
-    Called only when embeddings are actually needed, not at startup.
-    Using all-MiniLM-L6-v2 (~90 MB) instead of BAAI/bge-base-en-v1.5 (~440 MB).
-    """
     global _st_model
     if _st_model is None:
         from sentence_transformers import SentenceTransformer
@@ -234,7 +229,7 @@ NEWS_SCAN_TIMEOUT_SEC = max(1, int(os.getenv("NEWS_SCAN_TIMEOUT_SEC", "10")))
 DEEP_SCRAPE_DISCOVERY_TIMEOUT_SEC = max(1, int(os.getenv("DEEP_SCRAPE_DISCOVERY_TIMEOUT_SEC", "8")))
 DEEP_SCRAPE_PER_URL_TIMEOUT_SEC = max(1, int(os.getenv("DEEP_SCRAPE_PER_URL_TIMEOUT_SEC", "10")))
 DEEP_SCRAPE_TOTAL_TIMEOUT_SEC = max(1, int(os.getenv("DEEP_SCRAPE_TOTAL_TIMEOUT_SEC", "25")))
-DEEP_SCRAPE_MAX_KEYWORDS = max(1, int(os.getenv("DEEP_SCRAPE_MAX_KEYWORDS", "2")))
+DEEP_SCRAPE_MAX_KEYWORDS = max(1, 5)
 DEEP_SCRAPE_MAX_RESULTS_PER_KEYWORD = max(1, int(os.getenv("DEEP_SCRAPE_MAX_RESULTS_PER_KEYWORD", "1")))
 NEWS_SCRAPE_MAX_RESULTS = max(1, int(os.getenv("NEWS_SCRAPE_MAX_RESULTS", "1")))
 HTTPX_SCRAPE_TIMEOUT_SEC = max(1, int(os.getenv("HTTPX_SCRAPE_TIMEOUT_SEC", "8")))
@@ -697,11 +692,11 @@ async def deep_search_and_scrape(keywords: list[str], scraped_urls: set) -> list
 
 
 async def _generate_search_keywords(topic: str) -> list[str]:
-    """Generate 3 focused search keywords using DeepSeek."""
+    """Generate 5 focused search keywords using DeepSeek."""
     keyword_prompt = f"""
-    Your ONLY task is to generate 3 diverse search engine keyword phrases for: '{topic}'.
+    Your ONLY task is to generate 5 diverse search engine keyword phrases for: '{topic}'.
     Rules:
-    1. Return ONLY the 3 phrases.
+    1. Return ONLY the 5 phrases.
     2. NO numbers, markdown, or introductory text.
     3. Each phrase on a new line.
 
@@ -725,7 +720,7 @@ async def _generate_search_keywords(topic: str) -> list[str]:
     keywords = keywords_in_quotes if keywords_in_quotes else [
         kw.strip() for kw in raw_text.strip().split('\n') if kw.strip()
     ]
-    return keywords[:3]
+    return keywords[:5]
 
 
 NEWS_SCRAPE_MAX_RESULTS             = 10
@@ -802,7 +797,7 @@ async def get_latest_news_context(topic: str, scraped_urls: set) -> list[dict]:
     try:
         keywords = [
             f"{topic} latest news today",
-            f"{topic} 2025 update",
+            f"{topic} 2026 update",
         ]
 
         try:
@@ -876,7 +871,6 @@ async def get_db_context(topic: str, hypothetical_document: str = None) -> list[
         except Exception as exc:
             print(f"--- DB TASK: Embedding failed: {type(exc).__name__}: {exc} ---")
 
-        # ── Vector search — RAG_web_scraped ──
         if query_embedding is not None:
             try:
                 vector_response = await asyncio.wait_for(
@@ -1584,7 +1578,6 @@ Return:
 }}
 """
 
-
 def deepseek_idea_generate(messages: list) -> str:
     resp = deepseek_client.chat.completions.create(
         model="deepseek-v4-pro",
@@ -1954,158 +1947,1273 @@ async def process_topic(request: PromptRequest, background_tasks: BackgroundTask
         return {"error": "An error occurred in the processing pipeline."}
 
 
+
+
+import hashlib
+import re
+import asyncio
+from sklearn.feature_extraction.text import HashingVectorizer
+from fastapi import HTTPException, BackgroundTasks
+import os
+from openai import OpenAI
+
+openai_client = OpenAI(api_key=os.getenv("OPEN_AI"))
+
+HASH_FEATURES = 2**18
+MAX_WEB_SOURCES = 10  
+
+TABLES = [
+    "duplicate_RAG_Entrepreneurship",
+    "duplicate_RAG_Anthropology",
+    "duplicate_RAG_Biography",
+]
+
+IDEAS_SYSTEM_PROMPT = """
+You are a YouTube Content Ideation Engine.
+
+Input:
+- User Topic
+- 7-10 retrieved knowledge chunks
+
+Goal:
+Generate 8-10 unique, high-potential YouTube video ideas by synthesizing information across all retrieved chunks.
+
+Do NOT summarize the chunks.
+Instead, discover the most interesting stories, questions, conflicts, insights, and perspectives hidden within them.
+
+For every idea, reason across:
+
+• Historical background
+• Current situation
+• Future implications
+• Timeline of important events
+• Key stakeholders
+• Winners and losers
+• Political influence
+• Economic impact
+• Scientific or technological significance
+• Social and cultural effects
+• Human stories
+• Hidden incentives
+• Power dynamics
+• Ethical dilemmas
+• Myths vs facts
+• Unanswered questions
+• Ripple effects
+• Global and regional perspectives
+
+Each idea should focus on ONE compelling angle rather than covering everything.
+
+Vary the storytelling style naturally across ideas. Mix formats such as:
+- Documentary
+- Explainer
+- Mystery
+- Investigation
+- Historical Story
+- Business Analysis
+- Psychology
+- Science
+- "What If"
+- Timeline
+- Case Study
+- Behind the Scenes
+- Future Predictions
+- Myth Busting
+- Unexpected Facts
+
+Prioritize ideas that maximize:
+- Curiosity
+- Emotional engagement
+- Shareability
+- Educational value
+- Broad audience appeal
+- Strong storytelling potential
+
+Avoid:
+- Repeated angles
+- Generic summaries
+- Unsupported speculation
+- Clickbait
+- Nearly identical ideas
+
+Output exactly 8-10 ideas.
+
+For each idea provide:
+
+Title:
+A compelling YouTube title (8-15 words).
+
+Description:
+70-100 words describing:
+- the central story or question,
+- the primary stakeholders,
+- why it matters,
+- the historical and current context,
+- future implications when relevant,
+- and what viewers will learn.
+
+Descriptions should inspire creators to build a complete YouTube script while remaining grounded in the provided knowledge.
+
+Order ideas from highest audience potential to lowest.
+
+"""
+
+KEYWORD_GEN_PROMPT_TEMPLATE = """You are a Search Query Expansion Engine for automated web crawling.
+
+Input:
+A short user topic (2-10 words).
+
+Goal:
+Generate 10-15 high-quality search engine keyword combinations that maximize information retrieval from Google, Bing, academic search engines, and news websites.
+
+Requirements:
+- Preserve the original topic.
+- Generate search phrases, NOT sentences.
+- Each phrase should target a unique research dimension.
+- Cover:
+  • latest news
+  • history
+  • timeline
+  • root causes
+  • stakeholders
+  • government
+  • companies
+  • researchers
+  • statistics
+  • datasets
+  • reports
+  • research papers
+  • expert opinions
+  • controversies
+  • future trends
+- Include important entities when inferable.
+- Avoid duplicate intent.
+- Each keyword combination should contain 4-10 words.
+- Return only the keyword combinations.
+- Number each result.
+
+[TOPIC]: {topic}
+"""
+
+
+_bge_model = None
+def _get_st_model():
+    global _bge_model
+    if _bge_model is None:
+        from sentence_transformers import SentenceTransformer
+        print("[MODEL] Loading BAAI/bge-m3")
+        _bge_model = SentenceTransformer("BAAI/bge-m3")
+        print("[MODEL] BAAI/bge-m3 loaded")
+    return _bge_model
+
+_sparse_vectorizer = None
+def get_sparse_vectorizer() -> HashingVectorizer:
+    global _sparse_vectorizer
+    if _sparse_vectorizer is None:
+        _sparse_vectorizer = HashingVectorizer(
+            n_features=HASH_FEATURES,
+            alternate_sign=False,
+            norm="l2",
+        )
+    return _sparse_vectorizer
+
+
+def _sparse_row_to_dict(sparse_row) -> dict:
+    coo = sparse_row.tocoo()
+    return {str(int(idx)): float(val) for idx, val in zip(coo.col, coo.data)}
+
+
+def _sparse_cosine(query_sparse: dict, doc_sparse: dict) -> float:
+    if not query_sparse or not doc_sparse:
+        return 0.0
+    shared_keys = query_sparse.keys() & doc_sparse.keys()
+    return sum(query_sparse[k] * doc_sparse[k] for k in shared_keys)
+
+
+# ============================================================
+# DB RETRIEVAL (dense ANN via SQL + sparse rerank in Python)
+# ============================================================
+
+async def get_context_from_db(topic: str, hyde_doc: str = None, final_k: int = 7):
+    print(f"[DB] Starting retrieval for topic: '{topic}'")
+
+    table_selector_prompt = f"""
+    You are a routing assistant. Given a topic, select the single most relevant
+    table from the list below that would contain source documents for that topic.
+
+    Available tables:
+    - duplicate_RAG_Entrepreneurship: startups, business strategy, venture capital, founders
+    - duplicate_RAG_Anthropology: human culture, society, archaeology, ethnography
+    - duplicate_RAG_Biography: individual people's lives, histories, memoirs
+
+    Topic: "{topic}"
+
+    Respond with ONLY the exact table name from the list above, nothing else.
+    """
+
+    res = await asyncio.to_thread(
+        openai_client.chat.completions.create,
+        model="gpt-5.4-mini",
+        messages=[{"role": "user", "content": table_selector_prompt}],
+        stream=False,
+    )
+    table_name = res.choices[0].message.content.strip("`'\" \n")
+
+    if table_name not in TABLES:
+        print(f"[DB] table selector returned unexpected value '{table_name}', defaulting to {TABLES[0]}")
+        table_name = TABLES[0]
+    else:
+        print(f"[DB] Selected table: {table_name}")
+
+    embedding_source = hyde_doc if hyde_doc else topic
+
+    model = _get_st_model()
+    dense_embedding = await asyncio.to_thread(
+        lambda: model.encode(
+            embedding_source,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        ).tolist()
+    )
+    print("[DB] Dense embedding computed")
+
+    vectorizer = get_sparse_vectorizer()
+    sparse_row = await asyncio.to_thread(lambda: vectorizer.transform([embedding_source]))
+    query_sparse = _sparse_row_to_dict(sparse_row)
+    print("[DB] Sparse embedding computed")
+
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.rpc(
+                "match_documents",
+                {
+                    "query_dense_embedding": dense_embedding,
+                    "match_table": table_name,
+                    "match_count": 20,
+                },
+            ).execute()
+        )
+    except Exception as e:
+        print(f"[DB] vector search failed: {e}")
+        return []
+
+    candidates = result.data or []
+    print(f"[DB] RPC returned {len(candidates)} candidates from {table_name}")
+
+    reranked = []
+    for row in candidates:
+        doc_sparse = row.get("sparse_vector") or {}
+        sparse_score = _sparse_cosine(query_sparse, doc_sparse)
+        dense_score = row.get("dense_score", 0.0)
+        combined = (0.7 * dense_score) + (0.3 * sparse_score)
+        reranked.append({**row, "sparse_score": sparse_score, "combined_score": combined})
+
+    reranked.sort(key=lambda r: r["combined_score"], reverse=True)
+    matches = reranked[:final_k]
+
+    print(f"[DB] Top {len(matches)} chunks after hybrid rerank:")
+    for i, row in enumerate(matches, start=1):
+        content = row.get("content")
+        md5 = row.get("md5") or (
+            hashlib.md5(content.encode("utf-8")).hexdigest() if content else None
+        )
+        print(f"  [DB-{i}] md5={md5} combined_score={row['combined_score']:.4f}")
+        print(f"    content: {content[:200]}{'...' if content and len(content) > 200 else ''}")
+
+    return matches
+
+
+# ============================================================
+# DDGS NEWS SEARCH (LLM-generated keywords, capped source count)
+# ============================================================
+
+def _ddgs_search_for_ideas(keyword: str, max_results: int) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.news(keyword, max_results=max_results):
+                url = r.get("url")
+                snippet = r.get("body", "") or r.get("title", "")
+                if url:
+                    results.append((url, snippet))
+    except Exception as e:
+        print(f"[DDGS] search failed for '{keyword}': {e}")
+    return results
+
+
+def _parse_keyword_lines(raw: str) -> list[str]:
+    """Split LLM output into clean keyword lines, stripping stray bullets/numbering/quotes."""
+    lines = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[\-\*\u2022]\s*", "", line)
+        line = re.sub(r"^\d+[\.\)]\s*", "", line)
+        line = line.strip("\"'` ")
+        if line:
+            lines.append(line)
+    return lines
+
+
+async def _generate_search_keywords(topic: str) -> list[str]:
+    prompt = KEYWORD_GEN_PROMPT_TEMPLATE.format(topic=topic)
+
+    try:
+        res = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        raw = res.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[DDGS] keyword generation failed: {e}")
+        return [f"{topic} latest news today", f"{topic} 2026 update"]
+
+    keywords = _parse_keyword_lines(raw)
+
+    if not keywords:
+        print("[DDGS] keyword generation returned nothing usable, using fallback")
+        return [f"{topic} latest news today", f"{topic} 2026 update"]
+
+    print(f"[DDGS] generated {len(keywords)} keywords")
+    for i, kw in enumerate(keywords, start=1):
+        print(f"  [KW-{i}] {kw}")
+
+    return keywords
+
+
+async def get_ddgs_news_context(topic: str, scraped_urls: set, max_results: int = 5) -> list[dict]:
+    """
+    Runs DDGS news search across LLM-generated keyword variants, dedupes by URL
+    against scraped_urls, and returns AT MOST MAX_WEB_SOURCES article dicts.
+    Stops issuing further keyword searches once the cap is reached.
+    """
+    print(f"[DDGS] Starting news search for topic: '{topic}'")
+
+    keywords = await _generate_search_keywords(topic)
+
+    articles = []
+    for keyword in keywords:
+        if len(articles) >= MAX_WEB_SOURCES:
+            print(f"[DDGS] Reached cap of {MAX_WEB_SOURCES} sources, stopping further keyword searches")
+            break
+
+        try:
+            pairs = await asyncio.to_thread(_ddgs_search_for_ideas, keyword, max_results)
+            print(f"[DDGS] keyword '{keyword}' returned {len(pairs)} results")
+        except Exception as e:
+            print(f"[DDGS] thread failed for '{keyword}': {e}")
+            pairs = []
+
+        for url, snippet in pairs:
+            if len(articles) >= MAX_WEB_SOURCES:
+                break
+            if url in scraped_urls:
+                continue
+            scraped_urls.add(url)
+            articles.append({"url": url, "snippet": snippet})
+
+    print(f"[DDGS] {len(articles)} unique articles collected (capped at {MAX_WEB_SOURCES}):")
+    for i, article in enumerate(articles, start=1):
+        print(f"  [NEWS-{i}] {article['url']}")
+        print(f"    snippet: {article['snippet'][:200]}{'...' if len(article['snippet']) > 200 else ''}")
+
+    return articles
+
+
+
+def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> str:
+    """Combine DB chunks and DDGS snippets into one context block for the LLM prompt."""
+    parts = []
+
+    if db_results:
+        parts.append("=== KNOWLEDGE BASE EXCERPTS ===")
+        for i, row in enumerate(db_results, start=1):
+            content = row.get("content", "")
+            parts.append(f"[KB-{i}] {content}")
+
+    if new_articles:
+        parts.append("\n=== RECENT NEWS ===")
+        for i, article in enumerate(new_articles, start=1):
+            snippet = article.get("snippet", "")
+            url = article.get("url", "")
+            parts.append(f"[NEWS-{i}] {snippet} (source: {url})")
+
+    return "\n\n".join(parts) if parts else "No additional context available."
+
+
+
+_IDEA_PATTERN = re.compile(
+    r"(?:^|\n)\s*(?:#+\s*)?(?:\d+[\.\)]\s*)?\**Title\**:?\s*"
+    r"(?P<title>.+?)\s*\n+"
+    r"\s*(?:\**Description\**):?\s*(?P<description>.+?)"
+    r"(?=\n+\s*(?:#+\s*)?(?:\d+[\.\)]\s*)?\**Title\**:?|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+ 
+
+def _clean_idea_text(text: str) -> str:
+    text = re.sub(r"\n?-{2,}\s*$", "", text)  
+    text = text.strip("*_ \n")
+    return text.strip()
+ 
+
+def _parse_ideas_markdown(raw: str) -> list[dict]:
+    """
+    Parses ideas in either format:
+    Title: ...
+    Description: ...
+ 
+    or
+ 
+    **Title**: ...
+    **Description**: ...
+ 
+    (repeated, separated by --- , blank lines, or numbering)
+    """
+    ideas = []
+    for match in _IDEA_PATTERN.finditer(raw):
+        title = _clean_idea_text(match.group("title"))
+        description = _clean_idea_text(match.group("description"))
+        if title and description:
+            ideas.append({"title": title, "description": description})
+ 
+    if ideas:
+        return ideas
+ 
+    print("[IDEAS] structured parse found nothing, attempting fallback split")
+    blocks = re.split(r"\n\s*\n+", raw.strip())
+    buffer_title = None
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.splitlines()
+        if len(lines) == 1 and len(block) < 150 and buffer_title is None:
+            buffer_title = _clean_idea_text(block)
+            continue
+        if buffer_title:
+            ideas.append({"title": buffer_title, "description": _clean_idea_text(block)})
+            buffer_title = None
+ 
+    return ideas
+ 
+
+
+async def generate_ideas_from_context(topic: str, db_results: list[dict], new_articles: list[dict]) -> list[dict]:
+    print(f"[IDEAS] Building context block ({len(db_results)} DB chunks, {len(new_articles)} news articles)")
+    context_block = _build_ideas_context(db_results, new_articles)
+
+    user_prompt = f"""Topic: "{topic}"
+
+Content Chunks:
+{context_block}
+"""
+
+    print("[IDEAS] Sending prompt to gpt-5.4-mini")
+    res = await asyncio.to_thread(
+        openai_client.chat.completions.create,
+        model="gpt-5.4-mini",
+        messages=[
+            {"role": "system", "content": IDEAS_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        stream=False,
+    )
+
+    raw = res.choices[0].message.content.strip()
+
+    ideas = _parse_ideas_markdown(raw)
+
+    if ideas:
+        print(f"[IDEAS] Parsed {len(ideas)} ideas successfully")
+    else:
+        print("[IDEAS] failed to parse any ideas from markdown format")
+        print(f"[IDEAS] raw output was: {raw}")
+
+    for i, idea in enumerate(ideas, start=1):
+        print(f"  [IDEA-{i}] {idea.get('title')}")
+        print(f"    {idea.get('description')}")
+
+    return ideas
+
+
+# ============================================================
+# ENDPOINT
+# ============================================================
+
 @app.post("/generate-ideas")
 async def generate_ideas_endpoint(
     request: GenerateIdeasRequest,
     background_tasks: BackgroundTasks,
 ):
-    total_start_time = time.time()
     topic = request.topic.strip()
+
     if not topic:
         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
 
     try:
+        print("=" * 60)
         print(f"GENERATE IDEAS for topic: {topic}")
+        print("=" * 60)
 
-        # ── STAGE 1: TSS + DB lookup + keyword gen ALL in parallel ──
-        print("--- Stage 1: TSS + DB lookup + keyword gen in parallel ---")
-        tss_task = asyncio.create_task(
-            asyncio.wait_for(run_tss(topic), timeout=TSS_TIMEOUT_SEC)
+        hyde_prompt = f"""
+        You are a Semantic Query Expansion Engine for a YouTube documentary research pipeline.
+
+        Goal:
+        Convert short user search queries (typically 3–7 keywords) into a natural-language semantic search paragraph optimized for vector search (RAG), NOT for humans.
+
+        Input:
+        User Query:
+        "{topic}"
+        A user query containing 3–7 keywords or a short topic.
+
+        Task:
+        1. Infer the user's true research intent.
+        2. Expand the topic into a coherent natural-language paragraph of **100–150 words only**.
+        3. Preserve the original meaning while enriching context.
+        4. Include:
+        - synonyms
+        - related concepts
+        - alternate terminology
+        - historical context
+        - scientific concepts
+        - geographical references
+        - cultural context
+        - causes, effects, mechanisms
+        - notable events, discoveries, people, civilizations or theories when relevant
+        5. Include entities, alternate spellings and commonly searched phrases naturally.
+        6. Do NOT invent unsupported facts. Expand only using generally accepted knowledge.
+        7. Write as continuous natural language without bullets, lists or headings.
+        8. Avoid conversational text, opinions, explanations or instructions.
+        9. Maximize semantic richness and topical coverage for embedding similarity rather than keyword stuffing.
+        10. Output only the expanded paragraph.
+        11. The output must contain **only one paragraph of 100–150 words** with no additional text before or after it.
+
+        Purpose:
+        The output will be embedded and matched against a vector database to retrieve semantically relevant documents for generating high-quality YouTube documentary scripts. Optimize for semantic recall while maintaining precise topic relevance.
+
+        """
+        res = openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": hyde_prompt}],
+            stream=False,
         )
-        db_task = asyncio.create_task(get_db_context(topic))
-        kw_task = asyncio.create_task(_generate_search_keywords(topic))
 
-        tss_payload, db_results, base_keywords = await asyncio.gather(
-            tss_task, db_task, kw_task
-        )
+        hyde_doc = res.choices[0].message.content.strip()
+        print(f"[HYDE] {hyde_doc}")
 
-        cags_payload = tss_payload.get("cags") or {}
-        gap_angles = cags_payload.get("gap_angles") or []
-        briefs = cags_payload.get("briefs") or []
-        perspective_tree = cags_payload.get("perspective_tree") or []
-        if not gap_angles or not perspective_tree:
-            raise HTTPException(status_code=422, detail="No viable CAGS angles were produced.")
+        db_task = asyncio.create_task(get_context_from_db(topic, hyde_doc))
+        await asyncio.sleep(11)
 
-        # ── STAGE 2: Web scrape + social/news scans in parallel ──
-        print("--- Stage 2: Web scrape + social + news scans in parallel ---")
-        scraped_urls: set = set()
-        db_count = len(db_results)
+        db_results = []
+        new_articles = []
+        scraped_urls = set()
 
-        if db_count >= 5:
-            source_of_context = "DATABASE_RICH"
-            scrape_coro = get_latest_news_context(topic, scraped_urls)
+        if db_task.done():
+            db_results = db_task.result()
+            print(f"[MAIN] DB task finished within timeout. Found {len(db_results)} documents.")
         else:
-            source_of_context = "DATABASE_PARTIAL" if db_count >= 1 else "DEEP_SCRAPE"
-            scrape_coro = deep_search_and_scrape(base_keywords, scraped_urls)
+            print("[MAIN] DB task still running after 11s timeout, proceeding without it for now.")
 
-        (
-            new_articles,
-            social_payload,
-            news_payload,
-        ) = await asyncio.gather(
-            scrape_coro,
-            _safe_scan_topic_signals(
-                label="social",
-                scanner=scan_social_topic,
-                topic=topic,
-                timeout_sec=SOCIAL_SCAN_TIMEOUT_SEC,
-                fallback_key="sample_posts",
-            ),
-            _safe_scan_topic_signals(
-                label="news",
-                scanner=scan_news_topic,
-                topic=topic,
-                timeout_sec=NEWS_SCAN_TIMEOUT_SEC,
-                fallback_key="sample_articles",
-            ),
-        )
+        print("[MAIN] Performing web search (mandatory, regardless of DB result count).")
+        new_articles = await get_ddgs_news_context(topic, scraped_urls)
 
-        # ── Build context blocks ──
-        db_context, web_context = "", ""
-        source_urls: list[str] = []
+        if not db_results:
+            if db_task.done():
+                late_results = db_task.result()
+                if late_results:
+                    print(f"[MAIN] DB task finished late (during web search). Using {len(late_results)} documents.")
+                    db_results = late_results
+            else:
+                try:
+                    db_results = await asyncio.wait_for(asyncio.shield(db_task), timeout=5)
+                    print(f"[MAIN] DB task finished after extra wait. Found {len(db_results)} documents.")
+                except asyncio.TimeoutError:
+                    print("[MAIN] DB task still not done after extra wait, proceeding without DB results.")
+                    db_results = []
+                except Exception as e:
+                    print(f"[MAIN] DB task raised an error on late check: {e}")
+                    db_results = []
 
-        if db_results:
-            db_blocks = [item.get("content", "") for item in db_results]
-            db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
-            source_urls.extend([
-                item["source_url"] for item in db_results if item.get("source_url")
-            ])
+        print("-" * 60)
+        print("[MAIN] Generating ideas from combined context")
+        ideas = await generate_ideas_from_context(topic, db_results, new_articles)
+        print("=" * 60)
+        print(f"GENERATE IDEAS complete: {len(ideas)} ideas returned")
+        print("=" * 60)
 
-        if new_articles:
-            web_blocks = [f"Source: {art['title']}\n{art['text']}" for art in new_articles]
-            web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
-            source_urls.extend([art["url"] for art in new_articles])
-            for article in new_articles:
-                background_tasks.add_task(
-                    add_scraped_data_to_db,
-                    article["title"],
-                    article["text"],
-                    article["url"],
-                    "",
-                    topic,
-                    base_keywords,
-                )
-
-        social_data = social_payload.get("sample_posts") or []
-        news_data = news_payload.get("sample_articles") or []
-
-        # ── STAGE 3: Idea generation ──
-        print("--- Stage 3: Generating ideas ---")
-        idea_clusters = await generate_cags_aligned_ideas(
-            topic=topic,
-            gap_angles=gap_angles,
-            briefs=briefs,
-            perspective_tree=perspective_tree,
-            social_data=social_data,
-            news_data=news_data,
-            db_context=db_context,
-            web_context=web_context,
-            max_angles=int(request.max_angles or 5),
-            ideas_per_angle=int(request.ideas_per_angle or 3),
-            used_angle_ids=request.used_angle_ids or [],
-            deepseek_client=deepseek_client,
-        )
-
-        idea_clusters["source_of_context"] = source_of_context
-        idea_clusters["generated_keywords"] = base_keywords
-        idea_clusters["source_urls"] = list(set(source_urls))
-        idea_clusters["cags"] = {
-            "tss": tss_payload.get("tss"),
-            "csi": (tss_payload.get("csi") or {}).get("csi"),
-            "total_angles": len(gap_angles),
+        return {
+            "topic": topic,
+            "ideas": ideas,
         }
-
-        final_ideas, final_descriptions = [], []
-        for cluster in idea_clusters.get("idea_clusters") or []:
-            for variant in cluster.get("idea_variants") or []:
-                title = str(variant.get("title") or "").strip()
-                description = str(variant.get("description") or "").strip()
-                if title and description:
-                    final_ideas.append(title)
-                    final_descriptions.append(description)
-
-        idea_clusters["ideas"] = final_ideas
-        idea_clusters["descriptions"] = final_descriptions
-        idea_clusters["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
-        idea_clusters["total_request_time_sec"] = round(time.time() - total_start_time, 2)
-
-        if len(final_ideas) > 0:
-            if _payload_uses_fallback_variants(idea_clusters):
-                print(f"Skipping cache write for '{topic}' because fallback variants were used.")
-                idea_clusters["cache_write_skipped"] = "fallback_variants"
-        else:
-            print(f"Skipping cache write for '{topic}' because no ideas were generated.")
-
-        print(f"Total /generate-ideas time: {idea_clusters['total_request_time_sec']:.2f}s")
-        return idea_clusters
 
     except HTTPException:
         raise
     except Exception as e:
         import traceback
-        print(f"Error in /generate-ideas: {e}")
+        print(f"[ERROR] /generate-ideas failed: {e}")
         traceback.print_exc()
         return {"error": "An error occurred in the idea generation pipeline.", "detail": str(e)}
+
+
+
+
+
+# import hashlib
+# import re
+# import asyncio
+# from sklearn.feature_extraction.text import HashingVectorizer
+# from fastapi import HTTPException, BackgroundTasks
+
+# # ============================================================
+# # CONFIG
+# # ============================================================
+
+# HASH_FEATURES = 2**18
+# MAX_WEB_SOURCES = 10  # cap on total scraped/news sources fed into idea generation
+
+# TABLES = [
+#     "duplicate_RAG_Entrepreneurship",
+#     "duplicate_RAG_Anthropology",
+#     "duplicate_RAG_Biography",
+# ]
+
+# IDEAS_SYSTEM_PROMPT = """
+# You are a senior YouTube content strategist and analytical framework specialist. Your sole function is to dissect topics using the **Unified Content Perspective Framework** to generate 8–10 deeply unique, non-redundant video ideas.
+
+# ## MANDATORY FRAMEWORK (Internal Logic)
+# You must construct every perspective by layering these 6 dimensions:
+
+# 1. **STAKEHOLDER (WHO)**: Universal (Gov, Public, Media, Corporations, Workers, Experts, Judiciary) OR Contextual (Youth, Rural, Women, specific communities, activists).
+# 2. **DISCIPLINE (WHAT)**: 1–2 lenses from History, Econ, Law, Sociology, Tech, Psychology, Env, Ethics, Geopolitics, Policy.
+# 3. **TIME/SCALE (WHEN/WHERE)**: Past/Present/Future × Local/National/Global.
+# 4. **SYSTEM DYNAMIC (HOW EVOLVES)**: Cause-effect, Feedback loop, Trade-off, Second-order effects, Risk scenario.
+# 5. **POWER/STRUCTURE (WHO BENEFITS)**: Inequality, Corporate influence, Institutional failure, Historical legacy, Policy bias, Identity dynamics.
+# 6. **NARRATIVE FRAME (HOW TO TELL)**: Crisis, Opportunity, Conflict, Human story, Hidden angle, Myth vs Reality, Data-driven.
+
+# **Rule**: Always start with WHO. Ensure perspectives span micro (individual/psychology) to macro (geopolitics/global systems). Avoid obvious summaries—every angle must reveal a hidden "why" and a "who gains/loses".
+
+# ## OUTPUT SPECIFICATION
+# When the user supplies a **[TOPIC]** and **[CONTENT CHUNKS]**, generate exactly 8 to 10 ideas. Use this exact structure for every idea:
+
+# ---
+
+# **Title**: [Exactly 8-15 words. Clickable, provocative, and curiosity-driven.]
+
+# **Description**: [Exactly 50-70 words. Must explicitly articulate: the chosen stakeholder, the systemic/power dynamic uncovered, and the implication that mainstream coverage misses.]
+
+# ---
+
+# ## CRITICAL CONSTRAINTS
+# - **Do not** generate obvious, news-summary, or generic angles.
+# - **Do not** reuse the same stakeholder or time-frame across more than 2 ideas.
+# - Every description **must** answer: *"Why did this happen, who is silently benefiting, and what happens next?"*
+# - Ensure full variety—cover conflicting stakeholders (e.g., workers vs. corporations, global north vs. south, present vs. future generations).
+
+# """
+
+# KEYWORD_GEN_PROMPT_TEMPLATE = """You are an advanced SEO and research query generation engine optimized for comprehensive information retrieval across all topic domains including science, politics, economics, technology, culture, history, current affairs, and business.
+# Your task: Convert the user-provided [TOPIC] into exactly 10-15 highly specific, multi-word search engine keyword combinations.
+# Internal dimensional analysis requirement: Systematically generate keyword combinations that cover:
+# - Core terminology and commonly used phrases
+# - Historical origins and evolution
+# - Current/present state and latest developments
+# - Future trends, predictions, or emerging patterns
+# - Causal factors and driving forces
+# - Consequences, impacts, and ripple effects
+# - Geographic/regional dimensions (local, national, global)
+# - Key individuals, leaders, or influential figures
+# - Organizations, institutions, government bodies, or corporations
+# - Related industries, sectors, or adjacent fields
+# - Controversies, debates, or conflicting perspectives
+# - Regulatory, policy, or legal dimensions
+# - Economic, financial, or market implications
+# - Social, cultural, or demographic angles
+# - Technological or scientific aspects where applicable
+# - News events, recent developments, and breaking stories
+# - Case studies, real-world examples, or specific instances
+# - Data, statistics, or empirical evidence
+# Prioritize phrases optimized for discovering:
+# - Latest news articles and current coverage
+# - Research papers and academic publications
+# - Government publications and policy documents
+# - Industry reports and market analyses
+# - Books and long-form content
+# - High-authority websites and institutional sources
+# Strict output constraints:
+# - Each combination must contain exactly 4 to 8 words
+# - Do NOT use questions, full sentences, quotation marks, numbering, bullet points, markdown, or introductory phrases
+# - Output ONLY the keyword combinations, one per line
+# - No explanations, headings, or additional text
+# Ensure each keyword combination modifies the core topic with a specific analytical dimension rather than generic single-concept terms. Include a mix of recent news-oriented phrases and deeper analytical/contextual phrases.
+# Now generate keyword combinations for the following user query.
+
+# [TOPIC]: {topic}
+# """
+
+# # ============================================================
+# # MODEL / VECTORIZER LOADING (lazy singletons)
+# # ============================================================
+
+# _bge_model = None
+# def _get_st_model():
+#     global _bge_model
+#     if _bge_model is None:
+#         from sentence_transformers import SentenceTransformer
+#         print("[MODEL] Loading BAAI/bge-m3")
+#         _bge_model = SentenceTransformer("BAAI/bge-m3")
+#         print("[MODEL] BAAI/bge-m3 loaded")
+#     return _bge_model
+
+# _sparse_vectorizer = None
+# def get_sparse_vectorizer() -> HashingVectorizer:
+#     global _sparse_vectorizer
+#     if _sparse_vectorizer is None:
+#         _sparse_vectorizer = HashingVectorizer(
+#             n_features=HASH_FEATURES,
+#             alternate_sign=False,
+#             norm="l2",
+#         )
+#     return _sparse_vectorizer
+
+
+# def _sparse_row_to_dict(sparse_row) -> dict:
+#     coo = sparse_row.tocoo()
+#     return {str(int(idx)): float(val) for idx, val in zip(coo.col, coo.data)}
+
+
+# def _sparse_cosine(query_sparse: dict, doc_sparse: dict) -> float:
+#     if not query_sparse or not doc_sparse:
+#         return 0.0
+#     shared_keys = query_sparse.keys() & doc_sparse.keys()
+#     return sum(query_sparse[k] * doc_sparse[k] for k in shared_keys)
+
+
+# # ============================================================
+# # DB RETRIEVAL (dense ANN via SQL + sparse rerank in Python)
+# # ============================================================
+
+# async def get_context_from_db(topic: str, hyde_doc: str = None, final_k: int = 7):
+#     print(f"[DB] Starting retrieval for topic: '{topic}'")
+
+#     table_selector_prompt = f"""
+#     You are a routing assistant. Given a topic, select the single most relevant
+#     table from the list below that would contain source documents for that topic.
+
+#     Available tables:
+#     - duplicate_RAG_Entrepreneurship: startups, business strategy, venture capital, founders
+#     - duplicate_RAG_Anthropology: human culture, society, archaeology, ethnography
+#     - duplicate_RAG_Biography: individual people's lives, histories, memoirs
+
+#     Topic: "{topic}"
+
+#     Respond with ONLY the exact table name from the list above, nothing else.
+#     """
+
+#     res = await asyncio.to_thread(
+#         deepseek_client.chat.completions.create,
+#         model="deepseek-v4-pro",
+#         messages=[{"role": "user", "content": table_selector_prompt}],
+#         stream=False,
+#     )
+#     table_name = res.choices[0].message.content.strip("`'\" \n")
+
+#     if table_name not in TABLES:
+#         print(f"[DB] table selector returned unexpected value '{table_name}', defaulting to {TABLES[0]}")
+#         table_name = TABLES[0]
+#     else:
+#         print(f"[DB] Selected table: {table_name}")
+
+#     embedding_source = hyde_doc if hyde_doc else topic
+
+#     model = _get_st_model()
+#     dense_embedding = await asyncio.to_thread(
+#         lambda: model.encode(
+#             embedding_source,
+#             convert_to_numpy=True,
+#             normalize_embeddings=True,
+#         ).tolist()
+#     )
+#     print("[DB] Dense embedding computed")
+
+#     vectorizer = get_sparse_vectorizer()
+#     sparse_row = await asyncio.to_thread(lambda: vectorizer.transform([embedding_source]))
+#     query_sparse = _sparse_row_to_dict(sparse_row)
+#     print("[DB] Sparse embedding computed")
+
+#     try:
+#         result = await asyncio.to_thread(
+#             lambda: supabase.rpc(
+#                 "match_documents",
+#                 {
+#                     "query_dense_embedding": dense_embedding,
+#                     "match_table": table_name,
+#                     "match_count": 20,
+#                 },
+#             ).execute()
+#         )
+#     except Exception as e:
+#         print(f"[DB] vector search failed: {e}")
+#         return []
+
+#     candidates = result.data or []
+#     print(f"[DB] RPC returned {len(candidates)} candidates from {table_name}")
+
+#     reranked = []
+#     for row in candidates:
+#         doc_sparse = row.get("sparse_vector") or {}
+#         sparse_score = _sparse_cosine(query_sparse, doc_sparse)
+#         dense_score = row.get("dense_score", 0.0)
+#         combined = (0.7 * dense_score) + (0.3 * sparse_score)
+#         reranked.append({**row, "sparse_score": sparse_score, "combined_score": combined})
+
+#     reranked.sort(key=lambda r: r["combined_score"], reverse=True)
+#     matches = reranked[:final_k]
+
+#     print(f"[DB] Top {len(matches)} chunks after hybrid rerank:")
+#     for i, row in enumerate(matches, start=1):
+#         content = row.get("content")
+#         md5 = row.get("md5") or (
+#             hashlib.md5(content.encode("utf-8")).hexdigest() if content else None
+#         )
+#         print(f"  [DB-{i}] md5={md5} combined_score={row['combined_score']:.4f}")
+#         print(f"    content: {content[:200]}{'...' if content and len(content) > 200 else ''}")
+
+#     return matches
+
+
+# # ============================================================
+# # DDGS NEWS SEARCH (LLM-generated keywords, capped source count)
+# # ============================================================
+
+# def _ddgs_search_for_ideas(keyword: str, max_results: int) -> list[tuple[str, str]]:
+#     results: list[tuple[str, str]] = []
+#     try:
+#         with DDGS() as ddgs:
+#             for r in ddgs.news(keyword, max_results=max_results):
+#                 url = r.get("url")
+#                 snippet = r.get("body", "") or r.get("title", "")
+#                 if url:
+#                     results.append((url, snippet))
+#     except Exception as e:
+#         print(f"[DDGS] search failed for '{keyword}': {e}")
+#     return results
+
+
+# def _parse_keyword_lines(raw: str) -> list[str]:
+#     """Split LLM output into clean keyword lines, stripping stray bullets/numbering/quotes."""
+#     lines = []
+#     for line in raw.strip().splitlines():
+#         line = line.strip()
+#         if not line:
+#             continue
+#         line = re.sub(r"^[\-\*\u2022]\s*", "", line)
+#         line = re.sub(r"^\d+[\.\)]\s*", "", line)
+#         line = line.strip("\"'` ")
+#         if line:
+#             lines.append(line)
+#     return lines
+
+
+# async def _generate_search_keywords(topic: str) -> list[str]:
+#     prompt = KEYWORD_GEN_PROMPT_TEMPLATE.format(topic=topic)
+
+#     try:
+#         res = await asyncio.to_thread(
+#             deepseek_client.chat.completions.create,
+#             model="deepseek-v4-pro",
+#             messages=[{"role": "user", "content": prompt}],
+#             stream=False,
+#         )
+#         raw = res.choices[0].message.content.strip()
+#     except Exception as e:
+#         print(f"[DDGS] keyword generation failed: {e}")
+#         return [f"{topic} latest news today", f"{topic} 2026 update"]
+
+#     keywords = _parse_keyword_lines(raw)
+
+#     if not keywords:
+#         print("[DDGS] keyword generation returned nothing usable, using fallback")
+#         return [f"{topic} latest news today", f"{topic} 2026 update"]
+
+#     print(f"[DDGS] generated {len(keywords)} keywords")
+#     for i, kw in enumerate(keywords, start=1):
+#         print(f"  [KW-{i}] {kw}")
+
+#     return keywords
+
+
+# async def get_ddgs_news_context(topic: str, scraped_urls: set, max_results: int = 5) -> list[dict]:
+#     """
+#     Runs DDGS news search across LLM-generated keyword variants, dedupes by URL
+#     against scraped_urls, and returns AT MOST MAX_WEB_SOURCES article dicts.
+#     Stops issuing further keyword searches once the cap is reached.
+#     """
+#     print(f"[DDGS] Starting news search for topic: '{topic}'")
+
+#     keywords = await _generate_search_keywords(topic)
+
+#     articles = []
+#     for keyword in keywords:
+#         if len(articles) >= MAX_WEB_SOURCES:
+#             print(f"[DDGS] Reached cap of {MAX_WEB_SOURCES} sources, stopping further keyword searches")
+#             break
+
+#         try:
+#             pairs = await asyncio.to_thread(_ddgs_search_for_ideas, keyword, max_results)
+#             print(f"[DDGS] keyword '{keyword}' returned {len(pairs)} results")
+#         except Exception as e:
+#             print(f"[DDGS] thread failed for '{keyword}': {e}")
+#             pairs = []
+
+#         for url, snippet in pairs:
+#             if len(articles) >= MAX_WEB_SOURCES:
+#                 break
+#             if url in scraped_urls:
+#                 continue
+#             scraped_urls.add(url)
+#             articles.append({"url": url, "snippet": snippet})
+
+#     print(f"[DDGS] {len(articles)} unique articles collected (capped at {MAX_WEB_SOURCES}):")
+#     for i, article in enumerate(articles, start=1):
+#         print(f"  [NEWS-{i}] {article['url']}")
+#         print(f"    snippet: {article['snippet'][:200]}{'...' if len(article['snippet']) > 200 else ''}")
+
+#     return articles
+
+
+# # ============================================================
+# # IDEA GENERATION (final LLM pass over combined context)
+# # ============================================================
+
+# def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> str:
+#     """Combine DB chunks and DDGS snippets into one context block for the LLM prompt."""
+#     parts = []
+
+#     if db_results:
+#         parts.append("=== KNOWLEDGE BASE EXCERPTS ===")
+#         for i, row in enumerate(db_results, start=1):
+#             content = row.get("content", "")
+#             parts.append(f"[KB-{i}] {content}")
+
+#     if new_articles:
+#         parts.append("\n=== RECENT NEWS ===")
+#         for i, article in enumerate(new_articles, start=1):
+#             snippet = article.get("snippet", "")
+#             url = article.get("url", "")
+#             parts.append(f"[NEWS-{i}] {snippet} (source: {url})")
+
+#     return "\n\n".join(parts) if parts else "No additional context available."
+
+
+# def _parse_ideas_markdown(raw: str) -> list[dict]:
+#     """
+#     Parses ideas in the format:
+#     **Title**: ...
+#     **Description**: ...
+#     (repeated, separated by --- or blank lines)
+#     """
+#     ideas = []
+#     pattern = re.compile(
+#         r"\*\*Title\*\*:\s*(.+?)\s*\n+\*\*Description\*\*:\s*(.+?)(?=\n+\*\*Title\*\*:|\Z)",
+#         re.DOTALL,
+#     )
+#     for match in pattern.finditer(raw):
+#         title = match.group(1).strip()
+#         description = match.group(2).strip()
+#         description = re.sub(r"\n?-{2,}\s*$", "", description).strip()
+#         ideas.append({"title": title, "description": description})
+#     return ideas
+
+
+# async def generate_ideas_from_context(topic: str, db_results: list[dict], new_articles: list[dict]) -> list[dict]:
+#     print(f"[IDEAS] Building context block ({len(db_results)} DB chunks, {len(new_articles)} news articles)")
+#     context_block = _build_ideas_context(db_results, new_articles)
+
+#     user_prompt = f"""Topic: "{topic}"
+
+# Content Chunks:
+# {context_block}
+# """
+
+#     print("[IDEAS] Sending prompt to deepseek-v4-pro")
+#     res = await asyncio.to_thread(
+#         deepseek_client.chat.completions.create,
+#         model="deepseek-v4-pro",
+#         messages=[
+#             {"role": "system", "content": IDEAS_SYSTEM_PROMPT},
+#             {"role": "user", "content": user_prompt},
+#         ],
+#         stream=False,
+#     )
+
+#     raw = res.choices[0].message.content.strip()
+
+#     ideas = _parse_ideas_markdown(raw)
+
+#     if ideas:
+#         print(f"[IDEAS] Parsed {len(ideas)} ideas successfully")
+#     else:
+#         print("[IDEAS] failed to parse any ideas from markdown format")
+#         print(f"[IDEAS] raw output was: {raw}")
+
+#     for i, idea in enumerate(ideas, start=1):
+#         print(f"  [IDEA-{i}] {idea.get('title')}")
+#         print(f"    {idea.get('description')}")
+
+#     return ideas
+
+
+# # ============================================================
+# # ENDPOINT
+# # ============================================================
+
+# @app.post("/generate-ideas")
+# async def generate_ideas_endpoint(
+#     request: GenerateIdeasRequest,
+#     background_tasks: BackgroundTasks,
+# ):
+#     topic = request.topic.strip()
+
+#     if not topic:
+#         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
+
+#     try:
+#         print("=" * 60)
+#         print(f"GENERATE IDEAS for topic: {topic}")
+#         print("=" * 60)
+
+#         hyde_prompt = f"""
+#     `You are a semantic expansion expert. Your sole task is to transform the user's short keyword phrase into a single, dense, 100–150 word paragraph that fully captures the depth, nuance, and intent behind their keywords. Expand the core meaning into a vivid, contextual narrative that explores underlying themes, emotional undertones, potential conflicts, unexpected angles, and human experiences connected to the keywords. Weave in cultural touchpoints, provocative questions, contrasting viewpoints, and actionable insights that add layers of meaning. Your expansion should surface implicit connections, reveal hidden dimensions, and create a rich semantic landscape that precisely represents what the user truly seeks. The paragraph must be evocative, mentally stimulating, and packed with conceptual anchors that enable highly accurate semantic matching with relevant content chunks.
+
+#     Topic: "{topic}"
+
+#     Output Format: Return ONLY the expanded paragraph (100–150 words). Do not include any introductory text, explanations, bullet points, or additional commentary."
+#         """
+#         res = deepseek_client.chat.completions.create(
+#             model="deepseek-v4-pro",
+#             messages=[{"role": "user", "content": hyde_prompt}],
+#             stream=False,
+#         )
+
+#         hyde_doc = res.choices[0].message.content.strip()
+#         print(f"[HYDE] {hyde_doc}")
+
+#         db_task = asyncio.create_task(get_context_from_db(topic, hyde_doc))
+#         await asyncio.sleep(11)
+
+#         db_results = []
+#         new_articles = []
+#         scraped_urls = set()
+
+#         if db_task.done():
+#             db_results = db_task.result()
+#             print(f"[MAIN] DB task finished within timeout. Found {len(db_results)} documents.")
+#         else:
+#             print("[MAIN] DB task still running after 11s timeout, proceeding without it for now.")
+
+#         print("[MAIN] Performing web search (mandatory, regardless of DB result count).")
+#         new_articles = await get_ddgs_news_context(topic, scraped_urls)
+
+#         if not db_results:
+#             if db_task.done():
+#                 late_results = db_task.result()
+#                 if late_results:
+#                     print(f"[MAIN] DB task finished late (during web search). Using {len(late_results)} documents.")
+#                     db_results = late_results
+#             else:
+#                 try:
+#                     db_results = await asyncio.wait_for(asyncio.shield(db_task), timeout=5)
+#                     print(f"[MAIN] DB task finished after extra wait. Found {len(db_results)} documents.")
+#                 except asyncio.TimeoutError:
+#                     print("[MAIN] DB task still not done after extra wait, proceeding without DB results.")
+#                     db_results = []
+#                 except Exception as e:
+#                     print(f"[MAIN] DB task raised an error on late check: {e}")
+#                     db_results = []
+
+#         print("-" * 60)
+#         print("[MAIN] Generating ideas from combined context")
+#         ideas = await generate_ideas_from_context(topic, db_results, new_articles)
+#         print("=" * 60)
+#         print(f"GENERATE IDEAS complete: {len(ideas)} ideas returned")
+#         print("=" * 60)
+
+#         return {
+#             "topic": topic,
+#             "ideas": ideas,
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         import traceback
+#         print(f"[ERROR] /generate-ideas failed: {e}")
+#         traceback.print_exc()
+#         return {"error": "An error occurred in the idea generation pipeline.", "detail": str(e)}
+
+
+
+
+
+
+
+
+# @app.post("/generate-ideas")
+# async def generate_ideas_endpoint(
+#     request: GenerateIdeasRequest,
+#     background_tasks: BackgroundTasks,
+# ):
+#     total_start_time = time.time()
+#     topic = request.topic.strip()
+#     if not topic:
+#         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
+
+#     try:
+#         print(f"GENERATE IDEAS for topic: {topic}")
+
+#         # ── STAGE 1: TSS + DB lookup + keyword gen ALL in parallel ──
+#         print("--- Stage 1: TSS + DB lookup + keyword gen in parallel ---")
+#         tss_task = asyncio.create_task(
+#             asyncio.wait_for(run_tss(topic), timeout=TSS_TIMEOUT_SEC)
+#         )
+#         db_task = asyncio.create_task(get_db_context(topic))
+#         kw_task = asyncio.create_task(_generate_search_keywords(topic))
+
+#         tss_payload, db_results, base_keywords = await asyncio.gather(
+#             tss_task, db_task, kw_task
+#         )
+
+#         cags_payload = tss_payload.get("cags") or {}
+#         gap_angles = cags_payload.get("gap_angles") or []
+#         briefs = cags_payload.get("briefs") or []
+#         perspective_tree = cags_payload.get("perspective_tree") or []
+#         if not gap_angles or not perspective_tree:
+#             raise HTTPException(status_code=422, detail="No viable CAGS angles were produced.")
+
+#         # ── STAGE 2: Web scrape + social/news scans in parallel ──
+#         print("--- Stage 2: Web scrape + social + news scans in parallel ---")
+#         scraped_urls: set = set()
+#         db_count = len(db_results)
+
+#         if db_count >= 5:
+#             source_of_context = "DATABASE_RICH"
+#             scrape_coro = get_latest_news_context(topic, scraped_urls)
+#         else:
+#             source_of_context = "DATABASE_PARTIAL" if db_count >= 1 else "DEEP_SCRAPE"
+#             scrape_coro = deep_search_and_scrape(base_keywords, scraped_urls)
+
+#         (
+#             new_articles,
+#             social_payload,
+#             news_payload,
+#         ) = await asyncio.gather(
+#             scrape_coro,
+#             _safe_scan_topic_signals(
+#                 label="social",
+#                 scanner=scan_social_topic,
+#                 topic=topic,
+#                 timeout_sec=SOCIAL_SCAN_TIMEOUT_SEC,
+#                 fallback_key="sample_posts",
+#             ),
+#             _safe_scan_topic_signals(
+#                 label="news",
+#                 scanner=scan_news_topic,
+#                 topic=topic,
+#                 timeout_sec=NEWS_SCAN_TIMEOUT_SEC,
+#                 fallback_key="sample_articles",
+#             ),
+#         )
+
+#         # ── Build context blocks ──
+#         db_context, web_context = "", ""
+#         source_urls: list[str] = []
+
+#         if db_results:
+#             db_blocks = [item.get("content", "") for item in db_results]
+#             db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
+#             source_urls.extend([
+#                 item["source_url"] for item in db_results if item.get("source_url")
+#             ])
+
+#         if new_articles:
+#             web_blocks = [f"Source: {art['title']}\n{art['text']}" for art in new_articles]
+#             web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
+#             source_urls.extend([art["url"] for art in new_articles])
+#             for article in new_articles:
+#                 background_tasks.add_task(
+#                     add_scraped_data_to_db,
+#                     article["title"],
+#                     article["text"],
+#                     article["url"],
+#                     "",
+#                     topic,
+#                     base_keywords,
+#                 )
+
+#         social_data = social_payload.get("sample_posts") or []
+#         news_data = news_payload.get("sample_articles") or []
+
+#         # ── STAGE 3: Idea generation ──
+#         print("--- Stage 3: Generating ideas ---")
+#         idea_clusters = await generate_cags_aligned_ideas(
+#             topic=topic,
+#             gap_angles=gap_angles,
+#             briefs=briefs,
+#             perspective_tree=perspective_tree,
+#             social_data=social_data,
+#             news_data=news_data,
+#             db_context=db_context,
+#             web_context=web_context,
+#             max_angles=int(request.max_angles or 5),
+#             ideas_per_angle=int(request.ideas_per_angle or 3),
+#             used_angle_ids=request.used_angle_ids or [],
+#             deepseek_client=deepseek_client,
+#         )
+
+#         idea_clusters["source_of_context"] = source_of_context
+#         idea_clusters["generated_keywords"] = base_keywords
+#         idea_clusters["source_urls"] = list(set(source_urls))
+#         idea_clusters["cags"] = {
+#             "tss": tss_payload.get("tss"),
+#             "csi": (tss_payload.get("csi") or {}).get("csi"),
+#             "total_angles": len(gap_angles),
+#         }
+
+#         final_ideas, final_descriptions = [], []
+#         for cluster in idea_clusters.get("idea_clusters") or []:
+#             for variant in cluster.get("idea_variants") or []:
+#                 title = str(variant.get("title") or "").strip()
+#                 description = str(variant.get("description") or "").strip()
+#                 if title and description:
+#                     final_ideas.append(title)
+#                     final_descriptions.append(description)
+
+#         idea_clusters["ideas"] = final_ideas
+#         idea_clusters["descriptions"] = final_descriptions
+#         idea_clusters["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
+#         idea_clusters["total_request_time_sec"] = round(time.time() - total_start_time, 2)
+
+#         if len(final_ideas) > 0:
+#             if _payload_uses_fallback_variants(idea_clusters):
+#                 print(f"Skipping cache write for '{topic}' because fallback variants were used.")
+#                 idea_clusters["cache_write_skipped"] = "fallback_variants"
+#         else:
+#             print(f"Skipping cache write for '{topic}' because no ideas were generated.")
+
+#         print(f"Total /generate-ideas time: {idea_clusters['total_request_time_sec']:.2f}s")
+#         return idea_clusters
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         import traceback
+#         print(f"Error in /generate-ideas: {e}")
+#         traceback.print_exc()
+#         return {"error": "An error occurred in the idea generation pipeline.", "detail": str(e)}
 
 
 async def pick_best_template(topic: str, templates: list) -> dict:

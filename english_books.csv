@@ -1,7 +1,0 @@
--> md5 
--> content_type => { index,content_list,preface,chapters numbers,acronomys, : related text}
-=> txt_chunk => chunks_size = 1000
-=> embeddings 
-
-=> sparse vector bm25 study 
-=> metadata in json vs metadata in sperate col for searching

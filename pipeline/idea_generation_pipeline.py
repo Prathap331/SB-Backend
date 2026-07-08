@@ -40,7 +40,6 @@ deepseek_client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
-
 print("dotenv loaded:", os.path.exists(".env"))
 print("key exists:", "DEEPSEEK_API_KEY" in os.environ)
 print("value:", os.environ.get("DEEPSEEK_API_KEY"))
