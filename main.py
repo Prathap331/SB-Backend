@@ -1957,7 +1957,7 @@ from fastapi import HTTPException, BackgroundTasks
 import os
 from openai import OpenAI
 
-openai_client = OpenAI(api_key=os.getenv("OPEN_AI"))
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 HASH_FEATURES = 2**18
 MAX_WEB_SOURCES = 10  
