@@ -1941,6 +1941,73 @@ async def process_topic(request: PromptRequest, background_tasks: BackgroundTask
 
 
 
+from typing import List
+
+app = FastAPI()
+
+_bge_model = None
+
+def to_pgvector(embedding) -> str:
+    return "[" + ",".join(str(float(x)) for x in embedding) + "]"
+
+def get_model():
+    global _bge_model
+    if _bge_model is None:
+        from sentence_transformers import SentenceTransformer
+        print("[MODEL] Loading BAAI/bge-m3")
+        _bge_model = SentenceTransformer("BAAI/bge-m3")
+    return _bge_model
+
+
+class Idea(BaseModel):
+    title: str
+    description: str
+
+
+class SaveIdeasRequest(BaseModel):
+    topic: str
+    topic_summary: str
+    ideas: List[Idea]
+
+
+@app.post("/save-ideas")
+async def save_ideas(data: SaveIdeasRequest):
+    print("Topic:", data.topic)
+    print("Topic Summary:", data.topic_summary)
+
+    print("\nIdeas:")
+    for i, idea in enumerate(data.ideas, start=1):
+        print(f"\n{i}. {idea.title}")
+        print(idea.description)
+
+    model = get_model()
+
+    topic_embedding, summary_embedding = model.encode(
+        [data.topic, data.topic_summary],
+        normalize_embeddings=True,
+    )
+
+    ideas_payload = [idea.model_dump() for idea in data.ideas]
+
+    row = {
+        "topic": data.topic,
+        "ideas": ideas_payload,
+        "topic_embeddings": to_pgvector(topic_embedding),
+        "summary_embeddings": to_pgvector(summary_embedding),
+    }
+
+    try:
+        result = supabase.table("saved_ideas").insert(row).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Supabase insert failed: {e}")
+
+    return {
+        "message": "Ideas received successfully",
+        "total_ideas": len(data.ideas),
+        "row_id": result.data[0]["id"] if result.data else None,
+    }
+
+
 
 import hashlib
 import re
@@ -2670,74 +2737,6 @@ async def generate_ideas_endpoint(
 
 
 
-
-from typing import List
-
-app = FastAPI()
-
-
-_bge_model = None
-
-
-def to_pgvector(embedding) -> str:
-    return "[" + ",".join(str(float(x)) for x in embedding) + "]"
-
-def get_model():
-    global _bge_model
-    if _bge_model is None:
-        from sentence_transformers import SentenceTransformer
-        print("[MODEL] Loading BAAI/bge-m3")
-        _bge_model = SentenceTransformer("BAAI/bge-m3")
-    return _bge_model
-
-
-class Idea(BaseModel):
-    title: str
-    description: str
-
-
-class SaveIdeasRequest(BaseModel):
-    topic: str
-    topic_summary: str
-    ideas: List[Idea]
-
-
-@app.post("/save-ideas")
-async def save_ideas(data: SaveIdeasRequest):
-    print("Topic:", data.topic)
-    print("Topic Summary:", data.topic_summary)
-
-    print("\nIdeas:")
-    for i, idea in enumerate(data.ideas, start=1):
-        print(f"\n{i}. {idea.title}")
-        print(idea.description)
-
-    model = get_model()
-
-    topic_embedding, summary_embedding = model.encode(
-        [data.topic, data.topic_summary],
-        normalize_embeddings=True,
-    )
-
-    ideas_payload = [idea.model_dump() for idea in data.ideas]
-
-    row = {
-        "topic": data.topic,
-        "ideas": ideas_payload,
-        "topic_embeddings": to_pgvector(topic_embedding),
-        "summary_embeddings": to_pgvector(summary_embedding),
-    }
-
-    try:
-        result = supabase.table("saved_ideas").insert(row).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Supabase insert failed: {e}")
-
-    return {
-        "message": "Ideas received successfully",
-        "total_ideas": len(data.ideas),
-        "row_id": result.data[0]["id"] if result.data else None,
-    }
 
 
 
