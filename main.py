@@ -9,10 +9,6 @@ from postgrest.exceptions import APIError
 from supabase_auth.types import User
 from openai import AsyncOpenAI
 from auth_dependencies import get_current_user, login_user, refresh_access_token
-from researchAgent.tss_v3 import run_tss
-# from pipeline.idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas
-# from signals.social_market_signals import scan_topic as scan_social_topic
-# from signals.news_market_signals import scan_topic as scan_news_topic
 import os
 from openai import OpenAI
 from channelMemory.aiIntel import get_intelligence
@@ -29,9 +25,8 @@ from script_templates.selector import select_template_key
 from script_templates.injector import assemble_structure_section, assemble_chapter_scaffold
 
 from google import genai
-from seoAgent.seo import seo_agent
+# from seoAgent.seo import seo_agent
 from ddgs import DDGS
-import os
 import asyncio
 import time
 import re
@@ -50,7 +45,7 @@ from ddgs import DDGS
 from readability import Document
 from pytrends.request import TrendReq
 from channelMemory.channelMemory import process_pdf
-from channelMemory.aiIntel import get_chunks_from_db
+# from channelMemory.aiIntel import get_chunks_from_db
 
 load_dotenv()
 
@@ -109,8 +104,6 @@ client = genai.Client(api_key=google_api_key)
 
 print(google_api_key)
 
-# ── SINGLE lazy-loaded embedding model (fixes double-load OOM) ──
-# We use ONE model loaded on first use. Do NOT load at import time.
 _st_model = None
 
 def _get_st_model():
@@ -141,7 +134,6 @@ groq_client = AsyncOpenAI(
 
 SCRIPT_FRAMECHECK_PROVIDER = (os.getenv("SCRIPT_FRAMECHECK_PROVIDER") or "groq").strip().lower()
 
-# ── Google GenAI client(s) (NEW SDK) ─────────────────────────
 def _collect_embed_keys() -> list[str]:
     ordered = [
         (os.getenv("GOOGLE_API_KEY1") or "").strip(),
@@ -163,7 +155,6 @@ EMBED_CLIENTS = [genai.Client(api_key=key) for key in GOOGLE_EMBED_KEYS]
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 
-# ── OpenRouter (LLM generation) ──────────────────────────────
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 if not openrouter_api_key:
     raise ValueError("OPENROUTER_API_KEY not found.")
@@ -251,33 +242,7 @@ deepseek_client = OpenAI(
 print("deepseek", os.environ.get("DEEPSEEK_API_KEY"))
 
 
-def _cap_blocks(blocks: list[str], max_blocks: int, max_chars: int) -> str:
-    selected = [b.strip() for b in blocks if b and b.strip()][:max_blocks]
-    merged = "\n\n".join(selected)
-    if len(merged) > max_chars:
-        merged = merged[:max_chars]
-    return merged
 
-
-def _payload_uses_fallback_variants(payload: dict[str, Any] | None) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    clusters = payload.get("idea_clusters")
-    if not isinstance(clusters, list):
-        return False
-    for cluster in clusters:
-        variants = (cluster or {}).get("idea_variants")
-        if not isinstance(variants, list):
-            continue
-        for variant in variants:
-            reason = str((variant or {}).get("gap_reason") or "").lower()
-            if "fallback expansion" in reason:
-                return True
-    return False
-
-
-# ── Embedding helpers ─────────────────────────────────────────
-# All embedding now goes through ONE path using the single lazy model.
 
 from dataclasses import dataclass
 
@@ -405,15 +370,11 @@ async def generate_script_content(messages: list) -> str:
         return await openrouter_generate(messages)
 
 
-# ── Supabase ─────────────────────────────────────────────────
 if not supabase_url_env or not supabase_key_env:
     raise ValueError("Supabase credentials not found in .env file")
 print("Supabase client initialized.")
 
 
-# ════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
-# ════════════════════════════════════════════════════════════
 
 def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> list[str]:
     try:
@@ -1115,22 +1076,6 @@ class ChannelContextInput(BaseModel):
 class SEOAgentRequest(BaseModel):
     context: AgentPipelineContext
     channel_context: ChannelContextInput | None = None
-
-
-async def _safe_scan_topic_signals(
-    *,
-    label: str,
-    scanner: Any,
-    topic: str,
-    timeout_sec: int,
-    fallback_key: str,
-) -> dict[str, Any]:
-    try:
-        payload = await asyncio.wait_for(asyncio.to_thread(scanner, topic), timeout=timeout_sec)
-        return payload if isinstance(payload, dict) else {fallback_key: []}
-    except Exception as exc:
-        print(f"[warn] {label} scan failed ({exc}); falling back to empty signal")
-        return {fallback_key: []}
 
 
 BLOCKED_TITLE_TYPES = {
@@ -1977,20 +1922,15 @@ async def save_ideas(data: SaveIdeasRequest):
     }
 
 
-
-
-
+import os
 import hashlib
 import re
 import asyncio
 from sklearn.feature_extraction.text import HashingVectorizer
 from fastapi import HTTPException, BackgroundTasks
-import os
 from openai import OpenAI
+import trafilatura
 
-# NOTE: package was renamed from `duckduckgo_search` to `ddgs`.
-# This tries the new name first and falls back to the old one so the
-# import doesn't break depending on what's installed.
 try:
     from ddgs import DDGS
 except ImportError:
@@ -2206,17 +2146,18 @@ def _sparse_cosine(query_sparse: dict, doc_sparse: dict) -> float:
     return sum(query_sparse[k] * doc_sparse[k] for k in shared_keys)
 
 
-# NEW: pgvector literal formatter
 def to_pgvector(embedding) -> str:
     """Format a numpy/list embedding as a pgvector literal string, e.g. '[0.1,0.2,...]'."""
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
 
 
-# NEW: SEMANTIC MATCH AGAINST PREVIOUSLY SAVED IDEAS
+# ============================================================
+# SEMANTIC MATCH AGAINST PREVIOUSLY SAVED IDEAS
+# ============================================================
 
-TOPIC_SIMILARITY_THRESHOLD = 0.55     
-SUMMARY_SIMILARITY_THRESHOLD = 0.45  
-RPC_RAW_FETCH_THRESHOLD = 0.0         
+TOPIC_SIMILARITY_THRESHOLD = 0.55
+SUMMARY_SIMILARITY_THRESHOLD = 0.45
+RPC_RAW_FETCH_THRESHOLD = 0.0  # matches the SQL function's default; keep in sync
 
 async def get_similar_saved_ideas(
     topic: str,
@@ -2228,19 +2169,24 @@ async def get_similar_saved_ideas(
     """
     Semantic match against the `saved_ideas` table (topic_embeddings /
     summary_embeddings columns, both plain vector(1024)).
- 
+
     A saved idea counts as a "match" if EITHER:
       - topic_similarity >= topic_threshold, OR
       - summary_similarity >= summary_threshold
- 
+
     This OR logic matters because `topic` (short) vs saved topic (short)
     and `hyde_doc` (long, narrow expansion) vs saved topic_summary (short,
     broad synthesis) are fundamentally different comparisons with
     different natural score ranges. Requiring both to clear the same bar
     silently kills valid matches.
+
+    NOTE: this requires the `match_saved_ideas` SQL function to return
+    topic_similarity and summary_similarity as SEPARATE columns (not one
+    merged `similarity`), and to accept similarity_threshold=0 to return
+    unfiltered raw candidates for ranking here.
     """
     print(f"[MATCH] Searching saved_ideas for topic: '{topic}'")
- 
+
     model = _get_st_model()
     topic_embedding, summary_query_embedding = await asyncio.to_thread(
         lambda: model.encode(
@@ -2248,7 +2194,7 @@ async def get_similar_saved_ideas(
             normalize_embeddings=True,
         )
     )
- 
+
     try:
         result = await asyncio.to_thread(
             lambda: supabase.rpc(
@@ -2257,10 +2203,6 @@ async def get_similar_saved_ideas(
                     "query_topic_embedding": to_pgvector(topic_embedding),
                     "query_summary_embedding": to_pgvector(summary_query_embedding),
                     "match_count": match_count,
-                    # Pull raw candidates back; do NOT filter inside the RPC.
-                    # If your SQL function doesn't support 0 / disabling the
-                    # filter, temporarily edit it to default the threshold
-                    # param to 0 so this call returns everything ranked.
                     "similarity_threshold": RPC_RAW_FETCH_THRESHOLD,
                 },
             ).execute()
@@ -2270,44 +2212,41 @@ async def get_similar_saved_ideas(
         import traceback
         traceback.print_exc()
         return []
- 
+
     candidates = result.data or []
     print(f"[MATCH] RPC returned {len(candidates)} raw candidates (unfiltered)")
- 
-    # Log every raw candidate's scores BEFORE filtering so you can see
-    # exactly what's being compared and why something does/doesn't pass.
+
     for i, row in enumerate(candidates, start=1):
-        t_sim = row.get("topic_similarity", row.get("similarity"))
+        t_sim = row.get("topic_similarity")
         s_sim = row.get("summary_similarity")
         print(
             f"  [RAW-{i}] topic='{row.get('topic')}' "
             f"topic_similarity={t_sim} summary_similarity={s_sim}"
         )
- 
+
     matches = []
     for row in candidates:
-        t_sim = row.get("topic_similarity", row.get("similarity")) or 0.0
+        t_sim = row.get("topic_similarity") or 0.0
         s_sim = row.get("summary_similarity") or 0.0
- 
+
         if t_sim >= topic_threshold or s_sim >= summary_threshold:
             matches.append(row)
- 
+
     matches.sort(
         key=lambda r: max(
-            r.get("topic_similarity", r.get("similarity")) or 0.0,
+            r.get("topic_similarity") or 0.0,
             r.get("summary_similarity") or 0.0,
         ),
         reverse=True,
     )
- 
+
     print(f"[MATCH] {len(matches)}/{len(candidates)} candidates passed OR-threshold filter")
     for i, row in enumerate(matches, start=1):
-        t_sim = row.get("topic_similarity", row.get("similarity"))
+        t_sim = row.get("topic_similarity")
         s_sim = row.get("summary_similarity")
         print(f"  [MATCH-{i}] topic='{row.get('topic')}' topic_sim={t_sim} summary_sim={s_sim}")
- 
-    return matches
 
+    return matches
 
 
 # ============================================================
@@ -2464,10 +2403,49 @@ async def _generate_search_keywords(topic: str) -> list[str]:
     return keywords
 
 
-async def get_ddgs_news_context(topic: str, scraped_urls: set, max_results: int = 5) -> list[dict]:
+def _truncate_words(text: str, max_words: int = 400) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]) + "..."
+
+
+def _fetch_full_article_text(url: str) -> str:
+    """
+    Fetch and extract clean article text from a URL. Returns '' on failure.
+    NOTE: trafilatura.fetch_url() does NOT accept a `timeout` kwarg directly.
+    Timeout is instead enforced by the caller via asyncio.wait_for
+    (see _fetch_full_article_text_with_timeout below).
+    """
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return ""
+        text = trafilatura.extract(downloaded) or ""
+        return text.strip()
+    except Exception as e:
+        print(f"[FETCH] failed to extract {url}: {e}")
+        return ""
+
+
+async def _fetch_full_article_text_with_timeout(url: str, timeout: float = 8.0) -> str:
+    """Runs the blocking fetch in a thread and bounds it with a real timeout,
+    so one slow/hanging site (MSN etc.) can't stall the whole pipeline."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_fetch_full_article_text, url),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        print(f"[FETCH] timed out fetching {url}")
+        return ""
+
+
+async def get_ddgs_news_context(topic: str, scraped_urls: set, max_results: int = 10) -> list[dict]:
     """
     Runs DDGS news search across LLM-generated keyword variants, dedupes by URL
-    against scraped_urls, and returns AT MOST MAX_WEB_SOURCES article dicts.
+    against scraped_urls, fetches full article text for each result, and
+    returns AT MOST MAX_WEB_SOURCES article dicts.
     Stops issuing further keyword searches once the cap is reached.
     """
     print(f"[DDGS] Starting news search for topic: '{topic}'")
@@ -2493,15 +2471,21 @@ async def get_ddgs_news_context(topic: str, scraped_urls: set, max_results: int 
             if url in scraped_urls:
                 continue
             scraped_urls.add(url)
-            articles.append({"url": url, "snippet": snippet})
+
+            # fetch full article text instead of relying on the truncated DDGS snippet
+            full_text = await _fetch_full_article_text_with_timeout(url)
+            used_source = "full" if full_text else "fallback"
+            content = full_text if full_text else snippet  # fallback to snippet if fetch fails
+
+            content = _truncate_words(content, max_words=400)
+            articles.append({"url": url, "snippet": content, "source": used_source})
 
     print(f"[DDGS] {len(articles)} unique articles collected (capped at {MAX_WEB_SOURCES}):")
     for i, article in enumerate(articles, start=1):
-        print(f"  [NEWS-{i}] {article['url']}")
-        print(f"    snippet: {article['snippet'][:200]}{'...' if len(article['snippet']) > 200 else ''}")
+        print(f"  [NEWS-{i}] ({article['source']}) {article['url']}")
+        print(f"    snippet: {article['snippet']}")
 
     return articles
-
 
 
 def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> str:
@@ -2524,6 +2508,12 @@ def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> st
     return "\n\n".join(parts) if parts else "No additional context available."
 
 
+# ============================================================
+# PARSING: split the LLM's raw output into an "ideas" block and
+# a "topic summary" block BEFORE parsing ideas out of it. This is
+# what prevents the last idea's description from swallowing the
+# entire topic summary section.
+# ============================================================
 
 _SPLIT_ON_SUMMARY_HEADER = re.compile(
     r"\n\s*(?:#+\s*)?(?:\*\*)?"
@@ -2676,7 +2666,6 @@ Content Chunks:
 @app.post("/generate-ideas")
 async def generate_ideas_endpoint(
     request: GenerateIdeasRequest,
-    background_tasks: BackgroundTasks,
 ):
     topic = request.topic.strip()
 
@@ -2725,8 +2714,6 @@ async def generate_ideas_endpoint(
         The output will be embedded and matched against a vector database to retrieve semantically relevant documents for generating high-quality YouTube documentary scripts. Optimize for semantic recall while maintaining precise topic relevance.
 
         """
-        # FIX: this was a blocking sync call inside an async endpoint,
-        # stalling the event loop for the duration of the request.
         res = await asyncio.to_thread(
             openai_client.chat.completions.create,
             model="gpt-5.4-mini",
@@ -2738,12 +2725,8 @@ async def generate_ideas_endpoint(
         print(f"[HYDE] {hyde_doc}")
 
         db_task = asyncio.create_task(get_context_from_db(topic, hyde_doc))
-        # NEW: run the saved_ideas semantic match concurrently with DB retrieval
         similar_task = asyncio.create_task(get_similar_saved_ideas(topic, hyde_doc))
 
-        # FIX: previously always slept the full 11s even if the DB task
-        # finished much sooner. asyncio.wait returns as soon as the task
-        # completes, or after the timeout — whichever comes first.
         done, pending = await asyncio.wait({db_task}, timeout=11)
 
         db_results = []
@@ -2774,7 +2757,6 @@ async def generate_ideas_endpoint(
                 print(f"[MAIN] DB task raised an error on late check: {e}")
                 db_results = []
 
-        # NEW: resolve the saved_ideas semantic match (won't block long, cheap RPC)
         try:
             similar_saved_ideas = await asyncio.wait_for(similar_task, timeout=5)
         except asyncio.TimeoutError:
@@ -2816,658 +2798,15 @@ async def generate_ideas_endpoint(
 
 
 
-# import hashlib
-# import re
-# import asyncio
-# from sklearn.feature_extraction.text import HashingVectorizer
-# from fastapi import HTTPException, BackgroundTasks
 
-# # ============================================================
-# # CONFIG
-# # ============================================================
 
-# HASH_FEATURES = 2**18
-# MAX_WEB_SOURCES = 10  # cap on total scraped/news sources fed into idea generation
 
-# TABLES = [
-#     "duplicate_RAG_Entrepreneurship",
-#     "duplicate_RAG_Anthropology",
-#     "duplicate_RAG_Biography",
-# ]
 
-# IDEAS_SYSTEM_PROMPT = """
-# You are a senior YouTube content strategist and analytical framework specialist. Your sole function is to dissect topics using the **Unified Content Perspective Framework** to generate 8–10 deeply unique, non-redundant video ideas.
 
-# ## MANDATORY FRAMEWORK (Internal Logic)
-# You must construct every perspective by layering these 6 dimensions:
 
-# 1. **STAKEHOLDER (WHO)**: Universal (Gov, Public, Media, Corporations, Workers, Experts, Judiciary) OR Contextual (Youth, Rural, Women, specific communities, activists).
-# 2. **DISCIPLINE (WHAT)**: 1–2 lenses from History, Econ, Law, Sociology, Tech, Psychology, Env, Ethics, Geopolitics, Policy.
-# 3. **TIME/SCALE (WHEN/WHERE)**: Past/Present/Future × Local/National/Global.
-# 4. **SYSTEM DYNAMIC (HOW EVOLVES)**: Cause-effect, Feedback loop, Trade-off, Second-order effects, Risk scenario.
-# 5. **POWER/STRUCTURE (WHO BENEFITS)**: Inequality, Corporate influence, Institutional failure, Historical legacy, Policy bias, Identity dynamics.
-# 6. **NARRATIVE FRAME (HOW TO TELL)**: Crisis, Opportunity, Conflict, Human story, Hidden angle, Myth vs Reality, Data-driven.
 
-# **Rule**: Always start with WHO. Ensure perspectives span micro (individual/psychology) to macro (geopolitics/global systems). Avoid obvious summaries—every angle must reveal a hidden "why" and a "who gains/loses".
 
-# ## OUTPUT SPECIFICATION
-# When the user supplies a **[TOPIC]** and **[CONTENT CHUNKS]**, generate exactly 8 to 10 ideas. Use this exact structure for every idea:
 
-# ---
-
-# **Title**: [Exactly 8-15 words. Clickable, provocative, and curiosity-driven.]
-
-# **Description**: [Exactly 50-70 words. Must explicitly articulate: the chosen stakeholder, the systemic/power dynamic uncovered, and the implication that mainstream coverage misses.]
-
-# ---
-
-# ## CRITICAL CONSTRAINTS
-# - **Do not** generate obvious, news-summary, or generic angles.
-# - **Do not** reuse the same stakeholder or time-frame across more than 2 ideas.
-# - Every description **must** answer: *"Why did this happen, who is silently benefiting, and what happens next?"*
-# - Ensure full variety—cover conflicting stakeholders (e.g., workers vs. corporations, global north vs. south, present vs. future generations).
-
-# """
-
-# KEYWORD_GEN_PROMPT_TEMPLATE = """You are an advanced SEO and research query generation engine optimized for comprehensive information retrieval across all topic domains including science, politics, economics, technology, culture, history, current affairs, and business.
-# Your task: Convert the user-provided [TOPIC] into exactly 10-15 highly specific, multi-word search engine keyword combinations.
-# Internal dimensional analysis requirement: Systematically generate keyword combinations that cover:
-# - Core terminology and commonly used phrases
-# - Historical origins and evolution
-# - Current/present state and latest developments
-# - Future trends, predictions, or emerging patterns
-# - Causal factors and driving forces
-# - Consequences, impacts, and ripple effects
-# - Geographic/regional dimensions (local, national, global)
-# - Key individuals, leaders, or influential figures
-# - Organizations, institutions, government bodies, or corporations
-# - Related industries, sectors, or adjacent fields
-# - Controversies, debates, or conflicting perspectives
-# - Regulatory, policy, or legal dimensions
-# - Economic, financial, or market implications
-# - Social, cultural, or demographic angles
-# - Technological or scientific aspects where applicable
-# - News events, recent developments, and breaking stories
-# - Case studies, real-world examples, or specific instances
-# - Data, statistics, or empirical evidence
-# Prioritize phrases optimized for discovering:
-# - Latest news articles and current coverage
-# - Research papers and academic publications
-# - Government publications and policy documents
-# - Industry reports and market analyses
-# - Books and long-form content
-# - High-authority websites and institutional sources
-# Strict output constraints:
-# - Each combination must contain exactly 4 to 8 words
-# - Do NOT use questions, full sentences, quotation marks, numbering, bullet points, markdown, or introductory phrases
-# - Output ONLY the keyword combinations, one per line
-# - No explanations, headings, or additional text
-# Ensure each keyword combination modifies the core topic with a specific analytical dimension rather than generic single-concept terms. Include a mix of recent news-oriented phrases and deeper analytical/contextual phrases.
-# Now generate keyword combinations for the following user query.
-
-# [TOPIC]: {topic}
-# """
-
-# # ============================================================
-# # MODEL / VECTORIZER LOADING (lazy singletons)
-# # ============================================================
-
-# _bge_model = None
-# def _get_st_model():
-#     global _bge_model
-#     if _bge_model is None:
-#         from sentence_transformers import SentenceTransformer
-#         print("[MODEL] Loading BAAI/bge-m3")
-#         _bge_model = SentenceTransformer("BAAI/bge-m3")
-#         print("[MODEL] BAAI/bge-m3 loaded")
-#     return _bge_model
-
-# _sparse_vectorizer = None
-# def get_sparse_vectorizer() -> HashingVectorizer:
-#     global _sparse_vectorizer
-#     if _sparse_vectorizer is None:
-#         _sparse_vectorizer = HashingVectorizer(
-#             n_features=HASH_FEATURES,
-#             alternate_sign=False,
-#             norm="l2",
-#         )
-#     return _sparse_vectorizer
-
-
-# def _sparse_row_to_dict(sparse_row) -> dict:
-#     coo = sparse_row.tocoo()
-#     return {str(int(idx)): float(val) for idx, val in zip(coo.col, coo.data)}
-
-
-# def _sparse_cosine(query_sparse: dict, doc_sparse: dict) -> float:
-#     if not query_sparse or not doc_sparse:
-#         return 0.0
-#     shared_keys = query_sparse.keys() & doc_sparse.keys()
-#     return sum(query_sparse[k] * doc_sparse[k] for k in shared_keys)
-
-
-# # ============================================================
-# # DB RETRIEVAL (dense ANN via SQL + sparse rerank in Python)
-# # ============================================================
-
-# async def get_context_from_db(topic: str, hyde_doc: str = None, final_k: int = 7):
-#     print(f"[DB] Starting retrieval for topic: '{topic}'")
-
-#     table_selector_prompt = f"""
-#     You are a routing assistant. Given a topic, select the single most relevant
-#     table from the list below that would contain source documents for that topic.
-
-#     Available tables:
-#     - duplicate_RAG_Entrepreneurship: startups, business strategy, venture capital, founders
-#     - duplicate_RAG_Anthropology: human culture, society, archaeology, ethnography
-#     - duplicate_RAG_Biography: individual people's lives, histories, memoirs
-
-#     Topic: "{topic}"
-
-#     Respond with ONLY the exact table name from the list above, nothing else.
-#     """
-
-#     res = await asyncio.to_thread(
-#         deepseek_client.chat.completions.create,
-#         model="deepseek-v4-pro",
-#         messages=[{"role": "user", "content": table_selector_prompt}],
-#         stream=False,
-#     )
-#     table_name = res.choices[0].message.content.strip("`'\" \n")
-
-#     if table_name not in TABLES:
-#         print(f"[DB] table selector returned unexpected value '{table_name}', defaulting to {TABLES[0]}")
-#         table_name = TABLES[0]
-#     else:
-#         print(f"[DB] Selected table: {table_name}")
-
-#     embedding_source = hyde_doc if hyde_doc else topic
-
-#     model = _get_st_model()
-#     dense_embedding = await asyncio.to_thread(
-#         lambda: model.encode(
-#             embedding_source,
-#             convert_to_numpy=True,
-#             normalize_embeddings=True,
-#         ).tolist()
-#     )
-#     print("[DB] Dense embedding computed")
-
-#     vectorizer = get_sparse_vectorizer()
-#     sparse_row = await asyncio.to_thread(lambda: vectorizer.transform([embedding_source]))
-#     query_sparse = _sparse_row_to_dict(sparse_row)
-#     print("[DB] Sparse embedding computed")
-
-#     try:
-#         result = await asyncio.to_thread(
-#             lambda: supabase.rpc(
-#                 "match_documents",
-#                 {
-#                     "query_dense_embedding": dense_embedding,
-#                     "match_table": table_name,
-#                     "match_count": 20,
-#                 },
-#             ).execute()
-#         )
-#     except Exception as e:
-#         print(f"[DB] vector search failed: {e}")
-#         return []
-
-#     candidates = result.data or []
-#     print(f"[DB] RPC returned {len(candidates)} candidates from {table_name}")
-
-#     reranked = []
-#     for row in candidates:
-#         doc_sparse = row.get("sparse_vector") or {}
-#         sparse_score = _sparse_cosine(query_sparse, doc_sparse)
-#         dense_score = row.get("dense_score", 0.0)
-#         combined = (0.7 * dense_score) + (0.3 * sparse_score)
-#         reranked.append({**row, "sparse_score": sparse_score, "combined_score": combined})
-
-#     reranked.sort(key=lambda r: r["combined_score"], reverse=True)
-#     matches = reranked[:final_k]
-
-#     print(f"[DB] Top {len(matches)} chunks after hybrid rerank:")
-#     for i, row in enumerate(matches, start=1):
-#         content = row.get("content")
-#         md5 = row.get("md5") or (
-#             hashlib.md5(content.encode("utf-8")).hexdigest() if content else None
-#         )
-#         print(f"  [DB-{i}] md5={md5} combined_score={row['combined_score']:.4f}")
-#         print(f"    content: {content[:200]}{'...' if content and len(content) > 200 else ''}")
-
-#     return matches
-
-
-# # ============================================================
-# # DDGS NEWS SEARCH (LLM-generated keywords, capped source count)
-# # ============================================================
-
-# def _ddgs_search_for_ideas(keyword: str, max_results: int) -> list[tuple[str, str]]:
-#     results: list[tuple[str, str]] = []
-#     try:
-#         with DDGS() as ddgs:
-#             for r in ddgs.news(keyword, max_results=max_results):
-#                 url = r.get("url")
-#                 snippet = r.get("body", "") or r.get("title", "")
-#                 if url:
-#                     results.append((url, snippet))
-#     except Exception as e:
-#         print(f"[DDGS] search failed for '{keyword}': {e}")
-#     return results
-
-
-# def _parse_keyword_lines(raw: str) -> list[str]:
-#     """Split LLM output into clean keyword lines, stripping stray bullets/numbering/quotes."""
-#     lines = []
-#     for line in raw.strip().splitlines():
-#         line = line.strip()
-#         if not line:
-#             continue
-#         line = re.sub(r"^[\-\*\u2022]\s*", "", line)
-#         line = re.sub(r"^\d+[\.\)]\s*", "", line)
-#         line = line.strip("\"'` ")
-#         if line:
-#             lines.append(line)
-#     return lines
-
-
-# async def _generate_search_keywords(topic: str) -> list[str]:
-#     prompt = KEYWORD_GEN_PROMPT_TEMPLATE.format(topic=topic)
-
-#     try:
-#         res = await asyncio.to_thread(
-#             deepseek_client.chat.completions.create,
-#             model="deepseek-v4-pro",
-#             messages=[{"role": "user", "content": prompt}],
-#             stream=False,
-#         )
-#         raw = res.choices[0].message.content.strip()
-#     except Exception as e:
-#         print(f"[DDGS] keyword generation failed: {e}")
-#         return [f"{topic} latest news today", f"{topic} 2026 update"]
-
-#     keywords = _parse_keyword_lines(raw)
-
-#     if not keywords:
-#         print("[DDGS] keyword generation returned nothing usable, using fallback")
-#         return [f"{topic} latest news today", f"{topic} 2026 update"]
-
-#     print(f"[DDGS] generated {len(keywords)} keywords")
-#     for i, kw in enumerate(keywords, start=1):
-#         print(f"  [KW-{i}] {kw}")
-
-#     return keywords
-
-
-# async def get_ddgs_news_context(topic: str, scraped_urls: set, max_results: int = 5) -> list[dict]:
-#     """
-#     Runs DDGS news search across LLM-generated keyword variants, dedupes by URL
-#     against scraped_urls, and returns AT MOST MAX_WEB_SOURCES article dicts.
-#     Stops issuing further keyword searches once the cap is reached.
-#     """
-#     print(f"[DDGS] Starting news search for topic: '{topic}'")
-
-#     keywords = await _generate_search_keywords(topic)
-
-#     articles = []
-#     for keyword in keywords:
-#         if len(articles) >= MAX_WEB_SOURCES:
-#             print(f"[DDGS] Reached cap of {MAX_WEB_SOURCES} sources, stopping further keyword searches")
-#             break
-
-#         try:
-#             pairs = await asyncio.to_thread(_ddgs_search_for_ideas, keyword, max_results)
-#             print(f"[DDGS] keyword '{keyword}' returned {len(pairs)} results")
-#         except Exception as e:
-#             print(f"[DDGS] thread failed for '{keyword}': {e}")
-#             pairs = []
-
-#         for url, snippet in pairs:
-#             if len(articles) >= MAX_WEB_SOURCES:
-#                 break
-#             if url in scraped_urls:
-#                 continue
-#             scraped_urls.add(url)
-#             articles.append({"url": url, "snippet": snippet})
-
-#     print(f"[DDGS] {len(articles)} unique articles collected (capped at {MAX_WEB_SOURCES}):")
-#     for i, article in enumerate(articles, start=1):
-#         print(f"  [NEWS-{i}] {article['url']}")
-#         print(f"    snippet: {article['snippet'][:200]}{'...' if len(article['snippet']) > 200 else ''}")
-
-#     return articles
-
-
-# # ============================================================
-# # IDEA GENERATION (final LLM pass over combined context)
-# # ============================================================
-
-# def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> str:
-#     """Combine DB chunks and DDGS snippets into one context block for the LLM prompt."""
-#     parts = []
-
-#     if db_results:
-#         parts.append("=== KNOWLEDGE BASE EXCERPTS ===")
-#         for i, row in enumerate(db_results, start=1):
-#             content = row.get("content", "")
-#             parts.append(f"[KB-{i}] {content}")
-
-#     if new_articles:
-#         parts.append("\n=== RECENT NEWS ===")
-#         for i, article in enumerate(new_articles, start=1):
-#             snippet = article.get("snippet", "")
-#             url = article.get("url", "")
-#             parts.append(f"[NEWS-{i}] {snippet} (source: {url})")
-
-#     return "\n\n".join(parts) if parts else "No additional context available."
-
-
-# def _parse_ideas_markdown(raw: str) -> list[dict]:
-#     """
-#     Parses ideas in the format:
-#     **Title**: ...
-#     **Description**: ...
-#     (repeated, separated by --- or blank lines)
-#     """
-#     ideas = []
-#     pattern = re.compile(
-#         r"\*\*Title\*\*:\s*(.+?)\s*\n+\*\*Description\*\*:\s*(.+?)(?=\n+\*\*Title\*\*:|\Z)",
-#         re.DOTALL,
-#     )
-#     for match in pattern.finditer(raw):
-#         title = match.group(1).strip()
-#         description = match.group(2).strip()
-#         description = re.sub(r"\n?-{2,}\s*$", "", description).strip()
-#         ideas.append({"title": title, "description": description})
-#     return ideas
-
-
-# async def generate_ideas_from_context(topic: str, db_results: list[dict], new_articles: list[dict]) -> list[dict]:
-#     print(f"[IDEAS] Building context block ({len(db_results)} DB chunks, {len(new_articles)} news articles)")
-#     context_block = _build_ideas_context(db_results, new_articles)
-
-#     user_prompt = f"""Topic: "{topic}"
-
-# Content Chunks:
-# {context_block}
-# """
-
-#     print("[IDEAS] Sending prompt to deepseek-v4-pro")
-#     res = await asyncio.to_thread(
-#         deepseek_client.chat.completions.create,
-#         model="deepseek-v4-pro",
-#         messages=[
-#             {"role": "system", "content": IDEAS_SYSTEM_PROMPT},
-#             {"role": "user", "content": user_prompt},
-#         ],
-#         stream=False,
-#     )
-
-#     raw = res.choices[0].message.content.strip()
-
-#     ideas = _parse_ideas_markdown(raw)
-
-#     if ideas:
-#         print(f"[IDEAS] Parsed {len(ideas)} ideas successfully")
-#     else:
-#         print("[IDEAS] failed to parse any ideas from markdown format")
-#         print(f"[IDEAS] raw output was: {raw}")
-
-#     for i, idea in enumerate(ideas, start=1):
-#         print(f"  [IDEA-{i}] {idea.get('title')}")
-#         print(f"    {idea.get('description')}")
-
-#     return ideas
-
-
-# # ============================================================
-# # ENDPOINT
-# # ============================================================
-
-# @app.post("/generate-ideas")
-# async def generate_ideas_endpoint(
-#     request: GenerateIdeasRequest,
-#     background_tasks: BackgroundTasks,
-# ):
-#     topic = request.topic.strip()
-
-#     if not topic:
-#         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
-
-#     try:
-#         print("=" * 60)
-#         print(f"GENERATE IDEAS for topic: {topic}")
-#         print("=" * 60)
-
-#         hyde_prompt = f"""
-#     `You are a semantic expansion expert. Your sole task is to transform the user's short keyword phrase into a single, dense, 100–150 word paragraph that fully captures the depth, nuance, and intent behind their keywords. Expand the core meaning into a vivid, contextual narrative that explores underlying themes, emotional undertones, potential conflicts, unexpected angles, and human experiences connected to the keywords. Weave in cultural touchpoints, provocative questions, contrasting viewpoints, and actionable insights that add layers of meaning. Your expansion should surface implicit connections, reveal hidden dimensions, and create a rich semantic landscape that precisely represents what the user truly seeks. The paragraph must be evocative, mentally stimulating, and packed with conceptual anchors that enable highly accurate semantic matching with relevant content chunks.
-
-#     Topic: "{topic}"
-
-#     Output Format: Return ONLY the expanded paragraph (100–150 words). Do not include any introductory text, explanations, bullet points, or additional commentary."
-#         """
-#         res = deepseek_client.chat.completions.create(
-#             model="deepseek-v4-pro",
-#             messages=[{"role": "user", "content": hyde_prompt}],
-#             stream=False,
-#         )
-
-#         hyde_doc = res.choices[0].message.content.strip()
-#         print(f"[HYDE] {hyde_doc}")
-
-#         db_task = asyncio.create_task(get_context_from_db(topic, hyde_doc))
-#         await asyncio.sleep(11)
-
-#         db_results = []
-#         new_articles = []
-#         scraped_urls = set()
-
-#         if db_task.done():
-#             db_results = db_task.result()
-#             print(f"[MAIN] DB task finished within timeout. Found {len(db_results)} documents.")
-#         else:
-#             print("[MAIN] DB task still running after 11s timeout, proceeding without it for now.")
-
-#         print("[MAIN] Performing web search (mandatory, regardless of DB result count).")
-#         new_articles = await get_ddgs_news_context(topic, scraped_urls)
-
-#         if not db_results:
-#             if db_task.done():
-#                 late_results = db_task.result()
-#                 if late_results:
-#                     print(f"[MAIN] DB task finished late (during web search). Using {len(late_results)} documents.")
-#                     db_results = late_results
-#             else:
-#                 try:
-#                     db_results = await asyncio.wait_for(asyncio.shield(db_task), timeout=5)
-#                     print(f"[MAIN] DB task finished after extra wait. Found {len(db_results)} documents.")
-#                 except asyncio.TimeoutError:
-#                     print("[MAIN] DB task still not done after extra wait, proceeding without DB results.")
-#                     db_results = []
-#                 except Exception as e:
-#                     print(f"[MAIN] DB task raised an error on late check: {e}")
-#                     db_results = []
-
-#         print("-" * 60)
-#         print("[MAIN] Generating ideas from combined context")
-#         ideas = await generate_ideas_from_context(topic, db_results, new_articles)
-#         print("=" * 60)
-#         print(f"GENERATE IDEAS complete: {len(ideas)} ideas returned")
-#         print("=" * 60)
-
-#         return {
-#             "topic": topic,
-#             "ideas": ideas,
-#         }
-
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         import traceback
-#         print(f"[ERROR] /generate-ideas failed: {e}")
-#         traceback.print_exc()
-#         return {"error": "An error occurred in the idea generation pipeline.", "detail": str(e)}
-
-
-
-
-
-
-
-
-# @app.post("/generate-ideas")
-# async def generate_ideas_endpoint(
-#     request: GenerateIdeasRequest,
-#     background_tasks: BackgroundTasks,
-# ):
-#     total_start_time = time.time()
-#     topic = request.topic.strip()
-#     if not topic:
-#         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
-
-#     try:
-#         print(f"GENERATE IDEAS for topic: {topic}")
-
-#         # ── STAGE 1: TSS + DB lookup + keyword gen ALL in parallel ──
-#         print("--- Stage 1: TSS + DB lookup + keyword gen in parallel ---")
-#         tss_task = asyncio.create_task(
-#             asyncio.wait_for(run_tss(topic), timeout=TSS_TIMEOUT_SEC)
-#         )
-#         db_task = asyncio.create_task(get_db_context(topic))
-#         kw_task = asyncio.create_task(_generate_search_keywords(topic))
-
-#         tss_payload, db_results, base_keywords = await asyncio.gather(
-#             tss_task, db_task, kw_task
-#         )
-
-#         cags_payload = tss_payload.get("cags") or {}
-#         gap_angles = cags_payload.get("gap_angles") or []
-#         briefs = cags_payload.get("briefs") or []
-#         perspective_tree = cags_payload.get("perspective_tree") or []
-#         if not gap_angles or not perspective_tree:
-#             raise HTTPException(status_code=422, detail="No viable CAGS angles were produced.")
-
-#         # ── STAGE 2: Web scrape + social/news scans in parallel ──
-#         print("--- Stage 2: Web scrape + social + news scans in parallel ---")
-#         scraped_urls: set = set()
-#         db_count = len(db_results)
-
-#         if db_count >= 5:
-#             source_of_context = "DATABASE_RICH"
-#             scrape_coro = get_latest_news_context(topic, scraped_urls)
-#         else:
-#             source_of_context = "DATABASE_PARTIAL" if db_count >= 1 else "DEEP_SCRAPE"
-#             scrape_coro = deep_search_and_scrape(base_keywords, scraped_urls)
-
-#         (
-#             new_articles,
-#             social_payload,
-#             news_payload,
-#         ) = await asyncio.gather(
-#             scrape_coro,
-#             _safe_scan_topic_signals(
-#                 label="social",
-#                 scanner=scan_social_topic,
-#                 topic=topic,
-#                 timeout_sec=SOCIAL_SCAN_TIMEOUT_SEC,
-#                 fallback_key="sample_posts",
-#             ),
-#             _safe_scan_topic_signals(
-#                 label="news",
-#                 scanner=scan_news_topic,
-#                 topic=topic,
-#                 timeout_sec=NEWS_SCAN_TIMEOUT_SEC,
-#                 fallback_key="sample_articles",
-#             ),
-#         )
-
-#         # ── Build context blocks ──
-#         db_context, web_context = "", ""
-#         source_urls: list[str] = []
-
-#         if db_results:
-#             db_blocks = [item.get("content", "") for item in db_results]
-#             db_context = _cap_blocks(db_blocks, PROCESS_DB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
-#             source_urls.extend([
-#                 item["source_url"] for item in db_results if item.get("source_url")
-#             ])
-
-#         if new_articles:
-#             web_blocks = [f"Source: {art['title']}\n{art['text']}" for art in new_articles]
-#             web_context = _cap_blocks(web_blocks, PROCESS_WEB_MAX_BLOCKS, PROCESS_CONTEXT_MAX_CHARS // 2)
-#             source_urls.extend([art["url"] for art in new_articles])
-#             for article in new_articles:
-#                 background_tasks.add_task(
-#                     add_scraped_data_to_db,
-#                     article["title"],
-#                     article["text"],
-#                     article["url"],
-#                     "",
-#                     topic,
-#                     base_keywords,
-#                 )
-
-#         social_data = social_payload.get("sample_posts") or []
-#         news_data = news_payload.get("sample_articles") or []
-
-#         # ── STAGE 3: Idea generation ──
-#         print("--- Stage 3: Generating ideas ---")
-#         idea_clusters = await generate_cags_aligned_ideas(
-#             topic=topic,
-#             gap_angles=gap_angles,
-#             briefs=briefs,
-#             perspective_tree=perspective_tree,
-#             social_data=social_data,
-#             news_data=news_data,
-#             db_context=db_context,
-#             web_context=web_context,
-#             max_angles=int(request.max_angles or 5),
-#             ideas_per_angle=int(request.ideas_per_angle or 3),
-#             used_angle_ids=request.used_angle_ids or [],
-#             deepseek_client=deepseek_client,
-#         )
-
-#         idea_clusters["source_of_context"] = source_of_context
-#         idea_clusters["generated_keywords"] = base_keywords
-#         idea_clusters["source_urls"] = list(set(source_urls))
-#         idea_clusters["cags"] = {
-#             "tss": tss_payload.get("tss"),
-#             "csi": (tss_payload.get("csi") or {}).get("csi"),
-#             "total_angles": len(gap_angles),
-#         }
-
-#         final_ideas, final_descriptions = [], []
-#         for cluster in idea_clusters.get("idea_clusters") or []:
-#             for variant in cluster.get("idea_variants") or []:
-#                 title = str(variant.get("title") or "").strip()
-#                 description = str(variant.get("description") or "").strip()
-#                 if title and description:
-#                     final_ideas.append(title)
-#                     final_descriptions.append(description)
-
-#         idea_clusters["ideas"] = final_ideas
-#         idea_clusters["descriptions"] = final_descriptions
-#         idea_clusters["scraped_text_context"] = f"DB CONTEXT:\n{db_context}\n\nWEB CONTEXT:\n{web_context}"
-#         idea_clusters["total_request_time_sec"] = round(time.time() - total_start_time, 2)
-
-#         if len(final_ideas) > 0:
-#             if _payload_uses_fallback_variants(idea_clusters):
-#                 print(f"Skipping cache write for '{topic}' because fallback variants were used.")
-#                 idea_clusters["cache_write_skipped"] = "fallback_variants"
-#         else:
-#             print(f"Skipping cache write for '{topic}' because no ideas were generated.")
-
-#         print(f"Total /generate-ideas time: {idea_clusters['total_request_time_sec']:.2f}s")
-#         return idea_clusters
-
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         import traceback
-#         print(f"Error in /generate-ideas: {e}")
-#         traceback.print_exc()
-#         return {"error": "An error occurred in the idea generation pipeline.", "detail": str(e)}
 
 
 async def pick_best_template(topic: str, templates: list) -> dict:
@@ -3649,8 +2988,26 @@ async def cut_credits(request: UnlockRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @app.post("/generate-script")
 async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
+
     total_start_time = time.time()
     print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
 
@@ -3658,7 +3015,6 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
         channel_profile = await get_channel_profile(request.userId)
         summary = channel_profile[0]["Summary"] if channel_profile else None
 
-        # Generate HyDE document
         hyde_document = request.topic
         try:
             hyde_prompt = f"""
@@ -3678,430 +3034,545 @@ async def generate_script(request: ScriptRequest, background_tasks: BackgroundTa
             )
             hyde_document = hyde_completion.choices[0].message.content.strip()
             print(f"--- HyDE DOCUMENT GENERATED ---\n{hyde_document}\n--- END HyDE DOCUMENT ---")
+            db_results = []
+            new_articles = []
+            scraped_urls = set()
+            db_task = asyncio.create_task(get_context_from_db(request.topic, hyde_document))
+
+
+
+
         except Exception as exc:
             print(f"--- HyDE generation failed, using raw topic as fallback: {exc} ---")
+    except Exception as exc:
+            print(f"--- error ---")
 
-        content_category = await get_structure(request.topic)
-        category = content_category["category"]
-        print(f"Category: {category}")
 
-        loop = asyncio.get_event_loop()
-        res_templates = await loop.run_in_executor(
-            None,
-            lambda: supabase.table("script_structures").select("*").eq("catergory name", category).execute()
-        )
-        all_templates_raw = res_templates.data
 
-        all_templates = []
-        for row in all_templates_raw:
-            for template in row["Structure"]:
-                all_templates.append(template)
 
-        best_template = await pick_best_template(request.topic, all_templates)
-        print(f"Selected template: {best_template['tittle']}")
 
-        structure = best_template.get("segments", [])
-        filtered_structure = structure
 
-        template_meta = {
-            "title": best_template.get("tittle"),
-            "about": best_template.get("about"),
-        }
 
-        selected_idea_id = random.randint(1, 1000)
-        selected_angle_id = random.randint(1, 1000)
 
-        json_generation_prompt = f"""
-        You are an expert YouTube SEO strategist and content ideation assistant.
 
-        Return ONLY valid JSON.
 
-        OUTPUT FORMAT:
 
-        {{
-        "context": {{
-            "topic": "",
-            "keywords": [],
-            "selected_idea": {{
-            "title": "",
-            "idea_id": "{selected_idea_id}"
-            }},
-            "selected_idea_id": "{selected_idea_id}",
-            "selected_angle_id": "{selected_angle_id}",
-            "gap_context": {{
-            "problem": "",
-            "insight": "",
-            "angle_string": ""
-            }},
-            "pipeline_assembled_at": "2026-04-10T16:00:00"
-        }}
-        }}
 
-        RULES:
-        - Return ONLY valid JSON
-        - No markdown, no explanation, no comments
-        - keywords: 8–15 items
-        - selected_idea.idea_id MUST match selected_idea_id
 
-        INPUT:
-        Topic: {request.topic}
-        """
 
-        seo_response = await loop.run_in_executor(
-            None,
-            lambda: deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
-                messages=[
-                    {"role": "system", "content": "You must return only valid JSON"},
-                    {"role": "user", "content": json_generation_prompt},
-                ],
-                stream=False,
-                reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}},
-            )
-        )
 
-        text = seo_response.choices[0].message.content
-        data = json.loads(text)
-        print(data)
 
-        request_obj = SEOAgentRequest.model_validate(data)
-        print(request_obj)
-        seo_res = await seo_agent(request_obj)
-        print(seo_res)
 
-        # DB context fetch + web scrape (sequential to avoid memory spike from parallel)
-        db_task = asyncio.create_task(get_db_context(request.topic, hyde_document))
-        await asyncio.sleep(11)
 
-        db_results = []
-        new_articles = []
-        scraped_urls = set()
-        base_keywords = []
 
-        if db_task.done():
-            db_results = db_task.result()
-            print(f"--- DB task finished early. Found {len(db_results)} documents. ---")
 
-        if len(db_results) >= 3:
-            print("--- DB HIT: Performing LIGHT web scrape for latest news. ---")
-            new_articles = await get_latest_news_context(request.topic, scraped_urls)
-        else:
-            print("--- DB MISS or SLOW: Initiating DEEP web scrape. ---")
-            base_keywords = [request.topic]
-            try:
-                keyword_prompt = f"""
-                Your ONLY task is to generate 5 diverse search engine keyword phrases for the topic: '{request.topic}'.
-                Follow these rules STRICTLY:
-                1. Return ONLY the 5 phrases, nothing else.
-                2. DO NOT add numbers, markdown, bullet points, explanations, or any introductory text.
-                3. Each phrase must be on a new line.
-                4. Make them diverse — cover different angles, audiences, and search intents.
 
-                EXAMPLE INPUT: Is coding dead?
-                EXAMPLE OUTPUT:
-                future of programming jobs automation
-                AI replacing software developers
-                demand for software engineers 2025
-                will programmers become obsolete
-                coding careers vs AI tools
-                """
 
-                kw_completion = await loop.run_in_executor(
-                    None,
-                    lambda: deepseek_client.chat.completions.create(
-                        model="deepseek-v4-pro",
-                        messages=[{"role": "user", "content": keyword_prompt}],
-                        stream=False,
-                    )
-                )
-                raw_text = kw_completion.choices[0].message.content.strip()
-                print(f"--- DEEP SCRAPE: Raw keywords from DeepSeek:\n{raw_text} ---")
-                keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
-                if keywords_in_quotes:
-                    base_keywords = keywords_in_quotes
-                else:
-                    base_keywords = [kw.strip() for kw in raw_text.split('\n') if kw.strip()]
 
-            except Exception as e:
-                print(f"--- DEEP SCRAPE: Keyword generation failed, using topic as fallback: {e} ---")
-                base_keywords = [request.topic]
 
-            targeted_keywords = (
-                base_keywords +
-                [f"{request.topic} 2025"] +
-                [f"{kw} site:reddit.com" for kw in base_keywords[:3]]
-            )
-            targeted_keywords = list(dict.fromkeys(targeted_keywords))
-            print(f"--- DEEP SCRAPE: Searching with {len(targeted_keywords)} keywords: {targeted_keywords} ---")
-            new_articles = await deep_search_and_scrape(targeted_keywords, scraped_urls)
 
-        if not db_task.done():
-            print("--- Waiting for DB task to complete... ---")
-            db_results = await db_task
-            print(f"--- DB task finished. Found {len(db_results)} documents. ---")
 
-        db_context, web_context = "", ""
-        if db_results:
-            db_context = "\n\n".join([item['content'] for item in db_results])
-        if new_articles:
-            web_context = "\n\n".join([f"Source: {art['title']}\n{art['text']}" for art in new_articles])
 
-        print("SCRIPT GENERATION: Generating personalized script...")
 
-        WORDS_PER_MINUTE = 130
-        target_duration = request.duration_minutes if request.duration_minutes else 10
-        target_word_count = target_duration * WORDS_PER_MINUTE
-        print(f"Targeting {target_duration} minutes / approx. {target_word_count} words.")
 
-        script_prompt = f"""
-        You are a professional YouTube scriptwriter who creates natural, engaging, and conversational scripts that feel like a real YouTuber speaking directly to the camera.
 
-        **Your Task:**
-        You must write the script EXACTLY in this voice, tone, and structure:
-        {summary}
+
+
+
+
+
+
+
+
+
+
+
+# @app.post("/generate-script")
+# async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
+#     total_start_time = time.time()
+#     print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
+
+#     try:
+#         channel_profile = await get_channel_profile(request.userId)
+#         summary = channel_profile[0]["Summary"] if channel_profile else None
+
+#         hyde_document = request.topic
+#         try:
+#             hyde_prompt = f"""
+#             Write a short, factual, encyclopedia-style paragraph that provides a direct answer
+#             to the following topic. Be concise and include key terms.
+
+#             Topic: "{request.topic}"
+#             """
+#             loop = asyncio.get_event_loop()
+#             hyde_completion = await loop.run_in_executor(
+#                 None,
+#                 lambda: deepseek_client.chat.completions.create(
+#                     model="deepseek-v4-pro",
+#                     messages=[{"role": "user", "content": hyde_prompt}],
+#                     stream=False,
+#                 )
+#             )
+#             hyde_document = hyde_completion.choices[0].message.content.strip()
+#             print(f"--- HyDE DOCUMENT GENERATED ---\n{hyde_document}\n--- END HyDE DOCUMENT ---")
+#         except Exception as exc:
+#             print(f"--- HyDE generation failed, using raw topic as fallback: {exc} ---")
+
+#         content_category = await get_structure(request.topic)
+#         category = content_category["category"]
+#         print(f"Category: {category}")
+
+#         loop = asyncio.get_event_loop()
+#         res_templates = await loop.run_in_executor(
+#             None,
+#             lambda: supabase.table("script_structures").select("*").eq("catergory name", category).execute()
+#         )
+#         all_templates_raw = res_templates.data
+
+#         all_templates = []
+#         for row in all_templates_raw:
+#             for template in row["Structure"]:
+#                 all_templates.append(template)
+
+#         best_template = await pick_best_template(request.topic, all_templates)
+#         print(f"Selected template: {best_template['tittle']}")
+
+#         structure = best_template.get("segments", [])
+#         filtered_structure = structure
+
+#         template_meta = {
+#             "title": best_template.get("tittle"),
+#             "about": best_template.get("about"),
+#         }
+
+#         selected_idea_id = random.randint(1, 1000)
+#         selected_angle_id = random.randint(1, 1000)
+
+#         json_generation_prompt = f"""
+#         You are an expert YouTube SEO strategist and content ideation assistant.
+
+#         Return ONLY valid JSON.
+
+#         OUTPUT FORMAT:
+
+#         {{
+#         "context": {{
+#             "topic": "",
+#             "keywords": [],
+#             "selected_idea": {{
+#             "title": "",
+#             "idea_id": "{selected_idea_id}"
+#             }},
+#             "selected_idea_id": "{selected_idea_id}",
+#             "selected_angle_id": "{selected_angle_id}",
+#             "gap_context": {{
+#             "problem": "",
+#             "insight": "",
+#             "angle_string": ""
+#             }},
+#             "pipeline_assembled_at": "2026-04-10T16:00:00"
+#         }}
+#         }}
+
+#         RULES:
+#         - Return ONLY valid JSON
+#         - No markdown, no explanation, no comments
+#         - keywords: 8–15 items
+#         - selected_idea.idea_id MUST match selected_idea_id
+
+#         INPUT:
+#         Topic: {request.topic}
+#         """
+
+#         seo_response = await loop.run_in_executor(
+#             None,
+#             lambda: deepseek_client.chat.completions.create(
+#                 model="deepseek-v4-pro",
+#                 messages=[
+#                     {"role": "system", "content": "You must return only valid JSON"},
+#                     {"role": "user", "content": json_generation_prompt},
+#                 ],
+#                 stream=False,
+#                 reasoning_effort="high",
+#                 extra_body={"thinking": {"type": "enabled"}},
+#             )
+#         )
+
+#         text = seo_response.choices[0].message.content
+#         data = json.loads(text)
+#         print(data)
+
+#         request_obj = SEOAgentRequest.model_validate(data)
+#         print(request_obj)
+#         seo_res = await seo_agent(request_obj)
+#         print(seo_res)
+
+#         db_task = asyncio.create_task(get_db_context(request.topic, hyde_document))
+#         await asyncio.sleep(11)
+
+#         db_results = []
+#         new_articles = []
+#         scraped_urls = set()
+#         base_keywords = []
+
+#         if db_task.done():
+#             db_results = db_task.result()
+#             print(f"--- DB task finished early. Found {len(db_results)} documents. ---")
+
+#         if len(db_results) >= 3:
+#             print("--- DB HIT: Performing LIGHT web scrape for latest news. ---")
+#             new_articles = await get_latest_news_context(request.topic, scraped_urls)
+#         else:
+#             print("--- DB MISS or SLOW: Initiating DEEP web scrape. ---")
+#             base_keywords = [request.topic]
+#             try:
+#                 keyword_prompt = f"""
+#                 Your ONLY task is to generate 5 diverse search engine keyword phrases for the topic: '{request.topic}'.
+#                 Follow these rules STRICTLY:
+#                 1. Return ONLY the 5 phrases, nothing else.
+#                 2. DO NOT add numbers, markdown, bullet points, explanations, or any introductory text.
+#                 3. Each phrase must be on a new line.
+#                 4. Make them diverse — cover different angles, audiences, and search intents.
+
+#                 EXAMPLE INPUT: Is coding dead?
+#                 EXAMPLE OUTPUT:
+#                 future of programming jobs automation
+#                 AI replacing software developers
+#                 demand for software engineers 2025
+#                 will programmers become obsolete
+#                 coding careers vs AI tools
+#                 """
+
+#                 kw_completion = await loop.run_in_executor(
+#                     None,
+#                     lambda: deepseek_client.chat.completions.create(
+#                         model="deepseek-v4-pro",
+#                         messages=[{"role": "user", "content": keyword_prompt}],
+#                         stream=False,
+#                     )
+#                 )
+#                 raw_text = kw_completion.choices[0].message.content.strip()
+#                 print(f"--- DEEP SCRAPE: Raw keywords from DeepSeek:\n{raw_text} ---")
+#                 keywords_in_quotes = re.findall(r'"(.*?)"', raw_text)
+#                 if keywords_in_quotes:
+#                     base_keywords = keywords_in_quotes
+#                 else:
+#                     base_keywords = [kw.strip() for kw in raw_text.split('\n') if kw.strip()]
+
+#             except Exception as e:
+#                 print(f"--- DEEP SCRAPE: Keyword generation failed, using topic as fallback: {e} ---")
+#                 base_keywords = [request.topic]
+
+#             targeted_keywords = (
+#                 base_keywords +
+#                 [f"{request.topic} 2025"] +
+#                 [f"{kw} site:reddit.com" for kw in base_keywords[:3]]
+#             )
+#             targeted_keywords = list(dict.fromkeys(targeted_keywords))
+#             print(f"--- DEEP SCRAPE: Searching with {len(targeted_keywords)} keywords: {targeted_keywords} ---")
+#             new_articles = await deep_search_and_scrape(targeted_keywords, scraped_urls)
+
+#         if not db_task.done():
+#             print("--- Waiting for DB task to complete... ---")
+#             db_results = await db_task
+#             print(f"--- DB task finished. Found {len(db_results)} documents. ---")
+
+#         db_context, web_context = "", ""
+#         if db_results:
+#             db_context = "\n\n".join([item['content'] for item in db_results])
+#         if new_articles:
+#             web_context = "\n\n".join([f"Source: {art['title']}\n{art['text']}" for art in new_articles])
+
+#         print("SCRIPT GENERATION: Generating personalized script...")
+
+#         WORDS_PER_MINUTE = 130
+#         target_duration = request.duration_minutes if request.duration_minutes else 10
+#         target_word_count = target_duration * WORDS_PER_MINUTE
+#         print(f"Targeting {target_duration} minutes / approx. {target_word_count} words.")
+
+#         script_prompt = f"""
+#         You are a professional YouTube scriptwriter who creates natural, engaging, and conversational scripts that feel like a real YouTuber speaking directly to the camera.
+
+#         **Your Task:**
+#         You must write the script EXACTLY in this voice, tone, and structure:
+#         {summary}
         
-        Interpret this as the creator's permanent speaking identity. Every line of the script must reflect this style. Do NOT ignore or average it out.
+#         Interpret this as the creator's permanent speaking identity. Every line of the script must reflect this style. Do NOT ignore or average it out.
 
-        Generate a complete YouTube video script of approximately **{target_duration} minutes** (~{target_word_count} words) based on the **main topic** below, using the provided **research context**.
+#         Generate a complete YouTube video script of approximately **{target_duration} minutes** (~{target_word_count} words) based on the **main topic** below, using the provided **research context**.
 
-        **Script Style & Flow:**
-        - Output only the spoken dialogue — what the YouTuber would actually say aloud.
-        - **Do NOT include** section titles, notes, stage directions, or metadata.
-        - Speak directly to the viewer — friendly, confident, slightly spontaneous, and off-the-cuff.
-        - Use **short and medium-length sentences**, natural pauses (…) or dashes, and occasional repetition for emphasis.
-        - Include interjections, rhetorical questions, playful digressions, humor, and brief asides ("Wait, actually…", "Can you believe that…?", "By the way…").
-        - Include personal anecdotes or opinions ("I remember…", "When I tried this…").
-        - Use **visual and emotional imagery** to make scenes vivid ("Imagine this…", "Picture it like…").
-        - Hook viewers emotionally in the first 15–30 seconds.
-        - Alternate between facts, insights, reactions, and short reflections to keep pacing dynamic.
-        - Treat the script as a conversation with the audience — inclusive language like "you guys", "we all", "my friends".
-        - Build suspense naturally with rhetorical questions, mini cliffhangers, or curiosity hooks.
-        - Use relatable analogies or humor when explaining complex topics.
-        - Occasionally reference the creator's regional or cultural context for relatability.
-        - Maintain natural pacing as if recording live — mix excitement, storytelling, and factual explanation.
-        - Stay close to **{target_word_count} words** (±50).
+#         **Script Style & Flow:**
+#         - Output only the spoken dialogue — what the YouTuber would actually say aloud.
+#         - **Do NOT include** section titles, notes, stage directions, or metadata.
+#         - Speak directly to the viewer — friendly, confident, slightly spontaneous, and off-the-cuff.
+#         - Use **short and medium-length sentences**, natural pauses (…) or dashes, and occasional repetition for emphasis.
+#         - Include interjections, rhetorical questions, playful digressions, humor, and brief asides ("Wait, actually…", "Can you believe that…?", "By the way…").
+#         - Include personal anecdotes or opinions ("I remember…", "When I tried this…").
+#         - Use **visual and emotional imagery** to make scenes vivid ("Imagine this…", "Picture it like…").
+#         - Hook viewers emotionally in the first 15–30 seconds.
+#         - Alternate between facts, insights, reactions, and short reflections to keep pacing dynamic.
+#         - Treat the script as a conversation with the audience — inclusive language like "you guys", "we all", "my friends".
+#         - Build suspense naturally with rhetorical questions, mini cliffhangers, or curiosity hooks.
+#         - Use relatable analogies or humor when explaining complex topics.
+#         - Occasionally reference the creator's regional or cultural context for relatability.
+#         - Maintain natural pacing as if recording live — mix excitement, storytelling, and factual explanation.
+#         - Stay close to **{target_word_count} words** (±50).
 
-        **Main Topic/Idea:** "{request.topic}"
+#         **Main Topic/Idea:** "{request.topic}"
 
-        **Research Context:**
-        FOUNDATIONAL KNOWLEDGE (from database): {db_context}
-        LATEST NEWS (from web): {web_context}
+#         **Research Context:**
+#         FOUNDATIONAL KNOWLEDGE (from database): {db_context}
+#         LATEST NEWS (from web): {web_context}
 
-        **Additional Notes:**
-        - Make the opening a curiosity-driven hook that emotionally pulls the viewer in within 15–30 seconds.
-        - Use storytelling techniques: tension, suspense, surprise, and moral dilemmas when relevant.
-        - Make historical or technical details feel immersive and personal, not like a lecture.
-        - Emphasize the narrative arc: build curiosity, climax, and reflection for the audience.
-        - Ensure adaptability: script should feel natural regardless of topic, duration, or target audience.
-        """
+#         **Additional Notes:**
+#         - Make the opening a curiosity-driven hook that emotionally pulls the viewer in within 15–30 seconds.
+#         - Use storytelling techniques: tension, suspense, surprise, and moral dilemmas when relevant.
+#         - Make historical or technical details feel immersive and personal, not like a lecture.
+#         - Emphasize the narrative arc: build curiosity, climax, and reflection for the audience.
+#         - Ensure adaptability: script should feel natural regardless of topic, duration, or target audience.
+#         """
 
-        script_response = await loop.run_in_executor(
-            None,
-            lambda: deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
-                messages=[
-                    {"role": "system", "content": "You are a professional YouTube scriptwriter."},
-                    {"role": "user", "content": script_prompt},
-                ],
-                stream=False,
-                reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}},
-            )
-        )
+#         script_response = await loop.run_in_executor(
+#             None,
+#             lambda: deepseek_client.chat.completions.create(
+#                 model="deepseek-v4-pro",
+#                 messages=[
+#                     {"role": "system", "content": "You are a professional YouTube scriptwriter."},
+#                     {"role": "user", "content": script_prompt},
+#                 ],
+#                 stream=False,
+#                 reasoning_effort="high",
+#                 extra_body={"thinking": {"type": "enabled"}},
+#             )
+#         )
 
-        text3 = script_response.choices[0].message.content
+#         text3 = script_response.choices[0].message.content
 
-        total_mid_time = time.time()
-        print(f"--- PROFILING: Script generation took {total_mid_time - total_start_time:.2f} seconds ---")
+#         total_mid_time = time.time()
+#         print(f"--- PROFILING: Script generation took {total_mid_time - total_start_time:.2f} seconds ---")
 
-        ANALYSIS_PROMPT_TEMPLATE = """
-        You are an expert script analyzer.
+#         ANALYSIS_PROMPT_TEMPLATE = """
+#         You are an expert script analyzer.
 
-        Your job is to carefully analyze the YouTube script and IDENTIFY + COUNT specific elements.
+#         Your job is to carefully analyze the YouTube script and IDENTIFY + COUNT specific elements.
 
-        IMPORTANT: Do NOT assume zero unless you are absolutely certain none exist.
+#         IMPORTANT: Do NOT assume zero unless you are absolutely certain none exist.
 
-        ----------------------
-        DEFINITIONS (STRICT)
-        ----------------------
+#         ----------------------
+#         DEFINITIONS (STRICT)
+#         ----------------------
 
-        1. Real-world Examples:
-        - Any specific story, scenario, case study, or real-life situation
-        - Includes hypothetical but realistic situations
-        - Example: "A student who studies daily will succeed"
+#         1. Real-world Examples:
+#         - Any specific story, scenario, case study, or real-life situation
+#         - Includes hypothetical but realistic situations
+#         - Example: "A student who studies daily will succeed"
 
-        2. Research Facts / Stats:
-        - Any number, percentage, study, data point, or measurable claim
-        - Even approximate values count
-        - Example: "90% of startups fail", "Studies show..."
+#         2. Research Facts / Stats:
+#         - Any number, percentage, study, data point, or measurable claim
+#         - Even approximate values count
+#         - Example: "90% of startups fail", "Studies show..."
 
-        3. Proverbs / Sayings:
-        - Common traditional proverbs, idioms, or widely recognized sayings
-        - Must be culturally established phrases, not personal quotes or random sentences
-        - Typically short, fixed expressions used to convey general life wisdom
+#         3. Proverbs / Sayings:
+#         - Common traditional proverbs, idioms, or widely recognized sayings
+#         - Must be culturally established phrases, not personal quotes or random sentences
+#         - Typically short, fixed expressions used to convey general life wisdom
 
-        4. Emotional Depth:
-        - LOW → Informational, dry, no emotional hooks
-        - MEDIUM → Some engagement, mild storytelling or relatability
-        - HIGH → Strong emotional storytelling, persuasive, engaging
+#         4. Emotional Depth:
+#         - LOW → Informational, dry, no emotional hooks
+#         - MEDIUM → Some engagement, mild storytelling or relatability
+#         - HIGH → Strong emotional storytelling, persuasive, engaging
 
-        5. history Facts:
-        - Verified historical events, timelines, or occurrences from the past
-        - Must be factual and time-specific
+#         5. history Facts:
+#         - Verified historical events, timelines, or occurrences from the past
+#         - Must be factual and time-specific
 
-        ----------------------
-        PROCESS (MANDATORY)
-        ----------------------
+#         ----------------------
+#         PROCESS (MANDATORY)
+#         ----------------------
 
-        Step 1: Extract all matches for each category
-        Step 2: Count them
-        Step 3: Return result
+#         Step 1: Extract all matches for each category
+#         Step 2: Count them
+#         Step 3: Return result
 
-        If unsure → COUNT it (be slightly generous, not strict)
+#         If unsure → COUNT it (be slightly generous, not strict)
 
-        ----------------------
-        OUTPUT FORMAT (STRICT JSON ONLY)
-        ----------------------
-        {{
-        "examples_count": <number>,
-        "research_facts_count": <number>,
-        "proverbs_count": <number>,
-        "history_facts":<number>,
-        "emotional_depth": "Low | Medium | High"
-        }}
-        ----------------------
-        SCRIPT
-        ----------------------
-        {script_text}
-        ----------------------
-        """
+#         ----------------------
+#         OUTPUT FORMAT (STRICT JSON ONLY)
+#         ----------------------
+#         {{
+#         "examples_count": <number>,
+#         "research_facts_count": <number>,
+#         "proverbs_count": <number>,
+#         "history_facts":<number>,
+#         "emotional_depth": "Low | Medium | High"
+#         }}
+#         ----------------------
+#         SCRIPT
+#         ----------------------
+#         {script_text}
+#         ----------------------
+#         """
 
-        print("SCRIPT ANALYSIS: Analyzing generated script...")
-        analysis_start_time = time.time()
-        analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=text3)
+#         print("SCRIPT ANALYSIS: Analyzing generated script...")
+#         analysis_start_time = time.time()
+#         analysis_prompt_filled = ANALYSIS_PROMPT_TEMPLATE.format(script_text=text3)
 
-        analysis_response = await loop.run_in_executor(
-            None,
-            lambda: deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
-                messages=[
-                    {"role": "system", "content": "You must return only valid JSON"},
-                    {"role": "user", "content": analysis_prompt_filled},
-                ],
-                stream=False,
-                reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}},
-            )
-        )
+#         analysis_response = await loop.run_in_executor(
+#             None,
+#             lambda: deepseek_client.chat.completions.create(
+#                 model="deepseek-v4-pro",
+#                 messages=[
+#                     {"role": "system", "content": "You must return only valid JSON"},
+#                     {"role": "user", "content": analysis_prompt_filled},
+#                 ],
+#                 stream=False,
+#                 reasoning_effort="high",
+#                 extra_body={"thinking": {"type": "enabled"}},
+#             )
+#         )
 
-        text4 = analysis_response.choices[0].message.content
+#         text4 = analysis_response.choices[0].message.content
 
-        analysis_end_time = time.time()
-        print(f"--- PROFILING: Script analysis took {analysis_end_time - analysis_start_time:.2f} seconds ---")
+#         analysis_end_time = time.time()
+#         print(f"--- PROFILING: Script analysis took {analysis_end_time - analysis_start_time:.2f} seconds ---")
 
-        analysis_results = {
-            "examples_count": 0,
-            "research_facts_count": 0,
-            "proverbs_count": 0,
-            "emotional_depth": "Unknown",
-            "history": 0,
-        }
-        try:
-            analysis_data = json.loads(text4)
-            analysis_results["examples_count"] = analysis_data.get("examples_count", 0)
-            analysis_results["research_facts_count"] = analysis_data.get("research_facts_count", 0)
-            analysis_results["proverbs_count"] = analysis_data.get("proverbs_count", 0)
-            analysis_results["emotional_depth"] = analysis_data.get("emotional_depth", "Unknown")
-            analysis_results["history"] = analysis_data.get("history_facts", 0)
-            print(f"Script Analysis Results: {analysis_results}")
-        except json.JSONDecodeError:
-            print("SCRIPT ANALYSIS: Failed to parse analysis JSON response from AI.")
-        except Exception as e:
-            print(f"SCRIPT ANALYSIS: Error during analysis parsing: {e}")
+#         analysis_results = {
+#             "examples_count": 0,
+#             "research_facts_count": 0,
+#             "proverbs_count": 0,
+#             "emotional_depth": "Unknown",
+#             "history": 0,
+#         }
+#         try:
+#             analysis_data = json.loads(text4)
+#             analysis_results["examples_count"] = analysis_data.get("examples_count", 0)
+#             analysis_results["research_facts_count"] = analysis_data.get("research_facts_count", 0)
+#             analysis_results["proverbs_count"] = analysis_data.get("proverbs_count", 0)
+#             analysis_results["emotional_depth"] = analysis_data.get("emotional_depth", "Unknown")
+#             analysis_results["history"] = analysis_data.get("history_facts", 0)
+#             print(f"Script Analysis Results: {analysis_results}")
+#         except json.JSONDecodeError:
+#             print("SCRIPT ANALYSIS: Failed to parse analysis JSON response from AI.")
+#         except Exception as e:
+#             print(f"SCRIPT ANALYSIS: Error during analysis parsing: {e}")
 
-        total_end_time = time.time()
-        print(f"--- PROFILING: Total /generate-script request time was {total_end_time - total_start_time:.2f} seconds ---")
+#         total_end_time = time.time()
+#         print(f"--- PROFILING: Total /generate-script request time was {total_end_time - total_start_time:.2f} seconds ---")
 
-        generated_word_count = len(text3.split())
-        print(f"Generated script word count: approx. {generated_word_count}")
+#         generated_word_count = len(text3.split())
+#         print(f"Generated script word count: approx. {generated_word_count}")
 
-        category_prompt = f"""
-        You are a content categorization expert.
+#         category_prompt = f"""
+#         You are a content categorization expert.
 
-        Given the topic and script below, return ONLY valid JSON with the main category and up to 2 subcategories.
+#         Given the topic and script below, return ONLY valid JSON with the main category and up to 2 subcategories.
 
-        OUTPUT FORMAT:
-        {{
-            "category": "<main category>",
-            "subcategories": ["<subcategory 1>", "<subcategory 2>"]
-        }}
+#         OUTPUT FORMAT:
+#         {{
+#             "category": "<main category>",
+#             "subcategories": ["<subcategory 1>", "<subcategory 2>"]
+#         }}
 
-        RULES:
-        - Return ONLY valid JSON, no markdown, no explanation
-        - category: broad genre (e.g. "Technology", "Finance", "Health", "Education", "Entertainment")
-        - subcategories: more specific niches, max 2 (e.g. ["Artificial Intelligence", "Future of Work"])
-        - If only 1 subcategory fits, return a list with 1 item
+#         RULES:
+#         - Return ONLY valid JSON, no markdown, no explanation
+#         - category: broad genre (e.g. "Technology", "Finance", "Health", "Education", "Entertainment")
+#         - subcategories: more specific niches, max 2 (e.g. ["Artificial Intelligence", "Future of Work"])
+#         - If only 1 subcategory fits, return a list with 1 item
 
-        TOPIC: {request.topic}
-        SCRIPT (first 500 words): {" ".join(text3.split()[:500])}
-        """
+#         TOPIC: {request.topic}
+#         SCRIPT (first 500 words): {" ".join(text3.split()[:500])}
+#         """
 
-        category_response = await loop.run_in_executor(
-            None,
-            lambda: deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
-                messages=[
-                    {"role": "system", "content": "You must return only valid JSON"},
-                    {"role": "user", "content": category_prompt},
-                ],
-                stream=False,
-            )
-        )
+#         category_response = await loop.run_in_executor(
+#             None,
+#             lambda: deepseek_client.chat.completions.create(
+#                 model="deepseek-v4-pro",
+#                 messages=[
+#                     {"role": "system", "content": "You must return only valid JSON"},
+#                     {"role": "user", "content": category_prompt},
+#                 ],
+#                 stream=False,
+#             )
+#         )
 
-        script_categories = {"category": "Unknown", "subcategories": []}
-        try:
-            raw_cat = category_response.choices[0].message.content
-            script_categories = json.loads(raw_cat)
-            script_categories["subcategories"] = script_categories.get("subcategories", [])[:2]
-            print(f"Script categories: {script_categories}")
-        except (json.JSONDecodeError, Exception) as e:
-            print(f"Category parsing failed: {e}")
+#         script_categories = {"category": "Unknown", "subcategories": []}
+#         try:
+#             raw_cat = category_response.choices[0].message.content
+#             script_categories = json.loads(raw_cat)
+#             script_categories["subcategories"] = script_categories.get("subcategories", [])[:2]
+#             print(f"Script categories: {script_categories}")
+#         except (json.JSONDecodeError, Exception) as e:
+#             print(f"Category parsing failed: {e}")
 
-        if new_articles:
-            for article in new_articles:
-                background_tasks.add_task(
-                    add_scraped_data_to_db,
-                    article['title'],
-                    article['text'],
-                    article['url'],
-                    script_categories.get("category", ""),
-                    request.topic,
-                    script_categories.get("subcategories", []),
-                )
-            print(f"BACKGROUND TASKS: Scheduled {len(new_articles)} articles for DB upload.")
+#         if new_articles:
+#             for article in new_articles:
+#                 background_tasks.add_task(
+#                     add_scraped_data_to_db,
+#                     article['title'],
+#                     article['text'],
+#                     article['url'],
+#                     script_categories.get("category", ""),
+#                     request.topic,
+#                     script_categories.get("subcategories", []),
+#                 )
+#             print(f"BACKGROUND TASKS: Scheduled {len(new_articles)} articles for DB upload.")
 
-        return {
-            "script": text3,
-            "estimated_word_count": generated_word_count,
-            "source_urls": list(scraped_urls),
-            "analysis": analysis_results,
-            "structure": filtered_structure,
-            "template_meta": template_meta,
-            "seo": seo_res,
-            "category": script_categories["category"],
-            "subcategories": script_categories["subcategories"],
-        }
+#         return {
+#             "script": text3,
+#             "estimated_word_count": generated_word_count,
+#             "source_urls": list(scraped_urls),
+#             "analysis": analysis_results,
+#             "structure": filtered_structure,
+#             "template_meta": template_meta,
+#             "seo": seo_res,
+#             "category": script_categories["category"],
+#             "subcategories": script_categories["subcategories"],
+#         }
 
-    except Exception as e:
-        import traceback
-        print(f"SCRIPT GENERATION: An error occurred: {e}")
-        traceback.print_exc()
-        return {"error": "An error occurred during the script generation pipeline.", "detail": str(e)}
+#     except Exception as e:
+#         import traceback
+#         print(f"SCRIPT GENERATION: An error occurred: {e}")
+#         traceback.print_exc()
+#         return {"error": "An error occurred during the script generation pipeline.", "detail": str(e)}
 
 
-import os
-import random
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import datetime
 import string
 from reportlab.lib.pagesizes import A4
