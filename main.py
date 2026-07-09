@@ -10,9 +10,9 @@ from supabase_auth.types import User
 from openai import AsyncOpenAI
 from auth_dependencies import get_current_user, login_user, refresh_access_token
 from researchAgent.tss_v3 import run_tss
-from pipeline.idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas
-from signals.social_market_signals import scan_topic as scan_social_topic
-from signals.news_market_signals import scan_topic as scan_news_topic
+# from pipeline.idea_generation_pipeline import generate_ideas as generate_cags_aligned_ideas
+# from signals.social_market_signals import scan_topic as scan_social_topic
+# from signals.news_market_signals import scan_topic as scan_news_topic
 import os
 from openai import OpenAI
 from channelMemory.aiIntel import get_intelligence
@@ -1912,36 +1912,7 @@ async def eci(request: PromptRequest):
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
 
 
-# @app.post("/process-topic")
-# async def process_topic(request: PromptRequest, background_tasks: BackgroundTasks):
-#     topic = (request.topic or "").strip()
-#     if not topic:
-#         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
-
-#     print("Received /process-topic request; forwarding to /generate-ideas pipeline.")
-#     gen_request = GenerateIdeasRequest(
-#         topic=topic,
-#         max_angles=4,
-#         ideas_per_angle=3,
-#         used_angle_ids=[],
-#         force_refresh=False,
-#     )
-#     try:
-#         payload = await generate_ideas_endpoint(gen_request, background_tasks)
-#         if isinstance(payload, dict):
-#             payload["legacy_route"] = "process-topic"
-#         return payload
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         print(f"Error in /process-topic: {e}")
-#         return {"error": "An error occurred in the processing pipeline."}
-
-
-
 from typing import List
-
-app = FastAPI()
 
 _bge_model = None
 
