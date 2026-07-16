@@ -53,3 +53,4 @@ sentence_transformers
 google-search-results
 trafilatura
 SQLAlchemy
+yt-dlp
