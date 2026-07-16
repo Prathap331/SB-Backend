@@ -1857,6 +1857,11 @@ async def eci(request: PromptRequest):
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
 
 
+
+
+
+
+
 from typing import List
 
 _bge_model = None
@@ -1925,9 +1930,13 @@ async def save_ideas(data: SaveIdeasRequest):
 import os
 import hashlib
 import re
+import json
 import asyncio
+import numpy as np  # needed for cosine-similarity (dot product) filtering of scraped web content
+from urllib.parse import urlparse
+from sqlalchemy import create_engine, text, bindparam
 from sklearn.feature_extraction.text import HashingVectorizer
-from fastapi import HTTPException, BackgroundTasks
+from fastapi import HTTPException
 from openai import OpenAI
 import trafilatura
 
@@ -1936,10 +1945,21 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+    print("[YT] yt-dlp not installed — YouTube scraping will be skipped. "
+          "Install with: pip install yt-dlp")
+
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 HASH_FEATURES = 2**18
 MAX_WEB_SOURCES = 10
+
+WEB_CONTENT_SIMILARITY_THRESHOLD = 0.4
+
+DB_SIMILARITY_THRESHOLD = 0.5
 
 TABLES = [
     "duplicate_RAG_Entrepreneurship",
@@ -2080,10 +2100,13 @@ Input:
 A short user topic (2-10 words).
 
 Goal:
-Generate 10-15 high-quality search engine keyword combinations that maximize information retrieval from Google, Bing, academic search engines, and news websites.
+Generate exactly 15 high-quality search engine keyword combinations that maximize information retrieval from Google, Bing, academic search engines, and news websites.
 
 Requirements:
-- Preserve the original topic.
+- Every phrase must incorporate the topic's core subject/entities naturally —
+  do NOT output the raw topic string verbatim as one of the 15 lines by
+  itself; each line must be a distinct EXPANDED search phrase, not a copy of
+  the input.
 - Generate search phrases, NOT sentences.
 - Each phrase should target a unique research dimension.
 - Cover:
@@ -2105,7 +2128,8 @@ Requirements:
 - Include important entities when inferable.
 - Avoid duplicate intent.
 - Each keyword combination should contain 4-10 words.
-- Return only the keyword combinations.
+- Return ONLY the 15 keyword combinations, nothing else — no preamble, no
+  restating the topic on its own line.
 - Number each result.
 
 [TOPIC]: {topic}
@@ -2166,25 +2190,6 @@ async def get_similar_saved_ideas(
     topic_threshold: float = TOPIC_SIMILARITY_THRESHOLD,
     summary_threshold: float = SUMMARY_SIMILARITY_THRESHOLD,
 ) -> list[dict]:
-    """
-    Semantic match against the `saved_ideas` table (topic_embeddings /
-    summary_embeddings columns, both plain vector(1024)).
-
-    A saved idea counts as a "match" if EITHER:
-      - topic_similarity >= topic_threshold, OR
-      - summary_similarity >= summary_threshold
-
-    This OR logic matters because `topic` (short) vs saved topic (short)
-    and `hyde_doc` (long, narrow expansion) vs saved topic_summary (short,
-    broad synthesis) are fundamentally different comparisons with
-    different natural score ranges. Requiring both to clear the same bar
-    silently kills valid matches.
-
-    NOTE: this requires the `match_saved_ideas` SQL function to return
-    topic_similarity and summary_similarity as SEPARATE columns (not one
-    merged `similarity`), and to accept similarity_threshold=0 to return
-    unfiltered raw candidates for ranking here.
-    """
     print(f"[MATCH] Searching saved_ideas for topic: '{topic}'")
 
     model = _get_st_model()
@@ -2249,13 +2254,8 @@ async def get_similar_saved_ideas(
     return matches
 
 
-# ============================================================
-# DB RETRIEVAL (dense ANN via SQL + sparse rerank in Python)
-# ============================================================
 
-async def get_context_from_db(topic: str, hyde_doc: str = None, final_k: int = 7):
-    print(f"[DB] Starting retrieval for topic: '{topic}'")
-
+async def select_table_for_topic(topic: str) -> str:
     table_selector_prompt = f"""
     You are a routing assistant. Given a topic, select the single most relevant
     table from the list below that would contain source documents for that topic.
@@ -2284,6 +2284,275 @@ async def get_context_from_db(topic: str, hyde_doc: str = None, final_k: int = 7
     else:
         print(f"[DB] Selected table: {table_name}")
 
+    return table_name
+
+
+
+SCRIPT_TEMPLATE_MATCH_COUNT = 1  
+
+
+async def generate_topic_embedding(topic: str) -> np.ndarray:
+    """
+    STEP 1 — Embedding generation module.
+
+    Generates a normalized BGE-M3 embedding for `topic`, using the exact same
+    model + normalize_embeddings=True call used to build the
+    `script_structures.embedding` column, so the cosine similarity comparison
+    in retrieve_best_script_template() is apples-to-apples.
+    """
+    model = _get_st_model()
+    embedding = await asyncio.to_thread(
+        lambda: model.encode(topic, normalize_embeddings=True, convert_to_numpy=True)
+    )
+    return embedding
+
+
+async def retrieve_best_script_template(topic: str) -> dict | None:
+    """
+    STEP 2/3 — Template retrieval module.
+
+    Embeds `topic` (BGE-M3, normalized) and searches `script_structures` via
+    pgvector cosine similarity through the `match_script_structures` Supabase
+    RPC function (see SQL above), returning ONLY the single highest-scoring
+    row as a plain Template dict. Purely nearest-neighbor semantic search —
+    no category filtering, no keyword matching, no hardcoded template names.
+
+    Returns None if no template could be retrieved (RPC failure or empty
+    table), so callers can decide how to fall back.
+    """
+    print(f"[TEMPLATE] Embedding topic for template search: '{topic}'")
+    topic_embedding = await generate_topic_embedding(topic)
+    query_vector = to_pgvector(topic_embedding)
+
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.rpc(
+                "match_script_structures",
+                {
+                    "query_embedding": query_vector,
+                    "match_count": SCRIPT_TEMPLATE_MATCH_COUNT,
+                },
+            ).execute()
+        )
+    except Exception as e:
+        print(f"[TEMPLATE] match_script_structures RPC FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    rows = result.data or []
+    if not rows:
+        print("[TEMPLATE] no matching template found (empty result set)")
+        return None
+
+    best = rows[0]
+
+    selected_template = {
+        "key": best.get("key"),
+        "title": best.get("title"),
+        "cluster": best.get("cluster"),
+        "about": best.get("about"),
+        "best_fit_categories": best.get("best_fit_categories") or [],
+        "human_texture_tier": best.get("human_texture_tier"),
+        "segments": best.get("segments") or [],
+        # template_text isn't in the Step 3 field list but is required to
+        # ground the HyDE prompt in Step 4 — kept alongside the requested
+        # fields rather than as a separate lookup.
+        "template_text": best.get("template_text") or "",
+        "similarity": best.get("similarity"),
+    }
+
+    print(
+        f"[TEMPLATE] best match: key='{selected_template['key']}' "
+        f"title='{selected_template['title']}' cluster='{selected_template['cluster']}' "
+        f"similarity={selected_template['similarity']}"
+    )
+
+    return selected_template
+
+
+def _word_count(text: str) -> int:
+    return len(text.split())
+
+
+async def _generate_length_constrained_hyde(
+    client,
+    model: str,
+    prompt: str,
+    label: str,
+    target_min_words: int = 35,
+    target_max_words: int = 50,
+    hard_max_words: int = 70,
+    first_max_tokens: int = 180,
+    empty_retry_max_tokens: int = 1200,
+) -> tuple[str, bool]:
+    loop = asyncio.get_event_loop()
+
+    async def _call(messages: list[dict], max_tokens: int):
+        completion = await loop.run_in_executor(
+            None,
+            lambda: client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_completion_tokens=max_tokens,
+                stream=False,
+            )
+        )
+        choice = completion.choices[0]
+        raw_content = (choice.message.content or "").strip()
+        finish_reason = getattr(choice, "finish_reason", None)
+        output_tokens = None
+        try:
+            output_tokens = completion.usage.completion_tokens
+        except Exception:
+            pass
+        return raw_content, finish_reason, output_tokens
+
+    messages = [{"role": "user", "content": prompt}]
+
+    doc, finish_reason, output_tokens = await _call(messages, first_max_tokens)
+
+    if not doc:
+        print(
+            f"[{label}] came back EMPTY (finish_reason={finish_reason}, "
+            f"output_tokens={output_tokens}) — retrying with more headroom"
+        )
+        try:
+            doc, finish_reason, output_tokens = await _call(messages, empty_retry_max_tokens)
+        except Exception as retry_exc:
+            print(f"[{label}] retry call raised: {retry_exc}")
+            doc = ""
+
+    if not doc:
+        print(f"[{label}] still EMPTY after retry")
+        return "", False
+
+    wc = _word_count(doc)
+    print(f"[{label}] draft: {wc} word(s), output_tokens={output_tokens}, finish_reason={finish_reason}")
+
+    if wc <= hard_max_words:
+        return doc, False
+
+    print(f"[{label}] draft over length ({wc} words > {hard_max_words}) — asking model to rewrite shorter")
+    rewrite_request = (
+        f"Your draft above is {wc} words, which is too long. Rewrite the SAME "
+        f"passage so it is ONLY {target_min_words}-{target_max_words} words. "
+        f"Keep the same information density and tone. Output nothing but the "
+        f"rewritten passage — no preamble, no word count, no notes."
+    )
+    messages2 = messages + [
+        {"role": "assistant", "content": doc},
+        {"role": "user", "content": rewrite_request},
+    ]
+
+    try:
+        doc2, finish_reason2, output_tokens2 = await _call(messages2, max(first_max_tokens, 150))
+    except Exception as exc:
+        print(f"[{label}] rewrite call raised: {exc}")
+        doc2 = ""
+
+    if doc2:
+        wc2 = _word_count(doc2)
+        print(f"[{label}] rewrite: {wc2} word(s), output_tokens={output_tokens2}")
+        if wc2 <= hard_max_words:
+            return doc2, False
+        print(f"[{label}] rewrite STILL over length ({wc2} words) — falling back to a hard word-cut as last resort")
+        return _cap_hyde_doc_words(doc2, max_words=target_max_words), True
+
+    print(f"[{label}] rewrite came back empty — falling back to a hard word-cut of the original draft as last resort")
+    return _cap_hyde_doc_words(doc, max_words=target_max_words), True
+
+
+async def generate_hyde_document(topic: str, selected_template: dict) -> str:
+  
+    segments = selected_template.get("segments") or []
+    segments_json = json.dumps(segments, indent=2, ensure_ascii=False)
+
+    hyde_prompt = f"""
+            You are generating a HyDE (Hypothetical Document Embedding) passage for
+            a YouTube documentary research pipeline.
+
+            Topic: "{topic}"
+
+            You MUST strictly follow the script template below — do not invent a
+            different structure. The "segments" JSON defines the exact structure
+            the generated passage must mirror, section by section, in the same
+            order as listed.
+
+            Template title: "{selected_template.get('title')}"
+            Template cluster: {selected_template.get('cluster')}
+            Template purpose: {selected_template.get('about')}
+
+            Template segments (JSON) — mirror this structure exactly:
+            {segments_json}
+
+            Template reference text:
+            {selected_template.get('template_text')}
+
+            Task:
+            Write a short, factual, encyclopedia-style HyDE passage that provides
+            direct, concrete, retrievable information relevant to the topic above,
+            organized as one dense, information-rich block per segment, in the
+            same order as the segments list. Include key terms a search/embedding
+            system would match against. Do not write in a narrative or scripted
+            tone — this is a retrieval seed document, not the script itself.
+
+            Output only the passage, nothing else — no preamble, no headings or
+            labels beyond what naturally separates each segment's content.
+
+            STRICT LENGTH LIMIT: the passage must be 35-50 words (roughly 50-70
+            tokens) ONLY. Do not exceed this under any circumstances.
+""".strip()
+
+    doc, was_hard_trimmed = await _generate_length_constrained_hyde(
+        client=openai_client,
+        model="gpt-5.4-mini",
+        prompt=hyde_prompt,
+        label="HYDE-TEMPLATE",
+    )
+
+    if not doc:
+        print("[HYDE-TEMPLATE] falling back to topic")
+        return topic
+
+    if was_hard_trimmed:
+        print("[HYDE-TEMPLATE] WARNING: had to hard-trim as a fallback (model didn't comply with length after rewrite ask)")
+
+    print(f"[HYDE-TEMPLATE] final: {_word_count(doc)} word(s)")
+    print(f"[HYDE-TEMPLATE] {doc}")
+    return doc
+
+
+async def select_template_and_generate_hyde(topic: str) -> dict:
+    selected_template = await retrieve_best_script_template(topic)
+
+    if selected_template is None:
+        print("[PIPELINE] no template matched — generating a template-less HyDE document")
+        generated_hyde_document = topic
+    else:
+        generated_hyde_document = await generate_hyde_document(topic, selected_template)
+
+    return {
+        "selected_template": selected_template,
+        "generated_hyde_document": generated_hyde_document,
+    }
+
+
+
+async def get_context_from_db(
+    topic: str,
+    hyde_doc: str = None,
+    final_k: int = 7,
+    table_name: str = None,
+    similarity_threshold: float = DB_SIMILARITY_THRESHOLD,
+):
+    print(f"[DB] Starting retrieval for topic: '{topic}'")
+
+    if table_name is None:
+        table_name = await select_table_for_topic(topic)
+    else:
+        print(f"[DB] Using pre-selected table: {table_name}")
+
     embedding_source = hyde_doc if hyde_doc else topic
 
     model = _get_st_model()
@@ -2309,15 +2578,39 @@ async def get_context_from_db(topic: str, hyde_doc: str = None, final_k: int = 7
                     "query_dense_embedding": dense_embedding,
                     "match_table": table_name,
                     "match_count": 20,
+                    # SQL-side filter against the `embeddings` column — rows
+                    # below this cosine similarity never come back from
+                    # Postgres at all, so there's nothing weak to backfill
+                    # with even if fewer than 20 rows clear the bar.
+                    "similarity_threshold": similarity_threshold,
                 },
             ).execute()
         )
     except Exception as e:
-        print(f"[DB] vector search failed: {e}")
-        return []
+        print(f"[DB] RPC with similarity_threshold failed ({e}) — retrying with legacy 3-param signature")
+        try:
+            result = await asyncio.to_thread(
+                lambda: supabase.rpc(
+                    "match_documents",
+                    {
+                        "query_dense_embedding": dense_embedding,
+                        "match_table": table_name,
+                        "match_count": 20,
+                    },
+                ).execute()
+            )
+            print("[DB] legacy RPC call succeeded — filtering by similarity client-side instead")
+        except Exception as e2:
+            print(f"[DB] vector search failed even with legacy signature: {e2}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     candidates = result.data or []
-    print(f"[DB] RPC returned {len(candidates)} candidates from {table_name}")
+    print(
+        f"[DB] RPC returned {len(candidates)} candidate(s) from {table_name} "
+        f"(target similarity >= {similarity_threshold})"
+    )
 
     reranked = []
     for row in candidates:
@@ -2328,22 +2621,50 @@ async def get_context_from_db(topic: str, hyde_doc: str = None, final_k: int = 7
         reranked.append({**row, "sparse_score": sparse_score, "combined_score": combined})
 
     reranked.sort(key=lambda r: r["combined_score"], reverse=True)
-    matches = reranked[:final_k]
 
-    print(f"[DB] Top {len(matches)} chunks after hybrid rerank:")
+    # Defensive safety net: re-check the threshold client-side too, in case
+    # the SQL function is ever swapped for one that doesn't filter (or an
+    # older/uncached version is deployed). Should normally be a no-op since
+    # the RPC already only returns qualifying rows.
+    above_threshold = [r for r in reranked if (r.get("dense_score") or 0.0) >= similarity_threshold]
+    if len(above_threshold) != len(reranked):
+        print(
+            f"[DB] WARNING: {len(reranked) - len(above_threshold)} candidate(s) were below "
+            f"{similarity_threshold} similarity despite coming from the RPC — check that the "
+            f"match_documents SQL function is filtering on `embeddings` correctly."
+        )
+
+    matches = above_threshold[:final_k]
+
+    print(f"[DB] Top {len(matches)} chunks after hybrid rerank + similarity filter:")
     for i, row in enumerate(matches, start=1):
         content = row.get("content")
         md5 = row.get("md5") or (
             hashlib.md5(content.encode("utf-8")).hexdigest() if content else None
         )
-        print(f"  [DB-{i}] md5={md5} combined_score={row['combined_score']:.4f}")
+        print(
+            f"  [DB-{i}] md5={md5} dense_score={row.get('dense_score')} "
+            f"combined_score={row['combined_score']:.4f}"
+        )
         print(f"    content: {content[:200]}{'...' if content and len(content) > 200 else ''}")
+
+    # sparse_vector is only needed internally for the hybrid rerank score
+    # above — drop it before returning so it never ends up in the client
+    # response (it's large and not useful downstream).
+    for row in matches:
+        row.pop("sparse_vector", None)
 
     return matches
 
 
 # ============================================================
-# DDGS NEWS SEARCH (LLM-generated keywords, capped source count)
+# DDGS NEWS SEARCH  —  IDEA-GENERATION ONLY
+# (LLM-generated keywords, capped source count, semantically filtered
+# against the HyDE doc)
+#
+# IMPORTANT: everything in this section (_ddgs_search_for_ideas,
+# get_ddgs_news_context, and their helpers) is called EXCLUSIVELY from
+# /generate-ideas. /generate-script must never call get_ddgs_news_context.
 # ============================================================
 
 def _ddgs_search_for_ideas(keyword: str, max_results: int) -> list[tuple[str, str]]:
@@ -2392,6 +2713,13 @@ async def _generate_search_keywords(topic: str) -> list[str]:
 
     keywords = _parse_keyword_lines(raw)
 
+    # Safety net: even with the prompt fix, don't trust the model to never
+    # echo the raw topic as a standalone line or to respect "exactly 15" —
+    # strip an exact/near-exact echo of the topic and hard-cap the count.
+    topic_normalized = topic.strip().lower()
+    keywords = [kw for kw in keywords if kw.strip().lower() != topic_normalized]
+    keywords = keywords[:15]
+
     if not keywords:
         print("[DDGS] keyword generation returned nothing usable, using fallback")
         return [f"{topic} latest news today", f"{topic} 2026 update"]
@@ -2408,6 +2736,60 @@ def _truncate_words(text: str, max_words: int = 400) -> str:
     if len(words) <= max_words:
         return text
     return " ".join(words[:max_words]) + "..."
+
+
+def _split_into_chunks(text: str, max_words_per_chunk: int = 40) -> list[str]:
+    """
+    Splits article text into sentence-grouped passages (~max_words_per_chunk
+    words each) so the semantic layer can score and keep individual PASSAGES
+    of an article, instead of accepting/rejecting the whole article as one
+    blob. A long article is often a mix of relevant and irrelevant material —
+    this lets the useful paragraph survive even if the rest of the page
+    doesn't.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    chunks: list[str] = []
+    current: list[str] = []
+    current_words = 0
+
+    for sentence in sentences:
+        words = sentence.split()
+        if not words:
+            continue
+        if current and current_words + len(words) > max_words_per_chunk:
+            chunks.append(" ".join(current))
+            current = []
+            current_words = 0
+        current.append(sentence)
+        current_words += len(words)
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks
+
+
+_HASHTAG_PATTERN = re.compile(r"#(\w+)")
+
+
+def _extract_hashtags(*texts: str) -> list[str]:
+    """
+    Pulls #hashtags out of one or more text blocks (title, description).
+    These are distinct from yt-dlp's `tags` metadata field — hashtags are
+    literal #words the creator typed into the title/description, whereas
+    `tags` come from YouTube's separate (invisible) video-tags field.
+    """
+    found = []
+    seen = set()
+    for text in texts:
+        if not text:
+            continue
+        for match in _HASHTAG_PATTERN.findall(text):
+            tag = f"#{match}"
+            if tag.lower() not in seen:
+                seen.add(tag.lower())
+                found.append(tag)
+    return found
 
 
 def _fetch_full_article_text(url: str) -> str:
@@ -2441,16 +2823,92 @@ async def _fetch_full_article_text_with_timeout(url: str, timeout: float = 8.0) 
         return ""
 
 
-async def get_ddgs_news_context(topic: str, scraped_urls: set, max_results: int = 10) -> list[dict]:
-    """
-    Runs DDGS news search across LLM-generated keyword variants, dedupes by URL
-    against scraped_urls, fetches full article text for each result, and
-    returns AT MOST MAX_WEB_SOURCES article dicts.
-    Stops issuing further keyword searches once the cap is reached.
-    """
+
+MAX_WEB_SOURCES = 10
+MAX_YOUTUBE_SOURCES = 7   # final videos returned after scraping/ranking all keywords
+
+
+async def _generate_web_search_keywords(topic: str) -> list[str]:
+    return await _generate_search_keywords(topic)
+
+
+async def _generate_youtube_search_keywords(topic: str) -> list[str]:
+    loop = asyncio.get_event_loop()
+    prompt = f"""
+            You are a YouTube SEO strategist generating search queries to find the
+            BEST-PERFORMING, most-optimized existing videos on a topic — the goal is
+            to surface videos whose titles and descriptions are strong SEO examples,
+            not just any video that happens to match.
+
+            Topic: "{topic}"
+
+            YouTube search behaves differently from Google/web search:
+            - People phrase queries like video titles, not keyword strings
+              ("how X works", "X explained", "top 10 X", "X vs Y", "why does X
+              happen", "X for beginners", "the truth about X")
+            - High-performing videos usually rank for a clear, singular intent —
+              write queries the same way, not stuffed with extra modifiers
+            - Exact entities, names, places, or proper nouns from the topic pull
+              much more relevant, higher-quality results than generic phrasing —
+              preserve and reuse them naturally instead of abstracting away
+
+            Generate 10 distinct queries that together cover a SPREAD of these
+            intents (use each intent at most once, don't repeat the same angle
+            worded differently):
+            - the single broad head-term query anyone searching this topic would type
+            - a "how it works" / mechanism explainer query
+            - a "X explained" / definition-style query
+            - a beginner-friendly / "for beginners" query
+            - an advanced / in-depth / expert-level query
+            - a "top 10" or ranked-listicle query
+            - a comparison ("X vs Y") query, if a natural comparison exists —
+              otherwise substitute a myth-busting / "the truth about" query
+            - a case-study, real-example, or "what happened when" query
+            - a recent/current-year query (use the actual current year)
+            - a question-phrased query (who/what/why/how) or "why does X happen"
+
+            Rules:
+            - Each query should be 3-7 words, phrased like a real YouTube search bar entry
+            - No keyword stuffing, no boolean operators, no quotation marks
+            - No duplicate intent — each query must target a genuinely different angle
+            - Do not invent entities, names, or facts not implied by the topic
+            - Return ONLY the 10 queries, one per line, no numbering, no bullets, no commentary
+""".strip()
+
+    try:
+        completion = await loop.run_in_executor(
+            None,
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+            )
+        )
+        raw = completion.choices[0].message.content.strip()
+        keywords = _parse_keyword_lines(raw)
+        return keywords or [topic]
+    except Exception as exc:
+        print(f"--- YouTube keyword generation failed: {exc} ---")
+        return [topic]
+
+
+async def get_ddgs_news_context(
+    topic: str,
+    scraped_urls: set,
+    hyde_doc: str,
+    max_results: int = 10,
+    similarity_threshold: float = WEB_CONTENT_SIMILARITY_THRESHOLD,
+) -> list[dict]:
+
     print(f"[DDGS] Starting news search for topic: '{topic}'")
 
-    keywords = await _generate_search_keywords(topic)
+    keywords = await _generate_web_search_keywords(topic)
+
+    model = _get_st_model()
+
+    hyde_embedding = await asyncio.to_thread(
+        lambda: model.encode(hyde_doc, normalize_embeddings=True, convert_to_numpy=True)
+    )
 
     articles = []
     for keyword in keywords:
@@ -2472,20 +2930,404 @@ async def get_ddgs_news_context(topic: str, scraped_urls: set, max_results: int 
                 continue
             scraped_urls.add(url)
 
-            # fetch full article text instead of relying on the truncated DDGS snippet
             full_text = await _fetch_full_article_text_with_timeout(url)
             used_source = "full" if full_text else "fallback"
-            content = full_text if full_text else snippet  # fallback to snippet if fetch fails
+            content = full_text if full_text else snippet
 
-            content = _truncate_words(content, max_words=400)
-            articles.append({"url": url, "snippet": content, "source": used_source})
+            if not content:
+                print(f"[DDGS] SKIP (empty content, nothing to compare) {url}")
+                continue
 
-    print(f"[DDGS] {len(articles)} unique articles collected (capped at {MAX_WEB_SOURCES}):")
+            content = _truncate_words(content, max_words=600)
+
+            chunks = _split_into_chunks(content, max_words_per_chunk=40)
+            if not chunks:
+                print(f"[DDGS] SKIP (no chunks to compare) {url}")
+                continue
+
+            try:
+                chunk_embeddings = await asyncio.to_thread(
+                    lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
+                )
+            except Exception as e:
+                print(f"[DDGS] SKIP (embedding failed: {e}) {url}")
+                continue
+
+            chunk_similarities = np.dot(chunk_embeddings, hyde_embedding)
+
+            # Only passages whose similarity against the
+            # HyDE doc clears similarity_threshold survive into context.
+            picked = [
+                (chunk, float(sim))
+                for chunk, sim in zip(chunks, chunk_similarities)
+                if sim >= similarity_threshold
+            ]
+
+            if not picked:
+                best_sim = float(np.max(chunk_similarities)) if len(chunk_similarities) else 0.0
+                print(
+                    f"[DDGS] SKIP (no passage cleared threshold, "
+                    f"best_sim={best_sim:.4f} < {similarity_threshold}, "
+                    f"{len(chunks)} passage(s) checked) {url}"
+                )
+                continue
+
+            picked.sort(key=lambda p: p[1], reverse=True)
+
+            print(f"[DDGS] {len(picked)}/{len(chunks)} passage(s) picked from {url}:")
+            for chunk_text, sim in picked:
+                print(f"    [PICKED sim={sim:.4f}] {chunk_text}")
+
+            picked_text = _truncate_words(" ".join(chunk for chunk, _ in picked), max_words=200)
+            overall_similarity = picked[0][1]  # best passage's similarity
+
+            print(f"[DDGS] KEEP (best_sim={overall_similarity:.4f}) {url}")
+            articles.append({
+                "url": url,
+                "snippet": picked_text,
+                "source": used_source,
+                "similarity": overall_similarity,
+                "picked_passage_count": len(picked),
+                "total_passage_count": len(chunks),
+            })
+
+    # Surface the most semantically relevant scraped content first.
+    articles.sort(key=lambda a: a["similarity"], reverse=True)
+
+    print(f"[DDGS] {len(articles)} unique semantically-relevant articles kept "
+          f"(threshold={similarity_threshold}, capped at {MAX_WEB_SOURCES}):")
     for i, article in enumerate(articles, start=1):
-        print(f"  [NEWS-{i}] ({article['source']}) {article['url']}")
-        print(f"    snippet: {article['snippet']}")
+        print(
+            f"  [NEWS-{i}] ({article['source']}, best_sim={article['similarity']:.4f}, "
+            f"{article.get('picked_passage_count')}/{article.get('total_passage_count')} "
+            f"passage(s) picked) {article['url']}"
+        )
+        print(f"    picked text: {article['snippet']}")
 
     return articles
+
+
+SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE = """You are a Search Query Expansion Engine for automated web crawling.
+
+Input:
+A short video title/description (the topic of a script that's about to be written).
+
+Goal:
+Generate exactly 15 high-quality search engine keyword combinations that maximize information retrieval from Google, Bing, academic search engines, and news websites, to gather source material for writing the script.
+
+Requirements:
+- Every phrase must incorporate the topic's core subject/entities naturally —
+  do NOT output the raw topic string verbatim as one of the 15 lines by
+  itself; each line must be a distinct EXPANDED search phrase, not a copy of
+  the input.
+- Generate search phrases, NOT sentences.
+- Each phrase should target a unique research dimension.
+- Cover:
+  • latest news
+  • history
+  • timeline
+  • root causes
+  • stakeholders
+  • government
+  • companies
+  • researchers
+  • statistics
+  • datasets
+  • reports
+  • research papers
+  • expert opinions
+  • controversies
+  • future trends
+- Include important entities when inferable.
+- Avoid duplicate intent.
+- Each keyword combination should contain 4-10 words.
+- Return ONLY the 15 keyword combinations, nothing else — no preamble, no
+  restating the topic on its own line.
+- Number each result.
+
+[TOPIC]: {topic}
+"""
+
+
+def _ddgs_search_for_script(keyword: str, max_results: int) -> list[tuple[str, str]]:
+    """Script-side DDGS caller — independent copy of _ddgs_search_for_ideas."""
+    results: list[tuple[str, str]] = []
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.news(keyword, max_results=max_results):
+                url = r.get("url")
+                snippet = r.get("body", "") or r.get("title", "")
+                if url:
+                    results.append((url, snippet))
+    except Exception as e:
+        print(f"[DDGS-SCRIPT] search failed for '{keyword}': {e}")
+    return results
+
+
+async def _generate_search_keywords_for_script(topic: str) -> list[str]:
+    """Script-side keyword generation — independent copy of _generate_search_keywords."""
+    prompt = SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE.format(topic=topic)
+
+    try:
+        res = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        raw = res.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[DDGS-SCRIPT] keyword generation failed: {e}")
+        return [f"{topic} latest news today", f"{topic} 2026 update"]
+
+    keywords = _parse_keyword_lines(raw)
+
+    topic_normalized = topic.strip().lower()
+    keywords = [kw for kw in keywords if kw.strip().lower() != topic_normalized]
+    keywords = keywords[:15]
+
+    if not keywords:
+        print("[DDGS-SCRIPT] keyword generation returned nothing usable, using fallback")
+        return [f"{topic} latest news today", f"{topic} 2026 update"]
+
+    print(f"[DDGS-SCRIPT] generated {len(keywords)} keywords")
+    for i, kw in enumerate(keywords, start=1):
+        print(f"  [KW-SCRIPT-{i}] {kw}")
+
+    return keywords
+
+
+async def get_ddgs_news_context_for_script(
+    topic: str,
+    scraped_urls: set,
+    hyde_doc: str,
+    max_results: int = 10,
+    similarity_threshold: float = WEB_CONTENT_SIMILARITY_THRESHOLD,
+) -> list[dict]:
+    """
+    SCRIPT-GENERATION ONLY. Independent copy of get_ddgs_news_context, using
+    _generate_search_keywords_for_script / _ddgs_search_for_script instead of
+    the ideas-side helpers. Called ONLY from /generate-script.
+    """
+
+    print(f"[DDGS-SCRIPT] Starting news search for topic: '{topic}' (similarity_threshold={similarity_threshold})")
+
+    keywords = await _generate_search_keywords_for_script(topic)
+
+    model = _get_st_model()
+
+    hyde_embedding = await asyncio.to_thread(
+        lambda: model.encode(hyde_doc, normalize_embeddings=True, convert_to_numpy=True)
+    )
+
+    articles = []
+    for keyword in keywords:
+        if len(articles) >= MAX_WEB_SOURCES:
+            print(f"[DDGS-SCRIPT] Reached cap of {MAX_WEB_SOURCES} sources, stopping further keyword searches")
+            break
+
+        try:
+            pairs = await asyncio.to_thread(_ddgs_search_for_script, keyword, max_results)
+            print(f"[DDGS-SCRIPT] keyword '{keyword}' returned {len(pairs)} results")
+        except Exception as e:
+            print(f"[DDGS-SCRIPT] thread failed for '{keyword}': {e}")
+            pairs = []
+
+        for url, snippet in pairs:
+            if len(articles) >= MAX_WEB_SOURCES:
+                break
+            if url in scraped_urls:
+                continue
+            scraped_urls.add(url)
+
+            full_text = await _fetch_full_article_text_with_timeout(url)
+            used_source = "full" if full_text else "fallback"
+            content = full_text if full_text else snippet
+
+            if not content:
+                print(f"[DDGS-SCRIPT] SKIP (empty content, nothing to compare) {url}")
+                continue
+
+            content = _truncate_words(content, max_words=600)
+
+            chunks = _split_into_chunks(content, max_words_per_chunk=40)
+            if not chunks:
+                print(f"[DDGS-SCRIPT] SKIP (no chunks to compare) {url}")
+                continue
+
+            try:
+                chunk_embeddings = await asyncio.to_thread(
+                    lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
+                )
+            except Exception as e:
+                print(f"[DDGS-SCRIPT] SKIP (embedding failed: {e}) {url}")
+                continue
+
+            chunk_similarities = np.dot(chunk_embeddings, hyde_embedding)
+
+            # Same rule as the ideas-side pipeline: only
+            # passages whose similarity against the HyDE doc clears
+            # similarity_threshold survive into the script's context.
+            picked = [
+                (chunk, float(sim))
+                for chunk, sim in zip(chunks, chunk_similarities)
+                if sim >= similarity_threshold
+            ]
+
+            if not picked:
+                best_sim = float(np.max(chunk_similarities)) if len(chunk_similarities) else 0.0
+                print(
+                    f"[DDGS-SCRIPT] SKIP (no passage cleared threshold, "
+                    f"best_sim={best_sim:.4f} < {similarity_threshold}, "
+                    f"{len(chunks)} passage(s) checked) {url}"
+                )
+                continue
+
+            picked.sort(key=lambda p: p[1], reverse=True)
+
+            print(f"[DDGS-SCRIPT] {len(picked)}/{len(chunks)} passage(s) picked from {url}:")
+            for chunk_text, sim in picked:
+                print(f"    [PICKED sim={sim:.4f}] {chunk_text}")
+
+            picked_text = _truncate_words(" ".join(chunk for chunk, _ in picked), max_words=200)
+            overall_similarity = picked[0][1]  # best passage's similarity
+
+            print(f"[DDGS-SCRIPT] KEEP (best_sim={overall_similarity:.4f}) {url}")
+            articles.append({
+                "url": url,
+                "snippet": picked_text,
+                "source": used_source,
+                "similarity": overall_similarity,
+                "picked_passage_count": len(picked),
+                "total_passage_count": len(chunks),
+            })
+
+    # Surface the most semantically relevant scraped content first.
+    articles.sort(key=lambda a: a["similarity"], reverse=True)
+
+    print(f"[DDGS-SCRIPT] {len(articles)} unique semantically-relevant articles kept "
+          f"(threshold={similarity_threshold}, capped at {MAX_WEB_SOURCES}):")
+    for i, article in enumerate(articles, start=1):
+        print(
+            f"  [NEWS-SCRIPT-{i}] ({article['source']}, best_sim={article['similarity']:.4f}, "
+            f"{article.get('picked_passage_count')}/{article.get('total_passage_count')} "
+            f"passage(s) picked) {article['url']}"
+        )
+        print(f"    picked text: {article['snippet']}")
+
+    return articles
+
+
+def _youtube_search_yt_dlp(keyword: str, max_results: int) -> list[dict]:
+    if yt_dlp is None:
+        return []
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "ignoreerrors": True,
+    }
+
+    results = []
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{max_results}:{keyword}", download=False)
+            entries = (info or {}).get("entries") or []
+            for entry in entries:
+                if not entry:
+                    continue
+                video_id = entry.get("id")
+                url = entry.get("webpage_url") or (
+                    f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+                )
+                if not url:
+                    continue
+                results.append({
+                    "url": url,
+                    "title": entry.get("title", "") or "",
+                    "description": entry.get("description", "") or "",
+                    "channel": entry.get("uploader", "") or "",
+                    "view_count": entry.get("view_count"),
+                    "tags": entry.get("tags") or [],
+                })
+    except Exception as e:
+        print(f"[YT] yt-dlp search failed for '{keyword}': {e}")
+    return results
+
+
+async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 10) -> list[dict]:
+    print(f"[YT] Starting YouTube search for topic: '{topic}'")
+
+    if yt_dlp is None:
+        print("[YT] yt-dlp not installed, skipping YouTube scrape")
+        return []
+
+    keywords = await _generate_youtube_search_keywords(topic)
+    print(f"[YT] generated {len(keywords)} keywords")
+    for i, kw in enumerate(keywords, start=1):
+        print(f"  [KW-{i}] {kw}")
+
+    # Search + scrape EVERY keyword (no early-stop here) — each keyword was
+    # picked to cover a distinct intent, so cutting the loop short defeats
+    # the point of diversifying them. Only 1 result is pulled per keyword to
+    # keep total yt-dlp calls reasonable (10 keywords -> up to 10 candidates).
+    # We DON'T rank/trim until every keyword has been searched.
+    raw_candidates: list[dict] = []
+
+    for keyword in keywords:
+        try:
+            results = await asyncio.to_thread(_youtube_search_yt_dlp, keyword, 1)
+            print(f"[YT] keyword '{keyword}' returned {len(results)} result(s)")
+        except Exception as e:
+            print(f"[YT] search thread failed for '{keyword}': {e}")
+            results = []
+
+        for r in results:
+            url = r["url"]
+            if url in scraped_urls:
+                continue
+            scraped_urls.add(url)
+
+            title = r.get("title", "")
+            description = _truncate_words(r.get("description", ""), max_words=150)
+            tags = r.get("tags") or []
+            hashtags = _extract_hashtags(r.get("title", ""), r.get("description", ""))
+
+            print(f"[YT] SCRAPED {url}")
+            print(f"    title: {title}")
+            print(f"    description: {description}")
+            print(f"    tags: {tags}")
+            print(f"    hashtags: {hashtags}")
+
+            raw_candidates.append({
+                "url": url,
+                "title": title,
+                "description": description,
+                "channel": r.get("channel", ""),
+                "view_count": r.get("view_count"),
+                "tags": tags,
+                "hashtags": hashtags,
+            })
+
+    # NOW trim down to the final, best MAX_YOUTUBE_SOURCES (6-7) videos —
+    # ranked by view count as a proxy for which titles/descriptions are the
+    # strongest real-world SEO examples worth returning.
+    raw_candidates.sort(key=lambda v: v.get("view_count") or 0, reverse=True)
+    videos = raw_candidates[:MAX_YOUTUBE_SOURCES]
+
+    print(f"[YT] scraped {len(raw_candidates)} unique candidate video(s) from "
+          f"{len(keywords)} keyword(s), returning top {len(videos)} "
+          f"(capped at {MAX_YOUTUBE_SOURCES}):")
+    for i, v in enumerate(videos, start=1):
+        print(f"  [YT-{i}] views={v.get('view_count')} {v['url']}")
+        print(f"    title: {v['title']}")
+        print(f"    description: {v['description']}")
+        print(f"    tags: {v.get('tags')}")
+        print(f"    hashtags: {v.get('hashtags')}")
+
+    return videos
 
 
 def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> str:
@@ -2508,12 +3350,6 @@ def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> st
     return "\n\n".join(parts) if parts else "No additional context available."
 
 
-# ============================================================
-# PARSING: split the LLM's raw output into an "ideas" block and
-# a "topic summary" block BEFORE parsing ideas out of it. This is
-# what prevents the last idea's description from swallowing the
-# entire topic summary section.
-# ============================================================
 
 _SPLIT_ON_SUMMARY_HEADER = re.compile(
     r"\n\s*(?:#+\s*)?(?:\*\*)?"
@@ -2659,14 +3495,15 @@ Content Chunks:
     return {"ideas": ideas, "topic_summary": topic_summary}
 
 
-# ============================================================
-# ENDPOINT
-# ============================================================
 
 @app.post("/generate-ideas")
 async def generate_ideas_endpoint(
     request: GenerateIdeasRequest,
 ):
+    """
+    IDEA-GENERATION endpoint. This is the ONLY endpoint that triggers the
+    DDGS news search (get_ddgs_news_context -> _ddgs_search_for_ideas).
+    """
     topic = request.topic.strip()
 
     if not topic:
@@ -2690,7 +3527,7 @@ async def generate_ideas_endpoint(
 
         Task:
         1. Infer the user's true research intent.
-        2. Expand the topic into a coherent natural-language paragraph of **100–150 words only**.
+        2. Expand the topic into a coherent natural-language paragraph.
         3. Preserve the original meaning while enriching context.
         4. Include:
         - synonyms
@@ -2708,7 +3545,8 @@ async def generate_ideas_endpoint(
         8. Avoid conversational text, opinions, explanations or instructions.
         9. Maximize semantic richness and topical coverage for embedding similarity rather than keyword stuffing.
         10. Output only the expanded paragraph.
-        11. The output must contain **only one paragraph of 100–150 words** with no additional text before or after it.
+        11. STRICT LENGTH LIMIT: the output must be 50-70 tokens ONLY (roughly 35-50 words),
+        a single short paragraph, with no additional text before or after it.
 
         Purpose:
         The output will be embedded and matched against a vector database to retrieve semantically relevant documents for generating high-quality YouTube documentary scripts. Optimize for semantic recall while maintaining precise topic relevance.
@@ -2718,10 +3556,57 @@ async def generate_ideas_endpoint(
             openai_client.chat.completions.create,
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": hyde_prompt}],
+            # NOTE: same issue as the /generate-script HyDE calls — capping
+            # max_tokens at exactly 70 risks the model spending its whole
+            # budget on internal reasoning/formatting and returning an EMPTY
+            # message.content while usage still reports ~70 completion
+            # tokens. Give it real headroom, then trim to the 50-70 token
+            # target ourselves via _cap_hyde_doc_words.
+            max_completion_tokens=400,
             stream=False,
         )
 
-        hyde_doc = res.choices[0].message.content.strip()
+        raw_hyde_doc = (res.choices[0].message.content or "").strip()
+        hyde_finish_reason = getattr(res.choices[0], "finish_reason", None)
+        hyde_output_tokens = None
+        try:
+            hyde_output_tokens = res.usage.completion_tokens
+        except Exception:
+            pass
+
+        if not raw_hyde_doc:
+            print(
+                f"[HYDE] came back EMPTY (finish_reason={hyde_finish_reason}, "
+                f"raw_output_tokens={hyde_output_tokens}) — retrying with more headroom"
+            )
+            try:
+                retry_res = await asyncio.to_thread(
+                    openai_client.chat.completions.create,
+                    model="gpt-5.4-mini",
+                    messages=[{"role": "user", "content": hyde_prompt}],
+                    max_completion_tokens=1500,
+                    stream=False,
+                )
+                raw_hyde_doc = (retry_res.choices[0].message.content or "").strip()
+                hyde_finish_reason = getattr(retry_res.choices[0], "finish_reason", None)
+                try:
+                    hyde_output_tokens = retry_res.usage.completion_tokens
+                except Exception:
+                    pass
+            except Exception as retry_exc:
+                print(f"[HYDE] retry call raised: {retry_exc}")
+                raw_hyde_doc = ""
+
+        if not raw_hyde_doc:
+            print(
+                f"[HYDE] still EMPTY after retry (finish_reason={hyde_finish_reason}, "
+                f"raw_output_tokens={hyde_output_tokens}); falling back to topic"
+            )
+            hyde_doc = topic
+        else:
+            hyde_doc = _cap_hyde_doc_words(raw_hyde_doc)
+
+        print(f"[HYDE] raw_output_tokens={hyde_output_tokens} finish_reason={hyde_finish_reason} (trimmed to ~50-70 tokens)")
         print(f"[HYDE] {hyde_doc}")
 
         db_task = asyncio.create_task(get_context_from_db(topic, hyde_doc))
@@ -2744,7 +3629,18 @@ async def generate_ideas_endpoint(
             print("[MAIN] DB task still running after 11s timeout, proceeding without it for now.")
 
         print("[MAIN] Performing web search (mandatory, regardless of DB result count).")
-        new_articles = await get_ddgs_news_context(topic, scraped_urls)
+        # hyde_doc is passed through so scraped articles can be semantically
+        # filtered against it before being added to context — only
+        # semantically-matching web text survives into `new_articles`.
+        # This is the ONLY place in the whole app that calls
+        # get_ddgs_news_context / _ddgs_search_for_ideas.
+        try:
+            new_articles = await get_ddgs_news_context(topic, scraped_urls, hyde_doc)
+        except Exception as exc:
+            print(f"[MAIN] web search (DDGS) failed: {exc}")
+            import traceback
+            traceback.print_exc()
+            new_articles = []
 
         if not db_results and db_task not in done:
             try:
@@ -2768,9 +3664,16 @@ async def generate_ideas_endpoint(
 
         print("-" * 60)
         print("[MAIN] Generating ideas from combined context")
-        result = await generate_ideas_from_context(topic, db_results, new_articles)
-        ideas = result["ideas"]
-        topic_summary = result["topic_summary"]
+        try:
+            result = await generate_ideas_from_context(topic, db_results, new_articles)
+            ideas = result["ideas"]
+            topic_summary = result["topic_summary"]
+        except Exception as exc:
+            print(f"[MAIN] idea generation failed: {exc}")
+            import traceback
+            traceback.print_exc()
+            ideas = []
+            topic_summary = ""
 
         print("=" * 60)
         print(f"GENERATE IDEAS complete: {len(ideas)} ideas returned, summary present: {bool(topic_summary)}")
@@ -2793,24 +3696,18 @@ async def generate_ideas_endpoint(
         return {"error": "An error occurred in the idea generation pipeline.", "detail": str(e)}
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 async def pick_best_template(topic: str, templates: list) -> dict:
-    """Uses LLM to pick the best matching template based on topic + each template's 'about' field."""
+    """
+    DEPRECATED / no longer called by /generate-script.
+
+    This LLM-based "pick from a category-filtered subset" approach has been
+    replaced by retrieve_best_script_template() (pure BGE-M3 embedding
+    cosine-similarity search over ALL script_structures rows, no keyword or
+    category filtering). Left in place only in case something else in the
+    codebase still imports it — safe to delete once confirmed unused.
+
+    Uses LLM to pick the best matching template based on topic + each template's 'about' field.
+    """
     try:
         options = "\n\n".join([
             f"Key: {t['key']}\nTitle: {t['tittle']}\nAbout: {t['about']}"
@@ -2834,8 +3731,8 @@ async def pick_best_template(topic: str, templates: list) -> dict:
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
                 messages=[
                     {"role": "system", "content": "Return only the key value of the best matching template."},
                     {"role": "user", "content": prompt},
@@ -2881,8 +3778,8 @@ async def get_structure(content: str) -> dict:
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: deepseek_client.chat.completions.create(
-                model="deepseek-v4-pro",
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
                 messages=[
                     {"role": "system", "content": "Return only the category name."},
                     {"role": "user", "content": prompt},
@@ -2988,68 +3885,1357 @@ async def cut_credits(request: UnlockRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+import time
+import math
+
+
+MAX_WEB_SOURCES = 10
+MAX_YOUTUBE_SOURCES = 7
+MAX_DB_CHUNKS = 7
+
+# Approximate spoken narration pace used to size the generated script to the
+# requested video duration. 140 wpm sits in the typical 130-150 wpm range for
+# YouTube documentary/explainer narration.
+WORDS_PER_MINUTE = 140
+
+
+def target_word_count_for_time(minutes: int) -> int:
+    return max(50, int(minutes * WORDS_PER_MINUTE))
+
+
+class ScriptRequest(BaseModel):
+    userId: str
+    title: str
+    description: str
+    time: int
+
+
+def build_topic_text(request: "ScriptRequest") -> str:
+    return f"{request.title}\n\n{request.description}".strip()
+
+
+def bucket_segments_by_time(segments: list[dict], num_docs: int) -> list[list[dict]]:
+    if not segments:
+        return [[]]
+
+    num_docs = max(1, min(num_docs, len(segments)) if num_docs <= len(segments) else num_docs)
+
+    if num_docs >= len(segments):
+        return [[s] for s in segments]
+
+    total_pct = sum(s.get("percentage", 0) for s in segments) or 100
+    target_per_bucket = total_pct / num_docs
+
+    buckets: list[list[dict]] = []
+    current_bucket: list[dict] = []
+    running_pct = 0.0
+
+    for seg in segments:
+        current_bucket.append(seg)
+        running_pct += seg.get("percentage", 0)
+        if running_pct >= target_per_bucket and len(buckets) < num_docs - 1:
+            buckets.append(current_bucket)
+            current_bucket = []
+            running_pct = 0.0
+
+    if current_bucket:
+        buckets.append(current_bucket)
+
+    while len(buckets) < num_docs and len(buckets) > 0:
+        buckets.append(buckets[-1])
+    while len(buckets) > num_docs:
+        buckets[-2].extend(buckets[-1])
+        buckets.pop()
+
+    return buckets
+
+
+def num_hyde_docs_for_time(minutes: int) -> int:
+    return max(1, math.ceil(minutes / 2))
+
+
+def _cap_hyde_doc_words(text: str, max_words: int = 55) -> str:
+    text = text.strip()
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]).rstrip(",;:") + "."
+
+
+async def generate_hyde_doc_for_segments(
+    topic_text: str,
+    template: dict,
+    segment_group: list[dict],
+    title: str = None,
+    description: str = None,
+) -> str:
+    segment_briefs = "\n".join(
+        f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}%): {seg.get('brief', '')}"
+        for seg in segment_group
+    )
+
+    hyde_prompt = f"""
+            You are generating a HyDE (Hypothetical Document Embedding) passage to
+            drive retrieval for one part of a video script.
+
+            Idea Title: "{title}"
+            Idea Description: "{description}"
+
+            This passage must strictly follow the structure of the retrieved script
+            template below — do not invent a different structure.
+
+            Template: "{template.get('title')}" (cluster: {template.get('cluster')})
+            Template purpose: {template.get('about')}
+
+            This HyDE document should specifically support retrieval for the
+            following segment(s) of that template:
+            {segment_briefs}
+
+            Write a short, factual, encyclopedia-style paragraph that provides direct,
+            concrete, retrievable information relevant to the idea and the segment(s)
+            above. Be concise, information-dense, and include key terms a search/embedding
+            system would match against. Do not write in a narrative or scripted tone — this is
+            a retrieval seed document, not the script itself.
+
+            STRICT LENGTH LIMIT: output must be 50-70 tokens ONLY (roughly 35-50 words,
+            a single short paragraph). Do not exceed this. Output only the paragraph,
+            nothing else.
+""".strip()
+
+    loop = asyncio.get_event_loop()
+    segment_label = ', '.join(s.get('name', 'segment') for s in segment_group)
+
+    async def _call(max_tokens: int):
+        completion = await loop.run_in_executor(
+            None,
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": hyde_prompt}],
+                max_completion_tokens=max_tokens,
+                stream=False,
+            )
+        )
+        choice = completion.choices[0]
+        # NOTE: message.content can be None (not just ""), typically when a
+        # reasoning-capable model spends its entire max_tokens budget on
+        # internal reasoning and never gets to emit the visible answer.
+        # Calling .strip() directly on None used to raise AttributeError,
+        # which the outer except Exception caught SILENTLY and returned
+        # topic_text — giving zero visibility into what actually happened.
+        raw_content = (choice.message.content or "").strip()
+        finish_reason = getattr(choice, "finish_reason", None)
+        output_tokens = None
+        try:
+            output_tokens = completion.usage.completion_tokens
+        except Exception:
+            pass
+        return raw_content, finish_reason, output_tokens
+
+    try:
+        # NOTE: 400 tokens is sometimes still not enough — the model's
+        # internal reasoning tokens share the same budget as the visible
+        # answer, and this prompt got longer once template/segment context
+        # was added. Give it real headroom, then trim the finished text
+        # down to the 50-70 token target ourselves.
+        raw_doc, finish_reason, output_tokens = await _call(max_tokens=900)
+        doc = _cap_hyde_doc_words(raw_doc) if raw_doc else ""
+
+        if not doc:
+            print(
+                f"--- HyDE DOC [{segment_label}] came back EMPTY "
+                f"(finish_reason={finish_reason}, raw_output_tokens={output_tokens}) — "
+                f"{'hit token limit before finishing, retrying with more headroom' if finish_reason == 'length' else 'retrying once'} ---"
+            )
+            # One retry with a much larger budget — covers the case where
+            # reasoning simply needed more room to finish and emit content.
+            try:
+                raw_doc, finish_reason, output_tokens = await _call(max_tokens=2000)
+                doc = _cap_hyde_doc_words(raw_doc) if raw_doc else ""
+            except Exception as retry_exc:
+                print(f"--- HyDE DOC [{segment_label}] retry call raised: {retry_exc} ---")
+                doc = ""
+
+        if not doc:
+            print(
+                f"--- HyDE DOC [{segment_label}] still EMPTY after retry "
+                f"(finish_reason={finish_reason}, raw_output_tokens={output_tokens}); "
+                f"falling back to topic_text ---"
+            )
+            return topic_text
+
+        print(
+            f"--- HyDE DOC [{segment_label}] raw_output_tokens={output_tokens} "
+            f"finish_reason={finish_reason} (trimmed to ~50-70 tokens) ---\n{doc}\n---"
+        )
+        return doc
+    except Exception as exc:
+        print(f"--- HyDE generation failed for segment group [{segment_label}]: {type(exc).__name__}: {exc} ---")
+        return topic_text
 
 
 
+async def get_context_with_timeout(
+    topic_text: str, hyde_document: str, table_name: str = None, timeout: float = 20.0
+) -> list:
+    task = asyncio.create_task(get_context_from_db(topic_text, hyde_document, table_name=table_name))
+    done, pending = await asyncio.wait({task}, timeout=timeout)
+
+    if task in done:
+        try:
+            result = task.result()
+            print(f"[DB] task finished within timeout. Found {len(result)} documents.")
+            return result
+        except Exception as e:
+            print(f"[DB] task raised an error: {e}")
+            return []
+    else:
+        print("[DB] task still running after timeout, proceeding without it for now.")
+        return []
 
 
 
+SCRIPT_SYSTEM_PROMPT = """
+You are a YouTube Script Writer for long-form documentary-style videos.
+
+## Inputs
+1. Video Title & Description
+2. A script template (title, cluster, purpose, and an ordered list of segments,
+   each with a name, target percentage of runtime, and a brief describing what
+   that segment should accomplish)
+3. Retrieved knowledge chunks and recent news snippets — ONLY high-confidence,
+   semantically relevant material. Every chunk you are given already cleared a
+   similarity bar against the topic (see DB_SIMILARITY_THRESHOLD /
+   WEB_CONTENT_SIMILARITY_THRESHOLD), so treat all of it as
+   trustworthy, on-topic source material.
+4. A target total word count for the finished script (derived from the
+   requested video duration)
+
+## Objective
+Write a complete, narration-ready YouTube script that:
+- Strictly follows the template's segments, IN ORDER, using each segment's
+  brief as its creative direction
+- Allocates word count across segments roughly proportional to each
+  segment's target percentage of runtime
+- Weaves in concrete facts, figures, names, and details from the retrieved
+  knowledge chunks and news snippets — grounded, not vague or generic
+- Reads naturally aloud: conversational spoken-word rhythm, not essay prose
+- Opens with a strong hook in the first segment and maintains narrative
+  momentum throughout
+- Lands within about 10% of the target word count
+- Uses ONLY the provided source material for facts — do not invent
+  statistics, quotes, or events not supported by the retrieved context
+
+## Output
+Output ONLY the finished script text, written as continuous narration broken
+into paragraphs per segment. Prefix each segment with its name in brackets on
+its own line (e.g. "[Hook]"), followed by the narration for that segment.
+No preamble, no meta-commentary, no word-count notes, no markdown headers
+beyond the segment name markers.
+"""
 
 
+def _build_script_context(db_results: list[dict], new_articles: list[dict]) -> str:
+    """Combine high-confidence, similarity-filtered DB chunks and web snippets
+    into one context block for the script-writing prompt. Both inputs are
+    already pre-filtered (DB_SIMILARITY_THRESHOLD / WEB_CONTENT_SIMILARITY_THRESHOLD)
+    before this is called."""
+    parts = []
+
+    if db_results:
+        parts.append(f"=== KNOWLEDGE BASE EXCERPTS (dense similarity >= {DB_SIMILARITY_THRESHOLD}) ===")
+        for i, row in enumerate(db_results, start=1):
+            content = row.get("content", "")
+            dense_score = row.get("dense_score")
+            parts.append(f"[KB-{i}] (similarity={dense_score}) {content}")
+
+    if new_articles:
+        parts.append(f"\n=== RECENT NEWS / WEB (similarity >= {WEB_CONTENT_SIMILARITY_THRESHOLD}) ===")
+        for i, article in enumerate(new_articles, start=1):
+            snippet = article.get("snippet", "")
+            url = article.get("url", "")
+            similarity = article.get("similarity")
+            parts.append(f"[NEWS-{i}] (similarity={similarity}) {snippet} (source: {url})")
+
+    return "\n\n".join(parts) if parts else "No high-confidence source material available."
 
 
+def _segments_brief(segments: list[dict]) -> str:
+    if not segments:
+        return "No template segments available — write a natural documentary-style structure."
+    return "\n".join(
+        f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}% of runtime): {seg.get('brief', '')}"
+        for seg in segments
+    )
 
 
+async def generate_script_from_context(
+    request: "ScriptRequest",
+    selected_template: dict,
+    db_results: list[dict],
+    new_articles: list[dict],
+    target_word_count: int,
+) -> str:
+    print(
+        f"[SCRIPT] Building script context ({len(db_results)} DB chunks, "
+        f"{len(new_articles)} news articles), target_word_count={target_word_count}"
+    )
+    context_block = _build_script_context(db_results, new_articles)
+    segments_block = _segments_brief(selected_template.get("segments") or [])
+
+    user_prompt = f"""
+Video Title: "{request.title}"
+Video Description: "{request.description}"
+Target Duration: {request.time} minute(s)
+Target Word Count: approximately {target_word_count} words
+
+Template: "{selected_template.get('title')}" (cluster: {selected_template.get('cluster')})
+Template Purpose: {selected_template.get('about')}
+
+Segments (write the script in this exact order):
+{segments_block}
+
+Source Material:
+{context_block}
+"""
+
+    print("[SCRIPT] Sending prompt to gpt-5.4-mini")
+    loop = asyncio.get_event_loop()
+    try:
+        completion = await loop.run_in_executor(
+            None,
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+            )
+        )
+        script_text = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[SCRIPT] generation failed: {e}")
+        script_text = ""
+
+    if script_text:
+        print(f"[SCRIPT] generated {_word_count(script_text)} word(s) (target was {target_word_count})")
+    else:
+        print("[SCRIPT] generation returned an empty script")
+
+    return script_text
 
 
+# ============================================================
+# YOUTUBE SEO METADATA (titles / descriptions / keywords / thumbnail text)
+# ------------------------------------------------------------
+# Uses the finished script + the scraped reference metadata from currently-
+# ranking YouTube videos (get_youtube_context) to generate 3 alternatives
+# each of: title, description, keyword set, thumbnail text. Called ONLY from
+# /generate-script.
+# ============================================================
 
+YOUTUBE_SEO_SYSTEM_PROMPT = """
+You are a YouTube SEO metadata specialist.
+
+## Inputs
+1. The finished video script (or its title/description if no script is
+   available)
+2. Reference metadata scraped from real, currently-ranking YouTube videos on
+   the same topic (titles, tags, hashtags) — use these to understand what
+   keywords and phrasing already perform well. Do not copy them verbatim.
+
+## Objective
+Generate SEO-optimized YouTube metadata options for this video. Produce
+EXACTLY:
+- 3 alternative TITLES (each 40-70 characters, curiosity-driven, includes a
+  primary keyword naturally, no clickbait or false claims)
+- 3 alternative DESCRIPTIONS (each 60-100 words, opens with a hook sentence
+  containing the primary keyword, naturally works in supporting keywords,
+  ends with a soft call-to-action)
+- 3 HASHTAG SETS (each set is 8-15 distinct hashtags suited for a YouTube
+  video's hashtag field — every entry MUST start with "#", use camelCase for
+  multi-word phrases (e.g. "#artificialIntelligence"), no spaces, no
+  punctuation besides the leading "#", mix broad and long-tail/specific
+  terms, no duplicate hashtags within a set)
+- 3 THUMBNAIL TEXTS (each 4-8 words, punchy and readable at a glance, no
+  full sentences)
+
+## Output Format
+Respond with ONLY valid JSON, no markdown code fences, no preamble, no
+trailing commentary, in exactly this shape:
+
+{
+  "titles": ["...", "...", "..."],
+  "descriptions": ["...", "...", "..."],
+  "hashtags": [["#...", "#..."], ["#...", "#..."], ["#...", "#..."]],
+  "thumbnail_text": ["...", "...", "..."]
+}
+"""
+
+def _build_youtube_reference_block(new_videos: list[dict]) -> str:
+    if not new_videos:
+        return "No reference video metadata available."
+    parts = []
+    for i, v in enumerate(new_videos, start=1):
+        tags = ", ".join(v.get("tags") or [])
+        hashtags = ", ".join(v.get("hashtags") or [])
+        parts.append(f"[REF-{i}] title: {v.get('title')} | tags: {tags} | hashtags: {hashtags}")
+    return "\n".join(parts)
+
+
+def _parse_json_block(raw: str) -> dict:
+    """Strip optional markdown code fences an LLM might still wrap JSON in,
+    then parse. Raises on invalid JSON — caller is expected to catch it."""
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return json.loads(cleaned)
+
+
+def _build_fallback_youtube_metadata(request: "ScriptRequest") -> dict:
+    """
+    Deterministic, non-LLM fallback so `youtube_metadata` is NEVER returned
+    empty, even if the LLM call/parse fails outright. Used to fill in any
+    field (titles/descriptions/keywords/thumbnail_text) that comes back
+    missing or short after generate_youtube_seo_metadata() runs.
+    """
+    base = (request.title or "").strip() or "This Topic"
+    desc_hint = (request.description or "").strip()
+    short_desc = (desc_hint[:140] + "...") if len(desc_hint) > 140 else desc_hint
+    base_lower = base.lower()
+
+    return {
+        "titles": [
+            f"{base}: The Full Story Explained",
+            f"Why {base} Matters More Than You Think",
+            f"The Truth Behind {base} (In-Depth)",
+        ],
+        "descriptions": [
+            f"{base} — {short_desc or 'a deep dive into everything you need to know about this topic.'} Watch till the end for the full picture.",
+            f"Everything you need to know about {base_lower}, explained clearly with real context and evidence. Subscribe for more deep dives like this.",
+            f"A closer look at {base_lower}: what happened, why it matters, and what comes next. Let us know your thoughts in the comments.",
+        ],
+        "hashtags": _keyword_sets_to_hashtag_sets([
+            [base_lower, "documentary", "explained", "deep dive", "full story"],
+            [base_lower, "analysis", "breakdown", "case study", "explainer"],
+            [base_lower, "facts", "history", "insight", "overview"],
+        ]),
+        "thumbnail_text": [
+            (base[:28] or "Watch Now"),
+            "The Full Story",
+            "What Really Happened",
+        ],
+    }
+
+
+async def generate_youtube_seo_metadata(
+    request: "ScriptRequest",
+    script_text: str,
+    new_videos: list[dict],
+) -> dict:
+    """Generates 3 alternative titles/descriptions/hashtag-sets/thumbnail
+    texts, grounded in the finished script and real ranking-video reference
+    metadata scraped by get_youtube_context. Always backfills with a
+    deterministic fallback so no field is ever left empty."""
+    reference_block = _build_youtube_reference_block(new_videos)
+    script_excerpt = _truncate_words(script_text, max_words=300) if script_text else ""
+    fallback = _build_fallback_youtube_metadata(request)
+
+    user_prompt = f"""
+Video Title: "{request.title}"
+Video Description: "{request.description}"
+
+Script excerpt (for context on the actual content/angle):
+{script_excerpt or "No script available — base metadata on the title/description alone."}
+
+Reference metadata from currently-ranking videos on this topic:
+{reference_block}
+"""
+
+    print("[SEO] Sending prompt to gpt-5.4-mini")
+    metadata = None
+
+    try:
+        res = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-5.4-mini",
+            messages=[
+                {"role": "system", "content": YOUTUBE_SEO_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=False,
+        )
+        raw = (res.choices[0].message.content or "").strip()
+        metadata = _parse_json_block(raw)
+    except Exception as e:
+        print(f"[SEO] generation/parse failed: {e} — retrying once")
+        try:
+            res = await asyncio.to_thread(
+                openai_client.chat.completions.create,
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": YOUTUBE_SEO_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_completion_tokens=1500,
+                stream=False,
+            )
+            raw = (res.choices[0].message.content or "").strip()
+            metadata = _parse_json_block(raw)
+        except Exception as e2:
+            print(f"[SEO] retry also failed: {e2} — using deterministic fallback")
+            metadata = {}
+
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    # Normalize hashtags: accept either "hashtags" (the field we now ask
+    # for) or a stray "keywords" (in case the model reverts to the old
+    # field name), and always run the result through
+    # _keyword_sets_to_hashtag_sets so every entry ends up as a properly
+    # formatted "#camelCase" hashtag regardless of what the LLM produced.
+    raw_hashtag_sets = metadata.get("hashtags")
+    if not isinstance(raw_hashtag_sets, list) or not raw_hashtag_sets:
+        raw_hashtag_sets = metadata.get("keywords")
+    metadata["hashtags"] = _keyword_sets_to_hashtag_sets(raw_hashtag_sets or [])
+    metadata.pop("keywords", None)
+
+    # Backfill anything missing/empty/short with the deterministic fallback
+    # so titles/descriptions/hashtags/thumbnail_text are NEVER empty lists.
+    for key, fallback_values in fallback.items():
+        values = metadata.get(key)
+        if not isinstance(values, list) or len(values) == 0:
+            print(f"[SEO] '{key}' missing/empty in generated metadata, using fallback")
+            metadata[key] = fallback_values
+        else:
+            # top up to 3 items if the model returned fewer than requested
+            i = 0
+            while len(metadata[key]) < 3 and i < len(fallback_values):
+                metadata[key].append(fallback_values[i])
+                i += 1
+
+    print(
+        f"[SEO] generated {len(metadata['titles'])} title(s), "
+        f"{len(metadata['descriptions'])} description(s), "
+        f"{len(metadata['hashtags'])} hashtag set(s), "
+        f"{len(metadata['thumbnail_text'])} thumbnail text(s)"
+    )
+
+    return metadata
+
+async def _backfill_sources_to_target(
+    new_articles: list[dict],
+    scraped_urls: set,
+    title: str,
+    hyde_doc: str,
+    target_count: int = MAX_WEB_SOURCES,
+    max_rounds: int = 4,
+) -> list[dict]:
+    """
+    Keeps `new_articles` growing until it contains `target_count` unique
+    SOURCE DOMAINS (not just unique URLs — several articles can share a
+    domain). Runs multiple rounds, each one broadening coverage:
+      1) relaxed similarity threshold on the normal script keyword set
+      2) generic head-term queries (title, "title news", "title update", etc.)
+         searched directly and added even with zero similarity filtering,
+         since the goal here is domain diversity for `sources`, not
+         narration-grade relevance.
+    Stops as soon as the domain target is hit or a round adds nothing new.
+    """
+
+    def _domain_count(articles: list[dict]) -> int:
+        return len(_extract_source_website_names(articles))
+
+    def _known_domains(articles: list[dict]) -> set[str]:
+        return set(_extract_source_website_names(articles))
+
+    round_num = 0
+    while _domain_count(new_articles) < target_count and round_num < max_rounds:
+        round_num += 1
+        current = _domain_count(new_articles)
+        print(f"[MAIN] sources backfill round {round_num}: {current}/{target_count} unique domain(s) so far.")
+
+        added_this_round = 0
+
+        if round_num == 1:
+            # Round 1: same script keyword pipeline, but with a fully relaxed
+            # similarity threshold so more of what DDGS already returned survives.
+            try:
+                relaxed = await get_ddgs_news_context_for_script(
+                    title, scraped_urls, hyde_doc, similarity_threshold=0.0,
+                )
+            except Exception as e:
+                print(f"[MAIN] sources backfill round {round_num} failed: {e}")
+                relaxed = []
+
+            known = _known_domains(new_articles)
+            for article in relaxed:
+                if _domain_count(new_articles) >= target_count:
+                    break
+                url = article.get("url", "")
+                netloc = urlparse(url).netloc.lower() if url else ""
+                if netloc.startswith("www."):
+                    netloc = netloc[4:]
+                if netloc and netloc not in known:
+                    known.add(netloc)
+                    new_articles.append(article)
+                    added_this_round += 1
+
+        else:
+            # Later rounds: broad, generic head-term queries searched directly
+            # (bypassing keyword-generation + semantic filtering entirely) —
+            # purely to surface NEW domains DDGS hasn't returned yet.
+            generic_queries = [
+                title,
+                f"{title} news",
+                f"{title} latest update",
+                f"{title} analysis",
+                f"{title} explained",
+                f"{title} report",
+            ]
+            known = _known_domains(new_articles)
+            for query in generic_queries:
+                if _domain_count(new_articles) >= target_count:
+                    break
+                try:
+                    pairs = await asyncio.to_thread(_ddgs_search_for_script, query, 15)
+                except Exception as e:
+                    print(f"[MAIN] sources backfill generic query '{query}' failed: {e}")
+                    continue
+                for url, snippet in pairs:
+                    if _domain_count(new_articles) >= target_count:
+                        break
+                    if not url or url in scraped_urls:
+                        continue
+                    netloc = urlparse(url).netloc.lower()
+                    if netloc.startswith("www."):
+                        netloc = netloc[4:]
+                    if not netloc or netloc in known:
+                        continue
+                    scraped_urls.add(url)
+                    known.add(netloc)
+                    new_articles.append({
+                        "url": url,
+                        "snippet": _truncate_words(snippet or title, max_words=200),
+                        "source": "fallback-backfill",
+                        "similarity": 0.0,
+                        "picked_passage_count": 0,
+                        "total_passage_count": 0,
+                    })
+                    added_this_round += 1
+
+        print(f"[MAIN] sources backfill round {round_num} added {added_this_round} new domain(s); "
+              f"now {_domain_count(new_articles)}/{target_count}.")
+
+        if added_this_round == 0:
+            print("[MAIN] sources backfill round added nothing new, stopping.")
+            break
+
+    return new_articles
+
+
+def _extract_source_website_names(articles: list[dict]) -> list[str]:
+    names = []
+    seen = set()
+    for article in articles:
+        url = article.get("url", "")
+        if not url:
+            continue
+        try:
+            netloc = urlparse(url).netloc.lower()
+        except Exception:
+            continue
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        if netloc and netloc not in seen:
+            seen.add(netloc)
+            names.append(netloc)
+    return names
+
+
+SCRIPT_METRICS_SYSTEM_PROMPT = """
+You are a content analyst reviewing a finished YouTube documentary script.
+
+## Task
+Read the script and count/score the following content elements exactly as
+they appear in the script — do not estimate generically, actually look at
+what's present in the text.
+
+- emotionalDepth: a 1-10 score for how emotionally engaging/resonant the
+  script is (human stakes, tension, vivid imagery), not just informational
+- generalExamples: count of general illustrative examples used (concrete
+  scenarios, comparisons, "for example" style illustrations) that are NOT
+  historical events
+- proverbs_count: count of proverbs, sayings, quotes, or aphorisms used
+- historicalExamples: count of specific historical events, figures, or
+  eras referenced as examples
+- history: a 1-10 score for how much of the script's overall content is
+  grounded in historical context/narrative
+- researchFacts: count of distinct research-backed facts, statistics, or
+  studies cited
+- lawsIncluded: count of named laws, principles, theories, or rules
+  referenced (e.g. "Parkinson's Law", "the 80/20 rule")
+- keywords: 8-15 distinct topical keywords/phrases that best represent the
+  script's subject matter — real subject-matter terms only, never a segment
+  label like "[Hook]" or "[Intro]" and never a generic filler word
+
+## Scoring rules — READ CAREFULLY
+Every numeric field below is on a MINIMUM scale of 1. A value of 0 is NEVER
+valid output for any numeric field, even if the element is subtle, implicit,
+or only loosely present — every finished documentary script contains at
+least a trace of each dimension (a single relatable moment counts as an
+emotional beat, a single past reference counts as a historical example, a
+single cited number or named source counts as a research fact, and so on).
+Look harder and count the closest qualifying instance rather than returning
+0. Scores must be realistic and specific to THIS script, never a lazy
+default — but they must always be >= 1.
+
+## Output Format
+Respond with ONLY valid JSON, no markdown fences, no preamble, in exactly
+this shape:
+
+{
+  "emotionalDepth": <number, 1-10>,
+  "generalExamples": <number, >= 1>,
+  "proverbs_count": <number, >= 1>,
+  "historicalExamples": <number, >= 1>,
+  "researchFacts": <number, >= 1>,
+}
+"""
+
+_METRIC_MIN_VALUES = {
+    "emotionalDepth": 1,
+    "generalExamples": 1,
+    "proverbs_count": 1,
+    "historicalExamples": 1,
+    "researchFacts": 1,
+}
+
+_DEFAULT_SCRIPT_METRICS = {
+    "emotionalDepth": 1,
+    "generalExamples": 1,
+    "proverbs_count": 1,
+    "historicalExamples": 1,
+    "researchFacts": 1,
+}
+
+_KEYWORD_STOPWORDS = {
+    "hook", "intro", "introduction", "climax", "outro", "conclusion",
+    "segment", "around", "simple", "because", "before", "after", "there",
+    "their", "which", "would", "could", "should", "these", "those",
+    "where", "while", "about", "through", "during", "again", "still",
+}
+
+
+def _clean_keyword_token(token: str) -> str:
+    token = token.strip()
+    token = re.sub(r"^\[|\]$", "", token)  # strip leading "[" / trailing "]"
+    token = token.strip(".,!?\"'*:; \n").lower()
+    return token
+
+
+def _clamp_metric_value(key: str, value) -> int:
+    """Coerce to int and enforce the field's hard floor so it's never 0."""
+    floor = _METRIC_MIN_VALUES.get(key, 1)
+    try:
+        num = int(round(float(value)))
+    except (TypeError, ValueError):
+        num = floor
+    if num < floor:
+        num = floor
+    if key in ("emotionalDepth", "history") and num > 10:
+        num = 10
+    return num
+
+
+def _fallback_keywords_from_text(script_text: str, topic_text: str, min_count: int = 8) -> list[str]:
+    words = [_clean_keyword_token(w) for w in script_text.split()]
+    seen = set()
+    fallback_kw = []
+    for w in words:
+        if not w or len(w) <= 5 or w in _KEYWORD_STOPWORDS or not w.isalpha():
+            continue
+        if w not in seen:
+            seen.add(w)
+            fallback_kw.append(w)
+        if len(fallback_kw) >= min_count:
+            break
+    if not fallback_kw:
+        fallback_kw = [w.strip().lower() for w in re.split(r"[,\n]", topic_text) if w.strip()][:min_count]
+    return fallback_kw or [topic_text.strip().lower() or "topic"]
+
+
+async def generate_script_metrics(script_text: str, topic_text: str = "") -> dict:
+    if not script_text:
+        print("[METRICS] empty script_text, using floor defaults + topic-derived keywords")
+        metrics = dict(_DEFAULT_SCRIPT_METRICS)
+        metrics["keywords"] = _fallback_keywords_from_text("", topic_text)
+        return metrics
+
+    user_prompt = f"Script:\n{script_text}"
+
+    print("[METRICS] Sending prompt to gpt-5.4-mini")
+    metrics = None
+    try:
+        res = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-5.4-mini",
+            messages=[
+                {"role": "system", "content": SCRIPT_METRICS_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=False,
+        )
+        raw = (res.choices[0].message.content or "").strip()
+        metrics = _parse_json_block(raw)
+    except Exception as e:
+        print(f"[METRICS] generation/parse failed: {e}")
+        metrics = {}
+
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    # Clamp every numeric field to its floor of 1 — covers missing keys,
+    # None, non-numeric junk, AND the LLM literally returning 0.
+    for key in _METRIC_MIN_VALUES:
+        raw_value = metrics.get(key)
+        clamped = _clamp_metric_value(key, raw_value)
+        if raw_value != clamped:
+            print(f"[METRICS] '{key}' was {raw_value!r}, clamped to floor value {clamped}")
+        metrics[key] = clamped
+
+    # Clean keywords: strip segment markers ("[Hook]" -> drop), stopwords,
+    # and non-alphabetic junk; backfill from the script/topic if too short.
+    raw_keywords = metrics.get("keywords") or []
+    cleaned_keywords = []
+    seen_kw = set()
+    for kw in raw_keywords:
+        if not isinstance(kw, str):
+            continue
+        cleaned = _clean_keyword_token(kw)
+        if not cleaned or cleaned in _KEYWORD_STOPWORDS or not re.match(r"^[a-z][a-z\s\-']*$", cleaned):
+            continue
+        if cleaned not in seen_kw:
+            seen_kw.add(cleaned)
+            cleaned_keywords.append(cleaned)
+
+    if len(cleaned_keywords) < 8:
+        print(f"[METRICS] only {len(cleaned_keywords)} valid keyword(s) after cleaning, topping up from script text")
+        for kw in _fallback_keywords_from_text(script_text, topic_text, min_count=8):
+            if kw not in seen_kw:
+                seen_kw.add(kw)
+                cleaned_keywords.append(kw)
+            if len(cleaned_keywords) >= 8:
+                break
+
+    metrics["keywords"] = cleaned_keywords
+
+    print(f"[METRICS] generated: {metrics}")
+    return metrics
+
+
+MYSQL_URL = os.getenv("MYSQL_URL")
+print(MYSQL_URL)
+
+BOOKS_TABLE_NAME = "english_books"
+
+_mysql_engine = None
+
+
+def get_mysql_engine():
+    global _mysql_engine
+    if _mysql_engine is None:
+        print("[MYSQL] Creating engine")
+        _mysql_engine = create_engine(MYSQL_URL, pool_pre_ping=True, pool_recycle=280)
+    return _mysql_engine
+
+
+def _fetch_books_by_md5_sync(md5_list: list[str]) -> list[dict]:
+    if not md5_list:
+        return []
+
+    engine = get_mysql_engine()
+    query = text(
+        f"SELECT Title, Author FROM {BOOKS_TABLE_NAME} WHERE md5 IN :md5_list"
+    ).bindparams(bindparam("md5_list", expanding=True))
+
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(query, {"md5_list": md5_list})
+            rows = [dict(r._mapping) for r in result]
+        return rows
+    except Exception as e:
+        print(f"[MYSQL] book lookup failed: {e}")
+        return []
+
+
+MAX_BOOKS = 7
+
+
+async def _generate_fallback_books(
+    topic_text: str,
+    script_text: str,
+    count: int,
+    exclude_titles: set[str] | None = None,
+) -> list[dict]:
+    """
+    Non-DB fallback used to top `books` up to MAX_BOOKS (7). Called both when
+    the MySQL md5 lookup against `english_books` finds zero matches, and when
+    it finds SOME matches but fewer than MAX_BOOKS. Asks the LLM to suggest
+    real, well-known published books relevant to the topic, formatted the
+    same way as the DB rows (title/author), avoiding anything already found.
+    """
+    if count <= 0:
+        return []
+
+    context = _truncate_words(script_text, max_words=200) if script_text else topic_text
+    exclude_titles = exclude_titles or set()
+    exclude_block = (
+        f"\n    Do NOT repeat any of these already-listed books: {', '.join(sorted(exclude_titles))}"
+        if exclude_titles else ""
+    )
+
+    prompt = f"""
+    Suggest exactly {count} real, well-known, published non-fiction books that are
+    directly relevant as further-reading recommendations for the topic below.
+    Use only real books with real authors — do not invent titles or authors.{exclude_block}
+
+    Topic: "{topic_text}"
+    Context: "{context}"
+
+    Respond with ONLY valid JSON, no markdown fences, no preamble, in exactly
+    this shape (an array of exactly {count} objects):
+    [
+      {{"title": "...", "author": "..."}}
+    ]
+    """
+
+    try:
+        res = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        raw = (res.choices[0].message.content or "").strip()
+        books = _parse_json_block(raw)
+        if isinstance(books, list) and books:
+            cleaned = [
+                {"title": b.get("title"), "author": b.get("author")}
+                for b in books
+                if isinstance(b, dict) and b.get("title") and b.get("author")
+                and b.get("title").strip().lower() not in {t.lower() for t in exclude_titles}
+            ]
+            if cleaned:
+                print(f"[MYSQL] fallback: LLM suggested {len(cleaned)} book(s)")
+                return cleaned[:count]
+    except Exception as e:
+        print(f"[MYSQL] fallback book generation failed: {e}")
+
+    return []
+
+
+async def get_books_for_chunks(db_results: list[dict], topic_text: str = "", script_text: str = "") -> list[dict]:
+    """
+    Always returns exactly MAX_BOOKS (7) book entries. Pulls as many as it
+    can from the `english_books` MySQL table by chunk md5, then tops up the
+    remainder (or all 7, if the DB lookup returns nothing) with LLM-suggested
+    real books so the field is never short or empty. If the DB lookup alone
+    returns MORE than MAX_BOOKS, the list is trimmed to MAX_BOOKS.
+    """
+    md5_list = []
+    seen_md5 = set()
+    for row in db_results:
+        md5 = row.get("md5")
+        if md5 and md5 not in seen_md5:
+            seen_md5.add(md5)
+            md5_list.append(md5)
+
+    books: list[dict] = []
+    if md5_list:
+        print(f"[MYSQL] looking up {len(md5_list)} unique md5(s) for book Title/Author in '{BOOKS_TABLE_NAME}'")
+        rows = await asyncio.to_thread(_fetch_books_by_md5_sync, md5_list)
+
+        seen_books = set()
+        for row in rows:
+            title = row.get("Title")
+            author = row.get("Author")
+            key = (title, author)
+            if title and key not in seen_books:
+                seen_books.add(key)
+                books.append({"title": title, "author": author})
+
+        print(f"[MYSQL] resolved {len(books)} unique book(s) from {len(md5_list)} md5(s)")
+    else:
+        print("[MYSQL] no md5s found on finalized DB chunks, skipping direct lookup")
+
+    if len(books) < MAX_BOOKS:
+        needed = MAX_BOOKS - len(books)
+        print(f"[MYSQL] only {len(books)}/{MAX_BOOKS} book(s) found — generating {needed} LLM fallback book(s)")
+        existing_titles = {b["title"] for b in books if b.get("title")}
+        fallback_books = await _generate_fallback_books(
+            topic_text, script_text, count=needed, exclude_titles=existing_titles
+        )
+
+        # One retry round if the LLM returned fewer than needed (e.g. dupes
+        # got filtered out) — try once more to fully top up to MAX_BOOKS.
+        if len(fallback_books) < needed:
+            still_needed = needed - len(fallback_books)
+            existing_titles |= {b["title"] for b in fallback_books if b.get("title")}
+            extra = await _generate_fallback_books(
+                topic_text, script_text, count=still_needed, exclude_titles=existing_titles
+            )
+            fallback_books.extend(extra)
+
+        books.extend(fallback_books)
+
+    if len(books) < MAX_BOOKS:
+        # Last-resort padding so the list always has exactly MAX_BOOKS items,
+        # even if every LLM attempt above failed.
+        while len(books) < MAX_BOOKS:
+            books.append({"title": "No additional related book found", "author": "N/A"})
+
+    books = books[:MAX_BOOKS]
+    print(f"[MYSQL] final books list: {len(books)} entries")
+    return books
+
+
+def _keyword_sets_to_hashtag_sets(keyword_sets: list[list[str]]) -> list[list[str]]:
+    return [_build_hashtags_from_keywords(s) for s in (keyword_sets or [])]
+
+
+def _keyword_to_hashtag(keyword: str) -> str:
+    """Converts a single keyword/phrase (e.g. 'artificial intelligence') into
+    a hashtag (e.g. '#artificialIntelligence'). Strips non-alphanumeric
+    characters and camelCases multi-word phrases."""
+    words = re.findall(r"[A-Za-z0-9]+", keyword)
+    if not words:
+        return ""
+    first, rest = words[0].lower(), words[1:]
+    camel = first + "".join(w.capitalize() for w in rest)
+    return f"#{camel}" if camel else ""
+
+
+def _build_hashtags_from_keywords(keywords: list[str]) -> list[str]:
+    hashtags = []
+    seen = set()
+    for kw in keywords:
+        tag = _keyword_to_hashtag(kw)
+        if tag and tag.lower() not in seen:
+            seen.add(tag.lower())
+            hashtags.append(tag)
+    return hashtags
+
+
+# ============================================================
+# STRUCTURE RESPONSE BUILDER
+# ------------------------------------------------------------
+# The internal `selected_template` dict (built by
+# retrieve_best_script_template) carries extra fields — `template_text` and
+# `similarity` — plus per-segment `brief` text, all needed internally to
+# drive HyDE generation and script writing. None of that belongs in the
+# HTTP response. This builds the trimmed public version, returned under the
+# `structure` key.
+# ============================================================
+
+def _build_structure_response(selected_template: dict) -> list[dict]:
+    segments = selected_template.get("segments") or []
+    return [
+        {
+            "name": seg.get("name"),
+            "percentage": seg.get("percentage"),
+        }
+        for seg in segments
+    ]
 
 
 @app.post("/generate-script")
-async def generate_script(request: ScriptRequest, background_tasks: BackgroundTasks):
+async def generate_script(request: ScriptRequest):
+    """
+    SCRIPT-GENERATION endpoint. Uses its OWN independent DDGS keyword
+    generation + web search pipeline (get_ddgs_news_context_for_script /
+    _generate_search_keywords_for_script / _ddgs_search_for_script) — a
+    separate code path from the one /generate-ideas uses
+    (get_ddgs_news_context / _generate_search_keywords / _ddgs_search_for_ideas).
+    They don't share functions, so each generates its own 15 search keywords
+    independently and can be tuned without touching the other. This endpoint
+    also runs a YouTube search (get_youtube_context) for SEO reference
+    material, which is a separate, unrelated data source.
+
+    All LLM calls in this pipeline (HyDE generation, script writing, SEO
+    metadata, metrics, book fallback) go through the OpenAI Chat Completions
+    API via `openai_client` / model "gpt-5.4-mini" — DeepSeek has been fully
+    removed from this endpoint.
+
+    Both the DB chunks and the web/news snippets used to write the script are
+    pre-filtered to a semantic-similarity bar before they ever reach the
+    script-writing prompt (see DB_SIMILARITY_THRESHOLD /
+    WEB_CONTENT_SIMILARITY_THRESHOLD). If fewer than MAX_WEB_SOURCES (10)
+    unique sources are found, a second backfill pass is run with a relaxed
+    similarity threshold so `sources` is filled as close to 10 as possible.
+
+    `books` is looked up by chunk md5 against the `english_books` MySQL
+    table; if no rows match, an LLM fallback suggests 3 real relevant books
+    so the field is never returned empty.
+
+    `youtube_metadata` always returns 3 titles / 3 descriptions / 3 keyword
+    sets / 3 thumbnail texts — backfilled with a deterministic fallback if
+    the LLM call fails or returns incomplete data.
+
+    Response shape — nothing is written to Supabase, everything comes back
+    directly:
+        {
+            "script": "...",                      # the finished narration script
+
+            "youtube_metadata": {
+                "titles": [3 alternative titles],
+                "descriptions": [3 alternative descriptions],
+                "keywords": [3 keyword sets, each a list of tags],
+                "thumbnail_text": [3 short (4-8 word) thumbnail texts],
+            },
+
+            "metrics": {
+                "totalWords": <int>,          # actual word count of the script
+                "videoLength": <float>,       # minutes, derived from totalWords / WORDS_PER_MINUTE
+                "emotionalDepth": <int>,      # 1-10 LLM score
+                "generalExamples": <int>,
+                "proverbs_count": <int>,
+                "historical_facts": <int>,    # renamed from historicalExamples
+                "history": <int>,             # 1-10 LLM score
+                "researchFacts": <int>,
+                "hashtags": ["#example", "#anotherTopic", ...],  # derived from script keywords
+                # NOTE: lawsIncluded has been removed from this response.
+            },
+
+            "sources": ["bbc.com", "reuters.com", ...],   # web source domains only
+            "books": [{"title": "...", "author": "..."}, ...],  # from MySQL, by chunk md5
+
+            "structure": [{"name": "...", "percentage": <int>}, ...],
+            # NOTE: structure is now ONLY the segments array (name +
+            # percentage per segment). key/title/cluster/about/
+            # best_fit_categories/human_texture_tier/template_text/
+            # similarity/brief are all internal-only and never included.
+        }
+
+    Note: "keywords" appears in BOTH youtube_metadata (3 keyword *sets* for
+    YouTube tags) and metrics (a single flat list of content keywords) —
+    they are deliberately nested under different parents to avoid colliding.
+    """
 
     total_start_time = time.time()
-    print(f"SCRIPT GENERATION: Received request for topic: '{request.topic}'")
+    topic_text = build_topic_text(request)
+    print(f"SCRIPT GENERATION: Received request for title: '{request.title}'")
+
+    selected_template = await retrieve_best_script_template(topic_text)
+
+    if selected_template is None:
+        print("[SCRIPT] no template matched via embedding search — proceeding with an empty structure")
+        selected_template = {
+            "key": None,
+            "title": None,
+            "cluster": None,
+            "about": None,
+            "best_fit_categories": [],
+            "human_texture_tier": None,
+            "segments": [],
+            "template_text": "",
+            "similarity": None,
+        }
+
+    category = selected_template.get("cluster") or (
+        (selected_template.get("best_fit_categories") or ["UNKNOWN"])[0]
+    )
+    print(f"Category (from selected template): {category}")
+    print(
+        f"Selected template: '{selected_template.get('title')}' "
+        f"(key={selected_template.get('key')}, similarity={selected_template.get('similarity')})"
+    )
+
+    segments = selected_template.get("segments", [])
 
     try:
         channel_profile = await get_channel_profile(request.userId)
         summary = channel_profile[0]["Summary"] if channel_profile else None
-
-        hyde_document = request.topic
-        try:
-            hyde_prompt = f"""
-            Write a short, factual, encyclopedia-style paragraph that provides a direct answer
-            to the following topic. Be concise and include key terms.
-
-            Topic: "{request.topic}"
-            """
-            loop = asyncio.get_event_loop()
-            hyde_completion = await loop.run_in_executor(
-                None,
-                lambda: deepseek_client.chat.completions.create(
-                    model="deepseek-v4-pro",
-                    messages=[{"role": "user", "content": hyde_prompt}],
-                    stream=False,
-                )
-            )
-            hyde_document = hyde_completion.choices[0].message.content.strip()
-            print(f"--- HyDE DOCUMENT GENERATED ---\n{hyde_document}\n--- END HyDE DOCUMENT ---")
-            db_results = []
-            new_articles = []
-            scraped_urls = set()
-            db_task = asyncio.create_task(get_context_from_db(request.topic, hyde_document))
-
-
-
-
-        except Exception as exc:
-            print(f"--- HyDE generation failed, using raw topic as fallback: {exc} ---")
     except Exception as exc:
-            print(f"--- error ---")
+        print(f"--- error fetching channel profile: {exc} ---")
+        summary = None
 
+    num_docs = num_hyde_docs_for_time(request.time)
+    segment_buckets = bucket_segments_by_time(segments, num_docs)
+    print(f"Generating {len(segment_buckets)} HyDE doc(s) for a {request.time}-minute script")
 
+    hyde_documents: list[str] = []
+    db_results: list = []
+    new_articles: list = []
+    new_videos = []
+    scraped_urls = set()
+    script_text = ""
+    youtube_metadata = {"titles": [], "descriptions": [], "keywords": [], "thumbnail_text": []}
+    script_metrics = dict(_DEFAULT_SCRIPT_METRICS)
+    sources: list[str] = []
+    books: list[dict] = []
 
+    try:
+        table_name = await select_table_for_topic(topic_text)
 
+        hyde_documents = await asyncio.gather(
+            *[
+                generate_hyde_doc_for_segments(
+                    topic_text, selected_template, bucket, request.title, request.description
+                )
+                for bucket in segment_buckets
+            ]
+        )
+    except Exception as exc:
+        print(f"--- table selection / HyDE generation failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+        table_name = None
+
+    try:
+        # Each per-bucket lookup filters to DB_SIMILARITY_THRESHOLD (falls
+        # back to client-side filtering inside get_context_from_db if the
+        # RPC doesn't support the similarity_threshold param yet).
+        db_results_per_doc = await asyncio.gather(
+            *[get_context_with_timeout(topic_text, doc, table_name=table_name) for doc in hyde_documents]
+        )
+
+        seen_ids = set()
+        for doc_results in db_results_per_doc:
+            for item in doc_results:
+                if len(db_results) >= MAX_DB_CHUNKS:
+                    break
+                item_id = item.get("id") or item.get("url") or str(item)
+                if item_id not in seen_ids:
+                    seen_ids.add(item_id)
+                    db_results.append(item)
+            if len(db_results) >= MAX_DB_CHUNKS:
+                break
+
+        print(f"[MAIN] Combined DB context: {len(db_results)} unique chunk(s) "
+              f"(capped at {MAX_DB_CHUNKS}, target >= {DB_SIMILARITY_THRESHOLD} similarity) "
+              f"from {len(hyde_documents)} HyDE docs.")
+    except Exception as exc:
+        print(f"--- DB retrieval failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+
+    combined_hyde_doc = "\n\n".join(doc for doc in hyde_documents if doc) or topic_text
+
+    try:
+        print("[MAIN] Performing web search (script-specific DDGS pipeline, own 15 keywords).")
+        new_articles = await get_ddgs_news_context_for_script(
+            request.title,
+            scraped_urls,
+            combined_hyde_doc,
+        )
+
+        # Backfill: `sources` needs up to MAX_WEB_SOURCES (10) UNIQUE DOMAINS,
+        # not just 10 articles (several articles can share a domain). Keep
+        # broadening the search — relaxed threshold first, then generic
+        # head-term queries — until we hit 10 unique domains or run out of
+        # useful rounds. scraped_urls prevents re-fetching the same URL.
+        domain_count = len(_extract_source_website_names(new_articles))
+        if domain_count < MAX_WEB_SOURCES:
+            print(
+                f"[MAIN] Only {domain_count} unique source domain(s) found, "
+                f"running multi-round backfill to try to reach {MAX_WEB_SOURCES}."
+            )
+            try:
+                new_articles = await _backfill_sources_to_target(
+                    new_articles, scraped_urls, request.title, combined_hyde_doc,
+                    target_count=MAX_WEB_SOURCES,
+                )
+            except Exception as backfill_exc:
+                print(f"[MAIN] sources backfill failed: {backfill_exc}")
+
+        print(f"[MAIN] Final source domain count: {len(_extract_source_website_names(new_articles))}/{MAX_WEB_SOURCES}")
+        print(new_articles)
+    except Exception as exc:
+        print(f"--- web search (DDGS) failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+
+    try:
+        print("[MAIN] Performing YouTube search.")
+        new_videos = await get_youtube_context(request.title, scraped_urls)
+        print(new_videos)
+    except Exception as exc:
+        print(f"--- YouTube search failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+
+    try:
+        # Write the actual script from the semantically-filtered DB chunks
+        # and web snippets, sized to the requested video duration. No DB
+        # write — the script goes straight into the HTTP response.
+        target_word_count = target_word_count_for_time(request.time)
+        script_text = await generate_script_from_context(
+            request, selected_template, db_results, new_articles, target_word_count
+        )
+    except Exception as exc:
+        print(f"--- script generation failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+
+    try:
+        # Book Title/Author lookup (MySQL, `english_books`) for the finalized
+        # DB chunks, with an LLM fallback if no md5 matches are found — done
+        # after script_text is available so the fallback prompt has context.
+        books = await get_books_for_chunks(db_results, topic_text=topic_text, script_text=script_text)
+    except Exception as exc:
+        print(f"--- MySQL book lookup failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+        books = [{"title": "No related books found for this topic", "author": "N/A"}]
+
+    try:
+        print("[MAIN] Generating YouTube SEO metadata.")
+        youtube_metadata = await generate_youtube_seo_metadata(request, script_text, new_videos)
+    except Exception as exc:
+        print(f"--- YouTube SEO metadata generation failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+        youtube_metadata = _build_fallback_youtube_metadata(request)
+
+    try:
+        print("[MAIN] Generating script content metrics.")
+        script_metrics = await generate_script_metrics(script_text, topic_text=topic_text)
+    except Exception as exc:
+        print(f"--- script metrics generation failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+
+    sources = _extract_source_website_names(new_articles)
+
+    total_words = _word_count(script_text) if script_text else 0
+    video_length = round(total_words / WORDS_PER_MINUTE, 2) if total_words else 0
+
+    structure = _build_structure_response(selected_template)
+
+    print(f"Total time so far: {time.time() - total_start_time:.2f}s")
+
+    return {
+        "script": script_text,
+        "youtube_metadata": {
+            "titles": youtube_metadata.get("titles", []),
+            "descriptions": youtube_metadata.get("descriptions", []),
+            "hashtags": youtube_metadata.get("hashtags", []),
+            "thumbnail_text": youtube_metadata.get("thumbnail_text", []),
+        },
+        "metrics": {
+            "totalWords": total_words,
+            "videoLength": video_length,
+            "emotionalDepth": script_metrics.get("emotionalDepth", 0),
+            "generalExamples": script_metrics.get("generalExamples", 0),
+            "proverbs_count": script_metrics.get("proverbs_count", 0),
+            "historical_facts": script_metrics.get("historicalExamples", 0),
+            "researchFacts": script_metrics.get("researchFacts", 0),
+        },
+        "sources": sources,
+        "books": books,
+        "structure": structure,
+    }
 
 
 
