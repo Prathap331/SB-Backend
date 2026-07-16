@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, Request, Header, BackgroundTasks,UploadFile, File,Form
+from fastapi import Depends, HTTPException, Request, Header,UploadFile, File,Form
 from fastapi import FastAPI
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,7 +45,6 @@ from ddgs import DDGS
 from readability import Document
 from pytrends.request import TrendReq
 from channelMemory.channelMemory import process_pdf
-# from channelMemory.aiIntel import get_chunks_from_db
 
 load_dotenv()
 
@@ -55,23 +54,23 @@ nltk.data.path.insert(0, nltk_data_dir)
 
 print(os.getenv("RAZORPAY_WEBHOOK_SECRET"))
 
-def _ensure_nltk_resource(resource_path: str, download_name: str) -> None:
-    try:
-        nltk.data.find(resource_path)
-        return
-    except LookupError:
-        pass
-    try:
-        print(f"Downloading NLTK resource: {download_name}")
-        nltk.download(download_name, download_dir=nltk_data_dir, quiet=True)
-        nltk.data.find(resource_path)
-    except LookupError as e:
-        print(f"!!! CRITICAL NLTK DATA ERROR: {e} !!!")
+# def _ensure_nltk_resource(resource_path: str, download_name: str) -> None:
+#     try:
+#         nltk.data.find(resource_path)
+#         return
+#     except LookupError:
+#         pass
+#     try:
+#         print(f"Downloading NLTK resource: {download_name}")
+#         nltk.download(download_name, download_dir=nltk_data_dir, quiet=True)
+#         nltk.data.find(resource_path)
+#     except LookupError as e:
+#         print(f"!!! CRITICAL NLTK DATA ERROR: {e} !!!")
 
 
-_ensure_nltk_resource("tokenizers/punkt", "punkt")
-_ensure_nltk_resource("tokenizers/punkt_tab", "punkt_tab")
-print("NLTK 'punkt' and 'punkt_tab' data checked.")
+# _ensure_nltk_resource("tokenizers/punkt", "punkt")
+# _ensure_nltk_resource("tokenizers/punkt_tab", "punkt_tab")
+# print("NLTK 'punkt' and 'punkt_tab' data checked.")
 
 # ── Razorpay ─────────────────────────────────────────────────
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
@@ -1932,7 +1931,7 @@ import hashlib
 import re
 import json
 import asyncio
-import numpy as np  # needed for cosine-similarity (dot product) filtering of scraped web content
+import numpy as np  
 from urllib.parse import urlparse
 from sqlalchemy import create_engine, text, bindparam
 from sklearn.feature_extraction.text import HashingVectorizer
