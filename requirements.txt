@@ -52,4 +52,4 @@ youtube-transcript-api
 sentence_transformers
 google-search-results
 trafilatura
-sqlalchemy
+SQLAlchemy
