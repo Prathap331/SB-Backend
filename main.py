@@ -1861,35 +1861,7 @@ async def eci(request: PromptRequest):
 
 
 
-"""
-Storybit script-generation backend — memory-optimized version.
 
-KEY MEMORY FIXES vs the original:
-  1. Thread-limiting env vars set BEFORE torch/sentence-transformers import
-     (OMP/MKL/OPENBLAS each spawn per-core scratch buffers otherwise).
-  2. BGE-M3 is loaded once, then dynamically int8-quantized (Linear layers
-     only) -> ~2.2GB fp32 drops to roughly ~900MB-1.1GB, and CPU inference
-     is typically faster too.
-  3. A single `encode_texts()` async wrapper is used for every embedding
-     call in the app, gated behind a semaphore so concurrent HyDE/DB/DDGS
-     encode calls within one request can't all spike memory at once.
-  4. Removed duplicate model-loader functions, duplicate `to_pgvector`,
-     duplicate constant re-assignments (MAX_WEB_SOURCES etc. were defined
-     3x in the original file).
-  5. Fixed a real bug: /save-ideas called model.encode() directly inside an
-     async def with no thread offload -> blocked the entire event loop.
-  6. gc.collect() after each heavy endpoint to release transient tensors.
-
-NOTE: a few pieces (FastAPI app instance, Supabase client, the
-GenerateIdeasRequest model) were not present in the code you pasted — I
-reconstructed them from context and env-var names you already use
-elsewhere (MYSQL_URL, OPENAI_API_KEY). Adjust SUPABASE_URL / SUPABASE_KEY
-env var names if yours differ.
-"""
-
-import os
-
-# ---- MUST run before torch / sentence-transformers are imported ----------
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -1897,22 +1869,17 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import gc
-import re
-import json
 import time
 import math
-import hashlib
 import asyncio
 import threading
-from typing import List, Optional
+from typing import List
 from urllib.parse import urlparse
-
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sklearn.feature_extraction.text import HashingVectorizer
 from sqlalchemy import create_engine, text, bindparam
-from openai import OpenAI
 import trafilatura
 
 try:
@@ -1921,7 +1888,6 @@ except ImportError:
     yt_dlp = None
     print("[YT] yt-dlp not installed — YouTube scraping will be skipped. "
           "Install with: pip install yt-dlp")
-
 
 
 _bge_model = None
