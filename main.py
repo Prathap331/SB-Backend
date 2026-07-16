@@ -1916,17 +1916,6 @@ from openai import OpenAI
 import trafilatura
 
 try:
-    from ddgs import DDGS
-except ImportError:
-    from duckduckgo_search import DDGS
-
-try:
-    from supabase import create_client, Client
-except ImportError:
-    create_client = None
-    Client = None
-
-try:
     import yt_dlp
 except ImportError:
     yt_dlp = None
@@ -1934,31 +1923,10 @@ except ImportError:
           "Install with: pip install yt-dlp")
 
 
-# ============================================================
-# APP / CLIENT SETUP
-# ============================================================
-
-app = FastAPI()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-supabase = None
-if create_client and SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-else:
-    print("[SUPABASE] client not initialized — check SUPABASE_URL / SUPABASE_KEY env vars")
-
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-
-# ============================================================
-# EMBEDDING MODEL — single loader, quantized, concurrency-capped
-# ============================================================
 
 _bge_model = None
 _model_lock = threading.Lock()
-_ENCODE_SEMAPHORE = asyncio.Semaphore(2)  # caps concurrent CPU encode() calls per process
+_ENCODE_SEMAPHORE = asyncio.Semaphore(2)  
 
 
 def _get_st_model():
