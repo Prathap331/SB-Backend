@@ -4583,7 +4583,7 @@ except ImportError:
     print("[YT] yt-dlp not installed — YouTube scraping will be skipped. "
           "Install with: pip install yt-dlp")
 
-
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 _bge_model = None
 _model_lock = threading.Lock()
 _ENCODE_SEMAPHORE = asyncio.Semaphore(int(os.getenv("ENCODE_CONCURRENCY", "1")))
