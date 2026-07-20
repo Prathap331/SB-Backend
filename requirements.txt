@@ -20,7 +20,6 @@ langdetect
 nltk==3.9.2
 numpy==1.26.4
 openai==2.2.0
-# openpyxl==3.1.5
 packaging==25.0
 pandas==2.3.3
 playwright==1.55.0
@@ -42,7 +41,7 @@ schedule
 supabase==2.22.0
 supabase-auth==2.22.0
 supabase-functions==2.22.0
-# python-multipart
+python-multipart
 # typer==0.19.2
 # readability-lxml
 urllib3==2.5.0
