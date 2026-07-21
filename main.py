@@ -325,10 +325,6 @@ async def eci(request: PromptRequest):
 
 
 
-
-
-
-
 import os
 import re
 import json
@@ -363,57 +359,25 @@ except ImportError:
     from duckduckgo_search import DDGS
 
 try:
-    import yt_dlp
+    import scrapetube
 except ImportError:
-    yt_dlp = None
-    print("[YT] yt-dlp not installed — YouTube scraping will be skipped. "
-          "Install with: pip install yt-dlp")
+    scrapetube = None
+    print("[YT] scrapetube not installed — YouTube scraping will be skipped. "
+          "Install with: pip install scrapetube")
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Stable Diffusion (Stability AI) config for thumbnail generation ---
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
 STABILITY_IMAGE_MODEL = os.getenv("STABILITY_IMAGE_MODEL", "core")  # "core", "sd3", "ultra"
 STABILITY_BASE_URL = "https://api.stability.ai/v2beta/stable-image/generate"
 
 
-# ============================================================
-# CONCURRENCY / RESOURCE CONTROLS  (new — this is the actual fix)
-# ============================================================
 #
-# Nothing in the original code "leaked" memory in the classic sense — no
-# object was retained forever. The real risk under real traffic is that
-# EVERY hit to /generate-ideas or /generate-script fans out into several
-# LLM calls, dozens of web fetches, multiple embedding encodes, and (for
-# /generate-script) an image generation call, all with no cap. 50
-# concurrent users can turn into hundreds of simultaneous outbound HTTP
-# calls and encode operations, which is what actually exhausts RAM/CPU
-# and causes crashes or lag — not a leak, but it looks like one from the
-# outside (steadily climbing memory under load).
-#
-# The controls below throttle concurrency without changing any business
-# logic in the pipelines themselves.
-
-# Dedicated thread pool for CPU-heavy embedding encode calls. Kept SEPARATE
-# from asyncio's default executor (which is small — min(32, cpu+4) — and
-# shared with all other to_thread/run_in_executor calls in the app). Mixing
-# CPU-bound encode() calls into that shared pool starves I/O-bound work
-# (web fetches, DB calls) under load, which shows up as request lag.
 _ENCODE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=int(os.getenv("ENCODE_EXECUTOR_WORKERS", "4")),
     thread_name_prefix="encode",
 )
 
-# NOTE ON MODEL SIZE: this pipeline loads BAAI/bge-m3 for embeddings, which
-# is a substantially larger model (~2.2GB resident once loaded, not a small
-# ~100-400MB sentence-transformers model). Factor that into server RAM
-# sizing — it's a fixed baseline cost on top of everything else in this
-# file, and it's shared across all requests (loaded once, not per-request).
-
-# Shared HTTP session with connection pooling for outbound calls (Stability
-# AI image generation, face-photo downloads). The original code called
-# requests.get/post directly, which opens a brand-new TCP+TLS connection
-# every single call — wasteful and slower under concurrent load.
 _http_session = requests.Session()
 _http_adapter = requests.adapters.HTTPAdapter(
     pool_connections=20, pool_maxsize=20, max_retries=1
@@ -421,35 +385,14 @@ _http_adapter = requests.adapters.HTTPAdapter(
 _http_session.mount("https://", _http_adapter)
 _http_session.mount("http://", _http_adapter)
 
-# Caps how many FULL pipelines (scrape + embed + multi-LLM + image gen) run
-# concurrently across ALL users at once. This is the single most important
-# control for surviving concurrent traffic on limited RAM — it turns "500
-# users hit the endpoint at the exact same second" into a queue instead of
-# a simultaneous resource spike. Requests beyond the cap simply wait for a
-# slot; nothing is dropped.
 _MAX_CONCURRENT_PIPELINES = int(os.getenv("MAX_CONCURRENT_PIPELINES", "20"))
 _pipeline_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PIPELINES)
 
-# Caps concurrent embedding encode calls specifically. bge-m3 encode calls
-# are CPU-bound and reasonably heavy per call; uncontrolled concurrency
-# here compounds CPU contention AND peak RAM (each in-flight encode holds
-# tokenized batches + output arrays in memory simultaneously).
 _MAX_CONCURRENT_ENCODES = int(os.getenv("MAX_CONCURRENT_ENCODES", "4"))
 _encode_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ENCODES)
-
-# Caps concurrent outbound scrape/fetch calls (DDGS search + trafilatura
-# article fetch + yt-dlp search). A single script-generation request can
-# already fan out into 15 keyword searches x N results each; multiply that
-# by several concurrent users and the default thread pool gets exhausted,
-# which is what actually causes "hanging" requests, not a crash.
 _MAX_CONCURRENT_SCRAPES = int(os.getenv("MAX_CONCURRENT_SCRAPES", "8"))
 _scrape_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SCRAPES)
 
-# The original code had no timeout on several openai_client calls. A slow
-# or hung OpenAI response then holds a thread AND everything the request
-# has accumulated so far (scraped articles, embeddings, DB chunks) in
-# memory for however long the API takes to respond or fail. Wrapping every
-# call in a timeout bounds worst-case memory hold time per request.
 OPENAI_CALL_TIMEOUT = float(os.getenv("OPENAI_CALL_TIMEOUT", "45"))
 
 
@@ -462,9 +405,9 @@ async def _run_encode(fn):
 
 
 async def _run_scrape(fn, *args, **kwargs):
-    """Run a blocking network call (DDGS search, trafilatura fetch, yt-dlp
-    search) gated by a semaphore to cap total concurrent outbound
-    connections."""
+    """Run a blocking network call (DDGS search, trafilatura fetch,
+    scrapetube search) gated by a semaphore to cap total concurrent
+    outbound connections."""
     async with _scrape_semaphore:
         return await asyncio.to_thread(fn, *args, **kwargs)
 
@@ -1308,10 +1251,6 @@ async def get_context_from_db(
     return matches
 
 
-# ============================================================
-# DDGS NEWS SEARCH  —  IDEA-GENERATION ONLY
-# ============================================================
-
 def _ddgs_search_for_ideas(keyword: str, max_results: int) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
     try:
@@ -1813,75 +1752,200 @@ async def get_ddgs_news_context_for_script(
     return articles
 
 
-def _youtube_search_yt_dlp(keyword: str, max_results: int) -> list[dict]:
-    if yt_dlp is None:
+# ============================================================
+# YOUTUBE SEARCH  —  via scrapetube (no API key, no yt-dlp)
+# ============================================================
+
+def _extract_runs_text(field: dict | None) -> str:
+    """scrapetube returns most YouTube text fields as either
+    {"simpleText": "..."} or {"runs": [{"text": "..."}, ...]}. This pulls
+    plain text out of either shape."""
+    if not field:
+        return ""
+    if isinstance(field, str):
+        return field
+    if "simpleText" in field:
+        return field.get("simpleText", "") or ""
+    runs = field.get("runs") or []
+    return "".join(r.get("text", "") for r in runs)
+
+
+
+
+ 
+def _youtube_api_video_details(video_ids: list[str]) -> dict[str, dict]:
+    """Batch-fetch title/description/channel/view_count/tags for up to 50
+    video IDs per call via videos.list. Costs 1 quota unit per call
+    regardless of how many IDs are in the batch (max 50)."""
+    if not YOUTUBE_API_KEY or not video_ids:
+        return {}
+ 
+    details: dict[str, dict] = {}
+ 
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i + 50]
+        params = {
+            "part": "snippet,statistics",
+            "id": ",".join(batch),
+            "key": YOUTUBE_API_KEY,
+        }
+ 
+        try:
+            resp = _http_session.get(f"{YOUTUBE_API_BASE}/videos", params=params, timeout=15)
+        except Exception as e:
+            print(f"[YT-API] videos.list request failed: {e}")
+            continue
+ 
+        if resp.status_code != 200:
+            print(f"[YT-API] videos.list HTTP {resp.status_code}: {resp.text[:300]}")
+            continue
+ 
+        try:
+            data = resp.json()
+        except Exception as e:
+            print(f"[YT-API] failed to parse videos.list JSON: {e}")
+            continue
+ 
+        print(f"[YT-API] RAW videos.list response for batch of {len(batch)} id(s):")
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+ 
+        for item in data.get("items", []):
+            vid = item.get("id")
+            if not vid:
+                continue
+            snippet = item.get("snippet") or {}
+            statistics = item.get("statistics") or {}
+ 
+            view_count = None
+            raw_views = statistics.get("viewCount")
+            if raw_views is not None:
+                try:
+                    view_count = int(raw_views)
+                except (TypeError, ValueError):
+                    view_count = None
+ 
+            details[vid] = {
+                "title": snippet.get("title", "") or "",
+                "description": snippet.get("description", "") or "",
+                "channel": snippet.get("channelTitle", "") or "",
+                "view_count": view_count,
+                "tags": snippet.get("tags") or [],
+            }
+ 
+    return details
+
+
+
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+ 
+ 
+ 
+def _youtube_api_search_ids(keyword: str, max_results: int = 1) -> list[str]:
+    """Search YouTube via the Data API's search.list endpoint and return a
+    list of video IDs. Costs 100 quota units per call regardless of
+    max_results."""
+    if not YOUTUBE_API_KEY:
+        print("[YT-API] YOUTUBE_API_KEY not set, skipping search")
         return []
-
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "ignoreerrors": True,
-        "cookiefile": "/root/SB-Backend/cookies.txt",
+ 
+    params = {
+        "part": "id",
+        "q": keyword,
+        "type": "video",
+        "maxResults": max_results,
+        "key": YOUTUBE_API_KEY,
+        "safeSearch": "none",
+        "order": "relevance",
     }
-
-    results = []
+ 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{max_results}:{keyword}", download=False)
-            entries = (info or {}).get("entries") or []
-            for entry in entries:
-                if not entry:
-                    continue
-                video_id = entry.get("id")
-                url = entry.get("webpage_url") or (
-                    f"https://www.youtube.com/watch?v={video_id}" if video_id else None
-                )
-                if not url:
-                    continue
-                results.append({
-                    "url": url,
-                    "title": entry.get("title", "") or "",
-                    "description": entry.get("description", "") or "",
-                    "channel": entry.get("uploader", "") or "",
-                    "view_count": entry.get("view_count"),
-                    "tags": entry.get("tags") or [],
-                })
+        resp = _http_session.get(f"{YOUTUBE_API_BASE}/search", params=params, timeout=15)
     except Exception as e:
-        print(f"[YT] yt-dlp search failed for '{keyword}': {e}")
+        print(f"[YT-API] search request failed for '{keyword}': {e}")
+        return []
+ 
+    if resp.status_code != 200:
+        print(f"[YT-API] search HTTP {resp.status_code} for '{keyword}': {resp.text[:300]}")
+        return []
+ 
+    try:
+        data = resp.json()
+    except Exception as e:
+        print(f"[YT-API] failed to parse search JSON for '{keyword}': {e}")
+        return []
+ 
+    print(f"[YT-API] RAW search.list response for '{keyword}':")
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+ 
+    video_ids = []
+    for item in data.get("items", []):
+        vid = (item.get("id") or {}).get("videoId")
+        if vid:
+            video_ids.append(vid)
+ 
+    return video_ids
+ 
+ 
+
+
+def _youtube_search_via_api(keyword: str, max_results: int = 1) -> list[dict]:
+    video_ids = _youtube_api_search_ids(keyword, max_results=max_results)
+    if not video_ids:
+        return []
+ 
+    details_by_id = _youtube_api_video_details(video_ids)
+ 
+    results = []
+    for vid in video_ids:
+        detail = details_by_id.get(vid)
+        if not detail:
+            continue
+        results.append({
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "title": detail["title"],
+            "description": detail["description"],
+            "channel": detail["channel"],
+            "view_count": detail["view_count"],
+            "tags": detail["tags"],
+        })
+ 
     return results
 
-
+            
 async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 10) -> list[dict]:
     print(f"[YT] Starting YouTube search for topic: '{topic}'")
-
-    if yt_dlp is None:
-        print("[YT] yt-dlp not installed, skipping YouTube scrape")
+ 
+    if not YOUTUBE_API_KEY:
+        print("[YT] YOUTUBE_API_KEY not set, skipping YouTube search")
         return []
-
+ 
     keywords = await _generate_youtube_search_keywords(topic)
-
+ 
     raw_candidates: list[dict] = []
-
+ 
     for keyword in keywords:
         try:
-            results = await _run_scrape(_youtube_search_yt_dlp, keyword, 1)
+            # max_results=1 per keyword, same behavior as the old
+            # scrapetube version — keeps quota usage bounded and lets the
+            # 10 diversified keywords do the work of covering different
+            # angles rather than pulling many results per angle.
+            results = await _run_scrape(_youtube_search_via_api, keyword, 1)
         except Exception as e:
-            print(f"[YT] search thread failed for '{keyword}': {e}")
+            print(f"[YT] search failed for '{keyword}': {e}")
             results = []
-
+ 
         for r in results:
             url = r["url"]
             if url in scraped_urls:
                 continue
             scraped_urls.add(url)
-
+ 
             title = r.get("title", "")
             description = _truncate_words(r.get("description", ""), max_words=150)
             tags = r.get("tags") or []
             hashtags = _extract_hashtags(r.get("title", ""), r.get("description", ""))
-
+ 
             raw_candidates.append({
                 "url": url,
                 "title": title,
@@ -1891,16 +1955,18 @@ async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 
                 "tags": tags,
                 "hashtags": hashtags,
             })
-
+ 
     raw_candidates.sort(key=lambda v: v.get("view_count") or 0, reverse=True)
     videos = raw_candidates[:MAX_YOUTUBE_SOURCES]
-
-    print(f"[YT] scraped {len(raw_candidates)} unique candidate video(s) from "
-          f"{len(keywords)} keyword(s), returning top {len(videos)} "
-          f"(capped at {MAX_YOUTUBE_SOURCES})")
-
+ 
+    print(
+        f"[YT] fetched {len(raw_candidates)} unique candidate video(s) via YouTube Data API "
+        f"from {len(keywords)} keyword(s), returning top {len(videos)} "
+        f"(capped at {MAX_YOUTUBE_SOURCES})"
+    )
+ 
     return videos
-
+ 
 
 def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> str:
     parts = []
@@ -2031,10 +2097,7 @@ Content Chunks:
 async def generate_ideas_endpoint(
     request: GenerateIdeasRequest,
 ):
-    # Gate the entire pipeline behind the global concurrency cap. Under a
-    # burst of concurrent users this turns "everyone's pipeline runs at
-    # once" into "requests beyond the cap wait briefly for a slot" — this
-    # is what actually protects RAM/CPU under load, not per-call fixes.
+
     async with _pipeline_semaphore:
         return await _generate_ideas_endpoint_impl(request)
 
@@ -3949,12 +4012,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "structure": structure,
         "token_usage": token_usage,
     }
-
-
-
-
-
-
 
 
 
