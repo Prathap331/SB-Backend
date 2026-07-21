@@ -1823,6 +1823,7 @@ def _youtube_search_yt_dlp(keyword: str, max_results: int) -> list[dict]:
         "skip_download": True,
         "noplaylist": True,
         "ignoreerrors": True,
+        "cookiefile": "/cookies.txt"
     }
 
     results = []
