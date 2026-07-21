@@ -1,22 +1,13 @@
 uvicorn
 fastapi
-# beautifulsoup4
-# datasets
 ddgs==9.6.0
 duckduckgo-search==7.3.0
-# google-ai-generativelanguage==0.6.15
-# google-api-core==2.25.2
 google-api-python-client==2.184.0
 google-auth==2.41.1
 google-auth-httplib2==0.2.0
-# google-generativeai==0.8.5
-# google-genai==1.11.0
 httpx==0.28.1
 huggingface-hub==0.35.3
-# kaggle
-# kagglehub==0.3.4
 langdetect
-# markdown-it-py==4.0.0
 nltk==3.9.2
 numpy==1.26.4
 openai==2.2.0
@@ -37,18 +28,14 @@ razorpay==2.0.1
 reportlab
 requests==2.32.5
 schedule
-# selenium
 supabase==2.22.0
 supabase-auth==2.22.0
 supabase-functions==2.22.0
 python-multipart
-# typer==0.19.2
-# readability-lxml
 urllib3==2.5.0
-# webdriver-manager
-# youtube-transcript-api
 sentence_transformers
 google-search-results
 trafilatura
 SQLAlchemy
 yt-dlp
+tiktoken

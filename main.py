@@ -329,8 +329,6 @@ async def eci(request: PromptRequest):
 
 
 
-
-
 import os
 import re
 import json
@@ -341,6 +339,7 @@ import uuid
 import hashlib
 import asyncio
 import contextvars
+import concurrent.futures
 from urllib.parse import urlparse
 
 import requests
@@ -376,6 +375,104 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
 STABILITY_IMAGE_MODEL = os.getenv("STABILITY_IMAGE_MODEL", "core")  # "core", "sd3", "ultra"
 STABILITY_BASE_URL = "https://api.stability.ai/v2beta/stable-image/generate"
+
+
+# ============================================================
+# CONCURRENCY / RESOURCE CONTROLS  (new — this is the actual fix)
+# ============================================================
+#
+# Nothing in the original code "leaked" memory in the classic sense — no
+# object was retained forever. The real risk under real traffic is that
+# EVERY hit to /generate-ideas or /generate-script fans out into several
+# LLM calls, dozens of web fetches, multiple embedding encodes, and (for
+# /generate-script) an image generation call, all with no cap. 50
+# concurrent users can turn into hundreds of simultaneous outbound HTTP
+# calls and encode operations, which is what actually exhausts RAM/CPU
+# and causes crashes or lag — not a leak, but it looks like one from the
+# outside (steadily climbing memory under load).
+#
+# The controls below throttle concurrency without changing any business
+# logic in the pipelines themselves.
+
+# Dedicated thread pool for CPU-heavy embedding encode calls. Kept SEPARATE
+# from asyncio's default executor (which is small — min(32, cpu+4) — and
+# shared with all other to_thread/run_in_executor calls in the app). Mixing
+# CPU-bound encode() calls into that shared pool starves I/O-bound work
+# (web fetches, DB calls) under load, which shows up as request lag.
+_ENCODE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.getenv("ENCODE_EXECUTOR_WORKERS", "4")),
+    thread_name_prefix="encode",
+)
+
+# NOTE ON MODEL SIZE: this pipeline loads BAAI/bge-m3 for embeddings, which
+# is a substantially larger model (~2.2GB resident once loaded, not a small
+# ~100-400MB sentence-transformers model). Factor that into server RAM
+# sizing — it's a fixed baseline cost on top of everything else in this
+# file, and it's shared across all requests (loaded once, not per-request).
+
+# Shared HTTP session with connection pooling for outbound calls (Stability
+# AI image generation, face-photo downloads). The original code called
+# requests.get/post directly, which opens a brand-new TCP+TLS connection
+# every single call — wasteful and slower under concurrent load.
+_http_session = requests.Session()
+_http_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=20, pool_maxsize=20, max_retries=1
+)
+_http_session.mount("https://", _http_adapter)
+_http_session.mount("http://", _http_adapter)
+
+# Caps how many FULL pipelines (scrape + embed + multi-LLM + image gen) run
+# concurrently across ALL users at once. This is the single most important
+# control for surviving concurrent traffic on limited RAM — it turns "500
+# users hit the endpoint at the exact same second" into a queue instead of
+# a simultaneous resource spike. Requests beyond the cap simply wait for a
+# slot; nothing is dropped.
+_MAX_CONCURRENT_PIPELINES = int(os.getenv("MAX_CONCURRENT_PIPELINES", "20"))
+_pipeline_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PIPELINES)
+
+# Caps concurrent embedding encode calls specifically. bge-m3 encode calls
+# are CPU-bound and reasonably heavy per call; uncontrolled concurrency
+# here compounds CPU contention AND peak RAM (each in-flight encode holds
+# tokenized batches + output arrays in memory simultaneously).
+_MAX_CONCURRENT_ENCODES = int(os.getenv("MAX_CONCURRENT_ENCODES", "4"))
+_encode_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ENCODES)
+
+# Caps concurrent outbound scrape/fetch calls (DDGS search + trafilatura
+# article fetch + yt-dlp search). A single script-generation request can
+# already fan out into 15 keyword searches x N results each; multiply that
+# by several concurrent users and the default thread pool gets exhausted,
+# which is what actually causes "hanging" requests, not a crash.
+_MAX_CONCURRENT_SCRAPES = int(os.getenv("MAX_CONCURRENT_SCRAPES", "8"))
+_scrape_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SCRAPES)
+
+# The original code had no timeout on several openai_client calls. A slow
+# or hung OpenAI response then holds a thread AND everything the request
+# has accumulated so far (scraped articles, embeddings, DB chunks) in
+# memory for however long the API takes to respond or fail. Wrapping every
+# call in a timeout bounds worst-case memory hold time per request.
+OPENAI_CALL_TIMEOUT = float(os.getenv("OPENAI_CALL_TIMEOUT", "45"))
+
+
+async def _run_encode(fn):
+    """Run a CPU-bound model.encode(...) call on the dedicated encode
+    executor, gated by a semaphore."""
+    async with _encode_semaphore:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_ENCODE_EXECUTOR, fn)
+
+
+async def _run_scrape(fn, *args, **kwargs):
+    """Run a blocking network call (DDGS search, trafilatura fetch, yt-dlp
+    search) gated by a semaphore to cap total concurrent outbound
+    connections."""
+    async with _scrape_semaphore:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def _openai_create_with_timeout(call_fn, timeout: float = OPENAI_CALL_TIMEOUT):
+    """Run a blocking openai_client.chat.completions.create(...) call with
+    a hard timeout so a hung API call can't hold request memory forever."""
+    return await asyncio.wait_for(asyncio.to_thread(call_fn), timeout=timeout)
 
 
 HASH_FEATURES = 2**18
@@ -443,7 +540,7 @@ async def save_ideas(data: SaveIdeasRequest):
 
     model = _get_st_model()
 
-    topic_embedding, summary_embedding = await asyncio.to_thread(
+    topic_embedding, summary_embedding = await _run_encode(
         lambda: model.encode(
             [data.topic, data.topic_summary],
             normalize_embeddings=True,
@@ -796,7 +893,7 @@ async def get_similar_saved_ideas(
     print(f"[MATCH] Searching saved_ideas for topic: '{topic}'")
 
     model = _get_st_model()
-    topic_embedding, summary_query_embedding = await asyncio.to_thread(
+    topic_embedding, summary_query_embedding = await _run_encode(
         lambda: model.encode(
             [topic, hyde_doc],
             normalize_embeddings=True,
@@ -858,11 +955,12 @@ async def select_table_for_topic(topic: str) -> str:
     Respond with ONLY the exact table name from the list above, nothing else.
     """
 
-    res = await asyncio.to_thread(
-        openai_client.chat.completions.create,
-        model="gpt-5.4-mini",
-        messages=[{"role": "user", "content": table_selector_prompt}],
-        stream=False,
+    res = await _openai_create_with_timeout(
+        lambda: openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": table_selector_prompt}],
+            stream=False,
+        )
     )
     _record_token_usage("select_table_for_topic", res)
     table_name = res.choices[0].message.content.strip("`'\" \n")
@@ -881,7 +979,7 @@ SCRIPT_TEMPLATE_MATCH_COUNT = 1
 
 async def generate_topic_embedding(topic: str) -> np.ndarray:
     model = _get_st_model()
-    embedding = await asyncio.to_thread(
+    embedding = await _run_encode(
         lambda: model.encode(topic, normalize_embeddings=True, convert_to_numpy=True)
     )
     return embedding
@@ -949,11 +1047,9 @@ async def _generate_length_constrained_hyde(
     first_max_tokens: int = 180,
     empty_retry_max_tokens: int = 1200,
 ) -> tuple[str, bool]:
-    loop = asyncio.get_event_loop()
 
     async def _call(messages: list[dict], max_tokens: int):
-        completion = await loop.run_in_executor(
-            None,
+        completion = await _openai_create_with_timeout(
             lambda: client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -1122,7 +1218,7 @@ async def get_context_from_db(
     embedding_source = hyde_doc if hyde_doc else topic
 
     model = _get_st_model()
-    dense_embedding = await asyncio.to_thread(
+    dense_embedding = await _run_encode(
         lambda: model.encode(
             embedding_source,
             convert_to_numpy=True,
@@ -1248,11 +1344,12 @@ async def _generate_search_keywords(topic: str) -> list[str]:
     prompt = KEYWORD_GEN_PROMPT_TEMPLATE.format(topic=topic)
 
     try:
-        res = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-5.4-mini",
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+            )
         )
         _record_token_usage("_generate_search_keywords (ideas)", res)
         raw = res.choices[0].message.content.strip()
@@ -1339,7 +1436,7 @@ def _fetch_full_article_text(url: str) -> str:
 async def _fetch_full_article_text_with_timeout(url: str, timeout: float = 8.0) -> str:
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_fetch_full_article_text, url),
+            _run_scrape(_fetch_full_article_text, url),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -1352,7 +1449,6 @@ async def _generate_web_search_keywords(topic: str) -> list[str]:
 
 
 async def _generate_youtube_search_keywords(topic: str) -> list[str]:
-    loop = asyncio.get_event_loop()
     prompt = f"""
             You are a YouTube SEO strategist generating search queries to find the
             BEST-PERFORMING, most-optimized existing videos on a topic — the goal is
@@ -1395,8 +1491,7 @@ async def _generate_youtube_search_keywords(topic: str) -> list[str]:
 """.strip()
 
     try:
-        completion = await loop.run_in_executor(
-            None,
+        completion = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
                 messages=[{"role": "user", "content": prompt}],
@@ -1426,7 +1521,7 @@ async def get_ddgs_news_context(
 
     model = _get_st_model()
 
-    hyde_embedding = await asyncio.to_thread(
+    hyde_embedding = await _run_encode(
         lambda: model.encode(hyde_doc, normalize_embeddings=True, convert_to_numpy=True)
     )
 
@@ -1437,7 +1532,7 @@ async def get_ddgs_news_context(
             break
 
         try:
-            pairs = await asyncio.to_thread(_ddgs_search_for_ideas, keyword, max_results)
+            pairs = await _run_scrape(_ddgs_search_for_ideas, keyword, max_results)
             print(f"[DDGS] keyword '{keyword}' returned {len(pairs)} results")
         except Exception as e:
             print(f"[DDGS] thread failed for '{keyword}': {e}")
@@ -1466,7 +1561,7 @@ async def get_ddgs_news_context(
                 continue
 
             try:
-                chunk_embeddings = await asyncio.to_thread(
+                chunk_embeddings = await _run_encode(
                     lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
                 )
             except Exception as e:
@@ -1579,11 +1674,12 @@ async def _generate_search_keywords_for_script(topic: str) -> list[str]:
     prompt = SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE.format(topic=topic)
 
     try:
-        res = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-5.4-mini",
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+            )
         )
         _record_token_usage("_generate_search_keywords_for_script", res)
         raw = res.choices[0].message.content.strip()
@@ -1635,7 +1731,7 @@ async def get_ddgs_news_context_for_script(
 
     model = _get_st_model()
 
-    hyde_embedding = await asyncio.to_thread(
+    hyde_embedding = await _run_encode(
         lambda: model.encode(hyde_doc, normalize_embeddings=True, convert_to_numpy=True)
     )
 
@@ -1646,7 +1742,7 @@ async def get_ddgs_news_context_for_script(
             break
 
         try:
-            pairs = await asyncio.to_thread(_ddgs_search_for_script, keyword, max_results)
+            pairs = await _run_scrape(_ddgs_search_for_script, keyword, max_results)
             print(f"[DDGS-SCRIPT] keyword '{keyword}' returned {len(pairs)} results")
         except Exception as e:
             print(f"[DDGS-SCRIPT] thread failed for '{keyword}': {e}")
@@ -1675,7 +1771,7 @@ async def get_ddgs_news_context_for_script(
                 continue
 
             try:
-                chunk_embeddings = await asyncio.to_thread(
+                chunk_embeddings = await _run_encode(
                     lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
                 )
             except Exception as e:
@@ -1769,7 +1865,7 @@ async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 
 
     for keyword in keywords:
         try:
-            results = await asyncio.to_thread(_youtube_search_yt_dlp, keyword, 1)
+            results = await _run_scrape(_youtube_search_yt_dlp, keyword, 1)
         except Exception as e:
             print(f"[YT] search thread failed for '{keyword}': {e}")
             results = []
@@ -1908,14 +2004,15 @@ Content Chunks:
 {context_block}
 """
 
-    res = await asyncio.to_thread(
-        openai_client.chat.completions.create,
-        model="gpt-5.4-mini",
-        messages=[
-            {"role": "system", "content": IDEAS_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        stream=False,
+    res = await _openai_create_with_timeout(
+        lambda: openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            messages=[
+                {"role": "system", "content": IDEAS_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=False,
+        )
     )
     _record_token_usage("generate_ideas_from_context", res)
 
@@ -1933,6 +2030,15 @@ Content Chunks:
 async def generate_ideas_endpoint(
     request: GenerateIdeasRequest,
 ):
+    # Gate the entire pipeline behind the global concurrency cap. Under a
+    # burst of concurrent users this turns "everyone's pipeline runs at
+    # once" into "requests beyond the cap wait briefly for a slot" — this
+    # is what actually protects RAM/CPU under load, not per-call fixes.
+    async with _pipeline_semaphore:
+        return await _generate_ideas_endpoint_impl(request)
+
+
+async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
     _start_token_tracking()
 
     topic = request.topic.strip()
@@ -1969,12 +2075,13 @@ async def generate_ideas_endpoint(
         11. STRICT LENGTH LIMIT: the output must be under {HYDE_MAX_TOKENS} tokens
         (roughly 35-50 words), a single short paragraph, with no additional text before or after it.
         """
-        res = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-5.4-mini",
-            messages=[{"role": "user", "content": hyde_prompt}],
-            max_completion_tokens=400,
-            stream=False,
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": hyde_prompt}],
+                max_completion_tokens=400,
+                stream=False,
+            )
         )
         _record_token_usage("generate-ideas HYDE (initial)", res)
 
@@ -1982,12 +2089,13 @@ async def generate_ideas_endpoint(
 
         if not raw_hyde_doc:
             try:
-                retry_res = await asyncio.to_thread(
-                    openai_client.chat.completions.create,
-                    model="gpt-5.4-mini",
-                    messages=[{"role": "user", "content": hyde_prompt}],
-                    max_completion_tokens=1500,
-                    stream=False,
+                retry_res = await _openai_create_with_timeout(
+                    lambda: openai_client.chat.completions.create(
+                        model="gpt-5.4-mini",
+                        messages=[{"role": "user", "content": hyde_prompt}],
+                        max_completion_tokens=1500,
+                        stream=False,
+                    )
                 )
                 _record_token_usage("generate-ideas HYDE (retry)", retry_res)
                 raw_hyde_doc = (retry_res.choices[0].message.content or "").strip()
@@ -2093,9 +2201,7 @@ async def get_structure(content: str) -> dict:
         \"\"\"{content}\"\"\"
         """
 
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
+        response = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
                 messages=[
@@ -2290,12 +2396,10 @@ async def generate_hyde_doc_for_segments(
             Output only the paragraph, nothing else.
 """.strip()
 
-    loop = asyncio.get_event_loop()
     segment_label = ', '.join(s.get('name', 'segment') for s in segment_group)
 
     async def _call(max_tokens: int):
-        completion = await loop.run_in_executor(
-            None,
+        completion = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
                 messages=[{"role": "user", "content": hyde_prompt}],
@@ -2451,10 +2555,8 @@ Source Material:
 {context_block}
 """
 
-    loop = asyncio.get_event_loop()
     try:
-        completion = await loop.run_in_executor(
-            None,
+        completion = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
                 messages=[
@@ -2462,7 +2564,8 @@ Source Material:
                     {"role": "user", "content": user_prompt},
                 ],
                 stream=False,
-            )
+            ),
+            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),  # script generation is the longest call — give it more room
         )
         _record_token_usage("generate_script_from_context", completion)
         script_text = (completion.choices[0].message.content or "").strip()
@@ -2607,14 +2710,15 @@ Reference metadata from currently-ranking videos on this topic:
     metadata = None
 
     try:
-        res = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-5.4-mini",
-            messages=[
-                {"role": "system", "content": YOUTUBE_SEO_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            stream=False,
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": YOUTUBE_SEO_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+            )
         )
         _record_token_usage("generate_youtube_seo_metadata", res)
         raw = (res.choices[0].message.content or "").strip()
@@ -2622,15 +2726,16 @@ Reference metadata from currently-ranking videos on this topic:
     except Exception as e:
         print(f"[SEO] generation/parse failed: {e} — retrying once")
         try:
-            res = await asyncio.to_thread(
-                openai_client.chat.completions.create,
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": YOUTUBE_SEO_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_completion_tokens=1500,
-                stream=False,
+            res = await _openai_create_with_timeout(
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-5.4-mini",
+                    messages=[
+                        {"role": "system", "content": YOUTUBE_SEO_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_completion_tokens=1500,
+                    stream=False,
+                )
             )
             _record_token_usage("generate_youtube_seo_metadata (retry)", res)
             raw = (res.choices[0].message.content or "").strip()
@@ -2738,7 +2843,7 @@ async def _backfill_sources_to_target(
                 if _domain_count(new_articles) >= target_count:
                     break
                 try:
-                    pairs = await asyncio.to_thread(_ddgs_search_for_script, query, 15)
+                    pairs = await _run_scrape(_ddgs_search_for_script, query, 15)
                 except Exception as e:
                     print(f"[MAIN] sources backfill generic query '{query}' failed: {e}")
                     continue
@@ -2881,14 +2986,15 @@ async def generate_script_metrics(script_text: str, topic_text: str = "") -> dic
 
     metrics = None
     try:
-        res = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-5.4-mini",
-            messages=[
-                {"role": "system", "content": SCRIPT_METRICS_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            stream=False,
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": SCRIPT_METRICS_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+            )
         )
         _record_token_usage("generate_script_metrics", res)
         raw = (res.choices[0].message.content or "").strip()
@@ -2972,19 +3078,6 @@ async def get_books_for_chunks(
     """
     DB-ONLY. Pulls book Title/Author entries strictly from the `english_books`
     MySQL table by matching chunk md5 values.
-
-    FIX: this now receives `all_db_chunks` — every unique-by-md5 chunk
-    retrieved across ALL HyDE docs for this request (see the round-robin /
-    dedup fix in /generate-script) — instead of only the narrower,
-    cap-limited subset that's actually fed into the script prompt. That
-    subset used to be capped at 7 total chunks system-wide (with a broken
-    dedup key), which meant book diversity was accidentally bottlenecked by
-    the script-context cap rather than by how many distinct books were
-    actually retrieved. Passing the full pool here means `books` gets
-    filled with as many DISTINCT real books as were actually found, up to
-    `max_books`. No placeholder rows are ever returned — if fewer than
-    `max_books` chunks resolve to a real (title, author) pair in the DB,
-    the returned list is simply shorter than `max_books`.
     """
     md5_list = []
     seen_md5 = set()
@@ -3003,10 +3096,6 @@ async def get_books_for_chunks(
         for row in rows:
             title = row.get("Title")
             author = row.get("Author")
-            # FIX: only keep rows where BOTH title and author actually came
-            # back non-empty from the DB. No placeholders, no padding — if
-            # fewer than max_books real (title, author) pairs exist, the
-            # list is simply shorter than max_books.
             if not title or not author:
                 continue
             title = str(title).strip()
@@ -3036,20 +3125,6 @@ async def _backfill_books_to_target(
     target_count: int = MAX_BOOKS,
     max_rounds: int = 4,
 ) -> list[dict]:
-    """
-    Only called when the initial chunk pool didn't resolve to `target_count`
-    real (title, author) books. Widens the DB search purely to surface MORE
-    candidate md5s to check against MySQL — bigger match_count, similarity
-    threshold dropped to 0.0, and a couple of different query variants
-    (HyDE doc, then plain topic text) so we're not stuck re-finding the
-    same handful of chunks.
-
-    IMPORTANT: this never fabricates a book. It only ever appends a row
-    that MySQL actually returned a non-empty Title AND Author for. If the
-    underlying `english_books` table genuinely doesn't have `target_count`
-    matching books for this topic, the returned list will be shorter than
-    `target_count` — that's a real data limit, not a bug.
-    """
     books = list(current_books)
     seen_book_keys = {(b["title"], b["author"]) for b in books}
     seen_md5 = set(known_md5s)
@@ -3175,7 +3250,7 @@ async def get_user_face_photo_url(user_id: str, photo_key: str = FACE_PHOTO_DEFA
 
 def _download_image_bytes_sync(url: str, timeout: float = 15.0) -> bytes | None:
     try:
-        response = requests.get(url, timeout=timeout)
+        response = _http_session.get(url, timeout=timeout)
     except Exception as e:
         print(f"[FACE] failed to download photo from {url}: {e}")
         return None
@@ -3354,14 +3429,15 @@ async def generate_thumbnail_prompt(
     system_prompt = THUMBNAIL_PROMPT_SYSTEM_PROMPT_WITH_FACE if with_face else THUMBNAIL_PROMPT_SYSTEM_PROMPT
 
     try:
-        res = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-5.4-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": context_block},
-            ],
-            stream=False,
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": context_block},
+                ],
+                stream=False,
+            )
         )
         _record_token_usage("generate_thumbnail_prompt", res)
         image_prompt = (res.choices[0].message.content or "").strip()
@@ -3431,7 +3507,7 @@ def _generate_thumbnail_image_stable_diffusion_sync(
         print(f"[THUMBNAIL-SD] generating text-to-image (model='{STABILITY_IMAGE_MODEL}')")
 
     try:
-        response = requests.post(
+        response = _http_session.post(
             endpoint,
             headers=headers,
             files=files,
@@ -3593,6 +3669,15 @@ async def save_thumbnail_to_supabase(user_id: str, image_base64: str) -> str | N
 
 @app.post("/generate-script")
 async def generate_script(request: ScriptRequest):
+    # Same global concurrency gate as /generate-ideas — this endpoint is
+    # the heaviest pipeline in the app (multiple LLM calls, web scraping,
+    # YouTube search, MySQL lookups, AND image generation), so it benefits
+    # most from being queued rather than run fully unbounded.
+    async with _pipeline_semaphore:
+        return await _generate_script_impl(request)
+
+
+async def _generate_script_impl(request: "ScriptRequest"):
     _start_token_tracking()
 
     total_start_time = time.time()
@@ -3663,10 +3748,6 @@ async def generate_script(request: ScriptRequest):
             *[get_context_with_timeout(topic_text, doc, table_name=table_name) for doc in hyde_documents]
         )
 
-        # FIX (1/2): every unique-by-md5 chunk seen across ALL HyDE docs.
-        # This is the pool `get_books_for_chunks()` draws from below, so
-        # book coverage is never bottlenecked by the smaller script-context
-        # cap used for db_results.
         seen_md5_all = set()
         for doc_results in db_results_per_doc:
             for item in doc_results:
@@ -3678,11 +3759,6 @@ async def generate_script(request: ScriptRequest):
                     if md5_val:
                         all_db_md5s_seen.add(md5_val)
 
-        # FIX (2/2): round-robin across every HyDE doc's results (instead
-        # of draining doc[0] first), deduping by real md5/content instead
-        # of a broken id/url/str(item) key, capped at
-        # MAX_SCRIPT_CONTEXT_CHUNKS. This is what actually goes into the
-        # script-writing prompt.
         db_results = []
         seen_md5_context = set()
         max_len = max((len(d) for d in db_results_per_doc), default=0)
@@ -3767,9 +3843,6 @@ async def generate_script(request: ScriptRequest):
         traceback.print_exc()
 
     try:
-        # FIX: books are looked up from `all_db_chunks_seen` (the full,
-        # unbottlenecked pool), not from the narrower `db_results` used
-        # for narration context.
         books = await get_books_for_chunks(
             all_db_chunks_seen, topic_text=topic_text, script_text=script_text
         )
@@ -3875,14 +3948,6 @@ async def generate_script(request: ScriptRequest):
         "structure": structure,
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
 
 
 
