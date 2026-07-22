@@ -113,11 +113,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 origins = [
-    "http://localhost:3000"
-    "http://localhost:3000/ai-youtube-content-generator",
-    "https://www.storio.tech/ai-youtube-content-generator",
+    "http://localhost:3000",
     "https://www.storio.tech",
-    "https://storio.tech/ai-youtube-content-generator"
+    "https://storio.tech",
 ]
 
 
