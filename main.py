@@ -244,85 +244,6 @@ async def eci(request: PromptRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import os
 import re
 import json
@@ -356,18 +277,11 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-try:
-    import scrapetube
-except ImportError:
-    scrapetube = None
-    print("[YT] scrapetube not installed — YouTube scraping will be skipped. "
-          "Install with: pip install scrapetube")
-
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
-STABILITY_IMAGE_MODEL = os.getenv("STABILITY_IMAGE_MODEL", "core")  # "core", "sd3", "ultra"
-STABILITY_BASE_URL = "https://api.stability.ai/v2beta/stable-image/generate"
+GPT_IMAGE_MODEL = os.getenv("GPT_IMAGE_MODEL", "gpt-image-2")
+GPT_IMAGE_SIZE = os.getenv("GPT_IMAGE_SIZE", "1536x1024")  
+GPT_IMAGE_QUALITY = os.getenv("GPT_IMAGE_QUALITY", "high") 
 
 
 #
@@ -464,6 +378,7 @@ class Idea(BaseModel):
 
 
 class SaveIdeasRequest(BaseModel):
+    userId: str
     topic: str
     topic_summary: str
     ideas: List[Idea]
@@ -471,6 +386,7 @@ class SaveIdeasRequest(BaseModel):
 
 @app.post("/save-ideas")
 async def save_ideas(data: SaveIdeasRequest):
+    print("User ID:", data.userId)
     print("Topic:", data.topic)
     print("Topic Summary:", data.topic_summary)
 
@@ -491,6 +407,7 @@ async def save_ideas(data: SaveIdeasRequest):
     ideas_payload = [idea.model_dump() for idea in data.ideas]
 
     row = {
+        "userId": data.userId,         
         "topic": data.topic,
         "ideas": ideas_payload,
         "topic_embeddings": to_pgvector(topic_embedding),
@@ -507,6 +424,7 @@ async def save_ideas(data: SaveIdeasRequest):
         "total_ideas": len(data.ideas),
         "row_id": result.data[0]["id"] if result.data else None,
     }
+
 
 
 
@@ -3416,7 +3334,7 @@ phrase itself.
 """
 
 
-def _pick_thumbnail_text(youtube_metadata: dict, request: "ScriptRequest") -> str:
+def _pick_thumbnail_text(youtube_metadata: dict, request) -> str:
     candidates = youtube_metadata.get("thumbnail_text") or []
     for candidate in candidates:
         if isinstance(candidate, str) and candidate.strip():
@@ -3427,7 +3345,7 @@ def _pick_thumbnail_text(youtube_metadata: dict, request: "ScriptRequest") -> st
 
 
 def _build_thumbnail_context(
-    request: "ScriptRequest",
+    request,
     script_text: str,
     chosen_thumbnail_text: str,
 ) -> str:
@@ -3445,7 +3363,7 @@ Thumbnail text phrase that MUST be rendered inside the image (verbatim):
 """
 
 
-def _fallback_thumbnail_prompt(request: "ScriptRequest", chosen_thumbnail_text: str = None) -> str:
+def _fallback_thumbnail_prompt(request, chosen_thumbnail_text: str = None) -> str:
     base = (request.title or "this topic").strip()
     text_phrase = chosen_thumbnail_text or (base[:28] if base else "Watch Now")
     return (
@@ -3459,7 +3377,7 @@ def _fallback_thumbnail_prompt(request: "ScriptRequest", chosen_thumbnail_text: 
 
 
 async def generate_thumbnail_prompt(
-    request: "ScriptRequest",
+    request,
     script_text: str,
     chosen_thumbnail_text: str,
     with_face: bool = False,
@@ -3499,108 +3417,74 @@ async def generate_thumbnail_prompt(
     return image_prompt
 
 
-STABILITY_IMG2IMG_MODEL = "sd3"
-STABILITY_IMG2IMG_STRENGTH = float(os.getenv("STABILITY_IMG2IMG_STRENGTH", "0.35"))
-
-def _generate_thumbnail_image_stable_diffusion_sync(
+def _generate_thumbnail_image_gpt_image_sync(
     prompt: str,
     face_image_bytes: bytes | None = None,
-    aspect_ratio: str = "3:2",
-    output_format: str = "png",
-    img2img_strength: float = STABILITY_IMG2IMG_STRENGTH,
+    size: str = GPT_IMAGE_SIZE,
+    quality: str = GPT_IMAGE_QUALITY,
 ) -> dict:
-    api_key = (STABILITY_API_KEY or "").strip()
-
-    if not api_key:
-        print("[THUMBNAIL-SD] STABILITY_API_KEY is not set in the environment")
-        return {"image_base64": None, "error": "STABILITY_API_KEY is not set"}
-
-    print(f"[THUMBNAIL-SD] using key ending in '...{api_key[-4:]}' (len={len(api_key)})")
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "image/*",
-    }
-
-    if face_image_bytes:
-        endpoint = f"{STABILITY_BASE_URL}/{STABILITY_IMG2IMG_MODEL}"
-        files = {"image": ("face.jpg", face_image_bytes, "image/jpeg")}
-        data = {
-            "prompt": prompt,
-            "mode": "image-to-image",
-            "strength": img2img_strength,
-            "output_format": output_format,
-        }
-        print(
-            f"[THUMBNAIL-SD] generating WITH user face photo "
-            f"(image-to-image, model='{STABILITY_IMG2IMG_MODEL}', strength={img2img_strength})"
-        )
-    else:
-        endpoint = f"{STABILITY_BASE_URL}/{STABILITY_IMAGE_MODEL}"
-        files = {"none": ""}
-        data = {
-            "prompt": prompt,
-            "aspect_ratio": aspect_ratio,
-            "output_format": output_format,
-        }
-        print(f"[THUMBNAIL-SD] generating text-to-image (model='{STABILITY_IMAGE_MODEL}')")
-
     try:
-        response = _http_session.post(
-            endpoint,
-            headers=headers,
-            files=files,
-            data=data,
-            timeout=90,
-        )
+        if face_image_bytes:
+            print(f"[THUMBNAIL-GPT] editing WITH user face photo (image-to-image, model='{GPT_IMAGE_MODEL}')")
+            face_file = io.BytesIO(face_image_bytes)
+            face_file.name = "face.jpg"
+
+            response = openai_client.images.edit(
+                model=GPT_IMAGE_MODEL,
+                image=face_file,
+                prompt=prompt,
+                size=size,
+                quality=quality,
+            )
+        else:
+            print(f"[THUMBNAIL-GPT] generating text-to-image (model='{GPT_IMAGE_MODEL}')")
+
+            response = openai_client.images.generate(
+                model=GPT_IMAGE_MODEL,
+                prompt=prompt,
+                size=size,
+                quality=quality,
+                n=1,
+            )
     except Exception as e:
+        print(f"[THUMBNAIL-GPT] request to GPT Image 2 failed: {e}")
         return {"image_base64": None, "error": f"request failed: {e}"}
 
-    if response.status_code == 401:
-        detail = response.text[:500] if response.text else "unauthorized"
-        print(
-            "[THUMBNAIL-SD] 401 from Stability API — this means the key was sent but "
-            "rejected. Check that: (1) STABILITY_API_KEY is set on THIS server/process "
-            "(not just locally), (2) it's a valid, non-revoked key from "
-            "platform.stability.ai/account/keys, and (3) it has no leading/trailing "
-            "whitespace or quote characters baked into the value."
-        )
-        return {"image_base64": None, "error": f"Stability API 401 unauthorized: {detail}"}
-
-    if response.status_code != 200:
-        detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
-        return {"image_base64": None, "error": f"Stability API error ({response.status_code}): {detail}"}
-
     try:
-        image_base64 = base64.b64encode(response.content).decode("utf-8")
+        image_base64 = response.data[0].b64_json
     except Exception as e:
-        return {"image_base64": None, "error": f"failed to encode image bytes: {e}"}
+        return {"image_base64": None, "error": f"failed to parse GPT Image 2 response: {e}"}
 
+    if not image_base64:
+        print("[THUMBNAIL-GPT] GPT Image 2 returned no image data (b64_json empty)")
+        return {"image_base64": None, "error": "empty image data in response"}
+
+    print(f"[THUMBNAIL-GPT] received image ({len(image_base64)} base64 chars)")
     return {"image_base64": image_base64, "error": None}
 
 
 async def generate_thumbnail_image(prompt: str, face_image_bytes: bytes | None = None) -> dict:
     try:
         result = await asyncio.to_thread(
-            _generate_thumbnail_image_stable_diffusion_sync,
+            _generate_thumbnail_image_gpt_image_sync,
             prompt,
             face_image_bytes,
         )
     except Exception as e:
-        print(f"[THUMBNAIL] Stable Diffusion image generation failed: {e}")
+        print(f"[THUMBNAIL] GPT Image 2 image generation failed: {e}")
         import traceback
         traceback.print_exc()
         return {"image_base64": None, "prompt": prompt, "error": str(e)}
 
     if not result.get("image_base64"):
-        print(f"[THUMBNAIL] Stable Diffusion returned no image: {result.get('error')}")
+        print(f"[THUMBNAIL] GPT Image 2 returned no image: {result.get('error')}")
         return {"image_base64": None, "prompt": prompt, "error": result.get("error") or "empty image data"}
 
     return {"image_base64": result["image_base64"], "prompt": prompt, "error": None}
 
 
 async def generate_thumbnail_for_script(
-    request: "ScriptRequest",
+    request,
     script_text: str,
     youtube_metadata: dict,
 ) -> dict:
@@ -3706,12 +3590,73 @@ async def save_thumbnail_to_supabase(user_id: str, image_base64: str) -> str | N
     return public_url
 
 
+class ThumbnailRequest(BaseModel):
+    userId: str
+    title: str
+    description: str
+    time: int
+    isFace: bool
+    script: str = ""
+    thumbnail_text: str | None = None
+
+
+@app.post("/generate-thumbnail")
+async def generate_thumbnail_endpoint(request: ThumbnailRequest):
+    async with _pipeline_semaphore:
+        return await _generate_thumbnail_endpoint_impl(request)
+
+
+async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
+    _start_token_tracking()
+
+    total_start_time = time.time()
+    script_text = request.script or ""
+
+    youtube_metadata_stub = {
+        "thumbnail_text": [request.thumbnail_text] if request.thumbnail_text else [],
+    }
+
+    thumbnail_result = {"image_base64": None, "prompt": None, "error": "not attempted"}
+
+    try:
+        print("[MAIN] Generating thumbnail prompt + image (standalone endpoint).")
+        thumbnail_result = await generate_thumbnail_for_script(
+            request, script_text, youtube_metadata_stub
+        )
+        thumbnail_url = None
+        if thumbnail_result.get("image_base64"):
+            thumbnail_url = await save_thumbnail_to_supabase(
+                request.userId, thumbnail_result["image_base64"]
+            )
+        thumbnail_result["public_url"] = thumbnail_url
+    except Exception as exc:
+        print(f"--- thumbnail generation failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+        chosen_text = request.thumbnail_text or _pick_thumbnail_text(youtube_metadata_stub, request)
+        thumbnail_result = {
+            "image_base64": None,
+            "prompt": _fallback_thumbnail_prompt(request, chosen_text),
+            "error": str(exc),
+            "public_url": None,
+        }
+
+    token_usage = _get_token_usage_summary()
+
+    print(f"[/generate-thumbnail] total time: {time.time() - total_start_time:.2f}s")
+
+    return {
+        "thumbnail": {
+            "prompt": thumbnail_result.get("prompt"),
+            "public_url": thumbnail_result.get("public_url"),
+            "error": thumbnail_result.get("error"),
+        },
+        "token_usage": token_usage,
+    }
+
+
 @app.post("/generate-script")
 async def generate_script(request: ScriptRequest):
-    # Same global concurrency gate as /generate-ideas — this endpoint is
-    # the heaviest pipeline in the app (multiple LLM calls, web scraping,
-    # YouTube search, MySQL lookups, AND image generation), so it benefits
-    # most from being queued rather than run fully unbounded.
     async with _pipeline_semaphore:
         return await _generate_script_impl(request)
 
@@ -3763,7 +3708,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
     script_metrics = dict(_DEFAULT_SCRIPT_METRICS)
     sources: list[str] = []
     books: list[dict] = []
-    thumbnail_result: dict = {"image_base64": None, "prompt": None, "error": "not attempted"}
     table_name = None
 
     try:
@@ -3915,28 +3859,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         youtube_metadata = _build_fallback_youtube_metadata(request)
 
     try:
-        print("[MAIN] Generating thumbnail prompt + image from finished script.")
-        thumbnail_result = await generate_thumbnail_for_script(request, script_text, youtube_metadata)
-        thumbnail_url = None
-        if thumbnail_result.get("image_base64"):
-            thumbnail_url = await save_thumbnail_to_supabase(
-                request.userId, thumbnail_result["image_base64"]
-            )
-        thumbnail_result["public_url"] = thumbnail_url
-    except Exception as exc:
-        print(f"--- thumbnail generation failed: {exc} ---")
-        import traceback
-        traceback.print_exc()
-        thumbnail_result = {
-            "image_base64": None,
-            "prompt": _fallback_thumbnail_prompt(
-                request, _pick_thumbnail_text(youtube_metadata, request)
-            ),
-            "error": str(exc),
-            "public_url": None,
-        }
-
-    try:
         print("[MAIN] Generating script content metrics.")
         script_metrics = await generate_script_metrics(script_text, topic_text=topic_text)
     except Exception as exc:
@@ -3968,11 +3890,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
             "hashtags": youtube_metadata.get("hashtags", []),
             "thumbnail_text": youtube_metadata.get("thumbnail_text", []),
         },
-        "thumbnail": {
-            "prompt": thumbnail_result.get("prompt"),
-            "public_url": thumbnail_result.get("public_url"),
-            "error": thumbnail_result.get("error"),
-        },
         "metrics": {
             "totalWords": total_words,
             "videoLength": video_length,
@@ -3987,6 +3904,45 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "structure": structure,
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
