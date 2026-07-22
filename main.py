@@ -2248,7 +2248,6 @@ class ScriptRequest(BaseModel):
     title: str
     description: str
     time: int
-    isFace: bool
 
 def build_topic_text(request: "ScriptRequest") -> str:
     return f"{request.title}\n\n{request.description}".strip()
