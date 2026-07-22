@@ -116,14 +116,14 @@ origins = [
     "http://localhost:3000",
     "https://www.storio.tech",
     "https://storio.tech",
+    "https://www.storio.tech/ai-youtube-content-generator",
+    "https://storio.tech/ai-youtube-content-generator"
 ]
-
-
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
