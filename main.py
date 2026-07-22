@@ -112,18 +112,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-origins = [
-    "http://localhost:3000",
-    "https://www.storio.tech",
-    "https://storio.tech",
-    "https://www.storio.tech/ai-youtube-content-generator",
-    "https://storio.tech/ai-youtube-content-generator"
-]
+# origins = [
+#     "http://localhost:3000",
+#     "https://www.storio.tech",
+#     "https://storio.tech"
+# ]
+
+#     # "http://localhost:3000",
+#     # "https://www.storio.tech",
+#     # "https://storio.tech",
+#     # "https://www.storio.tech/ai-youtube-content-generator",
+#     # "https://storio.tech/ai-youtube-content-generator"
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1752,25 +1757,6 @@ async def get_ddgs_news_context_for_script(
     return articles
 
 
-# ============================================================
-# YOUTUBE SEARCH  —  via scrapetube (no API key, no yt-dlp)
-# ============================================================
-
-def _extract_runs_text(field: dict | None) -> str:
-    """scrapetube returns most YouTube text fields as either
-    {"simpleText": "..."} or {"runs": [{"text": "..."}, ...]}. This pulls
-    plain text out of either shape."""
-    if not field:
-        return ""
-    if isinstance(field, str):
-        return field
-    if "simpleText" in field:
-        return field.get("simpleText", "") or ""
-    runs = field.get("runs") or []
-    return "".join(r.get("text", "") for r in runs)
-
-
-
 
  
 def _youtube_api_video_details(video_ids: list[str]) -> dict[str, dict]:
@@ -1926,10 +1912,6 @@ async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 
  
     for keyword in keywords:
         try:
-            # max_results=1 per keyword, same behavior as the old
-            # scrapetube version — keeps quota usage bounded and lets the
-            # 10 diversified keywords do the work of covering different
-            # angles rather than pulling many results per angle.
             results = await _run_scrape(_youtube_search_via_api, keyword, 1)
         except Exception as e:
             print(f"[YT] search failed for '{keyword}': {e}")
@@ -4519,6 +4501,8 @@ async def razorpay_webhook(
 def content_radar():
     res = supabase.table("content_radar").select("*").execute()
     return {"message": res.data}
+
+
 
 
 async def run_intelligence_for_user(userId):
