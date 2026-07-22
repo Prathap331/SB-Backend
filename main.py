@@ -240,10 +240,6 @@ async def eci(request: PromptRequest):
 
 
 
-
-
-
-
 import os
 import re
 import json
@@ -280,8 +276,8 @@ except ImportError:
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 GPT_IMAGE_MODEL = os.getenv("GPT_IMAGE_MODEL", "gpt-image-2")
-GPT_IMAGE_SIZE = os.getenv("GPT_IMAGE_SIZE", "1536x1024")  
-GPT_IMAGE_QUALITY = os.getenv("GPT_IMAGE_QUALITY", "high") 
+GPT_IMAGE_SIZE = os.getenv("GPT_IMAGE_SIZE", "1536x1024")
+GPT_IMAGE_QUALITY = os.getenv("GPT_IMAGE_QUALITY", "high")
 
 
 #
@@ -333,9 +329,9 @@ async def _openai_create_with_timeout(call_fn, timeout: float = OPENAI_CALL_TIME
 HASH_FEATURES = 2**18
 MAX_WEB_SOURCES = 10
 MAX_YOUTUBE_SOURCES = 7
-MAX_DB_CHUNKS = 7               
-MAX_SCRIPT_CONTEXT_CHUNKS = 20   
-                                   
+MAX_DB_CHUNKS = 7
+MAX_SCRIPT_CONTEXT_CHUNKS = 20
+
 MAX_BOOKS = 7
 
 WEB_CONTENT_SIMILARITY_THRESHOLD = 0.4
@@ -407,7 +403,7 @@ async def save_ideas(data: SaveIdeasRequest):
     ideas_payload = [idea.model_dump() for idea in data.ideas]
 
     row = {
-        "userId": data.userId,         
+        "userId": data.userId,
         "topic": data.topic,
         "ideas": ideas_payload,
         "topic_embeddings": to_pgvector(topic_embedding),
@@ -424,7 +420,6 @@ async def save_ideas(data: SaveIdeasRequest):
         "total_ideas": len(data.ideas),
         "row_id": result.data[0]["id"] if result.data else None,
     }
-
 
 
 
@@ -447,11 +442,6 @@ _request_token_log: contextvars.ContextVar = contextvars.ContextVar(
     "_request_token_log", default=None
 )
 
-# Request-scoped cache so `_generate_search_keywords_for_script` can only
-# ever hit the LLM once per request, no matter how many call sites
-# (initial search, backfill, future refactors) ask for keywords on the same
-# topic within that request. Reset alongside token tracking at the top of
-# each endpoint.
 _script_keywords_cache: contextvars.ContextVar = contextvars.ContextVar(
     "_script_keywords_cache", default=None
 )
@@ -516,9 +506,7 @@ def _get_token_usage_summary() -> dict:
     }
 
 
-
 HYDE_MAX_TOKENS = 70
-
 
 def _cap_hyde_doc_tokens(text_value: str, max_tokens: int = HYDE_MAX_TOKENS) -> str:
     text_value = (text_value or "").strip()
@@ -713,7 +701,6 @@ Requirements:
 
 _sparse_vectorizer = None
 
-
 def get_sparse_vectorizer() -> HashingVectorizer:
     global _sparse_vectorizer
     if _sparse_vectorizer is None:
@@ -735,7 +722,6 @@ def _sparse_cosine(query_sparse: dict, doc_sparse: dict) -> float:
         return 0.0
     shared_keys = query_sparse.keys() & doc_sparse.keys()
     return sum(query_sparse[k] * doc_sparse[k] for k in shared_keys)
-
 
 
 TOPIC_SIMILARITY_THRESHOLD = 0.55
@@ -1669,16 +1655,15 @@ async def get_ddgs_news_context_for_script(
 
 
 
- 
 def _youtube_api_video_details(video_ids: list[str]) -> dict[str, dict]:
     """Batch-fetch title/description/channel/view_count/tags for up to 50
     video IDs per call via videos.list. Costs 1 quota unit per call
     regardless of how many IDs are in the batch (max 50)."""
     if not YOUTUBE_API_KEY or not video_ids:
         return {}
- 
+
     details: dict[str, dict] = {}
- 
+
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i:i + 50]
         params = {
@@ -1686,33 +1671,33 @@ def _youtube_api_video_details(video_ids: list[str]) -> dict[str, dict]:
             "id": ",".join(batch),
             "key": YOUTUBE_API_KEY,
         }
- 
+
         try:
             resp = _http_session.get(f"{YOUTUBE_API_BASE}/videos", params=params, timeout=15)
         except Exception as e:
             print(f"[YT-API] videos.list request failed: {e}")
             continue
- 
+
         if resp.status_code != 200:
             print(f"[YT-API] videos.list HTTP {resp.status_code}: {resp.text[:300]}")
             continue
- 
+
         try:
             data = resp.json()
         except Exception as e:
             print(f"[YT-API] failed to parse videos.list JSON: {e}")
             continue
- 
+
         print(f"[YT-API] RAW videos.list response for batch of {len(batch)} id(s):")
         print(json.dumps(data, indent=2, ensure_ascii=False))
- 
+
         for item in data.get("items", []):
             vid = item.get("id")
             if not vid:
                 continue
             snippet = item.get("snippet") or {}
             statistics = item.get("statistics") or {}
- 
+
             view_count = None
             raw_views = statistics.get("viewCount")
             if raw_views is not None:
@@ -1720,7 +1705,7 @@ def _youtube_api_video_details(video_ids: list[str]) -> dict[str, dict]:
                     view_count = int(raw_views)
                 except (TypeError, ValueError):
                     view_count = None
- 
+
             details[vid] = {
                 "title": snippet.get("title", "") or "",
                 "description": snippet.get("description", "") or "",
@@ -1728,16 +1713,15 @@ def _youtube_api_video_details(video_ids: list[str]) -> dict[str, dict]:
                 "view_count": view_count,
                 "tags": snippet.get("tags") or [],
             }
- 
+
     return details
 
 
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
- 
- 
- 
+
+
 def _youtube_api_search_ids(keyword: str, max_results: int = 1) -> list[str]:
     """Search YouTube via the Data API's search.list endpoint and return a
     list of video IDs. Costs 100 quota units per call regardless of
@@ -1745,7 +1729,7 @@ def _youtube_api_search_ids(keyword: str, max_results: int = 1) -> list[str]:
     if not YOUTUBE_API_KEY:
         print("[YT-API] YOUTUBE_API_KEY not set, skipping search")
         return []
- 
+
     params = {
         "part": "id",
         "q": keyword,
@@ -1755,44 +1739,43 @@ def _youtube_api_search_ids(keyword: str, max_results: int = 1) -> list[str]:
         "safeSearch": "none",
         "order": "relevance",
     }
- 
+
     try:
         resp = _http_session.get(f"{YOUTUBE_API_BASE}/search", params=params, timeout=15)
     except Exception as e:
         print(f"[YT-API] search request failed for '{keyword}': {e}")
         return []
- 
+
     if resp.status_code != 200:
         print(f"[YT-API] search HTTP {resp.status_code} for '{keyword}': {resp.text[:300]}")
         return []
- 
+
     try:
         data = resp.json()
     except Exception as e:
         print(f"[YT-API] failed to parse search JSON for '{keyword}': {e}")
         return []
- 
+
     print(f"[YT-API] RAW search.list response for '{keyword}':")
     print(json.dumps(data, indent=2, ensure_ascii=False))
- 
+
     video_ids = []
     for item in data.get("items", []):
         vid = (item.get("id") or {}).get("videoId")
         if vid:
             video_ids.append(vid)
- 
+
     return video_ids
- 
- 
+
 
 
 def _youtube_search_via_api(keyword: str, max_results: int = 1) -> list[dict]:
     video_ids = _youtube_api_search_ids(keyword, max_results=max_results)
     if not video_ids:
         return []
- 
+
     details_by_id = _youtube_api_video_details(video_ids)
- 
+
     results = []
     for vid in video_ids:
         detail = details_by_id.get(vid)
@@ -1806,39 +1789,39 @@ def _youtube_search_via_api(keyword: str, max_results: int = 1) -> list[dict]:
             "view_count": detail["view_count"],
             "tags": detail["tags"],
         })
- 
+
     return results
 
-            
+
 async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 10) -> list[dict]:
     print(f"[YT] Starting YouTube search for topic: '{topic}'")
- 
+
     if not YOUTUBE_API_KEY:
         print("[YT] YOUTUBE_API_KEY not set, skipping YouTube search")
         return []
- 
+
     keywords = await _generate_youtube_search_keywords(topic)
- 
+
     raw_candidates: list[dict] = []
- 
+
     for keyword in keywords:
         try:
             results = await _run_scrape(_youtube_search_via_api, keyword, 1)
         except Exception as e:
             print(f"[YT] search failed for '{keyword}': {e}")
             results = []
- 
+
         for r in results:
             url = r["url"]
             if url in scraped_urls:
                 continue
             scraped_urls.add(url)
- 
+
             title = r.get("title", "")
             description = _truncate_words(r.get("description", ""), max_words=150)
             tags = r.get("tags") or []
             hashtags = _extract_hashtags(r.get("title", ""), r.get("description", ""))
- 
+
             raw_candidates.append({
                 "url": url,
                 "title": title,
@@ -1848,18 +1831,18 @@ async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 
                 "tags": tags,
                 "hashtags": hashtags,
             })
- 
+
     raw_candidates.sort(key=lambda v: v.get("view_count") or 0, reverse=True)
     videos = raw_candidates[:MAX_YOUTUBE_SOURCES]
- 
+
     print(
         f"[YT] fetched {len(raw_candidates)} unique candidate video(s) via YouTube Data API "
         f"from {len(keywords)} keyword(s), returning top {len(videos)} "
         f"(capped at {MAX_YOUTUBE_SOURCES})"
     )
- 
+
     return videos
- 
+
 
 def _build_ideas_context(db_results: list[dict], new_articles: list[dict]) -> str:
     parts = []
@@ -2256,8 +2239,6 @@ async def cut_credits(request: UnlockRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Approximate spoken narration pace used to size the generated script to the
-# requested video duration.
 def target_word_count_for_time(minutes: int) -> int:
     return max(50, int(minutes * WORDS_PER_MINUTE))
 
@@ -2522,7 +2503,7 @@ Source Material:
                 ],
                 stream=False,
             ),
-            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),  # script generation is the longest call — give it more room
+            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
         )
         _record_token_usage("generate_script_from_context", completion)
         script_text = (completion.choices[0].message.content or "").strip()
@@ -2725,6 +2706,10 @@ Reference metadata from currently-ranking videos on this topic:
 
 
 def _extract_source_website_names(articles: list[dict]) -> list[str]:
+    """Unique domain names present in `articles` (order-preserving). Kept
+    for logging/diagnostics — the compulsory 10-source guarantee below is
+    based on unique URLs, not unique domains, since requiring a brand new
+    domain for every one of the 10 sources is often not achievable."""
     names = []
     seen = set()
     for article in articles:
@@ -2743,6 +2728,10 @@ def _extract_source_website_names(articles: list[dict]) -> list[str]:
     return names
 
 
+def _unique_url_count(articles: list[dict]) -> int:
+    return len({a.get("url") for a in articles if a.get("url")})
+
+
 async def _backfill_sources_to_target(
     new_articles: list[dict],
     scraped_urls: set,
@@ -2750,17 +2739,23 @@ async def _backfill_sources_to_target(
     hyde_doc: str,
     keywords: list[str] | None = None,
     target_count: int = MAX_WEB_SOURCES,
-    max_rounds: int = 4,
+    max_rounds: int = 8,
 ) -> list[dict]:
+    """
+    Keeps searching (with progressively looser/broader queries) until the
+    article list contains at least `target_count` unique-URL sources, or
+    until `max_rounds` of searching produced nothing new. The 10-source
+    requirement is compulsory, so this function tries hard: it first
+    prefers new domains (round 1), then falls back to any new URL
+    (subsequent rounds) so a shortage of distinct domains never blocks
+    reaching the target count.
+    """
 
-    def _domain_count(articles: list[dict]) -> int:
-        return len(_extract_source_website_names(articles))
-
-    def _known_domains(articles: list[dict]) -> set[str]:
-        return set(_extract_source_website_names(articles))
+    def _existing_urls() -> set:
+        return {a.get("url") for a in new_articles if a.get("url")}
 
     round_num = 0
-    while _domain_count(new_articles) < target_count and round_num < max_rounds:
+    while _unique_url_count(new_articles) < target_count and round_num < max_rounds:
         round_num += 1
         added_this_round = 0
 
@@ -2773,18 +2768,26 @@ async def _backfill_sources_to_target(
                 print(f"[MAIN] sources backfill round {round_num} failed: {e}")
                 relaxed = []
 
-            known = _known_domains(new_articles)
+            known_domains = set(_extract_source_website_names(new_articles))
+            existing_urls = _existing_urls()
             for article in relaxed:
-                if _domain_count(new_articles) >= target_count:
+                if _unique_url_count(new_articles) >= target_count:
                     break
                 url = article.get("url", "")
-                netloc = urlparse(url).netloc.lower() if url else ""
+                if not url or url in existing_urls:
+                    continue
+                netloc = urlparse(url).netloc.lower()
                 if netloc.startswith("www."):
                     netloc = netloc[4:]
-                if netloc and netloc not in known:
-                    known.add(netloc)
-                    new_articles.append(article)
-                    added_this_round += 1
+                # Prefer a brand-new domain in this first relaxed pass, but
+                # don't hard-require it — a duplicate domain is still a
+                # valid, distinct source URL that counts toward the
+                # compulsory total.
+                new_articles.append(article)
+                existing_urls.add(url)
+                if netloc:
+                    known_domains.add(netloc)
+                added_this_round += 1
 
         else:
             generic_queries = [
@@ -2794,28 +2797,27 @@ async def _backfill_sources_to_target(
                 f"{title} analysis",
                 f"{title} explained",
                 f"{title} report",
+                f"{title} overview",
+                f"{title} background",
+                f"{title} facts",
+                f"{title} details",
             ]
-            known = _known_domains(new_articles)
+            existing_urls = _existing_urls()
             for query in generic_queries:
-                if _domain_count(new_articles) >= target_count:
+                if _unique_url_count(new_articles) >= target_count:
                     break
                 try:
-                    pairs = await _run_scrape(_ddgs_search_for_script, query, 15)
+                    pairs = await _run_scrape(_ddgs_search_for_script, query, 20)
                 except Exception as e:
                     print(f"[MAIN] sources backfill generic query '{query}' failed: {e}")
                     continue
                 for url, snippet in pairs:
-                    if _domain_count(new_articles) >= target_count:
+                    if _unique_url_count(new_articles) >= target_count:
                         break
-                    if not url or url in scraped_urls:
-                        continue
-                    netloc = urlparse(url).netloc.lower()
-                    if netloc.startswith("www."):
-                        netloc = netloc[4:]
-                    if not netloc or netloc in known:
+                    if not url or url in scraped_urls or url in existing_urls:
                         continue
                     scraped_urls.add(url)
-                    known.add(netloc)
+                    existing_urls.add(url)
                     new_articles.append({
                         "url": url,
                         "snippet": _truncate_words(snippet or title, max_words=200),
@@ -2827,7 +2829,17 @@ async def _backfill_sources_to_target(
                     added_this_round += 1
 
         if added_this_round == 0:
-            break
+            print(f"[MAIN] sources backfill round {round_num} added 0 new source(s), stopping this round type")
+
+    final_count = _unique_url_count(new_articles)
+    if final_count < target_count:
+        print(
+            f"[MAIN] WARNING: could only find {final_count}/{target_count} unique source URL(s) "
+            f"for this topic after {round_num} backfill round(s) — the web genuinely doesn't have "
+            f"more distinct results to offer for this query."
+        )
+    else:
+        print(f"[MAIN] sources backfill reached the compulsory target: {final_count}/{target_count} unique source URL(s)")
 
     return new_articles
 
@@ -3013,7 +3025,7 @@ def _fetch_books_by_md5_sync(md5_list: list[str]) -> list[dict]:
 
     engine = get_mysql_engine()
     query = text(
-        f"SELECT Title, Author, md5 FROM {BOOKS_TABLE_NAME} WHERE md5 IN :md5_list"
+        f"SELECT Title, Author, Year, md5 FROM {BOOKS_TABLE_NAME} WHERE md5 IN :md5_list"
     ).bindparams(bindparam("md5_list", expanding=True))
 
     try:
@@ -3026,6 +3038,19 @@ def _fetch_books_by_md5_sync(md5_list: list[str]) -> list[dict]:
         return []
 
 
+def _normalize_book_year(raw_year) -> str | None:
+    """Normalize whatever comes back from MySQL for the Year column into a
+    clean display string (e.g. '2014'), or None if there's no usable year."""
+    if raw_year is None:
+        return None
+    year_str = str(raw_year).strip()
+    if not year_str or year_str.lower() in ("none", "null", "0", "0000"):
+        return None
+    # Some sources store a full date/timestamp — keep just the leading year.
+    match = re.match(r"(\d{3,4})", year_str)
+    return match.group(1) if match else year_str
+
+
 async def get_books_for_chunks(
     all_db_chunks: list[dict],
     topic_text: str = "",
@@ -3033,8 +3058,8 @@ async def get_books_for_chunks(
     max_books: int = MAX_BOOKS,
 ) -> list[dict]:
     """
-    DB-ONLY. Pulls book Title/Author entries strictly from the `english_books`
-    MySQL table by matching chunk md5 values.
+    DB-ONLY. Pulls book Title/Author/Year entries strictly from the
+    `english_books` MySQL table by matching chunk md5 values.
     """
     md5_list = []
     seen_md5 = set()
@@ -3046,7 +3071,7 @@ async def get_books_for_chunks(
 
     books: list[dict] = []
     if md5_list:
-        print(f"[MYSQL] looking up {len(md5_list)} unique md5(s) for book Title/Author in '{BOOKS_TABLE_NAME}'")
+        print(f"[MYSQL] looking up {len(md5_list)} unique md5(s) for book Title/Author/Year in '{BOOKS_TABLE_NAME}'")
         rows = await asyncio.to_thread(_fetch_books_by_md5_sync, md5_list)
 
         seen_books = set()
@@ -3059,12 +3084,13 @@ async def get_books_for_chunks(
             author = str(author).strip()
             if not title or not author:
                 continue
+            year = _normalize_book_year(row.get("Year"))
             key = (title, author)
             if key not in seen_books:
                 seen_books.add(key)
-                books.append({"title": title, "author": author})
+                books.append({"title": title, "author": author, "year": year})
 
-        print(f"[MYSQL] resolved {len(books)} unique book(s) with title+author from {len(md5_list)} md5(s)")
+        print(f"[MYSQL] resolved {len(books)} unique book(s) with title+author (+year where available) from {len(md5_list)} md5(s)")
     else:
         print("[MYSQL] no md5s found on retrieved DB chunks, skipping direct lookup")
 
@@ -3130,8 +3156,9 @@ async def _backfill_books_to_target(
             key = (title, author)
             if key in seen_book_keys:
                 continue
+            year = _normalize_book_year(row.get("Year"))
             seen_book_keys.add(key)
-            books.append({"title": title, "author": author})
+            books.append({"title": title, "author": author, "year": year})
 
         print(f"[MYSQL-BACKFILL] round {round_num} done — now {len(books)}/{target_count} book(s)")
 
@@ -3143,10 +3170,6 @@ async def _backfill_books_to_target(
 
     return books[:target_count]
 
-
-# ============================================================
-# USER FACE PHOTO (for isFace=True thumbnails)
-# ============================================================
 
 FACE_THUMBNAILS_TABLE = "user_profiles"
 FACE_PHOTO_DEFAULT_KEY = "photo1"
@@ -3597,13 +3620,14 @@ class ThumbnailRequest(BaseModel):
     time: int
     isFace: bool
     script: str = ""
-    thumbnail_text: str | None = None
+    thumbnail_text: list[str] | None = None
 
 
 @app.post("/generate-thumbnail")
 async def generate_thumbnail_endpoint(request: ThumbnailRequest):
     async with _pipeline_semaphore:
         return await _generate_thumbnail_endpoint_impl(request)
+
 
 
 async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
@@ -3613,7 +3637,7 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
     script_text = request.script or ""
 
     youtube_metadata_stub = {
-        "thumbnail_text": [request.thumbnail_text] if request.thumbnail_text else [],
+        "thumbnail_text": request.thumbnail_text or [],
     }
 
     thumbnail_result = {"image_base64": None, "prompt": None, "error": "not attempted"}
@@ -3633,7 +3657,12 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         print(f"--- thumbnail generation failed: {exc} ---")
         import traceback
         traceback.print_exc()
-        chosen_text = request.thumbnail_text or _pick_thumbnail_text(youtube_metadata_stub, request)
+
+        chosen_text = next(
+            (t.strip() for t in (request.thumbnail_text or []) if isinstance(t, str) and t.strip()),
+            None,
+        ) or _pick_thumbnail_text(youtube_metadata_stub, request)
+
         thumbnail_result = {
             "image_base64": None,
             "prompt": _fallback_thumbnail_prompt(request, chosen_text),
@@ -3654,11 +3683,121 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         "token_usage": token_usage,
     }
 
-
 @app.post("/generate-script")
 async def generate_script(request: ScriptRequest):
     async with _pipeline_semaphore:
         return await _generate_script_impl(request)
+
+
+_DEFAULT_CLASSIFICATION = {"category": "UNKNOWN", "subcategories": []}
+
+async def generate_category_and_subcategory(
+    title: str,
+    description: str | None,
+    script_text: str,
+) -> dict:
+    """
+    Uses an LLM call to classify the content into exactly 1 category
+    and up to 5 subcategories, based on the title, description, and script.
+    """
+    script_excerpt = (script_text or "")[:6000]
+
+    classification_prompt = f"""You are a strict content classifier for YouTube-style video scripts.
+
+Given the title, description, and script below, return exactly ONE top-level category and UP TO FIVE relevant subcategories.
+
+Respond ONLY with valid JSON in this exact shape, no preamble, no markdown fences, no extra text:
+{{"category": "string", "subcategories": ["string", "string"]}}
+
+Rules:
+- "category" must be a single, concise label (1-3 words).
+- "subcategories" must be an array of 0 to 5 short, concise labels (1-3 words each).
+- Do not include duplicates.
+- Do not include any text outside the JSON object.
+
+Title: {title}
+
+Description: {description or "N/A"}
+
+Script:
+{script_excerpt}
+
+Classify this content now. Return only the JSON object."""
+
+    raw_text = ""
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": classification_prompt}],
+            stream=False,
+        )
+
+        raw_text = response.choices[0].message.content.strip()
+        print(f"[CLASSIFY] raw LLM output: {raw_text!r}")
+
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+
+        parsed = json.loads(cleaned)
+
+        category = parsed.get("category")
+        if not isinstance(category, str) or not category.strip():
+            category = "UNKNOWN"
+        else:
+            category = category.strip()
+
+        subcategories_raw = parsed.get("subcategories", [])
+        if not isinstance(subcategories_raw, list):
+            subcategories_raw = []
+
+        subcategories = []
+        seen_lower = set()
+        for item in subcategories_raw:
+            if not isinstance(item, str):
+                continue
+            clean_item = item.strip()
+            if not clean_item:
+                continue
+            key = clean_item.lower()
+            if key in seen_lower:
+                continue
+            seen_lower.add(key)
+            subcategories.append(clean_item)
+            if len(subcategories) >= 5:
+                break
+
+        return {"category": category, "subcategories": subcategories}
+
+    except Exception as exc:
+        print(f"--- category/subcategory classification failed: {exc!r} ---")
+        print(f"--- raw_text at time of failure: {raw_text!r} ---")
+        import traceback
+        traceback.print_exc()
+        return dict(_DEFAULT_CLASSIFICATION)
+
+
+def _extract_source_links(articles: list[dict]) -> list[str]:
+    """
+    Returns up to MAX_WEB_SOURCES (10) unique source URLs, in the order the
+    articles list is already sorted (similarity-first, backfilled ones at
+    the end). Deduplicates on the full URL rather than the domain, so that
+    the compulsory count of 10 sources can actually be reached even if
+    fewer than 10 distinct domains turned up results for a given topic.
+    """
+    links = []
+    seen = set()
+    for article in articles:
+        url = article.get("url", "")
+        if url and url not in seen:
+            seen.add(url)
+            links.append(url)
+        if len(links) >= MAX_WEB_SOURCES:
+            break
+    return links
+
 
 
 async def _generate_script_impl(request: "ScriptRequest"):
@@ -3709,6 +3848,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
     sources: list[str] = []
     books: list[dict] = []
     table_name = None
+    classification = dict(_DEFAULT_CLASSIFICATION)
 
     try:
         table_name = await select_table_for_topic(topic_text)
@@ -3786,11 +3926,14 @@ async def _generate_script_impl(request: "ScriptRequest"):
             request.title, scraped_urls, combined_hyde_doc, keywords=script_search_keywords,
         )
 
-        domain_count = len(_extract_source_website_names(new_articles))
-        if domain_count < MAX_WEB_SOURCES:
+        # The 10-source requirement is compulsory: keep backfilling with
+        # progressively broader/relaxed queries until we have 10 unique
+        # source URLs (or genuinely exhaust what's findable for this topic).
+        unique_source_count = _unique_url_count(new_articles)
+        if unique_source_count < MAX_WEB_SOURCES:
             print(
-                f"[MAIN] Only {domain_count} unique source domain(s) found, "
-                f"running multi-round backfill to try to reach {MAX_WEB_SOURCES}."
+                f"[MAIN] Only {unique_source_count} unique source URL(s) found, "
+                f"running multi-round backfill to reach the compulsory {MAX_WEB_SOURCES}."
             )
             try:
                 new_articles = await _backfill_sources_to_target(
@@ -3801,7 +3944,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
             except Exception as backfill_exc:
                 print(f"[MAIN] sources backfill failed: {backfill_exc}")
 
-        print(f"[MAIN] Final source domain count: {len(_extract_source_website_names(new_articles))}/{MAX_WEB_SOURCES}")
+        print(f"[MAIN] Final unique source count: {_unique_url_count(new_articles)}/{MAX_WEB_SOURCES}")
     except Exception as exc:
         print(f"--- web search (DDGS) failed: {exc} ---")
         import traceback
@@ -3866,7 +4009,22 @@ async def _generate_script_impl(request: "ScriptRequest"):
         import traceback
         traceback.print_exc()
 
-    sources = _extract_source_website_names(new_articles)
+    try:
+        print("[MAIN] Generating category and subcategory classification.")
+        classification = await generate_category_and_subcategory(
+            request.title, request.description, script_text
+        )
+        print(
+            f"[MAIN] Classification -> category: {classification.get('category')}, "
+            f"subcategories: {classification.get('subcategories')}"
+        )
+    except Exception as exc:
+        print(f"--- category/subcategory classification failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+        classification = dict(_DEFAULT_CLASSIFICATION)
+
+    sources = _extract_source_links(new_articles)
 
     total_words = _word_count(script_text) if script_text else 0
     video_length = round(total_words / WORDS_PER_MINUTE, 2) if total_words else 0
@@ -3902,8 +4060,325 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "sources": sources,
         "books": books,
         "structure": structure,
+        "category": classification.get("category", "UNKNOWN"),
+        "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from typing import Optional
+
+from pydantic import Field
+
+_http_session = requests.Session()
+_http_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=20, pool_maxsize=20, max_retries=1
+)
+_http_session.mount("https://", _http_adapter)
+_http_session.mount("http://", _http_adapter)
+
+
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
+PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
+
+
+class PexelsVideoSearchRequest(BaseModel):
+    query: str = Field(..., description="Search term, e.g. 'ocean waves'")
+    per_page: int = Field(15, ge=1, le=80, description="Results per page (max 80)")
+    page: int = Field(1, ge=1, description="Page number")
+    orientation: Optional[str] = Field(
+        None, description="landscape | portrait | square (optional)"
+    )
+    size: Optional[str] = Field(
+        None, description="large | medium | small (optional, min video resolution)"
+    )
+
+
+def _pexels_search_videos_sync(
+    query: str,
+    per_page: int,
+    page: int,
+    orientation: Optional[str],
+    size: Optional[str],
+) -> dict:
+    if not PEXELS_API_KEY:
+        raise RuntimeError("PEXELS_API_KEY not set")
+
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {
+        "query": query,
+        "per_page": per_page,
+        "page": page,
+    }
+    if orientation:
+        params["orientation"] = orientation
+    if size:
+        params["size"] = size
+
+    resp = _http_session.get(
+        PEXELS_VIDEO_SEARCH_URL, headers=headers, params=params, timeout=15
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _extract_video_files(video: dict) -> list[dict]:
+    """Pick out the useful video_files entries (quality/resolution/link)."""
+    files = []
+    for vf in video.get("video_files", []):
+        files.append({
+            "quality": vf.get("quality"),
+            "width": vf.get("width"),
+            "height": vf.get("height"),
+            "file_type": vf.get("file_type"),
+            "link": vf.get("link"),
+        })
+    return files
+
+
+def _format_video_result(video: dict) -> dict:
+    return {
+        "id": video.get("id"),
+        "url": video.get("url"),
+        "width": video.get("width"),
+        "height": video.get("height"),
+        "duration": video.get("duration"),
+        "thumbnail": video.get("image"),
+        "user": {
+            "name": (video.get("user") or {}).get("name"),
+            "url": (video.get("user") or {}).get("url"),
+        },
+        "video_files": _extract_video_files(video),
+    }
+
+
+@app.post("/search-pexels-videos")
+async def search_pexels_videos(request: PexelsVideoSearchRequest):
+    if not PEXELS_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="PEXELS_API_KEY is not configured on the server.",
+        )
+
+    query = request.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must be a non-empty string")
+
+    try:
+        data = await asyncio.to_thread(
+            _pexels_search_videos_sync,
+            query,
+            request.per_page,
+            request.page,
+            request.orientation,
+            request.size,
+        )
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 502
+        detail = e.response.text[:300] if e.response is not None else str(e)
+        raise HTTPException(status_code=status, detail=f"Pexels API error: {detail}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pexels video search failed: {e}")
+
+    videos = [_format_video_result(v) for v in (data.get("videos") or [])]
+
+    return {
+        "query": query,
+        "page": data.get("page", request.page),
+        "per_page": data.get("per_page", request.per_page),
+        "total_results": data.get("total_results", 0),
+        "videos": videos,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
