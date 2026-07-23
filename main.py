@@ -3660,7 +3660,6 @@ async def save_thumbnail_to_supabase(user_id: str, image_base64: str) -> str | N
 
 
 
-
 class ThumbnailRequest(BaseModel):
     userId: str
     title: str
@@ -3689,7 +3688,7 @@ async def _get_user_tier(user_id: str) -> str:
         result = await asyncio.to_thread(
             lambda: supabase.table("user_profiles")
             .select("user_tier")
-            .eq("userId", user_id)
+            .eq("id", user_id)
             .single()
             .execute()
         )
@@ -3841,9 +3840,6 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
-
-
-
 
 
 
