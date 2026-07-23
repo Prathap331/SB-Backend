@@ -3703,13 +3703,11 @@ async def _get_user_tier(user_id: str) -> str:
 
 
 async def _deduct_profile_credits(user_id: str, amount: int = 20):
-    """Deduct credits from user_profiles.credits_remaining — used for
-    free-tier users."""
     try:
         result = (
             supabase.table("user_profiles")
             .select("credits_remaining")
-            .eq("userId", user_id)
+            .eq("id", user_id)
             .single()
             .execute()
         )
@@ -3723,7 +3721,7 @@ async def _deduct_profile_credits(user_id: str, amount: int = 20):
 
         supabase.table("user_profiles").update(
             {"credits_remaining": new_credits}
-        ).eq("userId", user_id).execute()
+        ).eq("id", user_id).execute()
 
         print(f"[CREDITS] (free tier / user_profiles) Deducted {amount} credits from user {user_id}: {current_credits} -> {new_credits}")
     except Exception as exc:
