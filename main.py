@@ -3664,7 +3664,6 @@ class ThumbnailRequest(BaseModel):
     userId: str
     title: str
     description: str
-    time: int
     isFace: bool
     script: str = ""
     thumbnail_text: list[str] | None = None
