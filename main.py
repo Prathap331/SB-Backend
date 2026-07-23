@@ -239,7 +239,7 @@ async def eci(request: PromptRequest):
 
 
 
-
+import io
 import os
 import re
 import json
@@ -1289,14 +1289,20 @@ async def _generate_web_search_keywords(topic: str) -> list[str]:
     return await _generate_search_keywords(topic)
 
 
-async def _generate_youtube_search_keywords(topic: str) -> list[str]:
+async def _generate_youtube_search_keywords(topic: str, description: str = "") -> list[str]:
     prompt = f"""
             You are a YouTube SEO strategist generating search queries to find the
             BEST-PERFORMING, most-optimized existing videos on a topic — the goal is
             to surface videos whose titles and descriptions are strong SEO examples,
             not just any video that happens to match.
 
-            Topic: "{topic}"
+            Idea Title: "{topic}"
+            Idea Description: "{description or 'N/A'}"
+
+            Use both the title and the description above to understand the true
+            intent, entities, and angle of the idea before writing queries — the
+            description often clarifies specific people, places, sub-topics, or
+            framing that the title alone doesn't capture.
 
             YouTube search behaves differently from Google/web search:
             - People phrase queries like video titles, not keyword strings
@@ -1304,9 +1310,10 @@ async def _generate_youtube_search_keywords(topic: str) -> list[str]:
               happen", "X for beginners", "the truth about X")
             - High-performing videos usually rank for a clear, singular intent —
               write queries the same way, not stuffed with extra modifiers
-            - Exact entities, names, places, or proper nouns from the topic pull
-              much more relevant, higher-quality results than generic phrasing —
-              preserve and reuse them naturally instead of abstracting away
+            - Exact entities, names, places, or proper nouns from the title or
+              description pull much more relevant, higher-quality results than
+              generic phrasing — preserve and reuse them naturally instead of
+              abstracting away
 
             Generate 10 distinct queries that together cover a SPREAD of these
             intents (use each intent at most once, don't repeat the same angle
@@ -1327,7 +1334,7 @@ async def _generate_youtube_search_keywords(topic: str) -> list[str]:
             - Each query should be 3-7 words, phrased like a real YouTube search bar entry
             - No keyword stuffing, no boolean operators, no quotation marks
             - No duplicate intent — each query must target a genuinely different angle
-            - Do not invent entities, names, or facts not implied by the topic
+            - Do not invent entities, names, or facts not implied by the title/description
             - Return ONLY the 10 queries, one per line, no numbering, no bullets, no commentary
 """.strip()
 
@@ -1447,14 +1454,31 @@ async def get_ddgs_news_context(
 SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE = """You are a Search Query Expansion Engine for automated web crawling.
 
 Input:
-A short video title/description (the topic of a script that's about to be written).
+Everything known so far about a video that's about to be scripted: the idea's
+title and description, the script template that was chosen for it (its title,
+its purpose, and its ordered segment structure), and the target video
+duration.
+
+Idea Title: "{title}"
+Idea Description: "{description}"
+Target Video Duration: {time_minutes} minute(s)
+
+Script Template Title: "{template_title}"
+Script Template Purpose: {template_about}
+Script Template Segments:
+{segments_block}
 
 Goal:
-Generate exactly 15 high-quality search engine keyword combinations that maximize information retrieval from Google, Bing, academic search engines, and news websites, to gather source material for writing the script.
+Generate exactly 15 high-quality search engine keyword combinations that
+maximize information retrieval from Google, Bing, academic search engines,
+and news websites, to gather source material for writing this script. Use
+the segment structure and template purpose above to make sure the keywords
+collectively cover what each part of the script will need, not just the
+idea title in isolation.
 
 Requirements:
 - Every phrase must incorporate the topic's core subject/entities naturally —
-  do NOT output the raw topic string verbatim as one of the 15 lines by
+  do NOT output the raw title string verbatim as one of the 15 lines by
   itself; each line must be a distinct EXPANDED search phrase, not a copy of
   the input.
 - Generate search phrases, NOT sentences.
@@ -1475,14 +1499,13 @@ Requirements:
   • expert opinions
   • controversies
   • future trends
-- Include important entities when inferable.
+- Include important entities when inferable from the title, description, or
+  template segments.
 - Avoid duplicate intent.
 - Each keyword combination should contain 4-10 words.
 - Return ONLY the 15 keyword combinations, nothing else — no preamble, no
-  restating the topic on its own line.
+  restating the title on its own line.
 - Number each result.
-
-[TOPIC]: {topic}
 """
 
 
@@ -1500,9 +1523,21 @@ def _ddgs_search_for_script(keyword: str, max_results: int) -> list[tuple[str, s
     return results
 
 
-async def _generate_search_keywords_for_script(topic: str) -> list[str]:
+async def _generate_search_keywords_for_script(
+    title: str,
+    description: str = "",
+    template: dict | None = None,
+    time_minutes: int = 0,
+) -> list[str]:
+    template = template or {}
+
     cache = _script_keywords_cache.get()
-    cache_key = topic.strip().lower()
+    cache_key = "|".join([
+        (title or "").strip().lower(),
+        (description or "").strip().lower(),
+        str(template.get("key") or "").strip().lower(),
+        str(time_minutes),
+    ])
 
     if cache is not None and cache_key in cache:
         cached_keywords = cache[cache_key]
@@ -1512,7 +1547,16 @@ async def _generate_search_keywords_for_script(topic: str) -> list[str]:
         )
         return cached_keywords
 
-    prompt = SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE.format(topic=topic)
+    segments_block = _segments_brief(template.get("segments") or [])
+
+    prompt = SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE.format(
+        title=title,
+        description=description or "N/A",
+        time_minutes=time_minutes,
+        template_title=template.get("title") or "N/A",
+        template_about=template.get("about") or "N/A",
+        segments_block=segments_block,
+    )
 
     try:
         res = await _openai_create_with_timeout(
@@ -1526,20 +1570,20 @@ async def _generate_search_keywords_for_script(topic: str) -> list[str]:
         raw = res.choices[0].message.content.strip()
     except Exception as e:
         print(f"[DDGS-SCRIPT] keyword generation failed: {e}")
-        fallback = [f"{topic} latest news today", f"{topic} 2026 update"]
+        fallback = [f"{title} latest news today", f"{title} 2026 update"]
         if cache is not None:
             cache[cache_key] = fallback
         return fallback
 
     keywords = _parse_keyword_lines(raw)
 
-    topic_normalized = topic.strip().lower()
-    keywords = [kw for kw in keywords if kw.strip().lower() != topic_normalized]
+    title_normalized = (title or "").strip().lower()
+    keywords = [kw for kw in keywords if kw.strip().lower() != title_normalized]
     keywords = keywords[:15]
 
     if not keywords:
         print("[DDGS-SCRIPT] keyword generation returned nothing usable, using fallback")
-        fallback = [f"{topic} latest news today", f"{topic} 2026 update"]
+        fallback = [f"{title} latest news today", f"{title} 2026 update"]
         if cache is not None:
             cache[cache_key] = fallback
         return fallback
@@ -1566,7 +1610,9 @@ async def get_ddgs_news_context_for_script(
     print(f"[DDGS-SCRIPT] Starting news search for topic: '{topic}' (similarity_threshold={similarity_threshold})")
 
     if keywords is None:
-        keywords = await _generate_search_keywords_for_script(topic)
+        # Fallback path — no pre-generated keywords supplied, so we only have
+        # the plain topic string to work with (no description/template/time).
+        keywords = await _generate_search_keywords_for_script(topic, "", {}, 0)
     else:
         print(f"[DDGS-SCRIPT] reusing {len(keywords)} previously generated keyword(s) — skipping keyword regeneration")
 
@@ -1793,14 +1839,16 @@ def _youtube_search_via_api(keyword: str, max_results: int = 1) -> list[dict]:
     return results
 
 
-async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 10) -> list[dict]:
+async def get_youtube_context(
+    topic: str, description: str, scraped_urls: set, max_results: int = 10
+) -> list[dict]:
     print(f"[YT] Starting YouTube search for topic: '{topic}'")
 
     if not YOUTUBE_API_KEY:
         print("[YT] YOUTUBE_API_KEY not set, skipping YouTube search")
         return []
 
-    keywords = await _generate_youtube_search_keywords(topic)
+    keywords = await _generate_youtube_search_keywords(topic, description)
 
     raw_candidates: list[dict] = []
 
@@ -1818,14 +1866,14 @@ async def get_youtube_context(topic: str, scraped_urls: set, max_results: int = 
             scraped_urls.add(url)
 
             title = r.get("title", "")
-            description = _truncate_words(r.get("description", ""), max_words=150)
+            desc = _truncate_words(r.get("description", ""), max_words=150)
             tags = r.get("tags") or []
             hashtags = _extract_hashtags(r.get("title", ""), r.get("description", ""))
 
             raw_candidates.append({
                 "url": url,
                 "title": title,
-                "description": description,
+                "description": desc,
                 "channel": r.get("channel", ""),
                 "view_count": r.get("view_count"),
                 "tags": tags,
@@ -2294,16 +2342,18 @@ def num_hyde_docs_for_time(minutes: int) -> int:
 
 
 async def generate_hyde_doc_for_segments(
-    topic_text: str,
+    title: str,
+    description: str,
     template: dict,
     segment_group: list[dict],
-    title: str = None,
-    description: str = None,
+    time_minutes: int,
 ) -> str:
     segment_briefs = "\n".join(
         f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}%): {seg.get('brief', '')}"
         for seg in segment_group
     )
+
+    fallback_text = f"{title}\n\n{description}".strip()
 
     hyde_prompt = f"""
             You are generating a HyDE (Hypothetical Document Embedding) passage to
@@ -2311,6 +2361,7 @@ async def generate_hyde_doc_for_segments(
 
             Idea Title: "{title}"
             Idea Description: "{description}"
+            Target Video Duration: {time_minutes} minute(s)
 
             This passage must strictly follow the structure of the retrieved script
             template below — do not invent a different structure.
@@ -2368,13 +2419,13 @@ async def generate_hyde_doc_for_segments(
                 doc = ""
 
         if not doc:
-            print(f"--- HyDE DOC [{segment_label}] still EMPTY after retry, falling back to topic_text ---")
-            return _cap_hyde_doc_tokens(topic_text)
+            print(f"--- HyDE DOC [{segment_label}] still EMPTY after retry, falling back to title/description ---")
+            return _cap_hyde_doc_tokens(fallback_text)
 
         return doc
     except Exception as exc:
         print(f"--- HyDE generation failed for segment group [{segment_label}]: {type(exc).__name__}: {exc} ---")
-        return _cap_hyde_doc_tokens(topic_text)
+        return _cap_hyde_doc_tokens(fallback_text)
 
 
 async def get_context_with_timeout(
@@ -2778,10 +2829,6 @@ async def _backfill_sources_to_target(
                 netloc = urlparse(url).netloc.lower()
                 if netloc.startswith("www."):
                     netloc = netloc[4:]
-                # Prefer a brand-new domain in this first relaxed pass, but
-                # don't hard-require it — a duplicate domain is still a
-                # valid, distinct source URL that counts toward the
-                # compulsory total.
                 new_articles.append(article)
                 existing_urls.add(url)
                 if netloc:
@@ -3612,6 +3659,8 @@ async def save_thumbnail_to_supabase(user_id: str, image_base64: str) -> str | N
     return public_url
 
 
+
+
 class ThumbnailRequest(BaseModel):
     userId: str
     title: str
@@ -3627,6 +3676,118 @@ async def generate_thumbnail_endpoint(request: ThumbnailRequest):
     async with _pipeline_semaphore:
         return await _generate_thumbnail_endpoint_impl(request)
 
+
+FREE_TIER_LABELS = {"free", "free_tier", "free-tier", "trial", "none", ""}
+
+
+async def _get_user_tier(user_id: str) -> str:
+    """Look up the user's plan tier from user_profiles.user_tier. Defaults
+    to 'free' (and therefore the credits_remaining deduction path) if the
+    column is missing, empty, or the lookup fails for any reason — this is
+    the safer default since it never silently skips a deduction."""
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("user_profiles")
+            .select("user_tier")
+            .eq("userId", user_id)
+            .single()
+            .execute()
+        )
+        raw_tier = (result.data or {}).get("user_tier")
+        tier = (raw_tier or "").strip().lower()
+        print(f"[CREDITS] user {user_id} user_tier='{tier or 'free (default)'}'")
+        return tier
+    except Exception as exc:
+        print(f"[CREDITS] failed to fetch user_tier for user {user_id}, defaulting to 'free': {exc}")
+        return "free"
+
+
+async def _deduct_profile_credits(user_id: str, amount: int = 20):
+    """Deduct credits from user_profiles.credits_remaining — used for
+    free-tier users."""
+    try:
+        result = (
+            supabase.table("user_profiles")
+            .select("credits_remaining")
+            .eq("userId", user_id)
+            .single()
+            .execute()
+        )
+
+        current_credits = (result.data or {}).get("credits_remaining")
+        if current_credits is None:
+            print(f"[CREDITS] No credits_remaining found for user {user_id}, skipping deduction.")
+            return
+
+        new_credits = max(current_credits - amount, 0)
+
+        supabase.table("user_profiles").update(
+            {"credits_remaining": new_credits}
+        ).eq("userId", user_id).execute()
+
+        print(f"[CREDITS] (free tier / user_profiles) Deducted {amount} credits from user {user_id}: {current_credits} -> {new_credits}")
+    except Exception as exc:
+        print(f"[CREDITS] Failed to deduct user_profiles credits for user {user_id}: {exc}")
+        import traceback
+        traceback.print_exc()
+
+
+async def _deduct_subscription_credits(user_id: str, amount: int = 20):
+    """Deduct credits from the user's MOST RECENT subscription row
+    (ordered by created_at desc) — used for paid/non-free tier users."""
+    try:
+        sub_res = (
+            supabase.table("subscriptions")
+            .select("id, credits, created_at")
+            .eq("userId", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        rows = sub_res.data or []
+        if not rows:
+            print(f"[CREDITS] No subscription rows found for user {user_id} (non-free tier) — skipping deduction.")
+            return
+
+        latest_subscription = rows[0]
+        subscription_id = latest_subscription["id"]
+        current_credits = latest_subscription.get("credits")
+        if current_credits is None:
+            print(f"[CREDITS] Latest subscription {subscription_id} for user {user_id} has no 'credits' value, skipping deduction.")
+            return
+
+        new_credits = max(current_credits - amount, 0)
+
+        supabase.table("subscriptions").update(
+            {"credits": new_credits}
+        ).eq("id", subscription_id).execute()
+
+        print(
+            f"[CREDITS] (non-free tier / subscriptions, most recent by created_at) "
+            f"Deducted {amount} credits from subscription {subscription_id} "
+            f"(user {user_id}): {current_credits} -> {new_credits}"
+        )
+    except Exception as exc:
+        print(f"[CREDITS] Failed to deduct subscription credits for user {user_id}: {exc}")
+        import traceback
+        traceback.print_exc()
+
+
+async def _deduct_thumbnail_credits(user_id: str, amount: int = 20):
+    """
+    Checks the user's plan (user_profiles.user_tier) first:
+      - free tier  -> deduct from user_profiles.credits_remaining
+      - non-free   -> deduct from the most recent subscriptions row
+                      (filtered by userId, ordered by created_at desc)
+    The same `amount` (20) is deducted either way.
+    """
+    tier = await _get_user_tier(user_id)
+
+    if tier in FREE_TIER_LABELS:
+        await _deduct_profile_credits(user_id, amount)
+    else:
+        await _deduct_subscription_credits(user_id, amount)
 
 
 async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
@@ -3651,6 +3812,7 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
             thumbnail_url = await save_thumbnail_to_supabase(
                 request.userId, thumbnail_result["image_base64"]
             )
+            await _deduct_thumbnail_credits(request.userId, 20)
         thumbnail_result["public_url"] = thumbnail_url
     except Exception as exc:
         print(f"--- thumbnail generation failed: {exc} ---")
@@ -3681,6 +3843,28 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 @app.post("/generate-script")
 async def generate_script(request: ScriptRequest):
@@ -3779,13 +3963,6 @@ Classify this content now. Return only the JSON object."""
 
 
 def _extract_source_links(articles: list[dict]) -> list[str]:
-    """
-    Returns up to MAX_WEB_SOURCES (10) unique source URLs, in the order the
-    articles list is already sorted (similarity-first, backfilled ones at
-    the end). Deduplicates on the full URL rather than the domain, so that
-    the compulsory count of 10 sources can actually be reached even if
-    fewer than 10 distinct domains turned up results for a given topic.
-    """
     links = []
     seen = set()
     for article in articles:
@@ -3852,10 +4029,17 @@ async def _generate_script_impl(request: "ScriptRequest"):
     try:
         table_name = await select_table_for_topic(topic_text)
 
+        # HyDE docs are now generated from: idea title + description,
+        # template title + about, the segment group for this bucket, and
+        # the requested video duration.
         hyde_documents = await asyncio.gather(
             *[
                 generate_hyde_doc_for_segments(
-                    topic_text, selected_template, bucket, request.title, request.description
+                    request.title,
+                    request.description,
+                    selected_template,
+                    bucket,
+                    request.time,
                 )
                 for bucket in segment_buckets
             ]
@@ -3913,8 +4097,12 @@ async def _generate_script_impl(request: "ScriptRequest"):
     combined_hyde_doc = "\n\n".join(doc for doc in hyde_documents if doc) or topic_text
 
     try:
+        # Web search keyword generation now takes: idea title + description,
+        # template title + about + segments, and the requested video duration.
         print("[MAIN] Generating search keywords ONCE for script web search.")
-        script_search_keywords = await _generate_search_keywords_for_script(request.title)
+        script_search_keywords = await _generate_search_keywords_for_script(
+            request.title, request.description, selected_template, request.time
+        )
     except Exception as exc:
         print(f"--- script search keyword generation failed: {exc} ---")
         script_search_keywords = [f"{request.title} latest news today", f"{request.title} 2026 update"]
@@ -3925,9 +4113,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
             request.title, scraped_urls, combined_hyde_doc, keywords=script_search_keywords,
         )
 
-        # The 10-source requirement is compulsory: keep backfilling with
-        # progressively broader/relaxed queries until we have 10 unique
-        # source URLs (or genuinely exhaust what's findable for this topic).
         unique_source_count = _unique_url_count(new_articles)
         if unique_source_count < MAX_WEB_SOURCES:
             print(
@@ -3950,8 +4135,9 @@ async def _generate_script_impl(request: "ScriptRequest"):
         traceback.print_exc()
 
     try:
+        # YouTube keyword generation now also takes the idea description.
         print("[MAIN] Performing YouTube search.")
-        new_videos = await get_youtube_context(request.title, scraped_urls)
+        new_videos = await get_youtube_context(request.title, request.description, scraped_urls)
     except Exception as exc:
         print(f"--- YouTube search failed: {exc} ---")
         import traceback
@@ -4104,6 +4290,47 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from typing import Optional
 
 from pydantic import Field
@@ -4122,7 +4349,7 @@ PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
 
 class PexelsVideoSearchRequest(BaseModel):
     query: str = Field(..., description="Search term, e.g. 'ocean waves'")
-    per_page: int = Field(15, ge=1, le=80, description="Results per page (max 80)")
+    per_page: int = Field(50, ge=1, le=80, description="Results per page (max 80)")
     page: int = Field(1, ge=1, description="Page number")
     orientation: Optional[str] = Field(
         None, description="landscape | portrait | square (optional)"
