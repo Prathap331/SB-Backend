@@ -146,6 +146,7 @@ class GenerateIdeasRequest(BaseModel):
     topic: str
 
 class ChannelContextInput(BaseModel):
+    userId: str
     channel_id: str | None = None
     channel_niche: str | None = None
     subscriber_count: int | None = None
@@ -220,8 +221,6 @@ async def eci(request: PromptRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
-
-
 
 
 
@@ -324,6 +323,50 @@ async def _openai_create_with_timeout(call_fn, timeout: float = OPENAI_CALL_TIME
     """Run a blocking openai_client.chat.completions.create(...) call with
     a hard timeout so a hung API call can't hold request memory forever."""
     return await asyncio.wait_for(asyncio.to_thread(call_fn), timeout=timeout)
+
+
+USER_PROFILES_TABLE = "user_profiles"
+USER_PROFILES_ID_COLUMN = "id"
+
+
+async def _user_exists_in_profiles(user_id: str | None) -> bool:
+    if not user_id or not str(user_id).strip():
+        return False
+
+    user_id = str(user_id).strip()
+
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table(USER_PROFILES_TABLE)
+            .select(USER_PROFILES_ID_COLUMN)
+            .eq(USER_PROFILES_ID_COLUMN, user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        print(f"[AUTH] user_profiles lookup failed for userId={user_id}: {e}")
+        return False
+
+    rows = result.data or []
+    exists = len(rows) > 0
+
+    if exists:
+        print(f"[AUTH] userId={user_id} verified against '{USER_PROFILES_TABLE}.{USER_PROFILES_ID_COLUMN}'")
+    else:
+        print(f"[AUTH] REJECTED — userId={user_id} not found in '{USER_PROFILES_TABLE}.{USER_PROFILES_ID_COLUMN}'")
+
+    return exists
+
+
+async def require_valid_user(user_id: str | None) -> None:
+    if not user_id or not str(user_id).strip():
+        raise HTTPException(status_code=401, detail="userId is required")
+
+    if not await _user_exists_in_profiles(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: userId not found in user_profiles",
+        )
 
 
 HASH_FEATURES = 2**18
@@ -1702,9 +1745,6 @@ async def get_ddgs_news_context_for_script(
 
 
 def _youtube_api_video_details(video_ids: list[str]) -> dict[str, dict]:
-    """Batch-fetch title/description/channel/view_count/tags for up to 50
-    video IDs per call via videos.list. Costs 1 quota unit per call
-    regardless of how many IDs are in the batch (max 50)."""
     if not YOUTUBE_API_KEY or not video_ids:
         return {}
 
@@ -2021,6 +2061,10 @@ Content Chunks:
 async def generate_ideas_endpoint(
     request: GenerateIdeasRequest,
 ):
+    # GenerateIdeasRequest must carry a `userId` field for this check to work.
+    # If your model doesn't have one yet, add: userId: str
+    user_id = getattr(request, "userId", None)
+    await require_valid_user(user_id)
 
     async with _pipeline_semaphore:
         return await _generate_ideas_endpoint_impl(request)
@@ -2756,10 +2800,6 @@ Reference metadata from currently-ranking videos on this topic:
 
 
 def _extract_source_website_names(articles: list[dict]) -> list[str]:
-    """Unique domain names present in `articles` (order-preserving). Kept
-    for logging/diagnostics — the compulsory 10-source guarantee below is
-    based on unique URLs, not unique domains, since requiring a brand new
-    domain for every one of the 10 sources is often not achievable."""
     names = []
     seen = set()
     for article in articles:
@@ -2791,15 +2831,6 @@ async def _backfill_sources_to_target(
     target_count: int = MAX_WEB_SOURCES,
     max_rounds: int = 8,
 ) -> list[dict]:
-    """
-    Keeps searching (with progressively looser/broader queries) until the
-    article list contains at least `target_count` unique-URL sources, or
-    until `max_rounds` of searching produced nothing new. The 10-source
-    requirement is compulsory, so this function tries hard: it first
-    prefers new domains (round 1), then falls back to any new URL
-    (subsequent rounds) so a shortage of distinct domains never blocks
-    reaching the target count.
-    """
 
     def _existing_urls() -> set:
         return {a.get("url") for a in new_articles if a.get("url")}
@@ -3092,7 +3123,6 @@ def _normalize_book_year(raw_year) -> str | None:
     year_str = str(raw_year).strip()
     if not year_str or year_str.lower() in ("none", "null", "0", "0000"):
         return None
-    # Some sources store a full date/timestamp — keep just the leading year.
     match = re.match(r"(\d{3,4})", year_str)
     return match.group(1) if match else year_str
 
@@ -3671,6 +3701,8 @@ class ThumbnailRequest(BaseModel):
 
 @app.post("/generate-thumbnail")
 async def generate_thumbnail_endpoint(request: ThumbnailRequest):
+    await require_valid_user(request.userId)
+
     async with _pipeline_semaphore:
         return await _generate_thumbnail_endpoint_impl(request)
 
@@ -3679,10 +3711,6 @@ FREE_TIER_LABELS = {"free", "free_tier", "free-tier", "trial", "none", ""}
 
 
 async def _get_user_tier(user_id: str) -> str:
-    """Look up the user's plan tier from user_profiles.user_tier. Defaults
-    to 'free' (and therefore the credits_remaining deduction path) if the
-    column is missing, empty, or the lookup fails for any reason — this is
-    the safer default since it never silently skips a deduction."""
     try:
         result = await asyncio.to_thread(
             lambda: supabase.table("user_profiles")
@@ -3729,8 +3757,6 @@ async def _deduct_profile_credits(user_id: str, amount: int = 20):
 
 
 async def _deduct_subscription_credits(user_id: str, amount: int = 20):
-    """Deduct credits from the user's MOST RECENT subscription row
-    (ordered by created_at desc) — used for paid/non-free tier users."""
     try:
         sub_res = (
             supabase.table("subscriptions")
@@ -3771,13 +3797,6 @@ async def _deduct_subscription_credits(user_id: str, amount: int = 20):
 
 
 async def _deduct_thumbnail_credits(user_id: str, amount: int = 20):
-    """
-    Checks the user's plan (user_profiles.user_tier) first:
-      - free tier  -> deduct from user_profiles.credits_remaining
-      - non-free   -> deduct from the most recent subscriptions row
-                      (filtered by userId, ordered by created_at desc)
-    The same `amount` (20) is deducted either way.
-    """
     tier = await _get_user_tier(user_id)
 
     if tier in FREE_TIER_LABELS:
@@ -3845,22 +3864,10 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @app.post("/generate-script")
 async def generate_script(request: ScriptRequest):
+    await require_valid_user(request.userId)
+
     async with _pipeline_semaphore:
         return await _generate_script_impl(request)
 
@@ -4022,9 +4029,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
     try:
         table_name = await select_table_for_topic(topic_text)
 
-        # HyDE docs are now generated from: idea title + description,
-        # template title + about, the segment group for this bucket, and
-        # the requested video duration.
         hyde_documents = await asyncio.gather(
             *[
                 generate_hyde_doc_for_segments(
@@ -4090,8 +4094,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
     combined_hyde_doc = "\n\n".join(doc for doc in hyde_documents if doc) or topic_text
 
     try:
-        # Web search keyword generation now takes: idea title + description,
-        # template title + about + segments, and the requested video duration.
         print("[MAIN] Generating search keywords ONCE for script web search.")
         script_search_keywords = await _generate_search_keywords_for_script(
             request.title, request.description, selected_template, request.time
@@ -4248,82 +4250,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 from typing import Optional
 
 from pydantic import Field
@@ -4341,6 +4267,7 @@ PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
 
 
 class PexelsVideoSearchRequest(BaseModel):
+    userId : str
     query: str = Field(..., description="Search term, e.g. 'ocean waves'")
     per_page: int = Field(50, ge=1, le=80, description="Results per page (max 80)")
     page: int = Field(1, ge=1, description="Page number")
@@ -4412,6 +4339,8 @@ def _format_video_result(video: dict) -> dict:
 
 @app.post("/search-pexels-videos")
 async def search_pexels_videos(request: PexelsVideoSearchRequest):
+    await require_valid_user(request.userId)
+
     if not PEXELS_API_KEY:
         raise HTTPException(
             status_code=500,
@@ -4447,40 +4376,6 @@ async def search_pexels_videos(request: PexelsVideoSearchRequest):
         "total_results": data.get("total_results", 0),
         "videos": videos,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
