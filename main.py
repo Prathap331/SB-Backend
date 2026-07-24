@@ -143,6 +143,7 @@ class RefreshTokenRequest(BaseModel):
 
 
 class GenerateIdeasRequest(BaseModel):
+    userId: str
     topic: str
 
 class ChannelContextInput(BaseModel):
