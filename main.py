@@ -225,6 +225,61 @@ async def eci(request: PromptRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import io
 import os
 import re
@@ -377,12 +432,6 @@ TABLES = [
 
 BOOKS_TABLE_NAME = "english_books"
 THUMBNAILS_BUCKET = "generated-thumbnails"
-
-# ---------------------------------------------------------------------------
-# CREDIT PRICING
-# ---------------------------------------------------------------------------
-# Script generation: 3 credits per minute of requested video length.
-# Thumbnail generation: 20 credits per generated image.
 SCRIPT_CREDITS_PER_MINUTE = 3
 THUMBNAIL_CREDITS_PER_IMAGE = 20
 
@@ -2056,13 +2105,18 @@ Content Chunks:
 async def generate_ideas_endpoint(
     request: GenerateIdeasRequest,
 ):
-    # GenerateIdeasRequest must carry a `userId` field for this check to work.
-    # If your model doesn't have one yet, add: userId: str
     user_id = getattr(request, "userId", None)
     await require_valid_user(user_id)
 
     async with _pipeline_semaphore:
         return await _generate_ideas_endpoint_impl(request)
+
+
+
+
+
+
+
 
 
 async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
@@ -2076,31 +2130,7 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
     try:
         hyde_prompt = f"""
         You are a Semantic Query Expansion Engine for a YouTube documentary research pipeline.
-
-        Goal:
-        Convert short user search queries (typically 3–7 keywords) into a natural-language semantic search paragraph optimized for vector search (RAG), NOT for humans.
-
-        Input:
-        User Query:
-        "{topic}"
-        A user query containing 3–7 keywords or a short topic.
-
-        Task:
-        1. Infer the user's true research intent.
-        2. Expand the topic into a coherent natural-language paragraph.
-        3. Preserve the original meaning while enriching context.
-        4. Include synonyms, related concepts, alternate terminology, historical
-           context, scientific concepts, geographical references, cultural
-           context, causes/effects/mechanisms, notable events/discoveries/
-           people/civilizations or theories when relevant.
-        5. Include entities, alternate spellings and commonly searched phrases naturally.
-        6. Do NOT invent unsupported facts. Expand only using generally accepted knowledge.
-        7. Write as continuous natural language without bullets, lists or headings.
-        8. Avoid conversational text, opinions, explanations or instructions.
-        9. Maximize semantic richness and topical coverage for embedding similarity rather than keyword stuffing.
-        10. Output only the expanded paragraph.
-        11. STRICT LENGTH LIMIT: the output must be under {HYDE_MAX_TOKENS} tokens
-        (roughly 35-50 words), a single short paragraph, with no additional text before or after it.
+        ...
         """
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
@@ -2132,7 +2162,17 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
 
         hyde_doc = _cap_hyde_doc_tokens(raw_hyde_doc) if raw_hyde_doc else topic
 
-        db_task = asyncio.create_task(get_context_from_db(topic, hyde_doc))
+        # NEW: resolve the table once up front so we can reuse it for both
+        # the initial DB retrieval and the book backfill later.
+        try:
+            table_name = await select_table_for_topic(topic)
+        except Exception as exc:
+            print(f"[MAIN] table selection failed, defaulting to {TABLES[0]}: {exc}")
+            table_name = TABLES[0]
+
+        db_task = asyncio.create_task(
+            get_context_from_db(topic, hyde_doc, table_name=table_name)
+        )
         similar_task = asyncio.create_task(get_similar_saved_ideas(topic, hyde_doc))
 
         done, pending = await asyncio.wait({db_task}, timeout=11)
@@ -2180,6 +2220,36 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
             ideas = []
             topic_summary = ""
 
+        # NEW: web source links, same extraction used by /generate-script
+        sources = _extract_source_links(new_articles)
+
+        # NEW: book lookup + backfill, same as /generate-script
+        books: list[dict] = []
+        try:
+            books = await get_books_for_chunks(
+                db_results, topic_text=topic, script_text=""
+            )
+
+            if len(books) < MAX_BOOKS:
+                print(
+                    f"[MAIN] Only {len(books)}/{MAX_BOOKS} real book(s) found from the "
+                    f"initial chunk pool (ideas) — widening DB search to try to reach {MAX_BOOKS}."
+                )
+                known_md5s = {r.get("md5") for r in db_results if r.get("md5")}
+                books = await _backfill_books_to_target(
+                    books,
+                    known_md5s,
+                    topic,
+                    hyde_doc,
+                    table_name,
+                    target_count=MAX_BOOKS,
+                )
+        except Exception as exc:
+            print(f"--- MySQL book lookup failed (ideas): {exc} ---")
+            import traceback
+            traceback.print_exc()
+            books = []
+
         token_usage = _get_token_usage_summary()
 
         return {
@@ -2187,6 +2257,8 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
             "topic_summary": topic_summary,
             "ideas": ideas,
             "similar_past_ideas": similar_saved_ideas,
+            "sources": sources,      
+            "books": books,          
             "token_usage": token_usage,
         }
 
@@ -2203,48 +2275,49 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
         }
 
 
-async def get_structure(content: str) -> dict:
-    try:
-        prompt = f"""
-        You are a strict content classifier.
+# async def get_structure(content: str) -> dict:
+#     try:
+#         prompt = f"""
+#         You are a strict content classifier.
 
-        Classify the given content into exactly ONE category.
+#         Classify the given content into exactly ONE category.
 
-        Return ONLY the category name.
+#         Return ONLY the category name.
 
-        Categories:
-        - PHILOSOPHY & IDEAS
-        - PSYCHOLOGY & BEHAVIOUR
-        - HISTORY & CIVILISATION
-        - BIOGRAPHY & LEGACY
-        - SCIENCE & TECHNOLOGY
-        - ECONOMICS & SOCIETY
-        - ANALYSIS & BREAKDOWNS
-        - NEWS & CONTEMPORARY EVENTS
-        - THOUGHT LEADERSHIP & DISCUSSION
-        - MOTIVATIONAL & INSPIRATIONAL
+#         Categories:
+#         - PHILOSOPHY & IDEAS
+#         - PSYCHOLOGY & BEHAVIOUR
+#         - HISTORY & CIVILISATION
+#         - BIOGRAPHY & LEGACY
+#         - SCIENCE & TECHNOLOGY
+#         - ECONOMICS & SOCIETY
+#         - ANALYSIS & BREAKDOWNS
+#         - NEWS & CONTEMPORARY EVENTS
+#         - THOUGHT LEADERSHIP & DISCUSSION
+#         - MOTIVATIONAL & INSPIRATIONAL
 
-        Content:
-        \"\"\"{content}\"\"\"
-        """
+#         Content:
+#         \"\"\"{content}\"\"\"
+#         """
 
-        response = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": "Return only the category name."},
-                    {"role": "user", "content": prompt},
-                ],
-                stream=False,
-            )
-        )
-        _record_token_usage("get_structure", response)
+#         response = await _openai_create_with_timeout(
+#             lambda: openai_client.chat.completions.create(
+#                 model="gpt-5.4-mini",
+#                 messages=[
+#                     {"role": "system", "content": "Return only the category name."},
+#                     {"role": "user", "content": prompt},
+#                 ],
+#                 stream=False,
+#             )
+#         )
+#         _record_token_usage("get_structure", response)
 
-        category = response.choices[0].message.content.strip()
-        return {"category": category}
+#         category = response.choices[0].message.content.strip()
+#         return {"category": category}
 
-    except Exception as e:
-        return {"category": "UNKNOWN", "error": str(e)}
+#     except Exception as e:
+#         return {"category": "UNKNOWN", "error": str(e)}
+
 
 
 async def get_channel_profile(userId: str):
@@ -3263,79 +3336,6 @@ async def _backfill_books_to_target(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# NOTE: this file is a drop-in replacement for the thumbnail-generation section
-# of your FastAPI backend. It assumes the following are already available/imported
-# elsewhere in the module (as in your original file):
-#   asyncio, json, io, re, base64, uuid, time
-#   supabase, openai_client, _http_session
-#   BaseModel (pydantic), app (FastAPI instance)
-#   require_valid_user, _pipeline_semaphore
-#   _openai_create_with_timeout, _record_token_usage
-#   _start_token_tracking, _get_token_usage_summary
-#   GPT_IMAGE_MODEL, GPT_IMAGE_SIZE, GPT_IMAGE_QUALITY, THUMBNAILS_BUCKET
-#   THUMBNAIL_CREDITS_PER_IMAGE, SCRIPT_CREDITS_PER_MINUTE
-#   _truncate_words (existing helper used elsewhere in your codebase)
-#
-# If `re` is not already imported at the top of your file, add: import re
-
-
 FACE_THUMBNAILS_TABLE = "user_profiles"
 FACE_PHOTO_DEFAULT_KEY = "photo1"
 
@@ -3474,10 +3474,6 @@ async def get_user_face_photo_bytes(user_id: str, photo_key: str = FACE_PHOTO_DE
 
     return normalized_bytes
 
-
-# ============================================================================
-# PIPELINE SYSTEM PROMPTS
-# ============================================================================
 
 STORY_ANALYST_SYSTEM_PROMPT = """
 # STORYBIT STORY ANALYST (SSL v1)
@@ -3774,10 +3770,6 @@ Return only the compiled prompt.
 """
 
 
-# ============================================================================
-# JSON PARSING HELPER
-# ============================================================================
-
 def _safe_parse_json(raw: str) -> dict | None:
     """Strip optional markdown code fences and parse JSON defensively."""
     if not raw:
@@ -3795,10 +3787,6 @@ def _safe_parse_json(raw: str) -> dict | None:
         print(f"[JSON-PARSE] failed to parse model output as JSON: {e}")
         return None
 
-
-# ============================================================================
-# STEP 1 — STORY ANALYST  (script -> SSL v1)
-# ============================================================================
 
 async def run_story_analyst(title: str, thumbnail_text: str, script_text: str) -> dict:
     script_excerpt = _truncate_words(script_text, max_words=1200) if script_text else "No script available."
@@ -3836,9 +3824,6 @@ Complete Video Script:
     return ssl_json
 
 
-# ============================================================================
-# STEP 2 — THUMBNAIL INTELLIGENCE AGENT  (SSL v1 + user_image -> TSL v1)
-# ============================================================================
 
 async def run_thumbnail_intelligence(ssl_json: dict, user_image: bool) -> dict:
     user_content = json.dumps(
@@ -3874,10 +3859,6 @@ async def run_thumbnail_intelligence(ssl_json: dict, user_image: bool) -> dict:
     print(f"[TSL] Step 2 (Thumbnail Intelligence) output: {json.dumps(tsl_json, ensure_ascii=False)[:1000]}")
     return tsl_json
 
-
-# ============================================================================
-# STEP 3 — PROMPT RENDERER  (TSL v1 + thumbnail text + image model -> prompt text)
-# ============================================================================
 
 async def run_prompt_renderer(
     tsl_json: dict,
@@ -3916,10 +3897,6 @@ Reference Image: {"provided" if has_reference_image else "none"}
     return rendered_prompt
 
 
-# ============================================================================
-# THUMBNAIL TEXT SELECTION  (now a single string, not a list)
-# ============================================================================
-
 def _pick_thumbnail_text(thumbnail_text: str | None, request) -> str:
     if isinstance(thumbnail_text, str) and thumbnail_text.strip():
         return thumbnail_text.strip()
@@ -3941,9 +3918,6 @@ def _fallback_thumbnail_prompt(request, chosen_thumbnail_text: str = None) -> st
     )
 
 
-# ============================================================================
-# STEP 4 — IMAGE GENERATION  (rendered prompt [+ face image] -> image bytes)
-# ============================================================================
 
 def _generate_thumbnail_image_gpt_image_sync(
     prompt: str,
@@ -4029,10 +4003,6 @@ async def generate_thumbnail_image(prompt: str, face_image_bytes: bytes | None =
     return {"image_base64": result["image_base64"], "prompt": prompt, "error": None}
 
 
-# ============================================================================
-# PIPELINE ORCHESTRATOR — runs Steps 1 -> 2 -> 3 -> 4 in sequence
-# ============================================================================
-
 async def generate_thumbnail_for_script(
     request,
     script_text: str,
@@ -4055,13 +4025,10 @@ async def generate_thumbnail_for_script(
     has_reference_image = bool(face_image_bytes)
     image_model = getattr(request, "image_model", None) or GPT_IMAGE_MODEL
 
-    # ---- STEP 1: Story Analyst -> SSL v1 ----
     ssl_json = await run_story_analyst(request.title, chosen_thumbnail_text, script_text)
 
-    # ---- STEP 2: Thumbnail Intelligence Agent -> TSL v1 ----
     tsl_json = await run_thumbnail_intelligence(ssl_json, user_image=has_reference_image)
 
-    # ---- STEP 3: Prompt Renderer -> plain-text image prompt ----
     rendered_prompt = await run_prompt_renderer(
         tsl_json,
         chosen_thumbnail_text,
@@ -4346,60 +4313,6 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
