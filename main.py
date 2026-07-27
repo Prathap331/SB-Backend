@@ -230,15 +230,6 @@ async def eci(request: PromptRequest):
 
 
 
-
-
-
-
-
-
-
-
-
 import io
 import os
 import re
@@ -391,6 +382,14 @@ TABLES = [
 
 BOOKS_TABLE_NAME = "english_books"
 THUMBNAILS_BUCKET = "generated-thumbnails"
+
+# ---------------------------------------------------------------------------
+# CREDIT PRICING
+# ---------------------------------------------------------------------------
+# Script generation: 3 credits per minute of requested video length.
+# Thumbnail generation: 20 credits per generated image.
+SCRIPT_CREDITS_PER_MINUTE = 3
+THUMBNAIL_CREDITS_PER_IMAGE = 20
 
 
 def to_pgvector(embedding) -> str:
@@ -2266,72 +2265,99 @@ async def get_channel_profile(userId: str):
     except Exception as e:
         print(e)
 
+from pydantic import BaseModel
+from fastapi import HTTPException
+
 
 class UnlockRequest(BaseModel):
     userId: str
-    duration: int
+    duration: int  # minutes
+
+
+CREDITS_PER_MINUTE = 3
 
 
 @app.post("/unlock")
 async def cut_credits(request: UnlockRequest):
+    if request.duration <= 0:
+        raise HTTPException(status_code=400, detail="duration must be positive")
+
+    cost = request.duration * CREDITS_PER_MINUTE
+
     try:
-        sub_res = supabase.table('subscriptions') \
-            .select('id, credits, purchased_date') \
-            .eq('userId', request.userId) \
-            .order('purchased_date', desc=True) \
-            .limit(1) \
+        # 1. Get the user's profile (need tier + current credits)
+        profile_res = supabase.table('user_profiles') \
+            .select('id, credits_remaining, user_tier') \
+            .eq('id', request.userId) \
+            .maybe_single() \
             .execute()
 
-        if sub_res.data and len(sub_res.data) > 0:
-            latest_subscription = sub_res.data[0]
-            subscription_id = latest_subscription["id"]
-            subscription_credits = latest_subscription["credits"]
+        if not profile_res.data:
+            raise HTTPException(status_code=404, detail="user profile not found")
 
-            if subscription_credits <= 0 or subscription_credits < request.duration:
+        profile = profile_res.data
+        user_tier = profile.get("user_tier")
+        profile_credits = profile["credits_remaining"]
+
+        if user_tier == "free":
+            if profile_credits <= 0 or profile_credits < cost:
                 return {"message": "credits not sufficient"}
 
-            new_subscription_credits = subscription_credits - request.duration
+            new_profile_credits = profile_credits - cost
 
-            supabase.table('subscriptions') \
-                .update({'credits': new_subscription_credits}) \
-                .eq('id', subscription_id) \
+            supabase.table('user_profiles') \
+                .update({'credits_remaining': new_profile_credits}) \
+                .eq('id', request.userId) \
                 .execute()
 
             return {
                 "message": "success",
-                "source": "subscription",
-                "remaining_credits": new_subscription_credits,
+                "source": "profile",
+                "remaining_credits": new_profile_credits,
             }
 
-        profile_res = supabase.table('user_profiles') \
-            .select('credits_remaining') \
-            .eq('id', request.userId) \
-            .single() \
+        sub_res = supabase.table('subscriptions') \
+            .select('id, credits') \
+            .eq('userId', request.userId) \
+            .order('created_at', desc=True) \
+            .limit(1) \
             .execute()
 
-        old_credits = profile_res.data["credits_remaining"]
+        if not sub_res.data:
+            raise HTTPException(status_code=404, detail="no subscription found for user")
 
-        if old_credits <= 0 or old_credits < request.duration:
+        subscription = sub_res.data[0]
+        subscription_id = subscription["id"]
+        subscription_credits = subscription["credits"]
+
+        if subscription_credits <= 0 or subscription_credits < cost:
             return {"message": "credits not sufficient"}
 
-        new_credits = old_credits - request.duration
+        new_subscription_credits = subscription_credits - cost
+        new_profile_credits = profile_credits - cost  
+
+        supabase.table('subscriptions') \
+            .update({'credits': new_subscription_credits}) \
+            .eq('id', subscription_id) \
+            .execute()
 
         supabase.table('user_profiles') \
-            .update({'credits_remaining': new_credits}) \
+            .update({'credits_remaining': new_profile_credits}) \
             .eq('id', request.userId) \
             .execute()
 
         return {
             "message": "success",
-            "source": "profile",
-            "remaining_credits": new_credits,
+            "source": "subscription",
+            "remaining_credits": new_subscription_credits,
+            "profile_remaining_credits": new_profile_credits,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         print("error:", e)
         raise HTTPException(status_code=500, detail=str(e))
-
-
 def target_word_count_for_time(minutes: int) -> int:
     return max(50, int(minutes * WORDS_PER_MINUTE))
 
@@ -3708,6 +3734,17 @@ async def generate_thumbnail_endpoint(request: ThumbnailRequest):
         return await _generate_thumbnail_endpoint_impl(request)
 
 
+# ---------------------------------------------------------------------------
+# CREDIT DEDUCTION (unified helper used by BOTH script + thumbnail generation)
+# ---------------------------------------------------------------------------
+#
+# Rule:
+#   1. Look up the user's `user_tier` in `user_profiles`.
+#   2. ALWAYS deduct `amount` credits from `user_profiles.credits_remaining`.
+#   3. If the tier is NOT free, ALSO deduct `amount` credits from the most
+#      recently created row in `subscriptions` (ordered by `created_at`,
+#      descending) — i.e. non-free users get charged in BOTH places.
+#
 FREE_TIER_LABELS = {"free", "free_tier", "free-tier", "trial", "none", ""}
 
 
@@ -3729,7 +3766,8 @@ async def _get_user_tier(user_id: str) -> str:
         return "free"
 
 
-async def _deduct_profile_credits(user_id: str, amount: int = 20):
+async def _deduct_profile_credits(user_id: str, amount: int):
+    """Always-on deduction from user_profiles.credits_remaining."""
     try:
         result = (
             supabase.table("user_profiles")
@@ -3741,7 +3779,7 @@ async def _deduct_profile_credits(user_id: str, amount: int = 20):
 
         current_credits = (result.data or {}).get("credits_remaining")
         if current_credits is None:
-            print(f"[CREDITS] No credits_remaining found for user {user_id}, skipping deduction.")
+            print(f"[CREDITS] No credits_remaining found for user {user_id}, skipping user_profiles deduction.")
             return
 
         new_credits = max(current_credits - amount, 0)
@@ -3750,14 +3788,22 @@ async def _deduct_profile_credits(user_id: str, amount: int = 20):
             {"credits_remaining": new_credits}
         ).eq("id", user_id).execute()
 
-        print(f"[CREDITS] (free tier / user_profiles) Deducted {amount} credits from user {user_id}: {current_credits} -> {new_credits}")
+        print(
+            f"[CREDITS] (user_profiles) Deducted {amount} credits from user {user_id}: "
+            f"{current_credits} -> {new_credits}"
+        )
     except Exception as exc:
         print(f"[CREDITS] Failed to deduct user_profiles credits for user {user_id}: {exc}")
         import traceback
         traceback.print_exc()
 
 
-async def _deduct_subscription_credits(user_id: str, amount: int = 20):
+async def _deduct_subscription_credits(user_id: str, amount: int):
+    """Deduction from the MOST RECENT (by created_at) row in `subscriptions`.
+
+    Only called for non-free tier users, in addition to the user_profiles
+    deduction above.
+    """
     try:
         sub_res = (
             supabase.table("subscriptions")
@@ -3770,7 +3816,7 @@ async def _deduct_subscription_credits(user_id: str, amount: int = 20):
 
         rows = sub_res.data or []
         if not rows:
-            print(f"[CREDITS] No subscription rows found for user {user_id} (non-free tier) — skipping deduction.")
+            print(f"[CREDITS] No subscription rows found for user {user_id} (non-free tier) — skipping subscriptions deduction.")
             return
 
         latest_subscription = rows[0]
@@ -3787,7 +3833,7 @@ async def _deduct_subscription_credits(user_id: str, amount: int = 20):
         ).eq("id", subscription_id).execute()
 
         print(
-            f"[CREDITS] (non-free tier / subscriptions, most recent by created_at) "
+            f"[CREDITS] (subscriptions, most recent by created_at) "
             f"Deducted {amount} credits from subscription {subscription_id} "
             f"(user {user_id}): {current_credits} -> {new_credits}"
         )
@@ -3797,13 +3843,45 @@ async def _deduct_subscription_credits(user_id: str, amount: int = 20):
         traceback.print_exc()
 
 
-async def _deduct_thumbnail_credits(user_id: str, amount: int = 20):
-    tier = await _get_user_tier(user_id)
+async def _deduct_credits_for_action(user_id: str, amount: int, action_label: str = "credits"):
+    """Unified credit deduction used by BOTH script generation and thumbnail
+    generation.
 
-    if tier in FREE_TIER_LABELS:
-        await _deduct_profile_credits(user_id, amount)
-    else:
+    - Always deducts `amount` from user_profiles.credits_remaining.
+    - If the user's tier is NOT free, ALSO deducts `amount` from the most
+      recent (by created_at) row in `subscriptions`.credits.
+    """
+    if amount <= 0:
+        print(f"[CREDITS] ({action_label}) amount <= 0 ({amount}), skipping deduction for user {user_id}")
+        return
+
+    tier = await _get_user_tier(user_id)
+    is_free = tier in FREE_TIER_LABELS
+
+    # 1. Always deduct from user_profiles.
+    await _deduct_profile_credits(user_id, amount)
+
+    # 2. Non-free tier -> ALSO deduct from subscriptions (most recent by created_at).
+    if not is_free:
+        print(
+            f"[CREDITS] ({action_label}) user {user_id} tier='{tier}' (non-free) — "
+            f"also deducting {amount} credits from subscriptions"
+        )
         await _deduct_subscription_credits(user_id, amount)
+    else:
+        print(
+            f"[CREDITS] ({action_label}) user {user_id} tier='{tier or 'free (default)'}' — "
+            f"free tier, only user_profiles was deducted"
+        )
+
+
+async def _deduct_thumbnail_credits(user_id: str, amount: int = THUMBNAIL_CREDITS_PER_IMAGE):
+    await _deduct_credits_for_action(user_id, amount, action_label="thumbnail")
+
+
+async def _deduct_script_credits(user_id: str, minutes: int):
+    amount = max(0, int(minutes)) * SCRIPT_CREDITS_PER_MINUTE
+    await _deduct_credits_for_action(user_id, amount, action_label="script")
 
 
 async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
@@ -3828,7 +3906,9 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
             thumbnail_url = await save_thumbnail_to_supabase(
                 request.userId, thumbnail_result["image_base64"]
             )
-            await _deduct_thumbnail_credits(request.userId, 20)
+            # 20 credits/image — deducted from user_profiles always, and also
+            # from subscriptions if the user is on a non-free tier.
+            await _deduct_thumbnail_credits(request.userId, THUMBNAIL_CREDITS_PER_IMAGE)
         thumbnail_result["public_url"] = thumbnail_url
     except Exception as exc:
         print(f"--- thumbnail generation failed: {exc} ---")
@@ -4149,6 +4229,26 @@ async def _generate_script_impl(request: "ScriptRequest"):
         import traceback
         traceback.print_exc()
 
+    # ------------------------------------------------------------------
+    # CREDIT DEDUCTION — 3 credits per requested minute of video.
+    # Always deducted from user_profiles; ALSO deducted from the most
+    # recent subscriptions row if the user's tier is not free.
+    # Charged once the script generation attempt has completed (whether
+    # or not it produced text), mirroring how the thumbnail endpoint only
+    # charges after the generation step has run.
+    # ------------------------------------------------------------------
+    try:
+        script_credits_to_deduct = SCRIPT_CREDITS_PER_MINUTE * request.time
+        print(
+            f"[MAIN] Deducting script generation credits: {script_credits_to_deduct} "
+            f"({SCRIPT_CREDITS_PER_MINUTE}/min * {request.time} min) for user {request.userId}"
+        )
+        await _deduct_script_credits(request.userId, request.time)
+    except Exception as exc:
+        print(f"--- script credit deduction failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+
     try:
         books = await get_books_for_chunks(
             all_db_chunks_seen, topic_text=topic_text, script_text=script_text
@@ -4245,6 +4345,44 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
