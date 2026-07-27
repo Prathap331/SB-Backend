@@ -225,11 +225,6 @@ async def eci(request: PromptRequest):
 
 
 
-
-
-
-
-
 import io
 import os
 import re
@@ -2271,8 +2266,7 @@ from fastapi import HTTPException
 
 class UnlockRequest(BaseModel):
     userId: str
-    duration: int  # minutes
-
+    duration: float 
 
 CREDITS_PER_MINUTE = 3
 
@@ -2282,10 +2276,9 @@ async def cut_credits(request: UnlockRequest):
     if request.duration <= 0:
         raise HTTPException(status_code=400, detail="duration must be positive")
 
-    cost = request.duration * CREDITS_PER_MINUTE
+    cost = round(request.duration * CREDITS_PER_MINUTE)
 
     try:
-        # 1. Get the user's profile (need tier + current credits)
         profile_res = supabase.table('user_profiles') \
             .select('id, credits_remaining, user_tier') \
             .eq('id', request.userId) \
@@ -2358,7 +2351,7 @@ async def cut_credits(request: UnlockRequest):
     except Exception as e:
         print("error:", e)
         raise HTTPException(status_code=500, detail=str(e))
-def target_word_count_for_time(minutes: int) -> int:
+def target_word_count_for_time(minutes: float) -> int:
     return max(50, int(minutes * WORDS_PER_MINUTE))
 
 
@@ -2408,7 +2401,7 @@ def bucket_segments_by_time(segments: list[dict], num_docs: int) -> list[list[di
     return buckets
 
 
-def num_hyde_docs_for_time(minutes: int) -> int:
+def num_hyde_docs_for_time(minutes: float) -> int:
     return max(1, math.ceil(minutes / 2))
 
 
@@ -2417,7 +2410,7 @@ async def generate_hyde_doc_for_segments(
     description: str,
     template: dict,
     segment_group: list[dict],
-    time_minutes: int,
+    time_minutes: float,
 ) -> str:
     segment_briefs = "\n".join(
         f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}%): {seg.get('brief', '')}"
@@ -2956,8 +2949,6 @@ Read the script and count/score the following content elements exactly as
 they appear in the script — do not estimate generically, actually look at
 what's present in the text.
 
-- emotionalDepth: a 1-10 score for how emotionally engaging/resonant the
-  script is (human stakes, tension, vivid imagery), not just informational
 - generalExamples: count of general illustrative examples used (concrete
   scenarios, comparisons, "for example" style illustrations) that are NOT
   historical events
@@ -2979,7 +2970,6 @@ Respond with ONLY valid JSON, no markdown fences, no preamble, in exactly
 this shape:
 
 {
-  "emotionalDepth": <number, 1-10>,
   "generalExamples": <number, >= 1>,
   "proverbs_count": <number, >= 1>,
   "historicalExamples": <number, >= 1>,
@@ -2989,7 +2979,6 @@ this shape:
 """
 
 _METRIC_MIN_VALUES = {
-    "emotionalDepth": 1,
     "generalExamples": 1,
     "proverbs_count": 1,
     "historicalExamples": 1,
@@ -2997,7 +2986,6 @@ _METRIC_MIN_VALUES = {
 }
 
 _DEFAULT_SCRIPT_METRICS = {
-    "emotionalDepth": 1,
     "generalExamples": 1,
     "proverbs_count": 1,
     "historicalExamples": 1,
@@ -3274,6 +3262,80 @@ async def _backfill_books_to_target(
     return books[:target_count]
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# NOTE: this file is a drop-in replacement for the thumbnail-generation section
+# of your FastAPI backend. It assumes the following are already available/imported
+# elsewhere in the module (as in your original file):
+#   asyncio, json, io, re, base64, uuid, time
+#   supabase, openai_client, _http_session
+#   BaseModel (pydantic), app (FastAPI instance)
+#   require_valid_user, _pipeline_semaphore
+#   _openai_create_with_timeout, _record_token_usage
+#   _start_token_tracking, _get_token_usage_summary
+#   GPT_IMAGE_MODEL, GPT_IMAGE_SIZE, GPT_IMAGE_QUALITY, THUMBNAILS_BUCKET
+#   THUMBNAIL_CREDITS_PER_IMAGE, SCRIPT_CREDITS_PER_MINUTE
+#   _truncate_words (existing helper used elsewhere in your codebase)
+#
+# If `re` is not already imported at the top of your file, add: import re
+
+
 FACE_THUMBNAILS_TABLE = "user_profiles"
 FACE_PHOTO_DEFAULT_KEY = "photo1"
 
@@ -3353,6 +3415,45 @@ def _download_image_bytes_sync(url: str, timeout: float = 15.0) -> bytes | None:
     return content
 
 
+FACE_IMAGE_MAX_DIMENSION = 1536
+
+
+def _normalize_face_image_bytes(raw_bytes: bytes) -> bytes | None:
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[FACE] Pillow (PIL) is not installed — cannot normalize face image. `pip install Pillow`.")
+        return None
+
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img.load()
+    except Exception as e:
+        print(f"[FACE] downloaded photo is not a decodable image (corrupt/unsupported format): {e}")
+        return None
+
+    try:
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            img = img.convert("RGBA")
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[-1])
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        if max(img.size) > FACE_IMAGE_MAX_DIMENSION:
+            img.thumbnail((FACE_IMAGE_MAX_DIMENSION, FACE_IMAGE_MAX_DIMENSION), Image.LANCZOS)
+
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        normalized = out.getvalue()
+        print(f"[FACE] normalized face image to clean RGB PNG ({len(normalized)} bytes, {img.size[0]}x{img.size[1]})")
+        return normalized
+    except Exception as e:
+        print(f"[FACE] failed to normalize/re-encode face image: {e}")
+        return None
+
+
 async def get_user_face_photo_bytes(user_id: str, photo_key: str = FACE_PHOTO_DEFAULT_KEY) -> bytes | None:
     photo_url = await get_user_face_photo_url(user_id, photo_key=photo_key)
     if not photo_url:
@@ -3363,130 +3464,468 @@ async def get_user_face_photo_bytes(user_id: str, photo_key: str = FACE_PHOTO_DE
         print(f"[FACE] could not download usable photo bytes for user {user_id} from {photo_url}")
         return None
 
-    return photo_bytes
+    normalized_bytes = await asyncio.to_thread(_normalize_face_image_bytes, photo_bytes)
+    if not normalized_bytes:
+        print(
+            f"[FACE] photo for user {user_id} downloaded but could not be normalized into a "
+            f"valid image — falling back to face-less thumbnail"
+        )
+        return None
+
+    return normalized_bytes
 
 
+# ============================================================================
+# PIPELINE SYSTEM PROMPTS
+# ============================================================================
 
-THUMBNAIL_PROMPT_SYSTEM_PROMPT = """
-You are a YouTube thumbnail art director.
+STORY_ANALYST_SYSTEM_PROMPT = """
+# STORYBIT STORY ANALYST (SSL v1)
 
-## Inputs
-1. Video title & description
-2. The finished narration script (for grounding the scene/mood/story beats
-   — use it to pick a moment or visual that actually represents the video,
-   not just the title)
-3. ONE specific short thumbnail text phrase that has already been chosen
-   and MUST be rendered as real, legible text inside the generated image
+## ROLE
 
-## Objective
-Write ONE image-generation prompt for a high-CTR YouTube thumbnail that
-visually represents the video's central story or hook, AND explicitly
-instructs the image model to render the given thumbnail text phrase as
-bold, large, high-contrast text baked directly into the image.
+You are **Storybit Story Analyst**, the first stage of the Storybit AI Pipeline. Your responsibility is to convert a YouTube documentary script into a compact **Story Semantic Language (SSL v1)**. You are **not** a script writer, thumbnail designer, or prompt engineer. You are a deterministic semantic compiler. Your output will be consumed only by the Storybit Thumbnail Intelligence Agent. Optimize for machine communication, not human readability.
 
-Guidelines:
-- Describe a single clear focal subject with strong emotional read, grounded
-  in a specific beat, fact, or image pulled from the script — not just the
-  title restated
-- Specify composition, lighting and color mood, and a photographic or
-  digital-art style appropriate to the content
-- Explicitly state the exact thumbnail text phrase (quote it verbatim) and
-  instruct it to appear as bold, punchy, high-contrast typography — e.g.
-  thick sans-serif or condensed impact-style lettering, drop shadow or
-  outline for readability, positioned in a clear area of the composition
-  (top, bottom, or one side) that doesn't overlap the focal subject
-- Do NOT add any other text, letters, numbers, logos, or watermarks beyond
-  that exact phrase
-- Do NOT depict real, named, identifiable public figures
-- Ground the scene in concrete, specific details from the input rather than
-  generic stock-photo phrasing
+## INPUT
 
-## Output
-Output ONLY the finished image-generation prompt as a single dense
-paragraph, 50-90 words. No preamble, no labels, no markdown, no explanation
-of your choices. You may use quotation marks only around the thumbnail text
-phrase itself.
+You receive three inputs: (1) Video Title, (2) Thumbnail Text, (3) Complete Video Script. Treat the complete script as the source of truth. Use the title and thumbnail text only to strengthen confidence or resolve ambiguity. If they conflict with the script, follow the script.
+
+## OBJECTIVE
+
+Extract only the semantic information required for thumbnail generation. Ignore information that does not influence visual storytelling. Every output token must carry semantic value.
+
+## RULES
+
+Return valid JSON only. No markdown, explanations, reasoning, summaries, opinions, recommendations, or natural-language paragraphs. No duplicate information. Omit null values, empty arrays, and default values. Keep arrays ordered by importance. Never invent facts. Infer only when strongly supported by the script.
+
+## OUTPUT
+
+```json
+{"v":1,"core":{},"sub":[],"rel":[],"evt":[],"emo":{},"conf":{},"vis":{},"sig":{}}
+```
+
+## core
+
+Story metadata.
+
+**Allowed fields:** `id cat era plot stage`
+
+**Definitions:** `id` = canonical story identifier. `cat` = story category (`business, history, war, technology, biography, finance, politics, science, crime, sports`). `era` = relevant historical period (e.g., `1990s, 2010-2014, Cold War, Modern`). `plot` = ordered plot stages using concise keywords (`rise, growth, success, dominance, conflict, betrayal, crisis, decline, collapse, failure, recovery, innovation, sale, merger, victory, defeat`). `stage` = overall narrative state (`beginning, middle, ending`).
+
+## sub
+
+Ordered subjects.
+
+```json
+{"id":"","type":"","role":"","rank":1}
+```
+
+**Allowed types:** `person, company, country, organization, technology, product, place, event`
+
+**Maximum:** 8 subjects.
+
+## rel
+
+Relationships.
+
+```json
+[source, relation, target]
+```
+
+**Relations:** `leads, owns, acquires, competes, defeats, supports, replaces, creates, invests, criticizes, wins, loses`
+
+**Maximum:** 20 relationships.
+
+## evt
+
+Only visually important events.
+
+```json
+{"id":"","type":"","rank":1}
+```
+
+**Event types:** `launch, bankruptcy, acquisition, war, speech, protest, accident, crash, announcement, lawsuit, election`
+
+**Maximum:** 10 events.
+
+## emo
+
+Dominant emotional signals.
+
+**Fields:** `primary secondary viewer`
+
+**Allowed values:** `curiosity, fear, trust, hope, success, failure, anger, shock, nostalgia, excitement, uncertainty`
+
+**Maximum:** One value per field.
+
+## conf
+
+Primary conflict.
+
+**Fields:** `type a b winner loser`
+
+**Conflict types:** `market, political, military, technology, legal, social, economic, personal`
+
+## vis
+
+Visual candidates.
+
+**Fields:** `hero support objects symbols locations environment`
+
+**Limits:** Hero (2), Support (4), Objects (8), Symbols (5), Locations (5), Environment (1). Include only visually useful items. Ignore non-visual concepts.
+
+## sig
+
+Thumbnail signals.
+
+**Fields:** `hook contrast focus risk impact`
+
+**Hook:** `why, how, secret, mistake, collapse, truth, inside`
+
+**Contrast:** `past_present, winner_loser, before_after, success_failure, small_big, old_new`
+
+**Definitions:** `focus` = primary visual anchor, `risk` = main perceived danger, `impact` = main consequence. Maximum one value for each field.
+
+## VALIDATION
+
+Before returning, verify: script is authoritative; plot stages are chronological; subjects are ranked by visual importance; relationships are unique; events are visually significant; exactly one primary emotion; exactly one primary conflict; hero subject exists whenever possible; thumbnail signals are consistent with the script; JSON is valid; no redundant fields remain.
+
+Return only the JSON.
 """
 
-THUMBNAIL_PROMPT_SYSTEM_PROMPT_WITH_FACE = """
-You are a YouTube thumbnail art director.
 
-## Inputs
-1. Video title & description
-2. The finished narration script (for grounding the scene/mood/story beats
-   — use it to pick a moment or visual that actually represents the video,
-   not just the title)
-3. ONE specific short thumbnail text phrase that has already been chosen
-   and MUST be rendered as real, legible text inside the generated image
+THUMBNAIL_INTELLIGENCE_SYSTEM_PROMPT = """
+# STORYBIT THUMBNAIL INTELLIGENCE AGENT (TSL v1)
 
-## Context
-This prompt will be used for an IMAGE-TO-IMAGE edit starting from a real
-photo of the video's creator. The creator's face and likeness from that
-source photo will be preserved and placed into the scene you describe —
-your job is to describe the SCENE, POSE, EXPRESSION, STYLING, and the
-overlaid TEXT around them, not to invent a different person.
+## ROLE
 
-## Objective
-Write ONE image-generation prompt for a high-CTR YouTube thumbnail where
-the creator is the central subject, reacting to or standing in front of a
-scene grounded in the script, AND the given thumbnail text phrase is
-rendered as bold, large, high-contrast text baked directly into the image.
+You are Storybit Thumbnail Intelligence Agent, Stage 2 of the Storybit Pipeline. Convert Story Semantic Language (SSL v1) into Thumbnail Specification Language (TSL v1). Produce only machine-readable visual specifications. Do not generate image prompts, explanations, reasoning, summaries, or creative writing. You are a deterministic compiler that converts story semantics into visual planning. The Prompt Renderer expands your output into a GPT Image prompt.
 
-Guidelines:
-- Keep the creator as a single, clear, front-and-center focal subject with
-  a strong, readable facial expression (e.g. shocked, intrigued, excited,
-  concerned — pick what fits the topic and the script's tone)
-- Describe the background/scene behind or around them, grounded in a
-  specific beat or detail from the script, plus composition, lighting, and
-  color mood
-- Explicitly state the exact thumbnail text phrase (quote it verbatim) and
-  instruct it to appear as bold, punchy, high-contrast typography — thick
-  sans-serif or condensed impact-style lettering, drop shadow or outline
-  for readability, positioned in a clear area (top, bottom, or one side)
-  that doesn't overlap the creator's face
-- Do NOT add any other text, letters, numbers, logos, or watermarks beyond
-  that exact phrase
-- Do not describe specific facial features, ethnicity, age, or identity
-  details — the real photo already provides those; focus only on
-  expression, pose, styling, surroundings, and the text overlay
-- Ground the scene in concrete, specific details from the input rather than
-  generic stock-photo phrasing
+## INPUT
 
-## Output
-Output ONLY the finished image-generation prompt as a single dense
-paragraph, 50-90 words. No preamble, no labels, no markdown, no explanation
-of your choices. You may use quotation marks only around the thumbnail text
-phrase itself.
+Receive:
+
+* SSL v1
+* `user_image` (true|false)
+
+SSL is the only story source of truth. Infer only when strongly supported. Omit uncertain information.
+
+If `user_image=true`, plan how the reference person should integrate into the thumbnail. Do not replace story subjects unless the story naturally requires it.
+
+## OBJECTIVE
+
+Generate the smallest possible TSL while preserving all important visual decisions. Optimize for high CTR, curiosity, emotional clarity, documentary realism, mobile readability, visual simplicity, clear hierarchy, and one dominant focal point.
+
+## RULES
+
+Return JSON only. No markdown. No explanations. No comments. No reasoning. No prose. Omit nulls, defaults, unsupported fields, and duplicates. Use compact keys, enums, and application IDs whenever available. Keep arrays ranked by importance. Never invent story facts.
+
+## OUTPUT
+
+```json
+{
+  "v":1,
+  "cs":{},
+  "vb":{},
+  "rs":{}
+}
+```
+
+If `user_image=true`, include:
+
+```json
+"idn":{}
+```
+
+between `vb` and `rs`.
+
+## cs (Creative Strategy)
+
+Keys:
+
+`goal promise emo psy hook style tone simp urg shock myst trust focus`
+
+Populate only non-default values.
+
+## vb (Visual Blueprint)
+
+Describe **what appears**, never **how it is rendered**.
+
+Keys:
+
+`sub obj sym loc env era expr pose fg bg focus layers layout text maxs maxo`
+
+Subjects always represent the planned thumbnail composition, not the reference image.
+
+## idn (Identity Integration)
+
+Generate only when `user_image=true`.
+
+Purpose: Describe how the user's reference image integrates into the planned composition.
+
+Keys:
+
+`mode slot expr pose gaze scale interact blend occ`
+
+Definitions:
+
+* mode → `replace insert foreground background observer group`
+* slot → `hero left right center foreground background`
+* expr → expression enum
+* pose → pose enum
+* gaze → `camera left right subject object up down`
+* scale → `primary secondary background`
+* interact → `none looking pointing holding shaking arguing celebrating`
+* blend → `match auto`
+* occ → `front partial behind`
+
+The `idn` section defines composition only. Never describe rendering.
+
+## rs (Rendering Specification)
+
+Populate only non-default values.
+
+Groups:
+
+`comp cam light clr txt fx neg`
+
+comp → `rule balance depth crop`
+
+cam → `shot angle lens dist dof`
+
+light → `style dir temp contrast`
+
+clr → `pal accent`
+
+txt → `pos size weight`
+
+fx → ordered rendering effect IDs
+
+neg → ordered negative constraint IDs
+
+## ENUMS
+
+Always use predefined application enums.
+
+Emotion → `fear hope anger trust curiosity surprise success failure`
+
+Style → `doc biz tech hist war editorial minimal`
+
+Layout → `hero left right center split triangle diagonal`
+
+Shot → `close medium wide`
+
+Angle → `low eye high`
+
+Lighting → `dramatic soft studio natural rim`
+
+Palette → `warm cool mono neutral`
+
+All subjects, objects, locations, symbols, typography, effects, constraints, poses, and expressions come from application dictionaries. Never invent enum values.
+
+## VALIDATION
+
+Before returning:
+
+* Preserve SSL story facts.
+* Maintain one dominant subject.
+* Maintain one dominant emotion.
+* Maintain one dominant curiosity hook.
+* Preserve subject ranking.
+* Preserve composition hierarchy.
+* Emit `idn` only when `user_image=true`.
+* Ensure identity integration supports the story composition.
+* Remove defaults and redundancy.
+* Return valid JSON only.
 """
 
 
-def _pick_thumbnail_text(youtube_metadata: dict, request) -> str:
-    candidates = youtube_metadata.get("thumbnail_text") or []
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
+PROMPT_RENDERER_SYSTEM_PROMPT = """
+# STORYBIT PROMPT RENDERER (PR v2)
+## ROLE
+Stage 3 of the Storybit Pipeline. Compile TSL v1 into an optimized prompt for the selected Image Model. Preserve all TSL decisions. Do not redesign, reinterpret, optimize, summarize or invent content. Deterministic compiler only.
+## INPUT
+* TSL v1
+* Thumbnail Text
+* Image Model
+* Reference Image (optional)
+TSL is the only planning source. If Reference Image exists, apply `idn` while preserving facial identity.
+## OBJECTIVE
+Generate the shortest high-fidelity prompt compatible with the selected Image Model while preserving composition, hierarchy, rendering intent and realism.
+## RULES
+Return plain text only. No JSON, markdown, comments, explanations or reasoning. Expand TSL IDs using built-in dictionaries. Never expose internal fields. Remove duplicates. Merge compatible descriptors. Omit missing/default values. Never invent story facts. Never modify Thumbnail Text.
+## MODEL
+Adapt descriptor ordering, syntax and rendering terms for the selected Image Model. Use only supported descriptors. Minimize prompt length without reducing fidelity.
+## OUTPUT ORDER
+Style → Primary Subject → Supporting Subjects → Expression → Pose → Interaction → Objects → Symbols → Environment → Composition → Camera → Lighting → Color Palette → Foreground → Background → Thumbnail Text → Rendering Quality → Negative Constraints.
+## COMPOSITION
+Preserve hierarchy, layout and focal point. Keep composition simple, clear and mobile-readable.
+## REFERENCE IMAGE
+Ignore if absent. If present: preserve facial identity, proportions, approximate age, hairstyle and skin tone; apply `idn` pose, expression, gaze, placement and scale; match lighting, perspective and color; blend naturally; never duplicate user; `replace` replaces only hero subject; `insert` preserves story subjects.
+## THUMBNAIL TEXT
+Render exactly as supplied. Never rewrite, translate or shorten. Follow TSL placement. Large bold typography, high contrast, safe margins, mobile readable.
+## QUALITY
+Emit model-appropriate quality descriptors once only.
+## NEGATIVE
+Expand negative IDs, merge duplicates, keep concise.
+## VALIDATION
+Verify: TSL preserved; composition preserved; Thumbnail Text preserved; identity rules applied only when Reference Image exists; IDs expanded; no internal metadata; prompt optimized for selected Image Model.
+Return only the compiled prompt.
+"""
+
+
+# ============================================================================
+# JSON PARSING HELPER
+# ============================================================================
+
+def _safe_parse_json(raw: str) -> dict | None:
+    """Strip optional markdown code fences and parse JSON defensively."""
+    if not raw:
+        return None
+
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+    try:
+        return json.loads(text)
+    except Exception as e:
+        print(f"[JSON-PARSE] failed to parse model output as JSON: {e}")
+        return None
+
+
+# ============================================================================
+# STEP 1 — STORY ANALYST  (script -> SSL v1)
+# ============================================================================
+
+async def run_story_analyst(title: str, thumbnail_text: str, script_text: str) -> dict:
+    script_excerpt = _truncate_words(script_text, max_words=1200) if script_text else "No script available."
+
+    user_content = f"""Video Title: "{title}"
+Thumbnail Text: "{thumbnail_text}"
+
+Complete Video Script:
+{script_excerpt}
+"""
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": STORY_ANALYST_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("story_analyst_ssl", res)
+        raw = (res.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[SSL] Step 1 (Story Analyst) call failed: {e}")
+        return {}
+
+    ssl_json = _safe_parse_json(raw)
+    if ssl_json is None:
+        print(f"[SSL] Step 1 output was not valid JSON. Raw output: {raw[:800]}")
+        return {}
+
+    print(f"[SSL] Step 1 (Story Analyst) output: {json.dumps(ssl_json, ensure_ascii=False)[:1000]}")
+    return ssl_json
+
+
+# ============================================================================
+# STEP 2 — THUMBNAIL INTELLIGENCE AGENT  (SSL v1 + user_image -> TSL v1)
+# ============================================================================
+
+async def run_thumbnail_intelligence(ssl_json: dict, user_image: bool) -> dict:
+    user_content = json.dumps(
+        {
+            "ssl": ssl_json,
+            "user_image": bool(user_image),
+        },
+        ensure_ascii=False,
+    )
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": THUMBNAIL_INTELLIGENCE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("thumbnail_intelligence_tsl", res)
+        raw = (res.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[TSL] Step 2 (Thumbnail Intelligence) call failed: {e}")
+        return {}
+
+    tsl_json = _safe_parse_json(raw)
+    if tsl_json is None:
+        print(f"[TSL] Step 2 output was not valid JSON. Raw output: {raw[:800]}")
+        return {}
+
+    print(f"[TSL] Step 2 (Thumbnail Intelligence) output: {json.dumps(tsl_json, ensure_ascii=False)[:1000]}")
+    return tsl_json
+
+
+# ============================================================================
+# STEP 3 — PROMPT RENDERER  (TSL v1 + thumbnail text + image model -> prompt text)
+# ============================================================================
+
+async def run_prompt_renderer(
+    tsl_json: dict,
+    thumbnail_text: str,
+    image_model: str,
+    has_reference_image: bool,
+) -> str:
+    user_content = f"""TSL v1:
+{json.dumps(tsl_json, ensure_ascii=False)}
+
+Thumbnail Text: "{thumbnail_text}"
+
+Image Model: {image_model}
+
+Reference Image: {"provided" if has_reference_image else "none"}
+"""
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": PROMPT_RENDERER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("prompt_renderer", res)
+        rendered_prompt = (res.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[PR] Step 3 (Prompt Renderer) call failed: {e}")
+        return ""
+
+    print(f"[PR] Step 3 (Prompt Renderer) output: {rendered_prompt}")
+    return rendered_prompt
+
+
+# ============================================================================
+# THUMBNAIL TEXT SELECTION  (now a single string, not a list)
+# ============================================================================
+
+def _pick_thumbnail_text(thumbnail_text: str | None, request) -> str:
+    if isinstance(thumbnail_text, str) and thumbnail_text.strip():
+        return thumbnail_text.strip()
 
     base = (request.title or "Watch Now").strip()
     return base[:28] if base else "Watch Now"
-
-
-def _build_thumbnail_context(
-    request,
-    script_text: str,
-    chosen_thumbnail_text: str,
-) -> str:
-    script_excerpt = _truncate_words(script_text, max_words=350) if script_text else "No script available."
-
-    return f"""
-Video Title: "{request.title}"
-Video Description: "{request.description}"
-
-Finished narration script (excerpt, for grounding the visual):
-{script_excerpt}
-
-Thumbnail text phrase that MUST be rendered inside the image (verbatim):
-"{chosen_thumbnail_text}"
-"""
 
 
 def _fallback_thumbnail_prompt(request, chosen_thumbnail_text: str = None) -> str:
@@ -3502,46 +3941,9 @@ def _fallback_thumbnail_prompt(request, chosen_thumbnail_text: str = None) -> st
     )
 
 
-async def generate_thumbnail_prompt(
-    request,
-    script_text: str,
-    chosen_thumbnail_text: str,
-    with_face: bool = False,
-) -> str:
-    context_block = _build_thumbnail_context(request, script_text, chosen_thumbnail_text)
-    system_prompt = THUMBNAIL_PROMPT_SYSTEM_PROMPT_WITH_FACE if with_face else THUMBNAIL_PROMPT_SYSTEM_PROMPT
-
-    try:
-        res = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": context_block},
-                ],
-                stream=False,
-            )
-        )
-        _record_token_usage("generate_thumbnail_prompt", res)
-        image_prompt = (res.choices[0].message.content or "").strip()
-        print(image_prompt)
-    except Exception as e:
-        print(f"[THUMBNAIL] prompt generation failed: {e}")
-        image_prompt = ""
-
-    if not image_prompt:
-        image_prompt = _fallback_thumbnail_prompt(request, chosen_thumbnail_text)
-
-    if chosen_thumbnail_text.lower() not in image_prompt.lower():
-        print("[THUMBNAIL] generated prompt didn't mention the chosen thumbnail text — appending it explicitly")
-        image_prompt = (
-            f'{image_prompt} Render the text "{chosen_thumbnail_text}" as bold, large, '
-            f"high-contrast typography baked into the image, in a clear area that doesn't "
-            f"overlap the main subject."
-        )
-
-    return image_prompt
-
+# ============================================================================
+# STEP 4 — IMAGE GENERATION  (rendered prompt [+ face image] -> image bytes)
+# ============================================================================
 
 def _generate_thumbnail_image_gpt_image_sync(
     prompt: str,
@@ -3549,11 +3951,13 @@ def _generate_thumbnail_image_gpt_image_sync(
     size: str = GPT_IMAGE_SIZE,
     quality: str = GPT_IMAGE_QUALITY,
 ) -> dict:
+    used_face = bool(face_image_bytes)
+
     try:
         if face_image_bytes:
             print(f"[THUMBNAIL-GPT] editing WITH user face photo (image-to-image, model='{GPT_IMAGE_MODEL}')")
             face_file = io.BytesIO(face_image_bytes)
-            face_file.name = "face.jpg"
+            face_file.name = "face.png"
 
             response = openai_client.images.edit(
                 model=GPT_IMAGE_MODEL,
@@ -3573,8 +3977,24 @@ def _generate_thumbnail_image_gpt_image_sync(
                 n=1,
             )
     except Exception as e:
+        error_str = str(e)
         print(f"[THUMBNAIL-GPT] request to GPT Image 2 failed: {e}")
-        return {"image_base64": None, "error": f"request failed: {e}"}
+        if used_face and ("invalid_image_file" in error_str or "image_generation_user_error" in error_str):
+            print("[THUMBNAIL-GPT] face photo was rejected by GPT Image 2 — retrying as text-to-image instead")
+            try:
+                response = openai_client.images.generate(
+                    model=GPT_IMAGE_MODEL,
+                    prompt=prompt,
+                    size=size,
+                    quality=quality,
+                    n=1,
+                )
+                used_face = False
+            except Exception as retry_e:
+                print(f"[THUMBNAIL-GPT] text-to-image fallback also failed: {retry_e}")
+                return {"image_base64": None, "error": f"request failed: {retry_e}"}
+        else:
+            return {"image_base64": None, "error": f"request failed: {e}"}
 
     try:
         image_base64 = response.data[0].b64_json
@@ -3585,8 +4005,8 @@ def _generate_thumbnail_image_gpt_image_sync(
         print("[THUMBNAIL-GPT] GPT Image 2 returned no image data (b64_json empty)")
         return {"image_base64": None, "error": "empty image data in response"}
 
-    print(f"[THUMBNAIL-GPT] received image ({len(image_base64)} base64 chars)")
-    return {"image_base64": image_base64, "error": None}
+    print(f"[THUMBNAIL-GPT] received image ({len(image_base64)} base64 chars, used_face={used_face})")
+    return {"image_base64": image_base64, "error": None, "used_face": used_face}
 
 
 async def generate_thumbnail_image(prompt: str, face_image_bytes: bytes | None = None) -> dict:
@@ -3609,14 +4029,15 @@ async def generate_thumbnail_image(prompt: str, face_image_bytes: bytes | None =
     return {"image_base64": result["image_base64"], "prompt": prompt, "error": None}
 
 
+# ============================================================================
+# PIPELINE ORCHESTRATOR — runs Steps 1 -> 2 -> 3 -> 4 in sequence
+# ============================================================================
+
 async def generate_thumbnail_for_script(
     request,
     script_text: str,
-    youtube_metadata: dict,
+    chosen_thumbnail_text: str,
 ) -> dict:
-    chosen_thumbnail_text = _pick_thumbnail_text(youtube_metadata, request)
-    print(f"[THUMBNAIL] chosen thumbnail text to render into image: '{chosen_thumbnail_text}'")
-
     face_image_bytes = None
 
     if getattr(request, "isFace", False):
@@ -3631,16 +4052,37 @@ async def generate_thumbnail_for_script(
         else:
             print(f"[THUMBNAIL] isFace=True but no usable photo found for user {request.userId} — using text-to-image instead")
 
-    image_prompt = await generate_thumbnail_prompt(
-        request,
-        script_text,
+    has_reference_image = bool(face_image_bytes)
+    image_model = getattr(request, "image_model", None) or GPT_IMAGE_MODEL
+
+    # ---- STEP 1: Story Analyst -> SSL v1 ----
+    ssl_json = await run_story_analyst(request.title, chosen_thumbnail_text, script_text)
+
+    # ---- STEP 2: Thumbnail Intelligence Agent -> TSL v1 ----
+    tsl_json = await run_thumbnail_intelligence(ssl_json, user_image=has_reference_image)
+
+    # ---- STEP 3: Prompt Renderer -> plain-text image prompt ----
+    rendered_prompt = await run_prompt_renderer(
+        tsl_json,
         chosen_thumbnail_text,
-        with_face=bool(face_image_bytes),
+        image_model,
+        has_reference_image,
     )
-    result = await generate_thumbnail_image(image_prompt, face_image_bytes=face_image_bytes)
+
+    if not rendered_prompt:
+        print("[PIPELINE] Step 3 returned empty output — using fallback prompt")
+        rendered_prompt = _fallback_thumbnail_prompt(request, chosen_thumbnail_text)
+    elif chosen_thumbnail_text.lower() not in rendered_prompt.lower():
+        print("[PIPELINE] rendered prompt didn't mention the thumbnail text — appending it explicitly")
+        rendered_prompt = (
+            f'{rendered_prompt} Render the text "{chosen_thumbnail_text}" as bold, large, '
+            f"high-contrast typography baked into the image, in a clear area that doesn't "
+            f"overlap the main subject."
+        )
+
+    # ---- STEP 4: Image generation ----
+    result = await generate_thumbnail_image(rendered_prompt, face_image_bytes=face_image_bytes)
     return result
-
-
 
 
 def _build_structure_response(selected_template: dict) -> list[dict]:
@@ -3716,14 +4158,13 @@ async def save_thumbnail_to_supabase(user_id: str, image_base64: str) -> str | N
     return public_url
 
 
-
 class ThumbnailRequest(BaseModel):
     userId: str
     title: str
     description: str
     isFace: bool
     script: str = ""
-    thumbnail_text: list[str] | None = None
+    thumbnail_text: str | None = None
 
 
 @app.post("/generate-thumbnail")
@@ -3734,17 +4175,6 @@ async def generate_thumbnail_endpoint(request: ThumbnailRequest):
         return await _generate_thumbnail_endpoint_impl(request)
 
 
-# ---------------------------------------------------------------------------
-# CREDIT DEDUCTION (unified helper used by BOTH script + thumbnail generation)
-# ---------------------------------------------------------------------------
-#
-# Rule:
-#   1. Look up the user's `user_tier` in `user_profiles`.
-#   2. ALWAYS deduct `amount` credits from `user_profiles.credits_remaining`.
-#   3. If the tier is NOT free, ALSO deduct `amount` credits from the most
-#      recently created row in `subscriptions` (ordered by `created_at`,
-#      descending) — i.e. non-free users get charged in BOTH places.
-#
 FREE_TIER_LABELS = {"free", "free_tier", "free-tier", "trial", "none", ""}
 
 
@@ -3767,7 +4197,6 @@ async def _get_user_tier(user_id: str) -> str:
 
 
 async def _deduct_profile_credits(user_id: str, amount: int):
-    """Always-on deduction from user_profiles.credits_remaining."""
     try:
         result = (
             supabase.table("user_profiles")
@@ -3799,11 +4228,6 @@ async def _deduct_profile_credits(user_id: str, amount: int):
 
 
 async def _deduct_subscription_credits(user_id: str, amount: int):
-    """Deduction from the MOST RECENT (by created_at) row in `subscriptions`.
-
-    Only called for non-free tier users, in addition to the user_profiles
-    deduction above.
-    """
     try:
         sub_res = (
             supabase.table("subscriptions")
@@ -3844,13 +4268,6 @@ async def _deduct_subscription_credits(user_id: str, amount: int):
 
 
 async def _deduct_credits_for_action(user_id: str, amount: int, action_label: str = "credits"):
-    """Unified credit deduction used by BOTH script generation and thumbnail
-    generation.
-
-    - Always deducts `amount` from user_profiles.credits_remaining.
-    - If the user's tier is NOT free, ALSO deducts `amount` from the most
-      recent (by created_at) row in `subscriptions`.credits.
-    """
     if amount <= 0:
         print(f"[CREDITS] ({action_label}) amount <= 0 ({amount}), skipping deduction for user {user_id}")
         return
@@ -3858,10 +4275,8 @@ async def _deduct_credits_for_action(user_id: str, amount: int, action_label: st
     tier = await _get_user_tier(user_id)
     is_free = tier in FREE_TIER_LABELS
 
-    # 1. Always deduct from user_profiles.
     await _deduct_profile_credits(user_id, amount)
 
-    # 2. Non-free tier -> ALSO deduct from subscriptions (most recent by created_at).
     if not is_free:
         print(
             f"[CREDITS] ({action_label}) user {user_id} tier='{tier}' (non-free) — "
@@ -3879,8 +4294,8 @@ async def _deduct_thumbnail_credits(user_id: str, amount: int = THUMBNAIL_CREDIT
     await _deduct_credits_for_action(user_id, amount, action_label="thumbnail")
 
 
-async def _deduct_script_credits(user_id: str, minutes: int):
-    amount = max(0, int(minutes)) * SCRIPT_CREDITS_PER_MINUTE
+async def _deduct_script_credits(user_id: str, minutes: float):
+    amount = max(0, round(float(minutes) * SCRIPT_CREDITS_PER_MINUTE))
     await _deduct_credits_for_action(user_id, amount, action_label="script")
 
 
@@ -3890,24 +4305,21 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
     total_start_time = time.time()
     script_text = request.script or ""
 
-    youtube_metadata_stub = {
-        "thumbnail_text": request.thumbnail_text or [],
-    }
+    chosen_thumbnail_text = _pick_thumbnail_text(request.thumbnail_text, request)
+    print(f"[THUMBNAIL] chosen thumbnail text to render into image: '{chosen_thumbnail_text}'")
 
     thumbnail_result = {"image_base64": None, "prompt": None, "error": "not attempted"}
 
     try:
-        print("[MAIN] Generating thumbnail prompt + image (standalone endpoint).")
+        print("[MAIN] Running 4-step thumbnail pipeline (SSL -> TSL -> Prompt -> Image).")
         thumbnail_result = await generate_thumbnail_for_script(
-            request, script_text, youtube_metadata_stub
+            request, script_text, chosen_thumbnail_text
         )
         thumbnail_url = None
         if thumbnail_result.get("image_base64"):
             thumbnail_url = await save_thumbnail_to_supabase(
                 request.userId, thumbnail_result["image_base64"]
             )
-            # 20 credits/image — deducted from user_profiles always, and also
-            # from subscriptions if the user is on a non-free tier.
             await _deduct_thumbnail_credits(request.userId, THUMBNAIL_CREDITS_PER_IMAGE)
         thumbnail_result["public_url"] = thumbnail_url
     except Exception as exc:
@@ -3915,14 +4327,9 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         import traceback
         traceback.print_exc()
 
-        chosen_text = next(
-            (t.strip() for t in (request.thumbnail_text or []) if isinstance(t, str) and t.strip()),
-            None,
-        ) or _pick_thumbnail_text(youtube_metadata_stub, request)
-
         thumbnail_result = {
             "image_base64": None,
-            "prompt": _fallback_thumbnail_prompt(request, chosen_text),
+            "prompt": _fallback_thumbnail_prompt(request, chosen_thumbnail_text),
             "error": str(exc),
             "public_url": None,
         }
@@ -3939,6 +4346,58 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -4229,16 +4688,8 @@ async def _generate_script_impl(request: "ScriptRequest"):
         import traceback
         traceback.print_exc()
 
-    # ------------------------------------------------------------------
-    # CREDIT DEDUCTION — 3 credits per requested minute of video.
-    # Always deducted from user_profiles; ALSO deducted from the most
-    # recent subscriptions row if the user's tier is not free.
-    # Charged once the script generation attempt has completed (whether
-    # or not it produced text), mirroring how the thumbnail endpoint only
-    # charges after the generation step has run.
-    # ------------------------------------------------------------------
     try:
-        script_credits_to_deduct = SCRIPT_CREDITS_PER_MINUTE * request.time
+        script_credits_to_deduct = round(SCRIPT_CREDITS_PER_MINUTE * request.time)
         print(
             f"[MAIN] Deducting script generation credits: {script_credits_to_deduct} "
             f"({SCRIPT_CREDITS_PER_MINUTE}/min * {request.time} min) for user {request.userId}"
@@ -4332,7 +4783,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "metrics": {
             "totalWords": total_words,
             "videoLength": video_length,
-            "emotionalDepth": script_metrics.get("emotionalDepth", 0),
             "generalExamples": script_metrics.get("generalExamples", 0),
             "proverbs_count": script_metrics.get("proverbs_count", 0),
             "historical_facts": script_metrics.get("historicalExamples", 0),
@@ -4345,38 +4795,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
