@@ -4583,7 +4583,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         traceback.print_exc()
 
     try:
-        # YouTube keyword generation now also takes the idea description.
         print("[MAIN] Performing YouTube search.")
         new_videos = await get_youtube_context(request.title, request.description, scraped_urls)
     except Exception as exc:
@@ -4598,18 +4597,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         )
     except Exception as exc:
         print(f"--- script generation failed: {exc} ---")
-        import traceback
-        traceback.print_exc()
-
-    try:
-        script_credits_to_deduct = round(SCRIPT_CREDITS_PER_MINUTE * request.time)
-        print(
-            f"[MAIN] Deducting script generation credits: {script_credits_to_deduct} "
-            f"({SCRIPT_CREDITS_PER_MINUTE}/min * {request.time} min) for user {request.userId}"
-        )
-        await _deduct_script_credits(request.userId, request.time)
-    except Exception as exc:
-        print(f"--- script credit deduction failed: {exc} ---")
         import traceback
         traceback.print_exc()
 
