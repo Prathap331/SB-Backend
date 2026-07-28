@@ -4659,8 +4659,8 @@ async def _generate_script_impl(request: "ScriptRequest"):
     sources = _extract_source_links(new_articles)
 
     total_words = _word_count(script_text) if script_text else 0
-    video_length = round(total_words / WORDS_PER_MINUTE, 2) if total_words else 0
-
+    video_length = round(total_words / WORDS_PER_MINUTE) if total_words else 0
+    
     structure = _build_structure_response(selected_template)
 
     token_usage = _get_token_usage_summary()
