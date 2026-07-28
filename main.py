@@ -314,6 +314,7 @@ SCRIPTS_UNIVERSAL_TABLE = "scripts_universal"
 
 
 
+
 async def save_english_script_to_universal_table(
     request: "ScriptRequest",
     topic_text: str,
@@ -361,7 +362,7 @@ async def save_english_script_to_universal_table(
         "books": _null_if_empty(books),
         "structure": _null_if_empty(structure),
         "userId": _null_if_empty(request.userId),
-        "topic": _null_if_empty(topic_text),
+        "topic": _null_if_empty(request.topic),
         "description": _null_if_empty(request.description),
         "thumbnail-generated": None,
         "category": _null_if_empty(classification.get("category")),
@@ -401,6 +402,7 @@ async def save_english_script_to_universal_table(
         f"[UNIVERSAL] gave up saving to '{SCRIPTS_UNIVERSAL_TABLE}' after "
         f"{max_attempts} attempt(s) dropping unrecognized columns"
     )
+ 
  
 
 
@@ -703,7 +705,7 @@ def _translate_with_library_sync(text_value: str, target_lang_code: str) -> str:
             translated_chunks.append(translated or chunk)
         except Exception as e:
             print(f"[TRANSLATE] library translation failed for a chunk ({len(chunk)} chars): {e}")
-            translated_chunks.append(chunk)  # fail open — keep English chunk rather than dropping it
+            translated_chunks.append(chunk)  
     return "\n".join(translated_chunks)
 
 
@@ -2907,6 +2909,7 @@ class ScriptRequest(BaseModel):
     description: str
     time: int
     language: str = "English"  
+    topic : str
 
 def build_topic_text(request: "ScriptRequest") -> str:
     return f"{request.title}\n\n{request.description}".strip()
@@ -5123,6 +5126,9 @@ async def _generate_script_impl(request: "ScriptRequest"):
         traceback.print_exc()
         youtube_metadata = _build_fallback_youtube_metadata(request)
 
+    # Snapshot the English version BEFORE any translation mutates it —
+    # json round-trip is a cheap, safe deep copy since this dict is
+    # already pure JSON-serializable data (lists of strings).
     english_youtube_metadata = json.loads(json.dumps(youtube_metadata))
 
     if target_language != "English":
@@ -5172,6 +5178,9 @@ async def _generate_script_impl(request: "ScriptRequest"):
     # Non-English requests: persist the canonical English version of the
     # full output to scripts_universal. Skipped entirely for English
     # requests. Never raises — a failure here must not break the response.
+    # NOTE: save_english_script_to_universal_table now saves request.topic
+    # (the new explicit field) into the "topic" column — topic_text is still
+    # passed through here but is no longer used for that column.
     if target_language != "English" and english_script_text:
         try:
             print(f"[MAIN] Non-English request ('{target_language}') — saving English copy to '{SCRIPTS_UNIVERSAL_TABLE}'.")
@@ -5226,15 +5235,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "token_usage": token_usage,
         "language": target_language,
     }
-
-
-
-
-
-
-
-
-
 
 
 
