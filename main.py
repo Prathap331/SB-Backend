@@ -4659,7 +4659,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
     sources = _extract_source_links(new_articles)
 
     total_words = _word_count(script_text) if script_text else 0
-    video_length = round(total_words / WORDS_PER_MINUTE) if total_words else 0
 
     structure = _build_structure_response(selected_template)
 
@@ -4682,7 +4681,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
         },
         "metrics": {
             "totalWords": total_words,
-            "videoLength": video_length,
+            "videoLength": request.time,
             "generalExamples": script_metrics.get("generalExamples", 0),
             "proverbs_count": script_metrics.get("proverbs_count", 0),
             "historical_facts": script_metrics.get("historicalExamples", 0),
