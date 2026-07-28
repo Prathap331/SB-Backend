@@ -305,6 +305,106 @@ from openai import OpenAI
 import trafilatura
 
 
+
+SCRIPTS_UNIVERSAL_TABLE = "scripts_universal"
+
+
+
+
+
+
+
+async def save_english_script_to_universal_table(
+    request: "ScriptRequest",
+    topic_text: str,
+    english_script_text: str,
+    english_youtube_metadata: dict,
+    script_metrics: dict,
+    sources: list[str],
+    books: list[dict],
+    structure: list[dict],
+    classification: dict,
+) -> None:
+    """Persists the ENGLISH version of a translated script's full output to
+    `scripts_universal`, so the canonical/source-of-truth copy always exists
+    in English regardless of what language the user actually requested.
+    Fire-and-forget from the caller's perspective — never raises, never
+    blocks or affects the main response."""
+ 
+    def _null_if_empty(value):
+        """Sends explicit null for anything empty (empty string, empty list,
+        empty dict) instead of an empty structure or omitting the key."""
+        if value is None:
+            return None
+        if isinstance(value, (str, list, dict, tuple, set)) and len(value) == 0:
+            return None
+        return value
+ 
+    metrics_payload = {
+        "totalWords": _word_count(english_script_text) if english_script_text else 0,
+        "videoLength": request.time,
+        "generalExamples": script_metrics.get("generalExamples", 0),
+        "proverbs_count": script_metrics.get("proverbs_count", 0),
+        "historical_facts": script_metrics.get("historicalExamples", 0),
+        "researchFacts": script_metrics.get("researchFacts", 0),
+    }
+ 
+    row = {
+        "title": _null_if_empty(request.title),
+        "script": _null_if_empty(english_script_text),
+        "youtube_metadata": _null_if_empty(english_youtube_metadata),
+        "thumbnail": _null_if_empty(
+            {"thumbnail_text": english_youtube_metadata.get("thumbnail_text", [])}
+        ),
+        "metrics": _null_if_empty(metrics_payload),
+        "sources": _null_if_empty(sources),
+        "books": _null_if_empty(books),
+        "structure": _null_if_empty(structure),
+        "userId": _null_if_empty(request.userId),
+        "topic": _null_if_empty(topic_text),
+        "description": _null_if_empty(request.description),
+        "thumbnail-generated": None,
+        "category": _null_if_empty(classification.get("category")),
+        "sub_category": _null_if_empty(classification.get("subcategories")),
+    }
+ 
+    max_attempts = len(row) + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await asyncio.to_thread(
+                lambda: supabase.table(SCRIPTS_UNIVERSAL_TABLE).insert(row).execute()
+            )
+            inserted_id = result.data[0]["id"] if result.data else None
+            print(
+                f"[UNIVERSAL] saved English copy to '{SCRIPTS_UNIVERSAL_TABLE}' "
+                f"(id={inserted_id}) for userId={request.userId}"
+            )
+            return
+        except Exception as e:
+            error_text = str(e)
+            match = re.search(r"Could not find the '(.+?)' column", error_text)
+            if match and match.group(1) in row:
+                missing_col = match.group(1)
+                print(
+                    f"[UNIVERSAL] column '{missing_col}' not found in schema cache "
+                    f"(PGRST204) — dropping it from the payload and retrying "
+                    f"(attempt {attempt}/{max_attempts})"
+                )
+                row.pop(missing_col, None)
+                continue
+            print(f"[UNIVERSAL] failed to save English copy to '{SCRIPTS_UNIVERSAL_TABLE}': {e}")
+            import traceback
+            traceback.print_exc()
+            return
+ 
+    print(
+        f"[UNIVERSAL] gave up saving to '{SCRIPTS_UNIVERSAL_TABLE}' after "
+        f"{max_attempts} attempt(s) dropping unrecognized columns"
+    )
+ 
+
+
+
 SUPPORTED_LANGUAGES = {
     "english": "en",
     "hindi": "hi",
@@ -4814,7 +4914,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
     topic_text = build_topic_text(request)
     print(f"SCRIPT GENERATION: Received request for title: '{request.title}'")
     target_language = _normalize_language(getattr(request, "language", None))
-    english_script_text = "" 
+    english_script_text = ""
     selected_template = await retrieve_best_script_template(topic_text)
 
     if selected_template is None:
@@ -4852,6 +4952,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
     scraped_urls = set()
     script_text = ""
     youtube_metadata = {"titles": [], "descriptions": [], "hashtags": [], "thumbnail_text": []}
+    english_youtube_metadata: dict = {}
     script_metrics = dict(_DEFAULT_SCRIPT_METRICS)
     sources: list[str] = []
     books: list[dict] = []
@@ -4975,7 +5076,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
             request, selected_template, db_results, new_articles, target_word_count
         )
         english_script_text = script_text
- 
+
         if target_language != "English" and script_text:
             try:
                 print(f"[MAIN] Translating script into {target_language}.")
@@ -4983,7 +5084,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
             except Exception as exc:
                 print(f"--- script translation failed, falling back to English script: {exc} ---")
                 script_text = english_script_text
- 
+
     except Exception as exc:
         print(f"--- script generation failed: {exc} ---")
         import traceback
@@ -5016,33 +5117,35 @@ async def _generate_script_impl(request: "ScriptRequest"):
     try:
         print("[MAIN] Generating YouTube SEO metadata.")
         youtube_metadata = await generate_youtube_seo_metadata(request, english_script_text, new_videos)
-        if target_language != "English":
-            try:
-                print(f"[MAIN] Translating YouTube SEO metadata into {target_language}.")
-                youtube_metadata["titles"] = await translate_array_full_pipeline(
-                    youtube_metadata.get("titles", []), target_language
-                )
-                youtube_metadata["descriptions"] = await translate_array_full_pipeline(
-                    youtube_metadata.get("descriptions", []), target_language
-                )
-                youtube_metadata["thumbnail_text"] = await translate_array_full_pipeline(
-                    youtube_metadata.get("thumbnail_text", []), target_language
-                )
-                youtube_metadata["hashtags"] = await translate_hashtag_sets(
-                    youtube_metadata.get("hashtags", []), target_language
-                )
-            except Exception as exc:
-                print(f"--- YouTube metadata translation failed, keeping English metadata: {exc} ---")
-
     except Exception as exc:
         print(f"--- YouTube SEO metadata generation failed: {exc} ---")
         import traceback
         traceback.print_exc()
         youtube_metadata = _build_fallback_youtube_metadata(request)
 
+    english_youtube_metadata = json.loads(json.dumps(youtube_metadata))
+
+    if target_language != "English":
+        try:
+            print(f"[MAIN] Translating YouTube SEO metadata into {target_language}.")
+            youtube_metadata["titles"] = await translate_array_full_pipeline(
+                youtube_metadata.get("titles", []), target_language
+            )
+            youtube_metadata["descriptions"] = await translate_array_full_pipeline(
+                youtube_metadata.get("descriptions", []), target_language
+            )
+            youtube_metadata["thumbnail_text"] = await translate_array_full_pipeline(
+                youtube_metadata.get("thumbnail_text", []), target_language
+            )
+            youtube_metadata["hashtags"] = await translate_hashtag_sets(
+                youtube_metadata.get("hashtags", []), target_language
+            )
+        except Exception as exc:
+            print(f"--- YouTube metadata translation failed, keeping English metadata: {exc} ---")
+
     try:
         print("[MAIN] Generating script content metrics.")
-        script_metrics = await generate_script_metrics(script_text, topic_text=topic_text)
+        script_metrics = await generate_script_metrics(english_script_text, topic_text=topic_text)
     except Exception as exc:
         print(f"--- script metrics generation failed: {exc} ---")
         import traceback
@@ -5051,7 +5154,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
     try:
         print("[MAIN] Generating category and subcategory classification.")
         classification = await generate_category_and_subcategory(
-            request.title, request.description, script_text
+            request.title, request.description, english_script_text
         )
         print(
             f"[MAIN] Classification -> category: {classification.get('category')}, "
@@ -5064,10 +5167,31 @@ async def _generate_script_impl(request: "ScriptRequest"):
         classification = dict(_DEFAULT_CLASSIFICATION)
 
     sources = _extract_source_links(new_articles)
+    structure = _build_structure_response(selected_template)
+
+    # Non-English requests: persist the canonical English version of the
+    # full output to scripts_universal. Skipped entirely for English
+    # requests. Never raises — a failure here must not break the response.
+    if target_language != "English" and english_script_text:
+        try:
+            print(f"[MAIN] Non-English request ('{target_language}') — saving English copy to '{SCRIPTS_UNIVERSAL_TABLE}'.")
+            await save_english_script_to_universal_table(
+                request=request,
+                topic_text=topic_text,
+                english_script_text=english_script_text,
+                english_youtube_metadata=english_youtube_metadata,
+                script_metrics=script_metrics,
+                sources=sources,
+                books=books,
+                structure=structure,
+                classification=classification,
+            )
+        except Exception as exc:
+            print(f"--- saving English copy to '{SCRIPTS_UNIVERSAL_TABLE}' failed: {exc} ---")
+            import traceback
+            traceback.print_exc()
 
     total_words = _word_count(script_text) if script_text else 0
-
-    structure = _build_structure_response(selected_template)
 
     token_usage = _get_token_usage_summary()
 
@@ -5102,82 +5226,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "token_usage": token_usage,
         "language": target_language,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

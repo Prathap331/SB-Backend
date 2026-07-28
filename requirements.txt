@@ -39,3 +39,4 @@ trafilatura
 SQLAlchemy
 yt-dlp
 tiktoken
+deep_translator
