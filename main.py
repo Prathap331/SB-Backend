@@ -293,6 +293,8 @@ import asyncio
 import contextvars
 import concurrent.futures
 from urllib.parse import urlparse
+from deep_translator import GoogleTranslator
+
 
 import requests
 import numpy as np
@@ -301,6 +303,421 @@ from sklearn.feature_extraction.text import HashingVectorizer
 from fastapi import HTTPException
 from openai import OpenAI
 import trafilatura
+
+
+SUPPORTED_LANGUAGES = {
+    "english": "en",
+    "hindi": "hi",
+    "gujarati": "gu",
+    "kannada": "kn",
+    "bengali": "bn",
+    "malayalam": "ml",
+    "telugu": "te",
+    "tamil": "ta",
+    "marathi": "mr",
+    "odia": "or",
+    "punjabi": "pa",
+}
+ 
+DEFAULT_LANGUAGE = "English"
+ 
+TRANSLATE_CHUNK_MAX_CHARS = 4000
+
+
+
+
+_TRANSLATE_ARRAY_SEP_LINE = "\u2021\u2021\u2021ITEM\u2021\u2021\u2021"  
+_LEADING_NUMBERING_RE = re.compile(r"^\s*(?:[\-\*\u2022]|\d+[\.\)])\s*")
+ 
+TRANSLATION_QC_ARRAY_SYSTEM_PROMPT = """
+You are a professional {language} language editor and translation QC specialist
+working on YouTube metadata (titles, descriptions, or hashtag phrases).
+ 
+You will be given:
+1. The ORIGINAL English text — exactly {item_count} item(s), each separated
+   by a line that contains exactly the token: {sep_token}
+2. A DRAFT machine translation of the same text into {language}, using the
+   same separator token
+ 
+## Task
+- Fix grammar, spelling, and word order so each item reads naturally to a
+  native {language} speaker
+- Keep each item short and punchy, suitable for a YouTube title, description,
+  or hashtag phrase
+- Translate EVERY item independently. Do NOT merge, deduplicate, reorder,
+  drop, summarize, or combine items — even if two items look similar or
+  redundant to you, keep them as separate items in the same position
+- Do NOT add numbering, bullets, or any new formatting
+- Preserve names, numbers, and proper nouns accurately
+ 
+## CRITICAL OUTPUT REQUIREMENT
+Your output MUST contain EXACTLY {item_count} item(s) separated by the exact
+token "{sep_token}" on its own line — the same count as the input, no more,
+no fewer. This is a hard structural requirement, not a style suggestion.
+ 
+## Output
+Return ONLY the corrected {language} text, items separated by "{sep_token}"
+on their own line, same order, same count — no preamble, no notes, no
+markdown, no explanations.
+"""
+
+
+
+async def refine_array_translation_with_llm(
+    original_text: str, draft_translation: str, target_language: str, item_count: int
+) -> str:
+    if not draft_translation:
+        return draft_translation
+ 
+    system_prompt = TRANSLATION_QC_ARRAY_SYSTEM_PROMPT.format(
+        language=target_language,
+        item_count=item_count,
+        sep_token=_TRANSLATE_ARRAY_SEP_LINE,
+    )
+    user_prompt = f"""ORIGINAL (English):
+{original_text}
+ 
+DRAFT TRANSLATION ({target_language}):
+{draft_translation}
+"""
+ 
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage(f"translation_qc_array_{target_language.lower()}", res)
+        refined = (res.choices[0].message.content or "").strip()
+        return refined or draft_translation
+    except Exception as e:
+        print(f"[TRANSLATE] array LLM QC pass failed for {target_language}: {e} — using library draft as-is")
+        return draft_translation
+
+
+
+_PURE_DIGIT_TAG_RE = re.compile(r"^#?\d+$")
+_MIN_HASHTAG_LEN = 3  
+
+async def translate_hashtag_sets(
+    hashtag_sets: list[list[str]], target_language: str
+) -> list[list[str]]:
+    target_language = _normalize_language(target_language)
+    if target_language == "English" or not hashtag_sets:
+        return hashtag_sets
+ 
+    flat_phrases: list[str] = []
+    set_sizes: list[int] = []
+    for tag_set in hashtag_sets:
+        set_sizes.append(len(tag_set))
+        flat_phrases.extend(_hashtag_to_phrase(tag) for tag in tag_set)
+ 
+    if not flat_phrases:
+        return hashtag_sets
+ 
+    try:
+        translated_phrases = await translate_array_full_pipeline(flat_phrases, target_language)
+    except Exception as e:
+        print(f"[TRANSLATE] hashtag translation failed, keeping English hashtags: {e}")
+        return hashtag_sets
+ 
+    if len(translated_phrases) != len(flat_phrases):
+        print("[TRANSLATE] hashtag translation count mismatch, keeping English hashtags")
+        return hashtag_sets
+ 
+    rebuilt: list[list[str]] = []
+    cursor = 0
+    for tag_set, size in zip(hashtag_sets, set_sizes):
+        translated_slice = translated_phrases[cursor: cursor + size]
+        cursor += size
+ 
+        tags: list[str] = []
+        seen: set[str] = set()
+ 
+        for original_tag, phrase in zip(tag_set, translated_slice):
+            candidate = _keyword_to_hashtag(phrase)
+ 
+            is_invalid = (
+                not candidate
+                or _PURE_DIGIT_TAG_RE.match(candidate)
+                or len(candidate.lstrip("#")) < _MIN_HASHTAG_LEN
+                or candidate.lower() in seen
+            )
+ 
+            if is_invalid:
+                candidate = original_tag if original_tag.lower() not in seen else None
+ 
+            if candidate and candidate.lower() not in seen:
+                seen.add(candidate.lower())
+                tags.append(candidate)
+        if len(tags) < size:
+            for original_tag in tag_set:
+                if len(tags) >= size:
+                    break
+                if original_tag.lower() not in seen:
+                    seen.add(original_tag.lower())
+                    tags.append(original_tag)
+ 
+        rebuilt.append(tags)
+ 
+    return rebuilt
+
+
+async def translate_array_full_pipeline(items: list[str], target_language: str) -> list[str]:
+    if not items:
+        return items
+ 
+    target_language = _normalize_language(target_language)
+    if target_language == "English":
+        return items
+ 
+    joined = f"\n{_TRANSLATE_ARRAY_SEP_LINE}\n".join(items)
+ 
+    parts: list[str] = []
+    try:
+        draft = await translate_with_library(joined, target_language)
+        refined = await refine_array_translation_with_llm(
+            joined, draft, target_language, item_count=len(items)
+        )
+        raw_parts = [
+            p.strip()
+            for p in re.split(re.escape(_TRANSLATE_ARRAY_SEP_LINE), refined)
+        ]
+        # Strip any stray numbering/bullets the model might have added despite
+        # instructions not to (this is what caused artifacts like a lone "#3").
+        parts = [_LEADING_NUMBERING_RE.sub("", p).strip() for p in raw_parts if p.strip()]
+    except Exception as e:
+        print(f"[TRANSLATE] array batch translation failed: {e}")
+        parts = []
+ 
+    if len(parts) == len(items):
+        return parts
+ 
+    print(
+        f"[TRANSLATE] batch array translation returned {len(parts)} part(s), "
+        f"expected {len(items)} — falling back to per-item translation "
+        f"(never drops items)"
+    )
+ 
+    results = []
+    for item in items:
+        try:
+            translated = await translate_text_full_pipeline(item, target_language)
+            results.append(translated or item)
+        except Exception as e:
+            print(f"[TRANSLATE] per-item fallback failed for '{item[:40]}...': {e} — keeping original")
+            results.append(item)
+    return results
+
+
+_CAMEL_SPLIT_RE = re.compile(r'(?<!^)(?=[A-Z])')
+_HASHTAG_WORD_RE = re.compile(r"[^\s#]+", re.UNICODE)
+ 
+def _hashtag_to_phrase(hashtag: str) -> str:
+        """Reverses '#artificialIntelligence' -> 'artificial Intelligence' so it
+        can be sent through translation like normal text."""
+        word = (hashtag or "").lstrip("#")
+        spaced = _CAMEL_SPLIT_RE.sub(" ", word)
+        return spaced.strip()
+
+
+
+def _keyword_to_hashtag(keyword: str) -> str:
+    words = _HASHTAG_WORD_RE.findall(keyword or "")
+    if not words:
+        return ""
+    if all(w.isascii() for w in words):
+        first, rest = words[0].lower(), words[1:]
+        camel = first + "".join(w.capitalize() for w in rest)
+        return f"#{camel}" if camel else ""
+    joined = "".join(words)
+    return f"#{joined}" if joined else ""    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _normalize_language(language: str | None) -> str:
+    """Validate/normalize whatever the client sent. Falls back to English on
+    anything unrecognized so a bad value never breaks the pipeline."""
+    if not language or not language.strip():
+        return DEFAULT_LANGUAGE
+    key = language.strip().lower()
+    if key not in SUPPORTED_LANGUAGES:
+        print(f"[LANG] unrecognized language '{language}', defaulting to English")
+        return DEFAULT_LANGUAGE
+    return "Odia" if key == "odia" else language.strip().title()
+ 
+ 
+def _lang_code(language: str) -> str:
+    return SUPPORTED_LANGUAGES.get(language.strip().lower(), "en")
+ 
+
+
+def _chunk_text_for_translation(text_value: str, max_chars: int = TRANSLATE_CHUNK_MAX_CHARS) -> list[str]:
+    """Splits on paragraph boundaries so we never cut a sentence mid-way and
+    never exceed the translator's per-request character limit."""
+    if len(text_value) <= max_chars:
+        return [text_value]
+ 
+    paragraphs = text_value.split("\n")
+    chunks: list[str] = []
+    current = ""
+    for para in paragraphs:
+        candidate = (current + "\n" + para) if current else para
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = para
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+ 
+
+
+
+def _translate_with_library_sync(text_value: str, target_lang_code: str) -> str:
+    chunks = _chunk_text_for_translation(text_value)
+    translated_chunks = []
+    for chunk in chunks:
+        if not chunk.strip():
+            translated_chunks.append(chunk)
+            continue
+        try:
+            translated = GoogleTranslator(source="en", target=target_lang_code).translate(chunk)
+            translated_chunks.append(translated or chunk)
+        except Exception as e:
+            print(f"[TRANSLATE] library translation failed for a chunk ({len(chunk)} chars): {e}")
+            translated_chunks.append(chunk)  # fail open — keep English chunk rather than dropping it
+    return "\n".join(translated_chunks)
+
+
+
+
+async def translate_with_library(text_value: str, target_language: str) -> str:
+    if not text_value:
+        return text_value
+    target_lang_code = _lang_code(target_language)
+    return await asyncio.to_thread(_translate_with_library_sync, text_value, target_lang_code)
+ 
+
+
+TRANSLATION_QC_SYSTEM_PROMPT = """
+You are a professional {language} language editor and translation QC specialist.
+ 
+You will be given:
+1. The ORIGINAL English text
+2. A DRAFT machine translation of that text into {language}
+ 
+## Task
+Produce a corrected, publication-ready {language} version of the text by:
+- Fixing grammar, spelling, conjugation, gender agreement, and word order errors
+- Making the phrasing sound natural and fluent to a native {language} speaker
+  — not a literal/awkward machine translation
+- Preserving the original meaning, tone, and factual content exactly
+- Preserving names, numbers, statistics, proper nouns, and technical terms
+  accurately (transliterate names naturally, never mistranslate them)
+- Preserving any structural markers exactly as they appear in the original,
+  such as segment labels in square brackets (e.g. "[Hook]", "[Climax]") —
+  keep these bracketed labels in English exactly as-is, untranslated
+- Keeping paragraph/line structure consistent with the original
+ 
+## Output
+Return ONLY the corrected {language} text. No preamble, no explanations, no
+notes, no markdown, no side-by-side comparison — just the final text.
+"""
+
+
+
+
+async def refine_translation_with_llm(
+    original_text: str, draft_translation: str, target_language: str
+) -> str:
+    if not draft_translation:
+        return draft_translation
+ 
+    system_prompt = TRANSLATION_QC_SYSTEM_PROMPT.format(language=target_language)
+    user_prompt = f"""ORIGINAL (English):
+{original_text}
+ 
+DRAFT TRANSLATION ({target_language}):
+{draft_translation}
+"""
+ 
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+            ),
+            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
+        )
+        _record_token_usage(f"translation_qc_{target_language.lower()}", res)
+        refined = (res.choices[0].message.content or "").strip()
+        return refined or draft_translation
+    except Exception as e:
+        print(f"[TRANSLATE] LLM grammar/QC pass failed for {target_language}: {e} — using library draft as-is")
+        return draft_translation
+ 
+
+
+
+
+async def translate_text_full_pipeline(text_value: str, target_language: str) -> str:
+    """Library translation -> LLM grammar/fluency QC pass.
+    Returns the original text untouched if target_language is English or on
+    any hard failure (fail-open, never blocks the response)."""
+    if not text_value:
+        return text_value
+ 
+    target_language = _normalize_language(target_language)
+    if target_language == "English":
+        return text_value
+ 
+    print(f"[TRANSLATE] translating text into {target_language} ({len(text_value)} chars)")
+    try:
+        draft = await translate_with_library(text_value, target_language)
+        refined = await refine_translation_with_llm(text_value, draft, target_language)
+        print(f"[TRANSLATE] translation into {target_language} complete ({len(refined)} chars)")
+        return refined
+    except Exception as e:
+        print(f"[TRANSLATE] full pipeline failed for {target_language}, returning original English: {e}")
+        return text_value
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 try:
     import tiktoken
@@ -2074,8 +2491,7 @@ async def generate_ideas_from_context(
     context_block = _build_ideas_context(db_results, new_articles)
 
     user_prompt = f"""Topic: "{topic}"
-
-Content Chunks:
+    Content Chunks:
 {context_block}
 """
 
@@ -2390,6 +2806,7 @@ class ScriptRequest(BaseModel):
     title: str
     description: str
     time: int
+    language: str = "English"  
 
 def build_topic_text(request: "ScriptRequest") -> str:
     return f"{request.title}\n\n{request.description}".strip()
@@ -2714,14 +3131,6 @@ def _parse_json_block(raw: str) -> dict:
     cleaned = re.sub(r"\s*```$", "", cleaned)
     return json.loads(cleaned)
 
-
-def _keyword_to_hashtag(keyword: str) -> str:
-    words = re.findall(r"[A-Za-z0-9]+", keyword)
-    if not words:
-        return ""
-    first, rest = words[0].lower(), words[1:]
-    camel = first + "".join(w.capitalize() for w in rest)
-    return f"#{camel}" if camel else ""
 
 
 def _build_hashtags_from_keywords(keywords: list[str]) -> list[str]:
@@ -4089,6 +4498,7 @@ class ThumbnailRequest(BaseModel):
     isFace: bool
     script: str = ""
     thumbnail_text: str | None = None
+    language: str = "English"  
 
 
 @app.post("/generate-thumbnail")
@@ -4229,7 +4639,18 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
     total_start_time = time.time()
     script_text = request.script or ""
 
+    target_language = _normalize_language(getattr(request, "language", None))
     chosen_thumbnail_text = _pick_thumbnail_text(request.thumbnail_text, request)
+ 
+    if target_language != "English" and chosen_thumbnail_text:
+        try:
+            print(f"[THUMBNAIL] Translating thumbnail text into {target_language}: '{chosen_thumbnail_text}'")
+            chosen_thumbnail_text = await translate_text_full_pipeline(
+                chosen_thumbnail_text, target_language
+            )
+            print(f"[THUMBNAIL] translated thumbnail text: '{chosen_thumbnail_text}'")
+        except Exception as exc:
+            print(f"--- thumbnail text translation failed, keeping English text: {exc} ---")
     print(f"[THUMBNAIL] chosen thumbnail text to render into image: '{chosen_thumbnail_text}'")
 
     thumbnail_result = {"image_base64": None, "prompt": None, "error": "not attempted"}
@@ -4392,7 +4813,8 @@ async def _generate_script_impl(request: "ScriptRequest"):
     total_start_time = time.time()
     topic_text = build_topic_text(request)
     print(f"SCRIPT GENERATION: Received request for title: '{request.title}'")
-
+    target_language = _normalize_language(getattr(request, "language", None))
+    english_script_text = "" 
     selected_template = await retrieve_best_script_template(topic_text)
 
     if selected_template is None:
@@ -4552,6 +4974,16 @@ async def _generate_script_impl(request: "ScriptRequest"):
         script_text = await generate_script_from_context(
             request, selected_template, db_results, new_articles, target_word_count
         )
+        english_script_text = script_text
+ 
+        if target_language != "English" and script_text:
+            try:
+                print(f"[MAIN] Translating script into {target_language}.")
+                script_text = await translate_text_full_pipeline(english_script_text, target_language)
+            except Exception as exc:
+                print(f"--- script translation failed, falling back to English script: {exc} ---")
+                script_text = english_script_text
+ 
     except Exception as exc:
         print(f"--- script generation failed: {exc} ---")
         import traceback
@@ -4583,7 +5015,25 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
     try:
         print("[MAIN] Generating YouTube SEO metadata.")
-        youtube_metadata = await generate_youtube_seo_metadata(request, script_text, new_videos)
+        youtube_metadata = await generate_youtube_seo_metadata(request, english_script_text, new_videos)
+        if target_language != "English":
+            try:
+                print(f"[MAIN] Translating YouTube SEO metadata into {target_language}.")
+                youtube_metadata["titles"] = await translate_array_full_pipeline(
+                    youtube_metadata.get("titles", []), target_language
+                )
+                youtube_metadata["descriptions"] = await translate_array_full_pipeline(
+                    youtube_metadata.get("descriptions", []), target_language
+                )
+                youtube_metadata["thumbnail_text"] = await translate_array_full_pipeline(
+                    youtube_metadata.get("thumbnail_text", []), target_language
+                )
+                youtube_metadata["hashtags"] = await translate_hashtag_sets(
+                    youtube_metadata.get("hashtags", []), target_language
+                )
+            except Exception as exc:
+                print(f"--- YouTube metadata translation failed, keeping English metadata: {exc} ---")
+
     except Exception as exc:
         print(f"--- YouTube SEO metadata generation failed: {exc} ---")
         import traceback
@@ -4650,7 +5100,89 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "category": classification.get("category", "UNKNOWN"),
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
+        "language": target_language,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
