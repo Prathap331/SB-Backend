@@ -2130,6 +2130,11 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
     try:
         hyde_prompt = f"""
         You are a Semantic Query Expansion Engine for a YouTube documentary research pipeline.
+
+        Topic: "{topic}"
+
+        Task: Write a short, factual, hypothetical passage that could plausibly appear in
+        a document deeply relevant to this topic, for use as a retrieval seed (HyDE).
         ...
         """
         res = await _openai_create_with_timeout(
@@ -2162,8 +2167,6 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
 
         hyde_doc = _cap_hyde_doc_tokens(raw_hyde_doc) if raw_hyde_doc else topic
 
-        # NEW: resolve the table once up front so we can reuse it for both
-        # the initial DB retrieval and the book backfill later.
         try:
             table_name = await select_table_for_topic(topic)
         except Exception as exc:
@@ -2220,10 +2223,8 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
             ideas = []
             topic_summary = ""
 
-        # NEW: web source links, same extraction used by /generate-script
         sources = _extract_source_links(new_articles)
 
-        # NEW: book lookup + backfill, same as /generate-script
         books: list[dict] = []
         try:
             books = await get_books_for_chunks(
@@ -2273,50 +2274,6 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
             "detail": str(e),
             "token_usage": _get_token_usage_summary(),
         }
-
-
-# async def get_structure(content: str) -> dict:
-#     try:
-#         prompt = f"""
-#         You are a strict content classifier.
-
-#         Classify the given content into exactly ONE category.
-
-#         Return ONLY the category name.
-
-#         Categories:
-#         - PHILOSOPHY & IDEAS
-#         - PSYCHOLOGY & BEHAVIOUR
-#         - HISTORY & CIVILISATION
-#         - BIOGRAPHY & LEGACY
-#         - SCIENCE & TECHNOLOGY
-#         - ECONOMICS & SOCIETY
-#         - ANALYSIS & BREAKDOWNS
-#         - NEWS & CONTEMPORARY EVENTS
-#         - THOUGHT LEADERSHIP & DISCUSSION
-#         - MOTIVATIONAL & INSPIRATIONAL
-
-#         Content:
-#         \"\"\"{content}\"\"\"
-#         """
-
-#         response = await _openai_create_with_timeout(
-#             lambda: openai_client.chat.completions.create(
-#                 model="gpt-5.4-mini",
-#                 messages=[
-#                     {"role": "system", "content": "Return only the category name."},
-#                     {"role": "user", "content": prompt},
-#                 ],
-#                 stream=False,
-#             )
-#         )
-#         _record_token_usage("get_structure", response)
-
-#         category = response.choices[0].message.content.strip()
-#         return {"category": category}
-
-#     except Exception as e:
-#         return {"category": "UNKNOWN", "error": str(e)}
 
 
 
