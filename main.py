@@ -4660,7 +4660,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
     total_words = _word_count(script_text) if script_text else 0
     video_length = round(total_words / WORDS_PER_MINUTE) if total_words else 0
-    
+
     structure = _build_structure_response(selected_template)
 
     token_usage = _get_token_usage_summary()
@@ -4833,14 +4833,6 @@ async def search_pexels_videos(request: PexelsVideoSearchRequest):
         "total_results": data.get("total_results", 0),
         "videos": videos,
     }
-
-
-
-
-
-
-
-
 
 
 
@@ -5324,8 +5316,8 @@ async def razorpay_webhook(
                 return {"status": "error", "message": "Missing required order notes."}
 
             plan_config = {
-                'plus': {'credits': 100, 'validity_days': 30},
-                'pro':   {'credits': 200, 'validity_days': 30},
+                'plus': {'credits': 500,  'validity_days': 30},
+                'pro':   {'credits': 1200, 'validity_days': 30},
             }
             config = plan_config.get(target_tier.lower())
             if not config:
@@ -5338,29 +5330,23 @@ async def razorpay_webhook(
             validity_date  = now + datetime.timedelta(days=validity_days)
 
             try:
-                profile_resp = (
-                    supabase.table('user_profiles')
-                    .select('credits_remaining')
-                    .eq('id', user_id)
-                    .single()
-                    .execute()
-                )
-                current_credits = (
-                    profile_resp.data.get('credits_remaining', 0)
-                    if profile_resp.data else 0
-                )
-                new_credits = current_credits + credits_to_add
-
                 update_result = (
                     supabase.table('user_profiles')
-                    .update({'user_tier': target_tier, 'credits_remaining': new_credits})
+                    .update({'user_tier': target_tier, 'credits_remaining': credits_to_add})
                     .eq('id', user_id)
                     .execute()
                 )
                 if update_result.data:
-                    print(f"Updated user {user_id} → tier '{target_tier}', credits {new_credits}.")
+                    updated_row = update_result.data[0]
+                    if (
+                        updated_row.get('credits_remaining') == credits_to_add
+                        and updated_row.get('user_tier') == target_tier
+                    ):
+                        print(f"Confirmed: user {user_id} -> tier '{target_tier}', credits reset to {credits_to_add}.")
+                    else:
+                        print(f"WARN: Update returned mismatched data for {user_id}: {updated_row}")
                 else:
-                    print(f"WARN: Failed to update profile for {user_id} after payment {payment_id}.")
+                    print(f"ERROR: Update affected 0 rows for user {user_id} (payment {payment_id}) - profile may not exist or RLS blocked it.")
 
             except APIError as e:
                 print(f"ERROR: Supabase profiles error for {user_id}: {e}")
@@ -5490,14 +5476,24 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
+    
+
+
+
+
+
+
+
+
+
+
+
 
 
 @app.get('/trending-data')
 def content_radar():
     res = supabase.table("content_radar").select("*").execute()
     return {"message": res.data}
-
-
 
 
 async def run_intelligence_for_user(userId):
