@@ -309,13 +309,6 @@ import trafilatura
 SCRIPTS_UNIVERSAL_TABLE = "scripts_universal"
 
 
-
-
-
-
-
-
-
 SUPPORTED_LANGUAGES = {
     "english": "en",
     "hindi": "hi",
@@ -865,6 +858,7 @@ def to_pgvector(embedding) -> str:
 
 _bge_model = None
 
+from typing import List, Dict, Any
 
 def _get_st_model():
     global _bge_model
@@ -886,16 +880,12 @@ class SaveIdeasRequest(BaseModel):
     userId: str
     topic: str
     topic_summary: str
+    sources: List[Dict[str, Any]] = []
+    books: List[Dict[str, Any]] = []
     ideas: List[Idea]
-
 
 @app.post("/save-ideas")
 async def save_ideas(data: SaveIdeasRequest):
-    print("User ID:", data.userId)
-    print("Topic:", data.topic)
-    print("Topic Summary:", data.topic_summary)
-
-    print("\nIdeas:")
     for i, idea in enumerate(data.ideas, start=1):
         print(f"\n{i}. {idea.title}")
         print(idea.description)
@@ -914,7 +904,10 @@ async def save_ideas(data: SaveIdeasRequest):
     row = {
         "userId": data.userId,
         "topic": data.topic,
+        "topic_summary": data.topic_summary,     
         "ideas": ideas_payload,
+        "sources": data.sources,                
+        "books": data.books,                    
         "topic_embeddings": to_pgvector(topic_embedding),
         "summary_embeddings": to_pgvector(summary_embedding),
     }
@@ -922,7 +915,10 @@ async def save_ideas(data: SaveIdeasRequest):
     try:
         result = supabase.table("saved_ideas").insert(row).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Supabase insert failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase insert failed: {e}"
+        )
 
     return {
         "message": "Ideas received successfully",
@@ -937,7 +933,6 @@ try:
 except Exception as e:
     print(f"[TOKENS] failed to load tiktoken encoding, using fallback estimator: {e}")
     _TIKTOKEN_ENCODING = None
-
 
 def _count_tokens(text_value: str) -> int:
     if not text_value:
