@@ -5510,7 +5510,7 @@ def generate_invoice_pdf(
     elements = []
 
     elements.append(Table(
-        [[Paragraph("<b>StoryBit</b>", brand_style), Paragraph("TAX INVOICE", invoice_label_style)]],
+        [[Paragraph("<b>Storio AI</b>", brand_style), Paragraph("TAX INVOICE", invoice_label_style)]],
         colWidths=[W*0.55, W*0.45],
         style=TableStyle([
             ('VALIGN',        (0,0),(-1,-1),'TOP'),
@@ -5526,7 +5526,7 @@ def generate_invoice_pdf(
         "Flat no. 502, Meenakshi enclave MIG 891",
         "KPHB phase 3, Kukatpally, Hyderabad, 500072",
         "GSTIN: 36AAQCM4860P1ZK",
-        "support@storybit.tech",
+        "support@storio.tech",
     ]:
         elements.append(Paragraph(line, company_info_style))
 
@@ -5598,6 +5598,13 @@ def generate_invoice_pdf(
             Paragraph("", lp()),
             "",
             "",
+            Paragraph("Subtotal", rp(False, colors.HexColor('#555555'))),
+            Paragraph(f"Rs. {base_price:.2f}", rp(False, TEXT_DARK)),
+        ],
+        [
+            Paragraph("", lp()),
+            "",
+            "",
             Paragraph("GST (18%)", rp(False, colors.HexColor('#555555'))),
             Paragraph(f"Rs. {gst_amount:.2f}", rp(False, TEXT_DARK)),
         ],
@@ -5632,19 +5639,28 @@ def generate_invoice_pdf(
         ('ALIGN',         (2,1),(-1,1), 'RIGHT'),
         ('ALIGN',         (3,1),(3,1),  'CENTER'),
         ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
+
         ('SPAN',          (0,2),(2,2)),
         ('BACKGROUND',    (0,2),(-1,2), LIGHT_GRAY),
         ('TOPPADDING',    (0,2),(-1,2), 8),
         ('BOTTOMPADDING', (0,2),(-1,2), 8),
         ('LINEBELOW',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
-        ('LINEABOVE',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
         ('VALIGN',        (0,2),(-1,2), 'MIDDLE'),
-        ('SPAN',          (0,3),(3,3)),
-        ('BACKGROUND',    (0,3),(-1,3), MID_GRAY),
-        ('TOPPADDING',    (0,3),(-1,3), 10),
-        ('BOTTOMPADDING', (0,3),(-1,3), 10),
-        ('LINEBELOW',     (0,3),(-1,3), 1.0, colors.HexColor('#cccccc')),
+
+        ('SPAN',          (0,3),(2,3)),
+        ('BACKGROUND',    (0,3),(-1,3), LIGHT_GRAY),
+        ('TOPPADDING',    (0,3),(-1,3), 8),
+        ('BOTTOMPADDING', (0,3),(-1,3), 8),
+        ('LINEBELOW',     (0,3),(-1,3), 0.5, colors.HexColor('#dddddd')),
         ('VALIGN',        (0,3),(-1,3), 'MIDDLE'),
+
+        ('SPAN',          (0,4),(3,4)),
+        ('BACKGROUND',    (0,4),(-1,4), MID_GRAY),
+        ('TOPPADDING',    (0,4),(-1,4), 10),
+        ('BOTTOMPADDING', (0,4),(-1,4), 10),
+        ('LINEBELOW',     (0,4),(-1,4), 1.0, colors.HexColor('#cccccc')),
+        ('VALIGN',        (0,4),(-1,4), 'MIDDLE'),
+
         ('LEFTPADDING',   (0,0),(-1,-1), 8),
         ('RIGHTPADDING',  (0,0),(-1,-1), 8),
     ])
@@ -5766,18 +5782,6 @@ async def razorpay_webhook(
             validity_date  = now + datetime.timedelta(days=validity_days)
 
             try:
-                profile_resp = (
-                    supabase.table('user_profiles')
-                    .select('credits_remaining')
-                    .eq('id', user_id)
-                    .single()
-                    .execute()
-                )
-                current_credits = (
-                    profile_resp.data.get('credits_remaining', 0)
-                    if profile_resp.data else 0
-                )
-                # new_credits = current_credits + credits_to_add
 
                 update_result = (
                     supabase.table('user_profiles')
