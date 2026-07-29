@@ -278,6 +278,7 @@ async def eci(request: PromptRequest):
 
 
 
+
 import io
 import os
 import re
@@ -539,6 +540,17 @@ def _keyword_to_hashtag(keyword: str) -> str:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
 def _normalize_language(language: str | None) -> str:
     """Validate/normalize whatever the client sent. Falls back to English on
     anything unrecognized so a bad value never breaks the pipeline."""
@@ -691,6 +703,19 @@ async def translate_text_full_pipeline(text_value: str, target_language: str) ->
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 try:
     import tiktoken
 except ImportError:
@@ -804,17 +829,12 @@ HASH_FEATURES = 2**18
 MAX_WEB_SOURCES = 10
 MAX_YOUTUBE_SOURCES = 7
 MAX_DB_CHUNKS = 7
+MAX_SCRIPT_CONTEXT_CHUNKS = 20
 
 MAX_BOOKS = 7
 
-IDEA_HYDE_DOC_COUNT = 5
-CHUNKS_PER_HYDE_DOC = 2
-SOURCES_PER_HYDE_DOC = 2
-
-SEARCH_KEYWORD_COUNT = 10
-
 WEB_CONTENT_SIMILARITY_THRESHOLD = 0.4
-DB_SIMILARITY_THRESHOLD = 0.4
+DB_SIMILARITY_THRESHOLD = 0.5
 
 WORDS_PER_MINUTE = 140
 
@@ -1146,11 +1166,11 @@ Input:
 A short user topic (2-10 words).
 
 Goal:
-Generate exactly 10 high-quality search engine keyword combinations that maximize information retrieval from Google, Bing, academic search engines, and news websites.
+Generate exactly 15 high-quality search engine keyword combinations that maximize information retrieval from Google, Bing, academic search engines, and news websites.
 
 Requirements:
 - Every phrase must incorporate the topic's core subject/entities naturally —
-  do NOT output the raw topic string verbatim as one of the 10 lines by
+  do NOT output the raw topic string verbatim as one of the 15 lines by
   itself; each line must be a distinct EXPANDED search phrase, not a copy of
   the input.
 - Generate search phrases, NOT sentences.
@@ -1161,15 +1181,20 @@ Requirements:
   • timeline
   • root causes
   • stakeholders
-  • government / companies / researchers
-  • statistics / datasets / reports
-  • research papers / expert opinions
+  • government
+  • companies
+  • researchers
+  • statistics
+  • datasets
+  • reports
+  • research papers
+  • expert opinions
   • controversies
   • future trends
 - Include important entities when inferable.
 - Avoid duplicate intent.
 - Each keyword combination should contain 4-10 words.
-- Return ONLY the 10 keyword combinations, nothing else — no preamble, no
+- Return ONLY the 15 keyword combinations, nothing else — no preamble, no
   restating the topic on its own line.
 - Number each result.
 
@@ -1631,229 +1656,6 @@ async def get_context_from_db(
     return matches
 
 
-def _dedup_take_top_n_per_doc(per_doc_lists: list[list[dict]], key_fn, n_per_doc: int) -> list[dict]:
-    """Given a list of already-ranked result lists (one per HyDE doc), take up
-    to n_per_doc items from each list, skipping anything already taken from
-    an earlier doc (dedup by key_fn). This is how we enforce "2 per doc"
-    style caps for both DB chunks and web sources."""
-    merged: list[dict] = []
-    seen_keys = set()
-    for lst in per_doc_lists:
-        taken = 0
-        for item in lst:
-            if taken >= n_per_doc:
-                break
-            key = key_fn(item)
-            if key and key in seen_keys:
-                continue
-            if key:
-                seen_keys.add(key)
-            merged.append(item)
-            taken += 1
-    return merged
-
-
-async def get_db_chunks_multi_hyde(
-    topic: str,
-    hyde_docs: list[str],
-    table_name: str,
-    chunks_per_doc: int = CHUNKS_PER_HYDE_DOC,
-    per_doc_fetch_k: int = 10,
-    per_doc_timeout: float = 20.0,
-    label: str = "DB",
-) -> tuple[list[dict], list[dict]]:
-    """Runs DB retrieval once per HyDE doc, then takes up to `chunks_per_doc`
-    unique chunks from each doc's ranked results. Returns
-    (final_chunks_for_llm, all_unique_chunks_seen)."""
-
-    async def _fetch_one(doc: str) -> list[dict]:
-        try:
-            return await asyncio.wait_for(
-                get_context_from_db(topic, doc, final_k=per_doc_fetch_k, table_name=table_name),
-                timeout=per_doc_timeout,
-            )
-        except asyncio.TimeoutError:
-            print(f"[{label}] per-doc retrieval timed out after {per_doc_timeout}s")
-            return []
-        except Exception as e:
-            print(f"[{label}] per-doc retrieval failed: {e}")
-            return []
-
-    per_doc_results = await asyncio.gather(*[_fetch_one(doc) for doc in hyde_docs])
-
-    all_chunks_seen: list[dict] = []
-    seen_all = set()
-    for doc_results in per_doc_results:
-        for item in doc_results:
-            key = item.get("md5") or item.get("content")
-            if key and key not in seen_all:
-                seen_all.add(key)
-                all_chunks_seen.append(item)
-
-    final_chunks = _dedup_take_top_n_per_doc(
-        per_doc_results,
-        key_fn=lambda item: item.get("md5") or item.get("content"),
-        n_per_doc=chunks_per_doc,
-    )
-
-    target_total = len(hyde_docs) * chunks_per_doc
-
-    print(
-        f"[{label}] final combined chunks: {len(final_chunks)} "
-        f"(target {target_total} = {chunks_per_doc}/doc across "
-        f"{len(hyde_docs)} doc(s)), {len(all_chunks_seen)} unique chunk(s) seen in total"
-    )
-
-    for i, doc_results in enumerate(per_doc_results, start=1):
-        print(f"[VERIFY][{label}] doc[{i}] raw candidates retrieved: {len(doc_results)}")
-
-    if len(final_chunks) == target_total:
-        status = "PASS"
-    elif len(final_chunks) < target_total:
-        status = "WARN (fewer chunks available than target — DB likely doesn't have enough matches)"
-    else:
-        status = "FAIL (more chunks than target, dedup/cap logic bug)"
-    print(
-        f"[VERIFY][{label}] db_chunk_count: got={len(final_chunks)} target={target_total} "
-        f"({chunks_per_doc}/doc x {len(hyde_docs)} docs) status={status}"
-    )
-
-    return final_chunks, all_chunks_seen
-
-
-async def get_web_sources_multi_hyde(
-    topic: str,
-    scraped_urls: set,
-    hyde_docs: list[str],
-    keywords: list[str],
-    search_fn=None,
-    max_results_per_keyword: int = 10,
-    similarity_threshold: float = WEB_CONTENT_SIMILARITY_THRESHOLD,
-    sources_per_doc: int = SOURCES_PER_HYDE_DOC,
-    label: str = "DDGS",
-) -> list[dict]:
-    """Searches the web once using the given keyword list, scores every
-    fetched article against EACH HyDE doc's embedding, assigns each article
-    to its best-matching HyDE doc, and then takes up to `sources_per_doc`
-    top-scoring articles per doc. This is the "2 per doc" rule applied to
-    web sources, mirroring get_db_chunks_multi_hyde."""
-
-    if search_fn is None:
-        search_fn = _ddgs_search_for_script
-
-    print(f"[{label}] Starting news search for topic: '{topic}' across {len(hyde_docs)} hyde doc angle(s)")
-
-    model = _get_st_model()
-    hyde_embeddings = await _run_encode(
-        lambda: model.encode(hyde_docs, normalize_embeddings=True, convert_to_numpy=True)
-    )
-
-    target_total = len(hyde_docs) * sources_per_doc
-    candidate_pool_cap = max(target_total * 5, target_total + 10)
-
-    candidate_articles: list[dict] = []
-
-    for keyword in keywords:
-        if len(candidate_articles) >= candidate_pool_cap:
-            print(f"[{label}] candidate pool cap ({candidate_pool_cap}) reached, stopping keyword search")
-            break
-
-        try:
-            pairs = await _run_scrape(search_fn, keyword, max_results_per_keyword)
-            print(f"[{label}] keyword '{keyword}' returned {len(pairs)} results")
-        except Exception as e:
-            print(f"[{label}] thread failed for '{keyword}': {e}")
-            pairs = []
-
-        for url, snippet in pairs:
-            if len(candidate_articles) >= candidate_pool_cap:
-                break
-            if url in scraped_urls:
-                continue
-            scraped_urls.add(url)
-
-            full_text = await _fetch_full_article_text_with_timeout(url)
-            used_source = "full" if full_text else "fallback"
-            content = full_text if full_text else snippet
-            if not content:
-                print(f"[{label}] SKIP (empty content, nothing to compare) {url}")
-                continue
-
-            content = _truncate_words(content, max_words=600)
-            chunks = _split_into_chunks(content, max_words_per_chunk=40)
-            if not chunks:
-                print(f"[{label}] SKIP (no chunks to compare) {url}")
-                continue
-
-            try:
-                chunk_embeddings = await _run_encode(
-                    lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
-                )
-            except Exception as e:
-                print(f"[{label}] SKIP (embedding failed: {e}) {url}")
-                continue
-
-            # chunks x hyde_docs similarity matrix
-            sim_matrix = np.dot(chunk_embeddings, hyde_embeddings.T)
-            best_per_doc = sim_matrix.max(axis=0)
-            best_doc_idx = int(np.argmax(best_per_doc))
-            best_sim = float(best_per_doc[best_doc_idx])
-
-            if best_sim < similarity_threshold:
-                continue
-
-            doc_sims = sim_matrix[:, best_doc_idx]
-            picked = [(chunk, float(s)) for chunk, s in zip(chunks, doc_sims) if s >= similarity_threshold]
-            if not picked:
-                continue
-            picked.sort(key=lambda p: p[1], reverse=True)
-            picked_text = _truncate_words(" ".join(c for c, _ in picked), max_words=200)
-
-            candidate_articles.append({
-                "url": url,
-                "snippet": picked_text,
-                "source": used_source,
-                "similarity": best_sim,
-                "best_doc_idx": best_doc_idx,
-                "picked_passage_count": len(picked),
-                "total_passage_count": len(chunks),
-            })
-
-    by_doc: dict[int, list[dict]] = {}
-    for art in candidate_articles:
-        by_doc.setdefault(art["best_doc_idx"], []).append(art)
-
-    final_articles: list[dict] = []
-    for idx in range(len(hyde_docs)):
-        group = sorted(by_doc.get(idx, []), key=lambda a: a["similarity"], reverse=True)
-        final_articles.extend(group[:sources_per_doc])
-        print(f"[VERIFY][{label}] doc[{idx + 1}] candidates={len(by_doc.get(idx, []))} taken={min(len(group), sources_per_doc)}")
-
-    for art in final_articles:
-        art.pop("best_doc_idx", None)
-
-    final_articles.sort(key=lambda a: a["similarity"], reverse=True)
-
-    print(
-        f"[{label}] selected {len(final_articles)} article(s) "
-        f"(target {target_total} = {sources_per_doc}/doc across {len(hyde_docs)} doc(s))"
-    )
-
-    if len(final_articles) == target_total:
-        status = "PASS"
-    elif len(final_articles) < target_total:
-        status = "WARN (fewer sources available than target — web search didn't surface enough matches)"
-    else:
-        status = "FAIL (more sources than target, grouping/cap logic bug)"
-    print(
-        f"[VERIFY][{label}] web_source_count: got={len(final_articles)} target={target_total} "
-        f"({sources_per_doc}/doc x {len(hyde_docs)} docs) status={status}, "
-        f"{len(candidate_articles)} total candidate(s) scored before selection"
-    )
-
-    return final_articles
-
-
 def _ddgs_search_for_ideas(keyword: str, max_results: int) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
     try:
@@ -1903,7 +1705,7 @@ async def _generate_search_keywords(topic: str) -> list[str]:
 
     topic_normalized = topic.strip().lower()
     keywords = [kw for kw in keywords if kw.strip().lower() != topic_normalized]
-    keywords = keywords[:SEARCH_KEYWORD_COUNT]
+    keywords = keywords[:15]
 
     if not keywords:
         print("[DDGS] keyword generation returned nothing usable, using fallback")
@@ -1912,12 +1714,6 @@ async def _generate_search_keywords(topic: str) -> list[str]:
     print(f"[DDGS] generated {len(keywords)} keywords")
     for i, kw in enumerate(keywords, start=1):
         print(f"  [KW-{i}] {kw}")
-
-    ok = len(keywords) == SEARCH_KEYWORD_COUNT
-    print(
-        f"[VERIFY][IDEAS] keyword_count: got={len(keywords)} target={SEARCH_KEYWORD_COUNT} "
-        f"status={'PASS' if ok else 'FAIL (LLM returned a different count than requested)'}"
-    )
 
     return keywords
 
@@ -2062,6 +1858,102 @@ async def _generate_youtube_search_keywords(topic: str, description: str = "") -
         return [topic]
 
 
+async def get_ddgs_news_context(
+    topic: str,
+    scraped_urls: set,
+    hyde_doc: str,
+    max_results: int = 10,
+    similarity_threshold: float = WEB_CONTENT_SIMILARITY_THRESHOLD,
+) -> list[dict]:
+
+    print(f"[DDGS] Starting news search for topic: '{topic}'")
+
+    keywords = await _generate_web_search_keywords(topic)
+
+    model = _get_st_model()
+
+    hyde_embedding = await _run_encode(
+        lambda: model.encode(hyde_doc, normalize_embeddings=True, convert_to_numpy=True)
+    )
+
+    articles = []
+    for keyword in keywords:
+        if len(articles) >= MAX_WEB_SOURCES:
+            print(f"[DDGS] Reached cap of {MAX_WEB_SOURCES} sources, stopping further keyword searches")
+            break
+
+        try:
+            pairs = await _run_scrape(_ddgs_search_for_ideas, keyword, max_results)
+            print(f"[DDGS] keyword '{keyword}' returned {len(pairs)} results")
+        except Exception as e:
+            print(f"[DDGS] thread failed for '{keyword}': {e}")
+            pairs = []
+
+        for url, snippet in pairs:
+            if len(articles) >= MAX_WEB_SOURCES:
+                break
+            if url in scraped_urls:
+                continue
+            scraped_urls.add(url)
+
+            full_text = await _fetch_full_article_text_with_timeout(url)
+            used_source = "full" if full_text else "fallback"
+            content = full_text if full_text else snippet
+
+            if not content:
+                print(f"[DDGS] SKIP (empty content, nothing to compare) {url}")
+                continue
+
+            content = _truncate_words(content, max_words=600)
+
+            chunks = _split_into_chunks(content, max_words_per_chunk=40)
+            if not chunks:
+                print(f"[DDGS] SKIP (no chunks to compare) {url}")
+                continue
+
+            try:
+                chunk_embeddings = await _run_encode(
+                    lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
+                )
+            except Exception as e:
+                print(f"[DDGS] SKIP (embedding failed: {e}) {url}")
+                continue
+
+            chunk_similarities = np.dot(chunk_embeddings, hyde_embedding)
+
+            picked = [
+                (chunk, float(sim))
+                for chunk, sim in zip(chunks, chunk_similarities)
+                if sim >= similarity_threshold
+            ]
+
+            if not picked:
+                best_sim = float(np.max(chunk_similarities)) if len(chunk_similarities) else 0.0
+                print(
+                    f"[DDGS] SKIP (no passage cleared threshold, "
+                    f"best_sim={best_sim:.4f} < {similarity_threshold}, "
+                    f"{len(chunks)} passage(s) checked) {url}"
+                )
+                continue
+
+            picked.sort(key=lambda p: p[1], reverse=True)
+
+            picked_text = _truncate_words(" ".join(chunk for chunk, _ in picked), max_words=200)
+            overall_similarity = picked[0][1]
+
+            articles.append({
+                "url": url,
+                "snippet": picked_text,
+                "source": used_source,
+                "similarity": overall_similarity,
+                "picked_passage_count": len(picked),
+                "total_passage_count": len(chunks),
+            })
+
+    articles.sort(key=lambda a: a["similarity"], reverse=True)
+    return articles
+
+
 SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE = """You are a Search Query Expansion Engine for automated web crawling.
 
 Input:
@@ -2080,7 +1972,7 @@ Script Template Segments:
 {segments_block}
 
 Goal:
-Generate exactly 10 high-quality search engine keyword combinations that
+Generate exactly 15 high-quality search engine keyword combinations that
 maximize information retrieval from Google, Bing, academic search engines,
 and news websites, to gather source material for writing this script. Use
 the segment structure and template purpose above to make sure the keywords
@@ -2089,7 +1981,7 @@ idea title in isolation.
 
 Requirements:
 - Every phrase must incorporate the topic's core subject/entities naturally —
-  do NOT output the raw title string verbatim as one of the 10 lines by
+  do NOT output the raw title string verbatim as one of the 15 lines by
   itself; each line must be a distinct EXPANDED search phrase, not a copy of
   the input.
 - Generate search phrases, NOT sentences.
@@ -2100,16 +1992,21 @@ Requirements:
   • timeline
   • root causes
   • stakeholders
-  • government / companies / researchers
-  • statistics / datasets / reports
-  • research papers / expert opinions
+  • government
+  • companies
+  • researchers
+  • statistics
+  • datasets
+  • reports
+  • research papers
+  • expert opinions
   • controversies
   • future trends
 - Include important entities when inferable from the title, description, or
   template segments.
 - Avoid duplicate intent.
 - Each keyword combination should contain 4-10 words.
-- Return ONLY the 10 keyword combinations, nothing else — no preamble, no
+- Return ONLY the 15 keyword combinations, nothing else — no preamble, no
   restating the title on its own line.
 - Number each result.
 """
@@ -2185,7 +2082,7 @@ async def _generate_search_keywords_for_script(
 
     title_normalized = (title or "").strip().lower()
     keywords = [kw for kw in keywords if kw.strip().lower() != title_normalized]
-    keywords = keywords[:SEARCH_KEYWORD_COUNT]
+    keywords = keywords[:15]
 
     if not keywords:
         print("[DDGS-SCRIPT] keyword generation returned nothing usable, using fallback")
@@ -2198,16 +2095,113 @@ async def _generate_search_keywords_for_script(
     for i, kw in enumerate(keywords, start=1):
         print(f"  [KW-SCRIPT-{i}] {kw}")
 
-    ok = len(keywords) == SEARCH_KEYWORD_COUNT
-    print(
-        f"[VERIFY][SCRIPT] keyword_count: got={len(keywords)} target={SEARCH_KEYWORD_COUNT} "
-        f"status={'PASS' if ok else 'FAIL (LLM returned a different count than requested)'}"
-    )
-
     if cache is not None:
         cache[cache_key] = keywords
 
     return keywords
+
+
+async def get_ddgs_news_context_for_script(
+    topic: str,
+    scraped_urls: set,
+    hyde_doc: str,
+    max_results: int = 10,
+    similarity_threshold: float = WEB_CONTENT_SIMILARITY_THRESHOLD,
+    keywords: list[str] | None = None,
+) -> list[dict]:
+
+    print(f"[DDGS-SCRIPT] Starting news search for topic: '{topic}' (similarity_threshold={similarity_threshold})")
+
+    if keywords is None:
+        # Fallback path — no pre-generated keywords supplied, so we only have
+        # the plain topic string to work with (no description/template/time).
+        keywords = await _generate_search_keywords_for_script(topic, "", {}, 0)
+    else:
+        print(f"[DDGS-SCRIPT] reusing {len(keywords)} previously generated keyword(s) — skipping keyword regeneration")
+
+    model = _get_st_model()
+
+    hyde_embedding = await _run_encode(
+        lambda: model.encode(hyde_doc, normalize_embeddings=True, convert_to_numpy=True)
+    )
+
+    articles = []
+    for keyword in keywords:
+        if len(articles) >= MAX_WEB_SOURCES:
+            print(f"[DDGS-SCRIPT] Reached cap of {MAX_WEB_SOURCES} sources, stopping further keyword searches")
+            break
+
+        try:
+            pairs = await _run_scrape(_ddgs_search_for_script, keyword, max_results)
+            print(f"[DDGS-SCRIPT] keyword '{keyword}' returned {len(pairs)} results")
+        except Exception as e:
+            print(f"[DDGS-SCRIPT] thread failed for '{keyword}': {e}")
+            pairs = []
+
+        for url, snippet in pairs:
+            if len(articles) >= MAX_WEB_SOURCES:
+                break
+            if url in scraped_urls:
+                continue
+            scraped_urls.add(url)
+
+            full_text = await _fetch_full_article_text_with_timeout(url)
+            used_source = "full" if full_text else "fallback"
+            content = full_text if full_text else snippet
+
+            if not content:
+                print(f"[DDGS-SCRIPT] SKIP (empty content, nothing to compare) {url}")
+                continue
+
+            content = _truncate_words(content, max_words=600)
+
+            chunks = _split_into_chunks(content, max_words_per_chunk=40)
+            if not chunks:
+                print(f"[DDGS-SCRIPT] SKIP (no chunks to compare) {url}")
+                continue
+
+            try:
+                chunk_embeddings = await _run_encode(
+                    lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
+                )
+            except Exception as e:
+                print(f"[DDGS-SCRIPT] SKIP (embedding failed: {e}) {url}")
+                continue
+
+            chunk_similarities = np.dot(chunk_embeddings, hyde_embedding)
+
+            picked = [
+                (chunk, float(sim))
+                for chunk, sim in zip(chunks, chunk_similarities)
+                if sim >= similarity_threshold
+            ]
+
+            if not picked:
+                best_sim = float(np.max(chunk_similarities)) if len(chunk_similarities) else 0.0
+                print(
+                    f"[DDGS-SCRIPT] SKIP (no passage cleared threshold, "
+                    f"best_sim={best_sim:.4f} < {similarity_threshold}, "
+                    f"{len(chunks)} passage(s) checked) {url}"
+                )
+                continue
+
+            picked.sort(key=lambda p: p[1], reverse=True)
+
+            picked_text = _truncate_words(" ".join(chunk for chunk, _ in picked), max_words=200)
+            overall_similarity = picked[0][1]
+
+            articles.append({
+                "url": url,
+                "snippet": picked_text,
+                "source": used_source,
+                "similarity": overall_similarity,
+                "picked_passage_count": len(picked),
+                "total_passage_count": len(chunks),
+            })
+
+    articles.sort(key=lambda a: a["similarity"], reverse=True)
+    return articles
+
 
 
 def _youtube_api_video_details(video_ids: list[str]) -> dict[str, dict]:
@@ -2540,103 +2534,6 @@ async def generate_ideas_endpoint(
 
 
 
-IDEA_HYDE_ANGLES = [
-    {
-        "label": "historical background",
-        "instruction": (
-            "Focus specifically on the historical background, origins, and "
-            "evolution of this topic over time."
-        ),
-    },
-    {
-        "label": "current landscape",
-        "instruction": (
-            "Focus specifically on the current landscape right now: the key "
-            "people, organizations, and stakeholders involved in this topic."
-        ),
-    },
-    {
-        "label": "statistics and facts",
-        "instruction": (
-            "Focus specifically on concrete statistics, data points, and "
-            "factual specifics relevant to this topic."
-        ),
-    },
-    {
-        "label": "controversies and debates",
-        "instruction": (
-            "Focus specifically on controversies, conflicts, ethical debates, "
-            "and differing perspectives surrounding this topic."
-        ),
-    },
-    {
-        "label": "future implications",
-        "instruction": (
-            "Focus specifically on future implications, emerging trends, and "
-            "predictions related to this topic."
-        ),
-    },
-]
-
-
-async def generate_hyde_doc_for_idea_angle(topic: str, angle: dict) -> str:
-    hyde_prompt = f"""
-            You are a Semantic Query Expansion Engine for a YouTube documentary
-            research pipeline.
-
-            Topic: "{topic}"
-
-            {angle['instruction']}
-
-            Task: Write a short, factual, hypothetical passage that could
-            plausibly appear in a document deeply relevant to this angle of the
-            topic, for use as a retrieval seed (HyDE). Be concrete and
-            information-dense, including key terms a search/embedding system
-            would match against. Do not write in a narrative tone — this is a
-            retrieval seed document, not the script itself.
-
-            Output only the passage, nothing else — no preamble, no headings.
-
-            STRICT LENGTH LIMIT: the passage must be under {HYDE_MAX_TOKENS}
-            tokens (roughly 35-50 words). Do not exceed this under any
-            circumstances.
-""".strip()
-
-    doc, was_hard_trimmed = await _generate_length_constrained_hyde(
-        client=openai_client,
-        model="gpt-5.4-mini",
-        prompt=hyde_prompt,
-        label=f"HYDE-IDEA[{angle['label']}]",
-    )
-
-    if not doc:
-        print(f"[HYDE-IDEA] angle '{angle['label']}' fell back to topic")
-        return topic
-
-    if was_hard_trimmed:
-        print(f"[HYDE-IDEA] angle '{angle['label']}' had to hard-trim as a fallback")
-
-    return _cap_hyde_doc_tokens(doc)
-
-
-async def generate_hyde_docs_for_ideas(topic: str) -> list[str]:
-    """Always generates exactly IDEA_HYDE_DOC_COUNT (5) HyDE docs, one per
-    fixed research angle, in parallel."""
-    docs = await asyncio.gather(
-        *[generate_hyde_doc_for_idea_angle(topic, angle) for angle in IDEA_HYDE_ANGLES]
-    )
-    docs = [d for d in docs if d] or [topic]
-    print(f"[HYDE-IDEA] generated {len(docs)} hyde doc(s) for ideas (target {IDEA_HYDE_DOC_COUNT})")
-    ok = len(docs) == IDEA_HYDE_DOC_COUNT
-    print(
-        f"[VERIFY][IDEAS] hyde_doc_count: got={len(docs)} target={IDEA_HYDE_DOC_COUNT} "
-        f"status={'PASS' if ok else 'FAIL (fell back to fewer docs than required)'}"
-    )
-    for i, d in enumerate(docs, start=1):
-        print(f"[VERIFY][IDEAS] hyde_doc[{i}] ({_count_tokens(d)} tok est.): {d[:160]}{'...' if len(d) > 160 else ''}")
-    return docs
-
-
 async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
     _start_token_tracking()
 
@@ -2646,9 +2543,44 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
         raise HTTPException(status_code=400, detail="topic must be a non-empty string")
 
     try:
-        # 1) Always generate exactly 5 fixed-angle HyDE docs for this topic.
-        hyde_docs = await generate_hyde_docs_for_ideas(topic)
-        combined_hyde_doc = "\n\n".join(hyde_docs)
+        hyde_prompt = f"""
+        You are a Semantic Query Expansion Engine for a YouTube documentary research pipeline.
+
+        Topic: "{topic}"
+
+        Task: Write a short, factual, hypothetical passage that could plausibly appear in
+        a document deeply relevant to this topic, for use as a retrieval seed (HyDE).
+        ...
+        """
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": hyde_prompt}],
+                max_completion_tokens=400,
+                stream=False,
+            )
+        )
+        _record_token_usage("generate-ideas HYDE (initial)", res)
+
+        raw_hyde_doc = (res.choices[0].message.content or "").strip()
+
+        if not raw_hyde_doc:
+            try:
+                retry_res = await _openai_create_with_timeout(
+                    lambda: openai_client.chat.completions.create(
+                        model="gpt-5.4-mini",
+                        messages=[{"role": "user", "content": hyde_prompt}],
+                        max_completion_tokens=1500,
+                        stream=False,
+                    )
+                )
+                _record_token_usage("generate-ideas HYDE (retry)", retry_res)
+                raw_hyde_doc = (retry_res.choices[0].message.content or "").strip()
+            except Exception as retry_exc:
+                print(f"[HYDE] retry call raised: {retry_exc}")
+                raw_hyde_doc = ""
+
+        hyde_doc = _cap_hyde_doc_tokens(raw_hyde_doc) if raw_hyde_doc else topic
 
         try:
             table_name = await select_table_for_topic(topic)
@@ -2656,56 +2588,38 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
             print(f"[MAIN] table selection failed, defaulting to {TABLES[0]}: {exc}")
             table_name = TABLES[0]
 
-        # 2) DB chunks: up to 2 per HyDE doc -> target 5*2 = 10 chunks total.
         db_task = asyncio.create_task(
-            get_db_chunks_multi_hyde(
-                topic, hyde_docs, table_name,
-                chunks_per_doc=CHUNKS_PER_HYDE_DOC, label="DB-IDEA",
-            )
+            get_context_from_db(topic, hyde_doc, table_name=table_name)
         )
-        similar_task = asyncio.create_task(get_similar_saved_ideas(topic, combined_hyde_doc))
+        similar_task = asyncio.create_task(get_similar_saved_ideas(topic, hyde_doc))
 
-        done, pending = await asyncio.wait({db_task}, timeout=25)
+        done, pending = await asyncio.wait({db_task}, timeout=11)
 
-        db_results: list[dict] = []
-        all_db_chunks_seen: list[dict] = []
-        new_articles: list[dict] = []
+        db_results = []
+        new_articles = []
         scraped_urls = set()
 
         if db_task in done:
             try:
-                db_results, all_db_chunks_seen = db_task.result()
+                db_results = db_task.result()
             except Exception as e:
                 print(f"[MAIN] DB task raised an error: {e}")
-                db_results, all_db_chunks_seen = [], []
+                db_results = []
 
-        # 3) Generate exactly 10 search keywords once for this topic.
         try:
-            idea_keywords = await _generate_search_keywords(topic)
-        except Exception as exc:
-            print(f"[MAIN] idea keyword generation failed: {exc}")
-            idea_keywords = [f"{topic} latest news today", f"{topic} 2026 update"]
-
-        # 4) Web sources: up to 2 per HyDE doc -> target 5*2 = 10 sources total.
-        try:
-            new_articles = await get_web_sources_multi_hyde(
-                topic, scraped_urls, hyde_docs, idea_keywords,
-                search_fn=_ddgs_search_for_ideas,
-                sources_per_doc=SOURCES_PER_HYDE_DOC,
-                label="DDGS-IDEA",
-            )
+            new_articles = await get_ddgs_news_context(topic, scraped_urls, hyde_doc)
         except Exception as exc:
             print(f"[MAIN] web search (DDGS) failed: {exc}")
             new_articles = []
 
         if not db_results and db_task not in done:
             try:
-                db_results, all_db_chunks_seen = await asyncio.wait_for(asyncio.shield(db_task), timeout=8)
+                db_results = await asyncio.wait_for(asyncio.shield(db_task), timeout=5)
             except asyncio.TimeoutError:
-                db_results, all_db_chunks_seen = [], []
+                db_results = []
             except Exception as e:
                 print(f"[MAIN] DB task raised an error on late check: {e}")
-                db_results, all_db_chunks_seen = [], []
+                db_results = []
 
         try:
             similar_saved_ideas = await asyncio.wait_for(similar_task, timeout=5)
@@ -2729,7 +2643,7 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
         books: list[dict] = []
         try:
             books = await get_books_for_chunks(
-                all_db_chunks_seen, topic_text=topic, script_text=""
+                db_results, topic_text=topic, script_text=""
             )
 
             if len(books) < MAX_BOOKS:
@@ -2737,12 +2651,12 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
                     f"[MAIN] Only {len(books)}/{MAX_BOOKS} real book(s) found from the "
                     f"initial chunk pool (ideas) — widening DB search to try to reach {MAX_BOOKS}."
                 )
-                known_md5s = {r.get("md5") for r in all_db_chunks_seen if r.get("md5")}
+                known_md5s = {r.get("md5") for r in db_results if r.get("md5")}
                 books = await _backfill_books_to_target(
                     books,
                     known_md5s,
                     topic,
-                    combined_hyde_doc,
+                    hyde_doc,
                     table_name,
                     target_count=MAX_BOOKS,
                 )
@@ -2751,17 +2665,6 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
             import traceback
             traceback.print_exc()
             books = []
-
-        idea_db_target = IDEA_HYDE_DOC_COUNT * CHUNKS_PER_HYDE_DOC
-        idea_web_target = IDEA_HYDE_DOC_COUNT * SOURCES_PER_HYDE_DOC
-        print(
-            f"[VERIFY][IDEAS][SUMMARY] topic='{topic}' "
-            f"hyde_docs={len(hyde_docs)}/{IDEA_HYDE_DOC_COUNT} "
-            f"keywords={len(idea_keywords)}/{SEARCH_KEYWORD_COUNT} "
-            f"db_chunks_to_llm={len(db_results)}/{idea_db_target} "
-            f"web_sources_to_llm={len(new_articles)}/{idea_web_target} "
-            f"ideas_generated={len(ideas)}/10"
-        )
 
         token_usage = _get_token_usage_summary()
 
@@ -3381,19 +3284,11 @@ async def _backfill_sources_to_target(
     new_articles: list[dict],
     scraped_urls: set,
     title: str,
-    hyde_docs: list[str],
+    hyde_doc: str,
     keywords: list[str] | None = None,
     target_count: int = MAX_WEB_SOURCES,
     max_rounds: int = 8,
-    search_fn=None,
-    sources_per_doc: int = SOURCES_PER_HYDE_DOC,
-    label: str = "BACKFILL",
 ) -> list[dict]:
-
-    if isinstance(hyde_docs, str):
-        hyde_docs = [hyde_docs]
-    if search_fn is None:
-        search_fn = _ddgs_search_for_script
 
     def _existing_urls() -> set:
         return {a.get("url") for a in new_articles if a.get("url")}
@@ -3405,13 +3300,8 @@ async def _backfill_sources_to_target(
 
         if round_num == 1:
             try:
-                relaxed = await get_web_sources_multi_hyde(
-                    title, scraped_urls, hyde_docs,
-                    keywords=keywords or [title],
-                    search_fn=search_fn,
-                    similarity_threshold=0.0,
-                    sources_per_doc=max(sources_per_doc, target_count),
-                    label=label,
+                relaxed = await get_ddgs_news_context_for_script(
+                    title, scraped_urls, hyde_doc, similarity_threshold=0.0, keywords=keywords,
                 )
             except Exception as e:
                 print(f"[MAIN] sources backfill round {round_num} failed: {e}")
@@ -3452,7 +3342,7 @@ async def _backfill_sources_to_target(
                 if _unique_url_count(new_articles) >= target_count:
                     break
                 try:
-                    pairs = await _run_scrape(search_fn, query, 20)
+                    pairs = await _run_scrape(_ddgs_search_for_script, query, 20)
                 except Exception as e:
                     print(f"[MAIN] sources backfill generic query '{query}' failed: {e}")
                     continue
@@ -4982,22 +4872,42 @@ async def _generate_script_impl(request: "ScriptRequest"):
         traceback.print_exc()
 
     try:
-        # DB chunks: up to CHUNKS_PER_HYDE_DOC (2) per HyDE doc -> target
-        # num_docs * 2 chunks total land in the final script-writing context.
-        db_results, all_db_chunks_seen = await get_db_chunks_multi_hyde(
-            topic_text, hyde_documents, table_name,
-            chunks_per_doc=CHUNKS_PER_HYDE_DOC, label="DB-SCRIPT",
+        db_results_per_doc = await asyncio.gather(
+            *[get_context_with_timeout(topic_text, doc, table_name=table_name) for doc in hyde_documents]
         )
-        for item in all_db_chunks_seen:
-            md5_val = item.get("md5")
-            if md5_val:
-                all_db_md5s_seen.add(md5_val)
+
+        seen_md5_all = set()
+        for doc_results in db_results_per_doc:
+            for item in doc_results:
+                key = item.get("md5") or item.get("content")
+                if key and key not in seen_md5_all:
+                    seen_md5_all.add(key)
+                    all_db_chunks_seen.append(item)
+                    md5_val = item.get("md5")
+                    if md5_val:
+                        all_db_md5s_seen.add(md5_val)
+
+        db_results = []
+        seen_md5_context = set()
+        max_len = max((len(d) for d in db_results_per_doc), default=0)
+        round_idx = 0
+        while len(db_results) < MAX_SCRIPT_CONTEXT_CHUNKS and round_idx < max_len:
+            for doc_results in db_results_per_doc:
+                if len(db_results) >= MAX_SCRIPT_CONTEXT_CHUNKS:
+                    break
+                if round_idx >= len(doc_results):
+                    continue
+                item = doc_results[round_idx]
+                key = item.get("md5") or item.get("content")
+                if key and key not in seen_md5_context:
+                    seen_md5_context.add(key)
+                    db_results.append(item)
+            round_idx += 1
 
         print(
             f"[MAIN] Combined DB context: {len(db_results)} unique chunk(s) "
-            f"(target {len(hyde_documents) * CHUNKS_PER_HYDE_DOC} = "
-            f"{CHUNKS_PER_HYDE_DOC}/doc across {len(hyde_documents)} HyDE doc(s), "
-            f"target >= {DB_SIMILARITY_THRESHOLD} similarity). "
+            f"(round-robin across {len(hyde_documents)} HyDE doc(s), capped at "
+            f"{MAX_SCRIPT_CONTEXT_CHUNKS}, target >= {DB_SIMILARITY_THRESHOLD} similarity). "
             f"{len(all_db_chunks_seen)} unique chunk(s) seen in total across all docs "
             f"(used for book lookups)."
         )
@@ -5017,38 +4927,28 @@ async def _generate_script_impl(request: "ScriptRequest"):
         print(f"--- script search keyword generation failed: {exc} ---")
         script_search_keywords = [f"{request.title} latest news today", f"{request.title} 2026 update"]
 
-    # Web sources: up to SOURCES_PER_HYDE_DOC (2) per HyDE doc -> target
-    # num_docs * 2 sources total land in the final script-writing context.
-    script_web_target = len(hyde_documents) * SOURCES_PER_HYDE_DOC
-
     try:
         print("[MAIN] Performing web search (script-specific DDGS pipeline, reusing the keywords above).")
-        new_articles = await get_web_sources_multi_hyde(
-            request.title, scraped_urls, hyde_documents, script_search_keywords,
-            search_fn=_ddgs_search_for_script,
-            sources_per_doc=SOURCES_PER_HYDE_DOC,
-            label="DDGS-SCRIPT",
+        new_articles = await get_ddgs_news_context_for_script(
+            request.title, scraped_urls, combined_hyde_doc, keywords=script_search_keywords,
         )
 
         unique_source_count = _unique_url_count(new_articles)
-        if unique_source_count < script_web_target:
+        if unique_source_count < MAX_WEB_SOURCES:
             print(
                 f"[MAIN] Only {unique_source_count} unique source URL(s) found, "
-                f"running multi-round backfill to reach the target {script_web_target}."
+                f"running multi-round backfill to reach the compulsory {MAX_WEB_SOURCES}."
             )
             try:
                 new_articles = await _backfill_sources_to_target(
-                    new_articles, scraped_urls, request.title, hyde_documents,
+                    new_articles, scraped_urls, request.title, combined_hyde_doc,
                     keywords=script_search_keywords,
-                    target_count=script_web_target,
-                    search_fn=_ddgs_search_for_script,
-                    sources_per_doc=SOURCES_PER_HYDE_DOC,
-                    label="BACKFILL-SCRIPT",
+                    target_count=MAX_WEB_SOURCES,
                 )
             except Exception as backfill_exc:
                 print(f"[MAIN] sources backfill failed: {backfill_exc}")
 
-        print(f"[MAIN] Final unique source count: {_unique_url_count(new_articles)}/{script_web_target}")
+        print(f"[MAIN] Final unique source count: {_unique_url_count(new_articles)}/{MAX_WEB_SOURCES}")
     except Exception as exc:
         print(f"--- web search (DDGS) failed: {exc} ---")
         import traceback
@@ -5135,17 +5035,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
     total_words = _word_count(script_text) if script_text else 0
 
-    script_db_target = len(hyde_documents) * CHUNKS_PER_HYDE_DOC
-    script_web_target_final = len(hyde_documents) * SOURCES_PER_HYDE_DOC
-    print(
-        f"[VERIFY][SCRIPT][SUMMARY] title='{request.title}' time={request.time}min "
-        f"hyde_docs={len(hyde_documents)} (expected ceil({request.time}/2)={num_docs}) "
-        f"keywords={len(script_search_keywords)}/{SEARCH_KEYWORD_COUNT} "
-        f"db_chunks_to_llm={len(db_results)}/{script_db_target} "
-        f"web_sources_to_llm={len(new_articles)}/{script_web_target_final} "
-        f"total_words={total_words}"
-    )
-
     token_usage = _get_token_usage_summary()
 
     print(f"Total time so far: {time.time() - total_start_time:.2f}s")
@@ -5178,17 +5067,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
-
-
-
 
 
 
