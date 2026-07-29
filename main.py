@@ -5564,7 +5564,7 @@ def generate_invoice_pdf(
     # gst_amount  = round(grand_total - base_price, 2)
 
     base_price  = amount / 1.18
-    gst_amount  = base_price * 1.18
+    gst_amount  = base_price * 0.18
     grand_total = base_price + gst_amount
 
 
