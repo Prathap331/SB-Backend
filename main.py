@@ -4628,11 +4628,6 @@ async def _deduct_thumbnail_credits(user_id: str, amount: int = THUMBNAIL_CREDIT
     await _deduct_credits_for_action(user_id, amount, action_label="thumbnail")
 
 
-async def _deduct_script_credits(user_id: str, minutes: float):
-    amount = max(0, round(float(minutes) * SCRIPT_CREDITS_PER_MINUTE))
-    await _deduct_credits_for_action(user_id, amount, action_label="script")
-
-
 async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
     _start_token_tracking()
 
@@ -5564,9 +5559,9 @@ def generate_invoice_pdf(
     elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
     elements.append(Spacer(1, 7*mm))
 
-    grand_total = round(amount, 2)
-    base_price  = round(amount / 1.18, 2)
-    gst_amount  = round(grand_total - base_price, 2)
+    base_price  = amount
+    gst_amount  = amount * 1.18
+    grand_total = amount + gst_amount
 
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
 
