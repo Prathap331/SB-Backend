@@ -315,97 +315,6 @@ SCRIPTS_UNIVERSAL_TABLE = "scripts_universal"
 
 
 
-async def save_english_script_to_universal_table(
-    request: "ScriptRequest",
-    topic_text: str,
-    english_script_text: str,
-    english_youtube_metadata: dict,
-    script_metrics: dict,
-    sources: list[str],
-    books: list[dict],
-    structure: list[dict],
-    classification: dict,
-) -> None:
-    """Persists the ENGLISH version of a translated script's full output to
-    `scripts_universal`, so the canonical/source-of-truth copy always exists
-    in English regardless of what language the user actually requested.
-    Fire-and-forget from the caller's perspective — never raises, never
-    blocks or affects the main response."""
- 
-    def _null_if_empty(value):
-        """Sends explicit null for anything empty (empty string, empty list,
-        empty dict) instead of an empty structure or omitting the key."""
-        if value is None:
-            return None
-        if isinstance(value, (str, list, dict, tuple, set)) and len(value) == 0:
-            return None
-        return value
- 
-    metrics_payload = {
-        "totalWords": _word_count(english_script_text) if english_script_text else 0,
-        "videoLength": request.time,
-        "generalExamples": script_metrics.get("generalExamples", 0),
-        "proverbs_count": script_metrics.get("proverbs_count", 0),
-        "historical_facts": script_metrics.get("historicalExamples", 0),
-        "researchFacts": script_metrics.get("researchFacts", 0),
-    }
- 
-    row = {
-        "title": _null_if_empty(request.title),
-        "script": _null_if_empty(english_script_text),
-        "youtube_metadata": _null_if_empty(english_youtube_metadata),
-        "thumbnail": _null_if_empty(
-            {"thumbnail_text": english_youtube_metadata.get("thumbnail_text", [])}
-        ),
-        "metrics": _null_if_empty(metrics_payload),
-        "sources": _null_if_empty(sources),
-        "books": _null_if_empty(books),
-        "structure": _null_if_empty(structure),
-        "userId": _null_if_empty(request.userId),
-        "topic": _null_if_empty(request.topic),
-        "description": _null_if_empty(request.description),
-        "thumbnail-generated": None,
-        "category": _null_if_empty(classification.get("category")),
-        "sub_category": _null_if_empty(classification.get("subcategories")),
-    }
- 
-    max_attempts = len(row) + 1
-    for attempt in range(1, max_attempts + 1):
-        try:
-            result = await asyncio.to_thread(
-                lambda: supabase.table(SCRIPTS_UNIVERSAL_TABLE).insert(row).execute()
-            )
-            inserted_id = result.data[0]["id"] if result.data else None
-            print(
-                f"[UNIVERSAL] saved English copy to '{SCRIPTS_UNIVERSAL_TABLE}' "
-                f"(id={inserted_id}) for userId={request.userId}"
-            )
-            return
-        except Exception as e:
-            error_text = str(e)
-            match = re.search(r"Could not find the '(.+?)' column", error_text)
-            if match and match.group(1) in row:
-                missing_col = match.group(1)
-                print(
-                    f"[UNIVERSAL] column '{missing_col}' not found in schema cache "
-                    f"(PGRST204) — dropping it from the payload and retrying "
-                    f"(attempt {attempt}/{max_attempts})"
-                )
-                row.pop(missing_col, None)
-                continue
-            print(f"[UNIVERSAL] failed to save English copy to '{SCRIPTS_UNIVERSAL_TABLE}': {e}")
-            import traceback
-            traceback.print_exc()
-            return
- 
-    print(
-        f"[UNIVERSAL] gave up saving to '{SCRIPTS_UNIVERSAL_TABLE}' after "
-        f"{max_attempts} attempt(s) dropping unrecognized columns"
-    )
- 
- 
-
-
 
 SUPPORTED_LANGUAGES = {
     "english": "en",
@@ -424,9 +333,6 @@ SUPPORTED_LANGUAGES = {
 DEFAULT_LANGUAGE = "English"
  
 TRANSLATE_CHUNK_MAX_CHARS = 4000
-
-
-
 
 _TRANSLATE_ARRAY_SEP_LINE = "\u2021\u2021\u2021ITEM\u2021\u2021\u2021"  
 _LEADING_NUMBERING_RE = re.compile(r"^\s*(?:[\-\*\u2022]|\d+[\.\)])\s*")
