@@ -785,9 +785,6 @@ DRAFT TRANSLATION ({target_language}):
 
 
 async def translate_text_full_pipeline(text_value: str, target_language: str) -> str:
-    """Library translation -> LLM grammar/fluency QC pass.
-    Returns the original text untouched if target_language is English or on
-    any hard failure (fail-open, never blocks the response)."""
     if not text_value:
         return text_value
  
@@ -2908,7 +2905,6 @@ class ScriptRequest(BaseModel):
     title: str
     description: str
     time: int
-    language: str = "English"  
     topic : str
 
 def build_topic_text(request: "ScriptRequest") -> str:
@@ -4916,7 +4912,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
     total_start_time = time.time()
     topic_text = build_topic_text(request)
     print(f"SCRIPT GENERATION: Received request for title: '{request.title}'")
-    target_language = _normalize_language(getattr(request, "language", None))
     english_script_text = ""
     selected_template = await retrieve_best_script_template(topic_text)
 
@@ -4955,7 +4950,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
     scraped_urls = set()
     script_text = ""
     youtube_metadata = {"titles": [], "descriptions": [], "hashtags": [], "thumbnail_text": []}
-    english_youtube_metadata: dict = {}
     script_metrics = dict(_DEFAULT_SCRIPT_METRICS)
     sources: list[str] = []
     books: list[dict] = []
@@ -5078,15 +5072,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         script_text = await generate_script_from_context(
             request, selected_template, db_results, new_articles, target_word_count
         )
-        english_script_text = script_text
-
-        if target_language != "English" and script_text:
-            try:
-                print(f"[MAIN] Translating script into {target_language}.")
-                script_text = await translate_text_full_pipeline(english_script_text, target_language)
-            except Exception as exc:
-                print(f"--- script translation failed, falling back to English script: {exc} ---")
-                script_text = english_script_text
 
     except Exception as exc:
         print(f"--- script generation failed: {exc} ---")
@@ -5126,28 +5111,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         traceback.print_exc()
         youtube_metadata = _build_fallback_youtube_metadata(request)
 
-    # Snapshot the English version BEFORE any translation mutates it —
-    # json round-trip is a cheap, safe deep copy since this dict is
-    # already pure JSON-serializable data (lists of strings).
-    english_youtube_metadata = json.loads(json.dumps(youtube_metadata))
-
-    if target_language != "English":
-        try:
-            print(f"[MAIN] Translating YouTube SEO metadata into {target_language}.")
-            youtube_metadata["titles"] = await translate_array_full_pipeline(
-                youtube_metadata.get("titles", []), target_language
-            )
-            youtube_metadata["descriptions"] = await translate_array_full_pipeline(
-                youtube_metadata.get("descriptions", []), target_language
-            )
-            youtube_metadata["thumbnail_text"] = await translate_array_full_pipeline(
-                youtube_metadata.get("thumbnail_text", []), target_language
-            )
-            youtube_metadata["hashtags"] = await translate_hashtag_sets(
-                youtube_metadata.get("hashtags", []), target_language
-            )
-        except Exception as exc:
-            print(f"--- YouTube metadata translation failed, keeping English metadata: {exc} ---")
 
     try:
         print("[MAIN] Generating script content metrics.")
@@ -5174,31 +5137,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
     sources = _extract_source_links(new_articles)
     structure = _build_structure_response(selected_template)
-
-    # Non-English requests: persist the canonical English version of the
-    # full output to scripts_universal. Skipped entirely for English
-    # requests. Never raises — a failure here must not break the response.
-    # NOTE: save_english_script_to_universal_table now saves request.topic
-    # (the new explicit field) into the "topic" column — topic_text is still
-    # passed through here but is no longer used for that column.
-    if target_language != "English" and english_script_text:
-        try:
-            print(f"[MAIN] Non-English request ('{target_language}') — saving English copy to '{SCRIPTS_UNIVERSAL_TABLE}'.")
-            await save_english_script_to_universal_table(
-                request=request,
-                topic_text=topic_text,
-                english_script_text=english_script_text,
-                english_youtube_metadata=english_youtube_metadata,
-                script_metrics=script_metrics,
-                sources=sources,
-                books=books,
-                structure=structure,
-                classification=classification,
-            )
-        except Exception as exc:
-            print(f"--- saving English copy to '{SCRIPTS_UNIVERSAL_TABLE}' failed: {exc} ---")
-            import traceback
-            traceback.print_exc()
 
     total_words = _word_count(script_text) if script_text else 0
 
@@ -5233,8 +5171,85 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "category": classification.get("category", "UNKNOWN"),
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
-        "language": target_language,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class TranslateScriptRequest(BaseModel):
+    userId: str
+    script: str
+    language: str = "English"
+
+
+@app.post("/translate-script")
+async def translate_script_endpoint(request: TranslateScriptRequest):
+    await require_valid_user(request.userId)
+
+    async with _pipeline_semaphore:
+        return await _translate_script_impl(request)
+
+
+async def _translate_script_impl(request: "TranslateScriptRequest"):
+    _start_token_tracking()
+
+    target_language = _normalize_language(request.language)
+
+    if not request.script:
+        return {
+            "script": request.script,
+            "language": target_language,
+            "token_usage": _get_token_usage_summary(),
+        }
+
+    if target_language == "English":
+        return {
+            "script": request.script,
+            "language": target_language,
+            "token_usage": _get_token_usage_summary(),
+        }
+
+    try:
+        print(f"[TRANSLATE-SCRIPT] Translating script into {target_language}.")
+        translated_script = await translate_text_full_pipeline(request.script, target_language)
+    except Exception as exc:
+        print(f"--- /translate-script failed, returning original script: {exc} ---")
+        translated_script = request.script
+
+    token_usage = _get_token_usage_summary()
+
+    return {
+        "script": translated_script,
+        "language": target_language,
+        "token_usage": token_usage,
+    }
+
+
+
+
+
+
+
+
 
 
 
