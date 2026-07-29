@@ -5559,9 +5559,14 @@ def generate_invoice_pdf(
     elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
     elements.append(Spacer(1, 7*mm))
 
-    base_price  = amount
-    gst_amount  = amount * 1.18
-    grand_total = amount + gst_amount
+    # grand_total = round(amount, 2)
+    # base_price  = round(amount / 1.18, 2)
+    # gst_amount  = round(grand_total - base_price, 2)
+
+    base_price  = amount / 1.18
+    gst_amount  = base_price * 1.18
+    grand_total = base_price + gst_amount
+
 
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
 
@@ -5589,13 +5594,6 @@ def generate_invoice_pdf(
     table_data = [
         ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],
         [item_name, plan.title(), f"Rs. {base_price:.2f}", "1", f"Rs. {base_price:.2f}"],
-        [
-            Paragraph("", lp()),
-            "",
-            "",
-            Paragraph("Subtotal", rp(False, colors.HexColor('#555555'))),
-            Paragraph(f"Rs. {base_price:.2f}", rp(False, TEXT_DARK)),
-        ],
         [
             Paragraph("", lp()),
             "",
@@ -5634,28 +5632,19 @@ def generate_invoice_pdf(
         ('ALIGN',         (2,1),(-1,1), 'RIGHT'),
         ('ALIGN',         (3,1),(3,1),  'CENTER'),
         ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
-
         ('SPAN',          (0,2),(2,2)),
         ('BACKGROUND',    (0,2),(-1,2), LIGHT_GRAY),
         ('TOPPADDING',    (0,2),(-1,2), 8),
         ('BOTTOMPADDING', (0,2),(-1,2), 8),
         ('LINEBELOW',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
+        ('LINEABOVE',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
         ('VALIGN',        (0,2),(-1,2), 'MIDDLE'),
-
-        ('SPAN',          (0,3),(2,3)),
-        ('BACKGROUND',    (0,3),(-1,3), LIGHT_GRAY),
-        ('TOPPADDING',    (0,3),(-1,3), 8),
-        ('BOTTOMPADDING', (0,3),(-1,3), 8),
-        ('LINEBELOW',     (0,3),(-1,3), 0.5, colors.HexColor('#dddddd')),
+        ('SPAN',          (0,3),(3,3)),
+        ('BACKGROUND',    (0,3),(-1,3), MID_GRAY),
+        ('TOPPADDING',    (0,3),(-1,3), 10),
+        ('BOTTOMPADDING', (0,3),(-1,3), 10),
+        ('LINEBELOW',     (0,3),(-1,3), 1.0, colors.HexColor('#cccccc')),
         ('VALIGN',        (0,3),(-1,3), 'MIDDLE'),
-
-        ('SPAN',          (0,4),(3,4)),
-        ('BACKGROUND',    (0,4),(-1,4), MID_GRAY),
-        ('TOPPADDING',    (0,4),(-1,4), 10),
-        ('BOTTOMPADDING', (0,4),(-1,4), 10),
-        ('LINEBELOW',     (0,4),(-1,4), 1.0, colors.HexColor('#cccccc')),
-        ('VALIGN',        (0,4),(-1,4), 'MIDDLE'),
-
         ('LEFTPADDING',   (0,0),(-1,-1), 8),
         ('RIGHTPADDING',  (0,0),(-1,-1), 8),
     ])
@@ -5777,6 +5766,18 @@ async def razorpay_webhook(
             validity_date  = now + datetime.timedelta(days=validity_days)
 
             try:
+                profile_resp = (
+                    supabase.table('user_profiles')
+                    .select('credits_remaining')
+                    .eq('id', user_id)
+                    .single()
+                    .execute()
+                )
+                current_credits = (
+                    profile_resp.data.get('credits_remaining', 0)
+                    if profile_resp.data else 0
+                )
+                # new_credits = current_credits + credits_to_add
 
                 update_result = (
                     supabase.table('user_profiles')
@@ -5925,10 +5926,6 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
-
-
-
-
 
 
 
