@@ -3913,37 +3913,27 @@ async def generate_script_metrics(script_text: str, topic_text: str = "") -> dic
     return metrics
 
 
-MYSQL_URL = os.getenv("MYSQL_URL")
-
-_mysql_engine = None
-
-
-def get_mysql_engine():
-    global _mysql_engine
-    if _mysql_engine is None:
-        print("[MYSQL] Creating engine")
-        _mysql_engine = create_engine(MYSQL_URL, pool_pre_ping=True, pool_recycle=280)
-    return _mysql_engine
+BOOKS_SUPABASE_TABLE = "Metadata_phase1"
+BOOKS_SUPABASE_MD5_COLUMN = "MD5"
 
 
 def _fetch_books_by_md5_sync(md5_list: list[str]) -> list[dict]:
     if not md5_list:
         return []
 
-    engine = get_mysql_engine()
-    query = text(
-        f"SELECT Title, Author, Year, md5 FROM {BOOKS_TABLE_NAME} WHERE md5 IN :md5_list"
-    ).bindparams(bindparam("md5_list", expanding=True))
-
     try:
-        with engine.connect() as conn:
-            result = conn.execute(query, {"md5_list": md5_list})
-            rows = [dict(r._mapping) for r in result]
+        result = (
+            supabase.table(BOOKS_SUPABASE_TABLE)
+            .select(f"Title, Author, Year, {BOOKS_SUPABASE_MD5_COLUMN}")
+            .in_(BOOKS_SUPABASE_MD5_COLUMN, md5_list)
+            .execute()
+        )
+        rows = result.data or []
+        print(f"[SUPABASE] '{BOOKS_SUPABASE_TABLE}' lookup returned {len(rows)} row(s) for {len(md5_list)} md5(s)")
         return rows
     except Exception as e:
-        print(f"[MYSQL] book lookup failed: {e}")
+        print(f"[SUPABASE] book lookup against '{BOOKS_SUPABASE_TABLE}' failed: {e}")
         return []
-
 
 def _normalize_book_year(raw_year) -> str | None:
     """Normalize whatever comes back from MySQL for the Year column into a
@@ -3974,6 +3964,11 @@ async def get_books_for_chunks(
         if md5 and md5 not in seen_md5:
             seen_md5.add(md5)
             md5_list.append(md5)
+
+    books: list[dict] = []
+    if md5_list:
+        print(f"[SUPABASE] looking up {len(md5_list)} unique md5(s) for book Title/Author/Year in '{BOOKS_SUPABASE_TABLE}'")
+        rows = await asyncio.to_thread(_fetch_books_by_md5_sync, md5_list)
 
     books: list[dict] = []
     if md5_list:
