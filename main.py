@@ -259,26 +259,6 @@ async def eci(request: PromptRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import io
 import os
 import re
@@ -5082,6 +5062,36 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class TranslateScriptRequest(BaseModel):
     userId: str
     script: str
@@ -5834,7 +5844,7 @@ async def razorpay_webhook(
                             customer_name=customer_name,
                             customer_address=customer_address,
                             customer_phone=customer_phone,
-                            item_name=f"StoryBit {target_tier.title()} Plan",
+                            item_name=f"Storio AI {target_tier.title()} Plan",
                             amount=amount_paid,
                             plan=target_tier,
                             due_date=validity_date,
