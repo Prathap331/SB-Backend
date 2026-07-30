@@ -3029,7 +3029,7 @@ async def cut_credits(request: UnlockRequest):
 
     try:
         profile_res = supabase.table('user_profiles') \
-            .select('id, credits_remaining, user_tier') \
+            .select('id, credit_batches') \
             .eq('id', request.userId) \
             .maybe_single() \
             .execute()
@@ -3037,62 +3037,24 @@ async def cut_credits(request: UnlockRequest):
         if not profile_res.data:
             raise HTTPException(status_code=404, detail="user profile not found")
 
-        profile = profile_res.data
-        user_tier = profile.get("user_tier")
-        profile_credits = profile["credits_remaining"]
+        batches = profile_res.data.get('credit_batches') or []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        active_batches = _expire_stale_batches(batches, now)
 
-        if user_tier == "free":
-            if profile_credits <= 0 or profile_credits < cost:
-                return {"message": "credits not sufficient"}
-
-            new_profile_credits = profile_credits - cost
-
-            supabase.table('user_profiles') \
-                .update({'credits_remaining': new_profile_credits}) \
-                .eq('id', request.userId) \
-                .execute()
-
-            return {
-                "message": "success",
-                "source": "profile",
-                "remaining_credits": new_profile_credits,
-            }
-
-        sub_res = supabase.table('subscriptions') \
-            .select('id, credits') \
-            .eq('userId', request.userId) \
-            .order('created_at', desc=True) \
-            .limit(1) \
-            .execute()
-
-        if not sub_res.data:
-            raise HTTPException(status_code=404, detail="no subscription found for user")
-
-        subscription = sub_res.data[0]
-        subscription_id = subscription["id"]
-        subscription_credits = subscription["credits"]
-
-        if subscription_credits <= 0 or subscription_credits < cost:
+        updated_batches, deducted = _deduct_from_batches(active_batches, cost)
+        if deducted == 0:
             return {"message": "credits not sufficient"}
 
-        new_subscription_credits = subscription_credits - cost
-        new_profile_credits = profile_credits - cost  
+        new_total = _sum_batches(updated_batches)
 
-        supabase.table('subscriptions') \
-            .update({'credits': new_subscription_credits}) \
-            .eq('id', subscription_id) \
-            .execute()
-
-        supabase.table('user_profiles') \
-            .update({'credits_remaining': new_profile_credits}) \
-            .eq('id', request.userId) \
-            .execute()
+        supabase.table('user_profiles').update({
+            'credit_batches': updated_batches,
+            'credits_remaining': new_total,
+        }).eq('id', request.userId).execute()
 
         return {
             "message": "success",
-            "source": "subscription",
-            "remaining_credits": new_subscription_credits,
-            "profile_remaining_credits": new_profile_credits,
+            "remaining_credits": new_total,
         }
 
     except HTTPException:
@@ -3100,6 +3062,9 @@ async def cut_credits(request: UnlockRequest):
     except Exception as e:
         print("error:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
 def target_word_count_for_time(minutes: float) -> int:
     return max(50, int(minutes * WORDS_PER_MINUTE))
 
@@ -4896,34 +4861,38 @@ async def _get_user_tier(user_id: str) -> str:
         print(f"[CREDITS] failed to fetch user_tier for user {user_id}, defaulting to 'free': {exc}")
         return "free"
 
-
 async def _deduct_profile_credits(user_id: str, amount: int):
     try:
         result = (
             supabase.table("user_profiles")
-            .select("credits_remaining")
+            .select("credit_batches")
             .eq("id", user_id)
             .single()
             .execute()
         )
+        batches = (result.data or {}).get("credit_batches") or []
 
-        current_credits = (result.data or {}).get("credits_remaining")
-        if current_credits is None:
-            print(f"[CREDITS] No credits_remaining found for user {user_id}, skipping user_profiles deduction.")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        active_batches = _expire_stale_batches(batches, now)
+
+        updated_batches, deducted = _deduct_from_batches(active_batches, amount)
+        if deducted == 0:
+            print(f"[CREDITS] user {user_id} has insufficient credits for {amount}, skipping deduction")
             return
 
-        new_credits = max(current_credits - amount, 0)
+        new_total = _sum_batches(updated_batches)
 
-        supabase.table("user_profiles").update(
-            {"credits_remaining": new_credits}
-        ).eq("id", user_id).execute()
+        supabase.table("user_profiles").update({
+            "credit_batches": updated_batches,
+            "credits_remaining": new_total,
+        }).eq("id", user_id).execute()
 
         print(
-            f"[CREDITS] (user_profiles) Deducted {amount} credits from user {user_id}: "
-            f"{current_credits} -> {new_credits}"
+            f"[CREDITS] (batch-aware FIFO) Deducted {amount} credits from user {user_id}, "
+            f"oldest-expiring batch spent first, new total={new_total}"
         )
     except Exception as exc:
-        print(f"[CREDITS] Failed to deduct user_profiles credits for user {user_id}: {exc}")
+        print(f"[CREDITS] Failed to deduct batch credits for user {user_id}: {exc}")
         import traceback
         traceback.print_exc()
 
@@ -6234,6 +6203,77 @@ def generate_invoice_pdf(
     return file_path
 
 
+
+
+
+import uuid as uuid_lib
+
+def _expire_stale_batches(batches: list[dict], now: datetime.datetime) -> list[dict]:
+    """Drop any batch past its validity. This is the literal 'old credits
+    become 0 once expired' rule — an expired batch is removed from the pool
+    entirely and can never be spent again, regardless of what's in it."""
+    active = []
+    for b in batches:
+        try:
+            expires_at = datetime.datetime.fromisoformat(b["expires_at"])
+        except Exception:
+            continue  # malformed/missing expiry — treat as already expired
+        if expires_at > now:
+            active.append(b)
+    return active
+
+
+def _sum_batches(batches: list[dict]) -> int:
+    return sum(int(b.get("remaining", 0)) for b in batches)
+
+
+def _add_credit_batch(
+    batches: list[dict], credits: int, validity_days: int, tier: str, now: datetime.datetime,
+) -> list[dict]:
+    expires_at = now + datetime.timedelta(days=validity_days)
+    new_batch = {
+        "id": str(uuid_lib.uuid4()),
+        "credits": credits,
+        "remaining": credits,
+        "granted_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "tier": tier,
+    }
+    return batches + [new_batch]  # old batch(es) stay, new one just appended
+
+
+def _deduct_from_batches(batches: list[dict], amount: int) -> tuple[list[dict], int]:
+    """FIFO by expires_at — oldest-expiring batch spent first. Returns
+    (updated_batches, amount_actually_deducted); 0 means insufficient
+    credits and NOTHING was deducted (all-or-nothing)."""
+    if _sum_batches(batches) < amount:
+        return batches, 0
+
+    sorted_batches = sorted(batches, key=lambda b: b["expires_at"])
+    remaining_to_deduct = amount
+    updated = []
+    for b in sorted_batches:
+        b = dict(b)
+        if remaining_to_deduct > 0:
+            take = min(b["remaining"], remaining_to_deduct)
+            b["remaining"] -= take
+            remaining_to_deduct -= take
+        if b["remaining"] > 0:
+            updated.append(b)  
+
+    return updated, amount
+
+
+
+
+
+
+
+
+
+
+
+
 @app.post("/payments/create-order")
 async def create_razorpay_order(
     request_data: CreateOrderRequest,
@@ -6344,31 +6384,42 @@ async def razorpay_webhook(
             try:
                 profile_resp = (
                     supabase.table('user_profiles')
-                    .select('credits_remaining')
+                    .select('credit_batches')
                     .eq('id', user_id)
                     .single()
                     .execute()
                 )
-                current_credits = (
-                    profile_resp.data.get('credits_remaining', 0)
-                    if profile_resp.data else 0
+                existing_batches = (profile_resp.data or {}).get('credit_batches') or []
+                active_batches = _expire_stale_batches(existing_batches, now)
+
+                updated_batches = _add_credit_batch(
+                    active_batches,
+                    credits=credits_to_add,
+                    validity_days=validity_days,
+                    tier=target_tier,
+                    now=now,
                 )
-                # new_credits = current_credits + credits_to_add
+                new_total_credits = _sum_batches(updated_batches)
 
                 update_result = (
                     supabase.table('user_profiles')
-                    .update({'user_tier': target_tier, 'credits_remaining': credits_to_add})
+                    .update({
+                        'user_tier': target_tier,
+                        'credit_batches': updated_batches,
+                        'credits_remaining': new_total_credits,   
+                    })
                     .eq('id', user_id)
                     .execute()
                 )
 
                 if update_result.data:
                     updated_row = update_result.data[0]
-                    if (
-                        updated_row.get('credits_remaining') == credits_to_add
-                        and updated_row.get('user_tier') == target_tier
-                    ):
-                        print(f"Confirmed: user {user_id} → tier '{target_tier}', credits reset to {credits_to_add}.")
+                    if updated_row.get('credits_remaining') == new_total_credits:
+                        print(
+                            f"Confirmed: user {user_id} → tier '{target_tier}', "
+                            f"added batch of {credits_to_add} (expires {updated_batches[-1]['expires_at']}), "
+                            f"new total={new_total_credits}"
+                        )
                     else:
                         print(f"WARN: Update returned mismatched data for {user_id}: {updated_row}")
                 else:
@@ -6502,24 +6553,6 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
