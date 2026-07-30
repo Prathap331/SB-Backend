@@ -5154,8 +5154,6 @@ Generated Thumbnail Texts:
         print("[QC] corrected script missing/empty in QC output, keeping original script")
         corrected_script = script_text
 
-    # Sanity guard: never accept a QC "correction" that gutted the script
-    # (e.g. a truncated or empty rewrite from a flaky completion).
     original_len = _word_count(script_text)
     corrected_len = _word_count(corrected_script)
     if original_len > 0 and corrected_len < original_len * 0.6:
@@ -5464,9 +5462,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         print(f"--- YouTube search failed: {exc} ---")
         import traceback
         traceback.print_exc()
-
-
-
 
 
     try:
@@ -6205,19 +6200,16 @@ def generate_invoice_pdf(
 
 
 
-
 import uuid as uuid_lib
 
+
 def _expire_stale_batches(batches: list[dict], now: datetime.datetime) -> list[dict]:
-    """Drop any batch past its validity. This is the literal 'old credits
-    become 0 once expired' rule — an expired batch is removed from the pool
-    entirely and can never be spent again, regardless of what's in it."""
     active = []
     for b in batches:
         try:
             expires_at = datetime.datetime.fromisoformat(b["expires_at"])
         except Exception:
-            continue  # malformed/missing expiry — treat as already expired
+            continue
         if expires_at > now:
             active.append(b)
     return active
@@ -6239,13 +6231,10 @@ def _add_credit_batch(
         "expires_at": expires_at.isoformat(),
         "tier": tier,
     }
-    return batches + [new_batch]  # old batch(es) stay, new one just appended
+    return batches + [new_batch]  
 
 
 def _deduct_from_batches(batches: list[dict], amount: int) -> tuple[list[dict], int]:
-    """FIFO by expires_at — oldest-expiring batch spent first. Returns
-    (updated_batches, amount_actually_deducted); 0 means insufficient
-    credits and NOTHING was deducted (all-or-nothing)."""
     if _sum_batches(batches) < amount:
         return batches, 0
 
@@ -6259,19 +6248,63 @@ def _deduct_from_batches(batches: list[dict], amount: int) -> tuple[list[dict], 
             b["remaining"] -= take
             remaining_to_deduct -= take
         if b["remaining"] > 0:
-            updated.append(b)  
+            updated.append(b)
 
     return updated, amount
 
 
+async def _get_legacy_batch_expiry(user_id: str, now: datetime.datetime) -> datetime.datetime:
+    try:
+        sub_res = (
+            supabase.table('subscriptions')
+            .select('validity, payment_status')
+            .eq('userId', user_id)
+            .order('purchased_date', desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = sub_res.data or []
+        if rows and rows[0].get('validity') and rows[0].get('payment_status') == 'paid':
+            validity_dt = datetime.datetime.fromisoformat(rows[0]['validity'])
+            if validity_dt > now:
+                return validity_dt
+    except Exception as e:
+        print(f"[CREDITS-MIGRATE] couldn't resolve legacy validity for {user_id}: {e}")
+    return now + datetime.timedelta(days=30)
 
 
+async def _get_active_batches_with_legacy_migration(
+    user_id: str, current_batches: list[dict], credits_remaining: int, now: datetime.datetime,
+) -> list[dict]:
+    """Ensures any pre-migration flat credit balance is folded into a batch
+    BEFORE new batches are added on top, so nothing gets silently dropped.
 
+    This is what was missing before: credits_remaining was never checked
+    against what's actually accounted for in credit_batches, so a user's
+    pre-existing balance (recorded only in the flat column, never in a
+    batch) got overwritten and lost the moment a new batch was added."""
+    active = _expire_stale_batches(current_batches or [], now)
 
+    already_migrated_total = _sum_batches(active)
+    unaccounted = (credits_remaining or 0) - already_migrated_total
 
+    if unaccounted > 0:
+        legacy_expiry = await _get_legacy_batch_expiry(user_id, now)
+        legacy_batch = {
+            "id": str(uuid_lib.uuid4()),
+            "credits": unaccounted,
+            "remaining": unaccounted,
+            "granted_at": now.isoformat(),
+            "expires_at": legacy_expiry.isoformat(),
+            "tier": "legacy",
+        }
+        print(
+            f"[CREDITS-MIGRATE] user {user_id}: found {unaccounted} unaccounted legacy "
+            f"credit(s) not in any batch — migrating into a batch expiring {legacy_expiry.isoformat()}"
+        )
+        active = active + [legacy_batch]
 
-
-
+    return active
 
 
 @app.post("/payments/create-order")
@@ -6384,13 +6417,17 @@ async def razorpay_webhook(
             try:
                 profile_resp = (
                     supabase.table('user_profiles')
-                    .select('credit_batches')
+                    .select('credit_batches, credits_remaining')
                     .eq('id', user_id)
                     .single()
                     .execute()
                 )
                 existing_batches = (profile_resp.data or {}).get('credit_batches') or []
-                active_batches = _expire_stale_batches(existing_batches, now)
+                existing_credits_remaining = (profile_resp.data or {}).get('credits_remaining') or 0
+
+                active_batches = await _get_active_batches_with_legacy_migration(
+                    user_id, existing_batches, existing_credits_remaining, now,
+                )
 
                 updated_batches = _add_credit_batch(
                     active_batches,
@@ -6406,7 +6443,7 @@ async def razorpay_webhook(
                     .update({
                         'user_tier': target_tier,
                         'credit_batches': updated_batches,
-                        'credits_remaining': new_total_credits,   
+                        'credits_remaining': new_total_credits,
                     })
                     .eq('id', user_id)
                     .execute()
@@ -6553,9 +6590,6 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
-
-
-
 
 
 
