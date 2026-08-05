@@ -8136,37 +8136,28 @@ async def save_audio(
         _create_signed_url_sync, AUDIO_BUCKET, storage_path, SIGNED_URL_EXPIRY_SECONDS
     )
 
+    if not file_url:
+        raise HTTPException(status_code=500, detail="Audio uploaded but failed to generate URL")
+
     try:
-        insert_result = await asyncio.to_thread(
-            lambda: supabase.table(AUDIO_TABLE).insert({
-                "userId": userId,
-                "file_path": storage_path,
-                "file_name": safe_name,
-                "content_type": audio.content_type,
-                "size_bytes": size_bytes,
-            }).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table("user_profiles")
+            .update({"audio-url": file_url})
+            .eq("id", userId)
+            .execute()
         )
     except Exception as e:
-        print(f"[AUDIO] metadata insert FAILED (file was uploaded to storage though): {e}")
+        print(f"[AUDIO] failed to save audio-url on user_profiles: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Audio uploaded but failed to save metadata: {e}")
-
-    row = insert_result.data[0] if insert_result.data else None
+        raise HTTPException(status_code=500, detail=f"Audio uploaded but failed to save URL to profile: {e}")
 
     return {
         "message": "Audio uploaded successfully",
-        "id": row.get("id") if row else None,
         "userId": userId,
-        "file_path": storage_path,
-        "file_name": safe_name,
-        "content_type": audio.content_type,
-        "size_bytes": size_bytes,
         "url": file_url,
-        "url_expires_in_seconds": SIGNED_URL_EXPIRY_SECONDS if file_url else None,
+        "url_expires_in_seconds": SIGNED_URL_EXPIRY_SECONDS,
     }
-
-
 
 
 
@@ -8376,7 +8367,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
         "word_count": _word_count(script_text),
         "token_usage": token_usage,
     }
-
 
 
 
