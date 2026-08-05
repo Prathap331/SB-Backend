@@ -286,18 +286,176 @@ SCRIPTS_UNIVERSAL_TABLE = "scripts_universal"
 IDEAS_HYDE_DOC_COUNT = 5
 
 SUPPORTED_LANGUAGES = {
-    "english": "en",
-    "hindi": "hi",
-    "gujarati": "gu",
-    "kannada": "kn",
+    "afrikaans": "af",
+    "albanian": "sq",
+    "amharic": "am",
+    "arabic": "ar",
+    "armenian": "hy",
+    "assamese": "as",
+    "aymara": "ay",
+    "azerbaijani": "az",
+    "bambara": "bm",
+    "basque": "eu",
+    "belarusian": "be",
     "bengali": "bn",
+    "bhojpuri": "bho",
+    "bosnian": "bs",
+    "bulgarian": "bg",
+    "catalan": "ca",
+    "cebuano": "ceb",
+    "chichewa": "ny",
+    "chinese simplified": "zh-CN",
+    "chinese traditional": "zh-TW",
+    "corsican": "co",
+    "croatian": "hr",
+    "czech": "cs",
+    "danish": "da",
+    "dhivehi": "dv",
+    "dogri": "doi",
+    "dutch": "nl",
+    "english": "en",
+    "esperanto": "eo",
+    "estonian": "et",
+    "ewe": "ee",
+    "filipino": "tl",
+    "finnish": "fi",
+    "french": "fr",
+    "frisian": "fy",
+    "galician": "gl",
+    "georgian": "ka",
+    "german": "de",
+    "greek": "el",
+    "guarani": "gn",
+    "gujarati": "gu",
+    "haitian creole": "ht",
+    "hausa": "ha",
+    "hawaiian": "haw",
+    "hebrew": "iw",
+    "hindi": "hi",
+    "hmong": "hmn",
+    "hungarian": "hu",
+    "icelandic": "is",
+    "igbo": "ig",
+    "ilocano": "ilo",
+    "indonesian": "id",
+    "irish": "ga",
+    "italian": "it",
+    "japanese": "ja",
+    "javanese": "jw",
+    "kannada": "kn",
+    "kazakh": "kk",
+    "khmer": "km",
+    "kinyarwanda": "rw",
+    "konkani": "gom",
+    "korean": "ko",
+    "krio": "kri",
+    "kurdish kurmanji": "ku",
+    "kurdish sorani": "ckb",
+    "kyrgyz": "ky",
+    "lao": "lo",
+    "latin": "la",
+    "latvian": "lv",
+    "lingala": "ln",
+    "lithuanian": "lt",
+    "luganda": "lg",
+    "luxembourgish": "lb",
+    "macedonian": "mk",
+    "maithili": "mai",
+    "malagasy": "mg",
+    "malay": "ms",
     "malayalam": "ml",
-    "telugu": "te",
-    "tamil": "ta",
+    "maltese": "mt",
+    "maori": "mi",
     "marathi": "mr",
+    "meiteilon/manipuri": "mni-Mtei",
+    "mizo": "lus",
+    "mongolian": "mn",
+    "myanmar": "my",
+    "nepali": "ne",
+    "norwegian": "no",
     "odia": "or",
+    "oromo": "om",
+    "pashto": "ps",
+    "persian": "fa",
+    "polish": "pl",
+    "portuguese": "pt",
     "punjabi": "pa",
+    "quechua": "qu",
+    "romanian": "ro",
+    "russian": "ru",
+    "samoan": "sm",
+    "sanskrit": "sa",
+    "scots gaelic": "gd",
+    "sepedi": "nso",
+    "serbian": "sr",
+    "sesotho": "st",
+    "shona": "sn",
+    "sindhi": "sd",
+    "sinhala": "si",
+    "slovak": "sk",
+    "slovenian": "sl",
+    "somali": "so",
+    "spanish": "es",
+    "sundanese": "su",
+    "swahili": "sw",
+    "swedish": "sv",
+    "tajik": "tg",
+    "tamil": "ta",
+    "tatar": "tt",
+    "telugu": "te",
+    "thai": "th",
+    "tigrinya": "ti",
+    "tsonga": "ts",
+    "turkish": "tr",
+    "turkmen": "tk",
+    "twi": "ak",
+    "ukrainian": "uk",
+    "urdu": "ur",
+    "uyghur": "ug",
+    "uzbek": "uz",
+    "vietnamese": "vi",
+    "welsh": "cy",
+    "xhosa": "xh",
+    "yiddish": "yi",
+    "yoruba": "yo",
+    "zulu": "zu",
 }
+
+
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
+
+QDRANT_URL = "http://37.27.101.243:6333"
+
+QDRANT_DENSE_VECTOR_NAME = "dense"
+QDRANT_SPARSE_VECTOR_NAME = "sparse"
+
+_qdrant_client: QdrantClient | None = None
+
+
+def get_qdrant_client() -> QdrantClient:
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(url=QDRANT_URL)
+    return _qdrant_client
+
+
+RAG_CATEGORIES = [
+    "Anthropology", "Biography", "Business", "Economics", "Entrepreneurship",
+    "Finance", "Geography", "Health", "History", "Knowledge", "Law",
+    "Personal_Development", "Philosophy", "Politics", "Psychology",
+    "Religion", "Science", "SocialScience", "Sports", "Technology",
+]
+
+
+def _qdrant_collection_name(category: str) -> str:
+    return f"RAG_{category}_supabase"
+
+
+def _supabase_content_table_name(category: str) -> str:
+    return f"RAG_{category}"
+
+
  
 DEFAULT_LANGUAGE = "English"
  
@@ -1150,11 +1308,6 @@ DB_SIMILARITY_THRESHOLD = 0.5
 
 WORDS_PER_MINUTE = 140
 
-TABLES = [
-    "duplicate_RAG_Entrepreneurship",
-    "duplicate_RAG_Anthropology",
-    "duplicate_RAG_Biography",
-]
 
 BOOKS_TABLE_NAME = "english_books"
 THUMBNAILS_BUCKET = "generated-thumbnails"
@@ -1734,18 +1887,17 @@ async def get_similar_saved_ideas(
 
 
 async def select_table_for_topic(topic: str) -> str:
+    categories_block = "\n".join(f"- {c}" for c in RAG_CATEGORIES)
     table_selector_prompt = f"""
     You are a routing assistant. Given a topic, select the single most relevant
-    table from the list below that would contain source documents for that topic.
+    category from the list below that would contain source documents for that topic.
 
-    Available tables:
-    - duplicate_RAG_Entrepreneurship: startups, business strategy, venture capital, founders
-    - duplicate_RAG_Anthropology: human culture, society, archaeology, ethnography
-    - duplicate_RAG_Biography: individual people's lives, histories, memoirs
+    Available categories:
+    {categories_block}
 
     Topic: "{topic}"
 
-    Respond with ONLY the exact table name from the list above, nothing else.
+    Respond with ONLY the exact category name from the list above, nothing else.
     """
 
     res = await _openai_create_with_timeout(
@@ -1756,16 +1908,15 @@ async def select_table_for_topic(topic: str) -> str:
         )
     )
     _record_token_usage("select_table_for_topic", res)
-    table_name = res.choices[0].message.content.strip("`'\" \n")
+    category = res.choices[0].message.content.strip("`'\" \n")
 
-    if table_name not in TABLES:
-        print(f"[DB] table selector returned unexpected value '{table_name}', defaulting to {TABLES[0]}")
-        table_name = TABLES[0]
+    if category not in RAG_CATEGORIES:
+        print(f"[QDRANT] table selector returned unexpected value '{category}', defaulting to {RAG_CATEGORIES[0]}")
+        category = RAG_CATEGORIES[0]
     else:
-        print(f"[DB] Selected table: {table_name}")
+        print(f"[QDRANT] Selected category: {category}")
 
-    return table_name
-
+    return category
 
 SCRIPT_TEMPLATE_MATCH_COUNT = 1
 
@@ -1993,20 +2144,21 @@ async def select_template_and_generate_hyde(topic: str) -> dict:
     }
 
 
+
+
 async def get_context_from_db(
     topic: str,
     hyde_doc: str = None,
     final_k: int = 7,
-    table_name: str = None,
-    similarity_threshold: float = DB_SIMILARITY_THRESHOLD,
-    match_count: int = 20,
+    table_name: str = None,   
+    match_count: int = 30,
 ):
-    print(f"[DB] Starting retrieval for topic: '{hyde_doc}'")
-
     if table_name is None:
         table_name = await select_table_for_topic(topic)
-    else:
-        print(f"[DB] Using pre-selected table: {table_name}")
+
+    category = table_name
+    collection_name = _qdrant_collection_name(category)
+    supabase_table = _supabase_content_table_name(category)
 
     embedding_source = hyde_doc if hyde_doc else topic
 
@@ -2018,104 +2170,95 @@ async def get_context_from_db(
             normalize_embeddings=True,
         ).tolist()
     )
-    print("[DB] Dense embedding computed")
 
     vectorizer = get_sparse_vectorizer()
     sparse_row = await asyncio.to_thread(lambda: vectorizer.transform([embedding_source]))
-    query_sparse = _sparse_row_to_dict(sparse_row)
-    print("[DB] Sparse embedding computed")
+    query_sparse_dict = _sparse_row_to_dict(sparse_row)
+    sparse_indices = [int(k) for k in query_sparse_dict.keys()]
+    sparse_values = [float(v) for v in query_sparse_dict.values()]
+
+    client = get_qdrant_client()
 
     try:
-        result = await asyncio.to_thread(
-            lambda: supabase.rpc(
-                "match_documents",
-                {
-                    "query_dense_embedding": dense_embedding,
-                    "match_table": table_name,
-                    "match_count": match_count,
-                    "similarity_threshold": similarity_threshold,
-                },
-            ).execute()
-        )
-    except Exception as e:
-        print(f"[DB] RPC with similarity_threshold failed ({e}) — retrying with legacy 3-param signature")
-        try:
-            result = await asyncio.to_thread(
-                lambda: supabase.rpc(
-                    "match_documents",
-                    {
-                        "query_dense_embedding": dense_embedding,
-                        "match_table": table_name,
-                        "match_count": match_count,
-                    },
-                ).execute()
+        qdrant_result = await asyncio.to_thread(
+            lambda: client.query_points(
+                collection_name=collection_name,
+                prefetch=[
+                    qdrant_models.Prefetch(
+                        query=dense_embedding,
+                        using=QDRANT_DENSE_VECTOR_NAME,
+                        limit=match_count,
+                    ),
+                    qdrant_models.Prefetch(
+                        query=qdrant_models.SparseVector(
+                            indices=sparse_indices,
+                            values=sparse_values,
+                        ),
+                        using=QDRANT_SPARSE_VECTOR_NAME,
+                        limit=match_count,
+                    ),
+                ],
+                query=qdrant_models.FusionQuery(fusion=qdrant_models.Fusion.RRF),
+                limit=match_count,
+                with_payload=True,
             )
-            print("[DB] legacy RPC call succeeded — filtering by similarity client-side instead")
-        except Exception as e2:
-            print(f"[DB] vector search failed even with legacy signature: {e2}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    candidates = result.data or []
-    print(
-        f"[DB] RPC returned {len(candidates)} candidate(s) from {table_name} "
-        f"(target similarity >= {similarity_threshold})"
-    )
-
-    reranked = []
-    for row in candidates:
-        doc_sparse = row.get("sparse_vector") or {}
-        sparse_score = _sparse_cosine(query_sparse, doc_sparse)
-        dense_score = row.get("dense_score", 0.0)
-        combined = (0.7 * dense_score) + (0.3 * sparse_score)
-        reranked.append({**row, "sparse_score": sparse_score, "combined_score": combined})
-
-    reranked.sort(key=lambda r: r["combined_score"], reverse=True)
-
-    above_threshold = [r for r in reranked if (r.get("dense_score") or 0.0) >= similarity_threshold]
-    if len(above_threshold) != len(reranked):
-        print(
-            f"[DB] WARNING: {len(reranked) - len(above_threshold)} candidate(s) were below "
-            f"{similarity_threshold} similarity despite coming from the RPC — check that the "
-            f"match_documents SQL function is filtering on `embeddings` correctly."
         )
-
-    matches = above_threshold[:final_k]
-
-    print(f"[DB] Top {len(matches)} chunks after hybrid rerank + similarity filter:")
-    for i, row in enumerate(matches, start=1):
-        content = row.get("content")
-        md5 = row.get("md5") or (
-            hashlib.md5(content.encode("utf-8")).hexdigest() if content else None
-        )
-        print(
-            f"  [DB-{i}] md5={md5} dense_score={row.get('dense_score')} "
-            f"combined_score={row['combined_score']:.4f}"
-        )
-        print(f"    content: {content[:200]}{'...' if content and len(content) > 200 else ''}")
-
-    for row in matches:
-        row.pop("sparse_vector", None)
-
-    return matches
-
-
-def _ddgs_search_for_ideas(keyword: str, max_results: int) -> list[tuple[str, str]]:
-    results: list[tuple[str, str]] = []
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(keyword, max_results=max_results * 2, backend="html"):
-                url = r.get("href") or r.get("url")
-                snippet = r.get("body", "") or r.get("title", "")
-                if not url or _is_blocked_source_url(url):
-                    continue
-                results.append((url, snippet))
-                if len(results) >= max_results:
-                    break
+        points = qdrant_result.points
     except Exception as e:
-        print(f"[DDGS] search failed for '{keyword}': {e}")
-    return results
+        print(f"[QDRANT] hybrid query FAILED against '{collection_name}': {e}")
+        return []
+
+    if not points:
+        return []
+
+    chunk_ids = []
+    score_by_chunk_id: dict = {}
+    for point in points:
+        payload = point.payload or {}
+        chunk_id = payload.get("chunk_id")
+        if chunk_id is None:
+            continue
+        chunk_ids.append(chunk_id)
+        score_by_chunk_id[chunk_id] = point.score
+
+    if not chunk_ids:
+        return []
+
+    try:
+        supabase_rows = await asyncio.to_thread(
+            lambda: supabase.table(supabase_table)
+            .select("chunk_id, md5, content")
+            .in_("chunk_id", chunk_ids)
+            .execute()
+        )
+        rows = supabase_rows.data or []
+    except Exception as e:
+        print(f"[QDRANT] Supabase content lookup against '{supabase_table}' failed: {e}")
+        return []
+
+    matches = []
+    for row in rows:
+        chunk_id = row.get("chunk_id")
+        content = row.get("content")
+        md5 = row.get("md5")
+        if not content:
+            continue
+        score = score_by_chunk_id.get(chunk_id, 0.0)
+        matches.append({
+            "content": content,
+            "md5": md5,
+            "chunk_id": chunk_id,
+            "dense_score": score,
+            "combined_score": score,
+        })
+
+    matches.sort(key=lambda r: r["combined_score"], reverse=True)
+    return matches[:final_k]
+
+
+
+
+
 
 def _parse_keyword_lines(raw: str) -> list[str]:
     lines = []
@@ -3455,232 +3598,345 @@ def num_hyde_docs_for_time(minutes: float) -> int:
     return max(1, math.ceil(minutes / 2))
 
 
+def _strip_json_fences(raw: str) -> str:
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
 
-async def generate_hyde_doc_for_segments(
+
+RRF_K = 60  
+
+
+async def get_context_from_db_segment(
+    hyde_document: str,
+    keywords: list[str],
+    table_name: str,
+    dense_k: int = 10,
+    sparse_k: int = 10,
+    rrf_k: int = RRF_K,
+) -> list[dict]:
+    category = table_name
+    collection_name = _qdrant_collection_name(category)
+    supabase_table = _supabase_content_table_name(category)
+
+    model = _get_st_model()
+    client = get_qdrant_client()
+
+    dense_embedding = await _run_encode(
+        lambda: model.encode(
+            hyde_document, convert_to_numpy=True, normalize_embeddings=True
+        ).tolist()
+    )
+
+    try:
+        dense_result = await asyncio.to_thread(
+            lambda: client.query_points(
+                collection_name=collection_name,
+                query=dense_embedding,
+                using=QDRANT_DENSE_VECTOR_NAME,
+                limit=dense_k,
+                with_payload=True,
+            )
+        )
+        dense_points = dense_result.points
+    except Exception as e:
+        print(f"[QDRANT-SEG] dense query FAILED against '{collection_name}': {e}")
+        dense_points = []
+
+    keyword_text = " ".join(k for k in (keywords or []) if k) or hyde_document
+    vectorizer = get_sparse_vectorizer()
+    sparse_row = await asyncio.to_thread(lambda: vectorizer.transform([keyword_text]))
+    query_sparse_dict = _sparse_row_to_dict(sparse_row)
+    sparse_indices = [int(k) for k in query_sparse_dict.keys()]
+    sparse_values = [float(v) for v in query_sparse_dict.values()]
+
+    try:
+        sparse_result = await asyncio.to_thread(
+            lambda: client.query_points(
+                collection_name=collection_name,
+                query=qdrant_models.SparseVector(
+                    indices=sparse_indices,
+                    values=sparse_values,
+                ),
+                using=QDRANT_SPARSE_VECTOR_NAME,
+                limit=sparse_k,
+                with_payload=True,
+            )
+        )
+        sparse_points = sparse_result.points
+    except Exception as e:
+        print(f"[QDRANT-SEG] sparse query FAILED against '{collection_name}': {e}")
+        sparse_points = []
+
+    dense_raw_scores: dict = {}
+    sparse_raw_scores: dict = {}
+    dense_ranks: dict = {}
+    sparse_ranks: dict = {}
+    chunk_ids: set = set()
+
+    for rank, point in enumerate(dense_points, start=1):
+        payload = point.payload or {}
+        chunk_id = payload.get("chunk_id")
+        if chunk_id is None:
+            continue
+        dense_ranks[chunk_id] = rank
+        dense_raw_scores[chunk_id] = point.score
+        chunk_ids.add(chunk_id)
+
+    for rank, point in enumerate(sparse_points, start=1):
+        payload = point.payload or {}
+        chunk_id = payload.get("chunk_id")
+        if chunk_id is None:
+            continue
+        sparse_ranks[chunk_id] = rank
+        sparse_raw_scores[chunk_id] = point.score
+        chunk_ids.add(chunk_id)
+
+    if not chunk_ids:
+        print(f"[QDRANT-SEG] dense={len(dense_points)} sparse={len(sparse_points)} -> 0 candidate(s)")
+        return []
+
+    try:
+        supabase_rows = await asyncio.to_thread(
+            lambda: supabase.table(supabase_table)
+            .select("chunk_id, md5, content")
+            .in_("chunk_id", list(chunk_ids))
+            .execute()
+        )
+        rows = supabase_rows.data or []
+    except Exception as e:
+        print(f"[QDRANT-SEG] Supabase content lookup against '{supabase_table}' failed: {e}")
+        return []
+
+    # ---------------- RRF: score = sum over channels of 1 / (rrf_k + rank) ----------------
+    matches = []
+    for row in rows:
+        chunk_id = row.get("chunk_id")
+        content = row.get("content")
+        md5 = row.get("md5")
+        if not content:
+            continue
+
+        d_rank = dense_ranks.get(chunk_id)
+        s_rank = sparse_ranks.get(chunk_id)
+
+        rrf_score = 0.0
+        if d_rank is not None:
+            rrf_score += 1.0 / (rrf_k + d_rank)
+        if s_rank is not None:
+            rrf_score += 1.0 / (rrf_k + s_rank)
+
+        matches.append({
+            "content": content,
+            "md5": md5,
+            "chunk_id": chunk_id,
+            "dense_score": dense_raw_scores.get(chunk_id),
+            "sparse_score": sparse_raw_scores.get(chunk_id),
+            "dense_rank": d_rank,
+            "sparse_rank": s_rank,
+            "combined_score": rrf_score,
+            "matched_via": "both" if (d_rank is not None and s_rank is not None) else ("dense" if d_rank is not None else "sparse"),
+        })
+
+    matches.sort(key=lambda r: r["combined_score"], reverse=True)
+
+    print(
+        f"[QDRANT-SEG] dense={len(dense_points)} sparse={len(sparse_points)} "
+        f"-> {len(chunk_ids)} unique candidate(s) in combined pool (RRF, k={rrf_k})"
+    )
+    for i, m in enumerate(matches[:5], start=1):
+        print(
+            f"    [{i}] chunk_id={m['chunk_id']} via={m['matched_via']} "
+            f"dense_rank={m['dense_rank']} sparse_rank={m['sparse_rank']} "
+            f"rrf={m['combined_score']:.5f}"
+        )
+
+    return matches
+
+
+
+async def get_context_from_db_segment_with_timeout(
+    hyde_document: str,
+    keywords: list[str],
+    table_name: str,
+    timeout: float = 20.0,
+    dense_k: int = 10,
+    sparse_k: int = 10,
+) -> list[dict]:
+    task = asyncio.create_task(
+        get_context_from_db_segment(hyde_document, keywords, table_name, dense_k, sparse_k)
+    )
+    done, pending = await asyncio.wait({task}, timeout=timeout)
+
+    if task in done:
+        try:
+            result = task.result()
+            print(f"[DB-SEG] task finished within timeout. Pool has {len(result)} candidate(s).")
+            return result
+        except Exception as e:
+            print(f"[DB-SEG] task raised an error: {e}")
+            return []
+    else:
+        print("[DB-SEG] task still running after timeout, proceeding without it for now.")
+        return []
+
+async def generate_hyde_docs_for_script(
     title: str,
     description: str,
     template: dict,
-    segment_group: list[dict],
-    time_minutes: float,
-) -> str:
+    segments: list[dict],
+) -> list[dict]:
+    """
+    Returns a list of {"hyde_document": str, "keywords": list[str]} — one
+    entry per template segment, in order.
+    """
     segment_briefs = "\n".join(
         f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}%): {seg.get('brief', '')}"
-        for seg in segment_group
+        for seg in segments
     )
 
     fallback_text = f"{title}\n\n{description}".strip()
+    fallback_docs = lambda: [{"hyde_document": fallback_text, "keywords": []} for _ in segments]
+
+    if not segments:
+        return [{"hyde_document": fallback_text, "keywords": []}]
 
     template_title = template.get('title')
-    template_cluster = template.get('cluster')
+    template_about = template.get('about')
 
     hyde_prompt = f"""
 
-## ROLE
 
-You are a **Script Segment Hypothetical Document Generator** for a Retrieval-Augmented Generation (RAG) system.
+# SS-HDG v7 — Script Segment HyDE + Keyword Generator
 
-Your task is **not** to write the video script. Instead, generate hypothetical retrieval documents so they can be embedded and used to retrieve the most relevant passages from books, research papers, reports, encyclopedias, biographies, historical works, technical references, government publications, company reports, and other authoritative sources.
+ROLE: For each script segment, generate TWO retrieval artifacts:
+(1) a HyDE paragraph for dense embedding, and
+(2) a keyword set for sparse/lexical retrieval.
+These serve different retrieval mechanisms and must be optimized differently — do not just extract keywords from the paragraph afterward; reason about each independently.
 
-Your objective is to maximize **semantic retrieval quality**, ensuring every document closely resembles the type of source material likely to contain the knowledge required for the corresponding portion of the final script.
+INPUT
+Idea Title: {title}
+Idea Description: {description}
+Template Title: {template_title}
+Template Purpose: {template_about}
+Segments: {segment_briefs}
 
----
+Each segment in {segment_briefs} includes a precomputed `keyword_count` — the exact number of keywords required for that segment (derived from its % of script and retrieval objective type). Use it exactly as given; do not decide the count yourself.
 
-## INPUT
+RULES
 
-* **Idea Title:** `{title}`
-* **Idea Description:** `{description}`
-* **Target Duration:** `{time_minutes}` minute(s)
-* **Template Title:** `{template_title}`
-* **Template Cluster:** `{template_cluster}`
-* **Template Purpose:** `{segment_briefs}`
+1. RETRIEVAL OBJECTIVE PER SEGMENT — infer from segment purpose, e.g.:
+- Hook → memorable incidents, founder stories, verifiable quotes
+- Definition → authoritative definitions, terminology, taxonomy
+- Mechanism/Mapping → causal processes, technical detail
+- Evidence → studies, benchmarks, institutional reports
+- Applications → real-world deployments, organizations, products
+- Comparison → alternative approaches, contrasts
+- Limitations → criticisms, failure modes, open questions
+- Synthesis → integrative framework (write LAST, must add an angle not covered above)
+Infer objective for any other segment from its brief. This objective guides both outputs.
 
-The total number of hypothetical retrieval documents to generate is determined by:
+2. HYDE_DOCUMENT:
+- No meta-language: never mention "retrieval," "should target," "sources on," or reference itself as a document. Write as a standalone excerpt from an authoritative source.
+- No shared sentence-opening pattern across segments.
+- Only the Definition segment may formally introduce/define the topic.
+- Word budget scales with segment %: ≤10% → 50-60 words | 11-20% → 90-110 words | 21-30%+ → 130-150 words.
+- Factual discipline: never fabricate statistics, dates, quotes, studies, citations.
 
-**Total Documents = ceil(Target Duration ÷ 2)**
+3. KEYWORDS — count is fixed per segment via `keyword_count`, not open-ended:
+- Each entry is a short phrase (1-4 words), NOT a sentence.
+- Include: named frameworks/methods relevant to this segment, technical terminology, named people/organizations if factually associated with this segment's objective, synonyms and alternate phrasings a source might use for the same concept, closely related sub-concepts.
+- Do NOT include: generic filler words, stopword-heavy phrases, terms already used in this exact form by an earlier segment's keyword list.
+- Prioritize coverage breadth over redundancy: if genuinely distinct terms run out before reaching the count, prefer a slightly shorter list over padding with near-duplicate phrasings.
+- Keywords may share a few terms with the hyde_document's vocabulary, but should extend beyond it — synonyms and adjacent terms the paragraph didn't use, since the goal is catching lexical matches the dense channel might miss.
 
-Examples:
+4. SEMANTIC ISOLATION — applies to both outputs. Before finalizing a segment, check:
+- Does another segment's hyde_document cover largely the same ground? Rewrite if so.
+- Does another segment's keyword list overlap heavily (same terms in same form)? Trim/replace overlapping terms with segment-specific alternatives.
 
-* 5 minutes → 3 documents
-* 8 minutes → 4 documents
-* 10 minutes → 5 documents
-* 15 minutes → 8 documents
+5. STYLE (hyde_document only) — objective, reference-book tone. No storytelling, opinions, second-person language, intros, conclusions, or self-referential commentary. Keywords are exempt from prose style rules per Rule 3.
 
-Template segments provide only high-level structural context. They help infer the progression of the topic but do **not** determine the number of retrieval documents.
+OUTPUT — valid JSON only, no markdown fences, no preamble, no trailing text:
 
----
+{{
+  "documents": [
+    {{
+      "segment": "<Segment Name>",
+      "focus": "<one short phrase, internal logging only>",
+      "hyde_document": "<standalone paragraph, zero meta-language>",
+      "keywords": ["<term 1>", "<term 2>", "..."]
+    }}
+  ]
+}}
 
-## TASK
-
-1. Infer the topic's primary domain(s) (such as history, business, technology, science, psychology, philosophy, politics, finance, biography, health, law, or other academic disciplines).
-2. Calculate the total number of retrieval documents using:
-
-   **Total Documents = ceil(Target Duration ÷ 2)**
-
-3. Divide the overall topic into sequential knowledge regions that together comprehensively cover the complete subject from beginning to end.
-4. Generate **exactly one hypothetical retrieval document for each knowledge region**.
-5. Ensure adjacent documents naturally progress through the topic while minimizing semantic overlap.
-6. Adapt vocabulary, concepts, and related entities naturally to the inferred domain instead of using generic wording.
-
----
-
-## RETRIEVAL REQUIREMENTS
-
-Each document should resemble a concise passage from an authoritative reference source rather than a script.
-
-Model each document after the type of material commonly found in:
-
-* academic textbooks
-* scholarly research papers
-* peer-reviewed journals
-* government publications
-* international organizations
-* technical standards
-* company reports
-* biographies
-* historical archives
-* encyclopedias
-* authoritative factual web sources
-
-Naturally include, where appropriate:
-
-* domain terminology
-* related concepts
-* synonyms
-* broader and narrower concepts
-* important people
-* organizations
-* technologies
-* historical events
-* theories
-* frameworks
-* methodologies
-* institutions
-
-Prioritize concepts that improve semantic similarity and retrieval.
-
-Do **not** keyword stuff.
-
----
-
-## TEMPLATE AWARENESS
-
-Treat the template only as a **high-level structural guide** for understanding the natural progression of the topic.
-
-Do **not** generate one document per segment.
-
-Instead, generate the required number of retrieval documents based on the target duration while ensuring the combined documents collectively cover the knowledge needed for the complete script.
-
-Ignore storytelling instructions such as hooks, suspense, pacing, callbacks, emotional beats, or audience engagement. Those belong to the script-writing stage.
-
-Focus only on retrieving the factual, conceptual, historical, technical, scientific, business, philosophical, legal, or contextual knowledge needed throughout the entire topic.
-
----
-
-## FACTUAL DISCIPLINE
-
-Base every hypothetical document on knowledge that would reasonably appear in authoritative books, scholarly literature, government publications, reputable institutional reports, or high-quality factual web sources.
-
-Do not fabricate statistics, dates, quotations, study findings, citations, financial figures, publication names, or specific evidence unless universally inseparable from the topic.
-
-When uncertain, describe concepts using neutral, authoritative language similar to textbooks, encyclopedias, or technical reference works.
-
-Semantic relevance is more important than fabricated specificity.
-
----
-
-## STYLE
-
-* Objective
-* Information-dense
-* Encyclopedia or textbook style
-* No storytelling
-* No opinions
-* No recommendations
-* No introductions or conclusions
-* No second-person language
-
----
-
-## LENGTH
-
-Generate **80–100 words** for each retrieval document.
----
-## OUTPUT
-
-Generate exactly:
-
-**ceil(Target Duration ÷ 2)**
-
-retrieval documents.
-
-Format the output as:
-
-```text
-Document 1:
-<retrieval document>
-
-Document 2:
-<retrieval document>
-
-Document 3:
-<retrieval document>
-
-Document N:
-<retrieval document>
-```
-
-Return **only** the retrieval documents.
-
-Do **not** mention segment names, template details, retrieval objectives, or the document generation logic.
 
 """.strip()
 
-    segment_label = ', '.join(s.get('name', 'segment') for s in segment_group)
-
-    async def _call(max_tokens: int):
+    try:
         completion = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
                 messages=[{"role": "user", "content": hyde_prompt}],
-                max_completion_tokens=max_tokens,
                 stream=False,
-                temperature=0.3,   
-                top_p=0.9
+                temperature=0.3,
+                top_p=0.9,
             )
         )
-        _record_token_usage(f"generate_hyde_doc_for_segments[{segment_label}] (max_tokens={max_tokens})", completion)
+        _record_token_usage("generate_hyde_docs_for_script", completion)
+
         choice = completion.choices[0]
-        raw_content = (choice.message.content or "").strip()
-        finish_reason = getattr(choice, "finish_reason", None)
-        output_tokens = None
+        raw = (choice.message.content or "").strip()
+
+        print(f"\n{'#' * 80}")
+        print(f"HYDE RAW OUTPUT — {len(segments)} segment(s) requested")
+        print(f"{'#' * 80}")
+        print(raw if raw else "(empty response from model)")
+        print(f"{'#' * 80}\n")
+
+        if not raw:
+            print("--- HyDE generation EMPTY, falling back to title/description ---")
+            return fallback_docs()
+
         try:
-            output_tokens = completion.usage.completion_tokens
-        except Exception:
-            pass
-        return raw_content, finish_reason, output_tokens
+            parsed = json.loads(_strip_json_fences(raw))
+        except Exception as parse_exc:
+            print(f"--- HyDE JSON parse failed: {parse_exc} — falling back ---")
+            return fallback_docs()
 
-    try:
-        raw_doc, finish_reason, output_tokens = await _call(max_tokens=900)
-        doc = _cap_hyde_doc_tokens(raw_doc) if raw_doc else ""
+        raw_docs = parsed.get("documents") if isinstance(parsed, dict) else None
+        if not isinstance(raw_docs, list) or not raw_docs:
+            print("--- HyDE JSON had no usable 'documents' list, falling back ---")
+            return fallback_docs()
 
-        if not doc:
-            try:
-                raw_doc, finish_reason, output_tokens = await _call(max_tokens=2000)
-                doc = _cap_hyde_doc_tokens(raw_doc) if raw_doc else ""
-            except Exception as retry_exc:
-                print(f"--- HyDE DOC [{segment_label}] retry call raised: {retry_exc} ---")
-                doc = ""
+        docs = []
+        for entry in raw_docs:
+            if not isinstance(entry, dict):
+                continue
+            text_value = (entry.get("hyde_document") or "").strip()
+            raw_keywords = entry.get("keywords") or []
+            if not isinstance(raw_keywords, list):
+                raw_keywords = []
+            kw_clean = [str(k).strip() for k in raw_keywords if str(k).strip()]
+            if text_value:
+                docs.append({"hyde_document": text_value, "keywords": kw_clean})
 
-        if not doc:
-            print(f"--- HyDE DOC [{segment_label}] still EMPTY after retry, falling back to title/description ---")
-            return _cap_hyde_doc_tokens(fallback_text)
+        if len(docs) != len(segments):
+            print(
+                f"--- HyDE parse WARNING: got {len(docs)} document(s) but "
+                f"expected {len(segments)} — using what was parsed anyway ---"
+            )
 
-        return doc
+        if not docs:
+            print("--- HyDE parse produced 0 documents, falling back ---")
+            return fallback_docs()
+
+        return docs
+
     except Exception as exc:
-        print(f"--- HyDE generation failed for segment group [{segment_label}]: {type(exc).__name__}: {exc} ---")
-        return _cap_hyde_doc_tokens(fallback_text)
-    
-
+        print(f"--- HyDE generation failed: {type(exc).__name__}: {exc} ---")
+        return fallback_docs()
+                        
 async def get_context_with_timeout(
     topic_text: str,
     hyde_document: str,
@@ -5325,6 +5581,22 @@ SCRIPT_RAG_POOL_PER_DOC = 10   #
 SCRIPT_TOP_K_PER_DOC = 2       
 
 
+def _pick_top_k_unique(pool: list[dict], k: int) -> list[dict]:
+    picked = []
+    seen_keys = set()
+    for item in pool:
+        key = item.get("md5") or item.get("content")
+        if key and key in seen_keys:
+            continue
+        if key:
+            seen_keys.add(key)
+        picked.append(item)
+        if len(picked) >= k:
+            break
+    return picked
+
+
+
 async def _generate_script_impl(request: "ScriptRequest"):
     _start_token_tracking()
 
@@ -5356,19 +5628,12 @@ async def _generate_script_impl(request: "ScriptRequest"):
         print(f"--- error fetching channel profile: {exc} ---")
         summary = None
 
-    num_docs = num_hyde_docs_for_time(request.time)
-    segment_buckets = bucket_segments_by_time(segments, num_docs)
-    print(f"Planning {len(segment_buckets)} HyDE doc(s) for a {request.time}-minute script")
+    print(f"Planning HyDE generation for {len(segments)} template segment(s)")
 
-    # Per-HyDE-doc RAG rules:
-    # - SCRIPT_RAG_POOL_PER_DOC: how big a candidate pool each HyDE doc retrieves
-    # - SCRIPT_TOP_K_PER_DOC: STRICT number of chunks each HyDE doc contributes
-    #   (also reused for web sources in Stage 3, same strict rule)
     SCRIPT_RAG_POOL_PER_DOC = 10
     SCRIPT_TOP_K_PER_DOC = 2
-    script_web_source_target = num_docs * SCRIPT_TOP_K_PER_DOC
 
-    hyde_documents: list[str] = []
+    hyde_documents: list[dict] = []
     db_results: list = []
     all_db_chunks_seen: list = []
     all_db_md5s_seen: set = set()
@@ -5384,31 +5649,30 @@ async def _generate_script_impl(request: "ScriptRequest"):
     classification = dict(_DEFAULT_CLASSIFICATION)
 
     # =========================================================================
-    # STAGE 1 — HyDE document generation.
-    # Nothing else may start until this stage has produced usable output.
+    # STAGE 1 — HyDE document + keyword generation. ONE LLM call generates
+    # both the dense-retrieval HyDE paragraph AND the sparse-retrieval
+    # keyword list for every template segment at once, parsed back into a
+    # list of {"hyde_document", "keywords"} dicts. Nothing else may start
+    # until this stage has produced usable output.
     # =========================================================================
-    print("\n[STAGE 1] Generating HyDE documents...")
+    print("\n[STAGE 1] Generating HyDE documents + keywords...")
     try:
-        hyde_documents = list(await asyncio.gather(
-            *[
-                generate_hyde_doc_for_segments(
-                    request.title,
-                    request.description,
-                    selected_template,
-                    bucket,
-                    request.time,
-                )
-                for bucket in segment_buckets
-            ]
-        ))
+        hyde_documents = await generate_hyde_docs_for_script(
+            request.title,
+            request.description,
+            selected_template,
+            segments,
+        )
     except Exception as exc:
         print(f"--- [STAGE 1] HyDE generation failed: {exc} ---")
         import traceback
         traceback.print_exc()
         hyde_documents = []
 
-    combined_hyde_doc = "\n\n".join(doc for doc in hyde_documents if doc) or topic_text
-    hyde_docs_usable = any((doc or "").strip() for doc in hyde_documents)
+    combined_hyde_doc = "\n\n".join(
+        d.get("hyde_document", "") for d in hyde_documents if d.get("hyde_document")
+    ) or topic_text
+    hyde_docs_usable = any((d.get("hyde_document") or "").strip() for d in hyde_documents)
 
     if not hyde_docs_usable:
         print("[STAGE 1] FAILED — no usable HyDE document was produced, aborting pipeline before Stage 2")
@@ -5417,37 +5681,51 @@ async def _generate_script_impl(request: "ScriptRequest"):
             "token_usage": _get_token_usage_summary(),
         }
 
-    print(f"[STAGE 1] done — {len(hyde_documents)} HyDE doc(s) generated")
+    print(f"[STAGE 1] done — {len(hyde_documents)} HyDE segment(s) generated")
 
     # =========================================================================
-    # STAGE 2 — Table selection + RAG DB chunk retrieval.
-    # STRICT RULE: total RAG chunks = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC.
-    # Each HyDE doc independently contributes exactly SCRIPT_TOP_K_PER_DOC chunks
-    # from its own retrieval pool — never more, never fewer than what's available.
-    # Runs only after Stage 1 completes.
+    # STAGE 2 — Category selection + RAG chunk retrieval. Per segment, DENSE
+    # search runs on the segment's hyde_document (top 10) and SPARSE search
+    # runs on the segment's keywords (top 10) as two SEPARATE Qdrant queries
+    # (no RRF fusion). The two result sets are merged/deduped into a pool of
+    # up to 20 candidates per segment, and the top 2 are picked from that
+    # pool. Total RAG chunks = up to len(hyde_documents) * SCRIPT_TOP_K_PER_DOC,
+    # deduped ACROSS segments. NO BACKFILL — if a segment's top picks turn
+    # out to be duplicates of chunks another segment already claimed, they
+    # are simply dropped rather than replaced with lower-relevance chunks
+    # pulled deeper from the pool just to hit a target count. Runs only
+    # after Stage 1 completes.
     # =========================================================================
-    print("\n[STAGE 2] Selecting table and retrieving RAG DB chunks using HyDE documents...")
+    print("\n[STAGE 2] Selecting category and retrieving RAG chunks (dense + sparse, separately) using HyDE segments...")
     try:
         table_name = await select_table_for_topic(topic_text)
     except Exception as exc:
-        print(f"--- [STAGE 2] table selection failed, defaulting to {TABLES[0]}: {exc} ---")
-        table_name = TABLES[0]
+        print(f"--- [STAGE 2] category selection failed, defaulting to {RAG_CATEGORIES[0]}: {exc} ---")
+        table_name = RAG_CATEGORIES[0]
 
     script_rag_target = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC
-    print(f"[STAGE 2] target RAG chunk count = {len(hyde_documents)} HyDE doc(s) x {SCRIPT_TOP_K_PER_DOC} = {script_rag_target}")
+    print(
+        f"[STAGE 2] category='{table_name}' | {len(hyde_documents)} segment(s) x "
+        f"(dense-{SCRIPT_RAG_POOL_PER_DOC} + sparse-{SCRIPT_RAG_POOL_PER_DOC} = up to "
+        f"{SCRIPT_RAG_POOL_PER_DOC * 2} pooled) -> top {SCRIPT_TOP_K_PER_DOC} unique-md5 "
+        f"pick per segment = up to {script_rag_target} chunk(s) (no cross-segment "
+        f"backfill — duplicates across segments are dropped, not replaced)"
+    )
 
     try:
         db_results_per_doc = await asyncio.gather(
             *[
-                get_context_with_timeout(
-                    topic_text, doc, table_name=table_name, final_k=SCRIPT_RAG_POOL_PER_DOC
+                get_context_from_db_segment_with_timeout(
+                    hyde_document=seg.get("hyde_document", ""),
+                    keywords=seg.get("keywords", []),
+                    table_name=table_name,
+                    dense_k=SCRIPT_RAG_POOL_PER_DOC,
+                    sparse_k=SCRIPT_RAG_POOL_PER_DOC,
                 )
-                for doc in hyde_documents
+                for seg in hyde_documents
             ]
         )
 
-        # Wide pool of every unique chunk seen (used later only for book lookups,
-        # not for the strict script_rag_target count).
         seen_md5_all = set()
         for doc_results in db_results_per_doc:
             for item in doc_results:
@@ -5459,68 +5737,72 @@ async def _generate_script_impl(request: "ScriptRequest"):
                     if md5_val:
                         all_db_md5s_seen.add(md5_val)
 
-        # STRICT pass: exactly top-K per doc, deduped
         db_results = []
         seen_md5_context = set()
+
+        print(f"\n{'=' * 90}")
+        print(f"[HYDE-RAG] {len(hyde_documents)} segment(s) — dense+sparse pool -> top-{SCRIPT_TOP_K_PER_DOC} unique picks")
+        print(f"{'=' * 90}")
+
         for doc_idx, doc_results in enumerate(db_results_per_doc, start=1):
-            top_for_doc = doc_results[:SCRIPT_TOP_K_PER_DOC]
+            top_for_doc = _pick_top_k_unique(doc_results, SCRIPT_TOP_K_PER_DOC)
+            kept_this_segment = 0
             for item in top_for_doc:
                 key = item.get("md5") or item.get("content")
                 if key and key not in seen_md5_context:
                     seen_md5_context.add(key)
                     db_results.append(item)
-            print(
-                f"[STAGE 2] HyDE doc #{doc_idx}: picked top {len(top_for_doc)} "
-                f"RAG chunk(s) from a pool of {len(doc_results)} "
-                f"(target pool size {SCRIPT_RAG_POOL_PER_DOC})"
-            )
+                    kept_this_segment += 1
 
-        # Backfill ONLY if dedup dropped us below target — still bounded by
-        # script_rag_target, never pulls more than that.
-        if len(db_results) < script_rag_target:
-            max_pool_len = max((len(d) for d in db_results_per_doc), default=0)
-            rank = SCRIPT_TOP_K_PER_DOC
-            while len(db_results) < script_rag_target and rank < max_pool_len:
-                for doc_results in db_results_per_doc:
-                    if len(db_results) >= script_rag_target:
-                        break
-                    if rank >= len(doc_results):
-                        continue
-                    item = doc_results[rank]
-                    key = item.get("md5") or item.get("content")
-                    if key and key not in seen_md5_context:
-                        seen_md5_context.add(key)
-                        db_results.append(item)
-                rank += 1
-            print(
-                f"[STAGE 2] backfill — now {len(db_results)}/{script_rag_target} "
-                f"unique chunk(s) after pulling deeper into each doc's own pool"
-            )
+            hyde_full = (hyde_documents[doc_idx - 1].get("hyde_document") or "").strip().replace("\n", " ")
+            kw_full = hyde_documents[doc_idx - 1].get("keywords") or []
+            print(f"\n[SEGMENT #{doc_idx}] HyDE: \"{hyde_full}\"")
+            print(f"  keywords: {kw_full}")
+            print(f"  pooled candidates: {len(doc_results)} (dense+sparse, deduped by chunk_id)")
 
-        db_results = db_results[:script_rag_target]
+            picked_ids = {item.get("chunk_id") for item in top_for_doc}
+            for rank, item in enumerate(doc_results, start=1):
+                marker = "→ PICKED (unique)" if item.get("chunk_id") in picked_ids else ""
+                print(
+                    f"    [{rank}] rrf={item.get('combined_score'):.5f} "
+                    f"via={item.get('matched_via')} dense_rank={item.get('dense_rank')} "
+                    f"sparse_rank={item.get('sparse_rank')} md5={item.get('md5')} {marker}"
+                )
 
-        if len(db_results) < script_rag_target:
-            print(
-                f"[STAGE 2] WARNING: only {len(db_results)}/{script_rag_target} unique RAG "
-                f"chunk(s) available even after backfill — DB genuinely doesn't have more "
-                f"distinct on-topic chunks across the HyDE docs' pools."
-            )
+            print(f"  picked (unique-md5, within-segment): {len(top_for_doc)} | kept after cross-segment dedup: {kept_this_segment}")
+            if not top_for_doc:
+                print("    (no chunks retrieved for this segment)")
+            for rank, item in enumerate(top_for_doc, start=1):
+                content_full = (item.get("content") or "").strip().replace("\n", " ")
+                print(f"    #{rank} rrf={item.get('combined_score'):.5f} md5={item.get('md5')}")
+                print(f"        \"{content_full}\"")
 
+        print(f"\n{'=' * 90}")
         print(
-            f"[STAGE 2] done — {len(db_results)} RAG chunk(s) selected "
-            f"(strict target: {len(hyde_documents)} HyDE doc(s) x {SCRIPT_TOP_K_PER_DOC} = {script_rag_target}). "
-            f"{len(all_db_chunks_seen)} unique chunk(s) seen in total across pools (used for book lookups)."
+            f"[HYDE-RAG] TOTAL: {len(db_results)}/{script_rag_target} unique chunk(s) selected "
+            f"for script generation (unique within each segment's own pool, then deduped "
+            f"across segments, no backfill applied) "
+            f"({len(all_db_chunks_seen)} unique chunk(s) seen across all pools, kept for book lookups)"
         )
+        print(f"{'=' * 90}\n")
+
+        if len(db_results) < script_rag_target:
+            print(
+                f"[HYDE-RAG] NOTE: {len(db_results)}/{script_rag_target} unique chunk(s) — "
+                f"this is expected when segments share overlapping top-ranked source "
+                f"material; no lower-relevance chunks were pulled in to pad the count."
+            )
     except Exception as exc:
         print(f"--- [STAGE 2] DB retrieval failed: {exc} ---")
         import traceback
         traceback.print_exc()
-
     # =========================================================================
     # STAGE 3 — Web search keyword generation, searching each keyword, and
     # matching the retrieved website content against the HyDE documents.
     # Runs only after Stage 2 completes.
     # =========================================================================
+    script_web_source_target = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC
+
     print("\n[STAGE 3] Generating web search keywords...")
     try:
         script_search_keywords = await _generate_search_keywords_for_script(
@@ -5548,7 +5830,8 @@ async def _generate_script_impl(request: "ScriptRequest"):
         new_articles = []
         seen_urls_final: set = set()
 
-        for doc_idx, doc in enumerate(hyde_documents, start=1):
+        for doc_idx, seg in enumerate(hyde_documents, start=1):
+            doc = seg.get("hyde_document", "")
             hyde_embedding = await _run_encode(
                 lambda d=doc: model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
             )
@@ -5561,7 +5844,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
                     seen_urls_final.add(url)
                     new_articles.append(article)
             print(
-                f"[STAGE 3] HyDE doc #{doc_idx}: matched top {len(top_for_doc)} "
+                f"[STAGE 3] HyDE segment #{doc_idx}: matched top {len(top_for_doc)} "
                 f"from the pool of {len(shared_pool)}"
             )
 
@@ -5719,7 +6002,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
-
 
 
 
@@ -7723,6 +8005,381 @@ async def razorpay_webhook(
 
 
 
+
+
+
+
+
+
+from fastapi import UploadFile, File, Form
+
+AUDIO_BUCKET = "user-audio"
+AUDIO_TABLE = "user_audio"
+
+ALLOWED_AUDIO_CONTENT_TYPES = {
+    "audio/mpeg",     
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/webm",
+    "audio/ogg",
+    "audio/mp4",       
+    "audio/x-m4a",
+    "audio/aac",
+}
+
+MAX_AUDIO_SIZE_BYTES = int(os.getenv("MAX_AUDIO_SIZE_BYTES", str(200 * 1024 * 1024)))
+SIGNED_URL_EXPIRY_SECONDS = int(os.getenv("AUDIO_SIGNED_URL_EXPIRY_SECONDS", str(60 * 60 * 24 * 7)))
+
+
+def _sanitize_filename(filename: str) -> str:
+    filename = filename or "audio"
+    filename = re.sub(r"[^a-zA-Z0-9._-]", "_", filename)
+    return filename[:150] or "audio"
+
+
+def _guess_extension(content_type: str, filename: str) -> str:
+    ext_from_name = os.path.splitext(filename or "")[1]
+    if ext_from_name:
+        return ext_from_name
+    mapping = {
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/wave": ".wav",
+        "audio/webm": ".webm",
+        "audio/ogg": ".ogg",
+        "audio/mp4": ".m4a",
+        "audio/x-m4a": ".m4a",
+        "audio/aac": ".aac",
+    }
+    return mapping.get(content_type, ".bin")
+
+
+def _upload_audio_to_storage_sync(
+    bucket: str,
+    storage_path: str,
+    file_bytes: bytes,
+    content_type: str,
+) -> None:
+    supabase.storage.from_(bucket).upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options={
+            "content-type": content_type or "application/octet-stream",
+            "upsert": "false",
+        },
+    )
+
+
+def _create_signed_url_sync(bucket: str, storage_path: str, expires_in: int) -> str | None:
+    try:
+        result = supabase.storage.from_(bucket).create_signed_url(storage_path, expires_in)
+        return result.get("signedURL") or result.get("signedUrl")
+    except Exception as e:
+        print(f"[AUDIO] failed to create signed URL for '{storage_path}': {e}")
+        return None
+
+
+@app.post("/save-audio")
+async def save_audio(
+    userId: str = Form(...),
+    audio: UploadFile = File(...),
+):
+    await require_valid_user(userId)
+
+    if audio.content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio content type: {audio.content_type}",
+        )
+
+    file_bytes = await audio.read()
+    size_bytes = len(file_bytes)
+
+    if size_bytes == 0:
+        raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+
+    if size_bytes > MAX_AUDIO_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio file too large ({size_bytes} bytes, max {MAX_AUDIO_SIZE_BYTES} bytes)",
+        )
+
+    safe_name = _sanitize_filename(audio.filename)
+    extension = _guess_extension(audio.content_type, safe_name)
+    unique_name = f"{uuid.uuid4().hex}{extension}"
+    storage_path = f"{userId}/{unique_name}"
+
+    print(
+        f"[AUDIO] uploading '{safe_name}' ({size_bytes} bytes, {audio.content_type}) "
+        f"for userId={userId} -> {AUDIO_BUCKET}/{storage_path}"
+    )
+
+    try:
+        await asyncio.to_thread(
+            _upload_audio_to_storage_sync,
+            AUDIO_BUCKET,
+            storage_path,
+            file_bytes,
+            audio.content_type,
+        )
+    except Exception as e:
+        print(f"[AUDIO] storage upload FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to upload audio to storage: {e}")
+
+    file_url = await asyncio.to_thread(
+        _create_signed_url_sync, AUDIO_BUCKET, storage_path, SIGNED_URL_EXPIRY_SECONDS
+    )
+
+    try:
+        insert_result = await asyncio.to_thread(
+            lambda: supabase.table(AUDIO_TABLE).insert({
+                "userId": userId,
+                "file_path": storage_path,
+                "file_name": safe_name,
+                "content_type": audio.content_type,
+                "size_bytes": size_bytes,
+            }).execute()
+        )
+    except Exception as e:
+        print(f"[AUDIO] metadata insert FAILED (file was uploaded to storage though): {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Audio uploaded but failed to save metadata: {e}")
+
+    row = insert_result.data[0] if insert_result.data else None
+
+    return {
+        "message": "Audio uploaded successfully",
+        "id": row.get("id") if row else None,
+        "userId": userId,
+        "file_path": storage_path,
+        "file_name": safe_name,
+        "content_type": audio.content_type,
+        "size_bytes": size_bytes,
+        "url": file_url,
+        "url_expires_in_seconds": SIGNED_URL_EXPIRY_SECONDS if file_url else None,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class AddScriptTagsRequest(BaseModel):
+    userId: str
+    script: str
+
+
+SCRIPT_TAG_LIST = [
+    "pause", "emphasis", "laughing", "inhale", "chuckle", "tsk", "singing",
+    "excited", "laughing tone", "interrupting", "chuckling", "excited tone",
+    "volume up", "echo", "angry", "low volume", "sigh", "low voice", "whisper",
+    "screaming", "shouting", "loud", "surprised", "short pause", "exhale",
+    "delight", "panting", "audience laughter", "with strong accent",
+    "volume down", "clearing throat", "sad", "moaning", "shocked",
+]
+
+SCRIPT_TAG_SYSTEM_PROMPT = f"""
+## ROLE
+
+You are a professional voice-direction editor. You take a finished narration
+script and mark it up with inline delivery/emotion tags for a text-to-speech
+engine (Fish Audio style), so the narrator/TTS model knows exactly how to
+perform each moment.
+
+---
+
+## SUPPORTED TAGS
+
+You may ONLY use tags from this list (this is not exhaustive of what the
+engine supports — it supports 15,000+ tags — but for this task, restrict
+yourself to the tags below so output stays consistent and predictable):
+
+{", ".join(f"[{t}]" for t in SCRIPT_TAG_LIST)}
+
+Do not invent new tags. Do not use any tag not in this list. Do not use a
+tag whose emotional/delivery meaning does not genuinely fit the moment.
+
+---
+
+## TASK
+
+Read the script and insert tags inline, directly into the text, at the exact
+point where that delivery should occur. A tag can appear:
+- before a word or phrase it modifies (e.g. "[whisper] I never told anyone")
+- before a punctuation-marked pause point (e.g. "[short pause] And then—")
+- standalone between sentences/clauses where a vocal beat belongs
+  (e.g. "[sigh] It wasn't supposed to happen this way.")
+
+---
+
+## RULES
+
+1. NEVER alter, remove, add, paraphrase, reorder, or "fix" any of the
+   original script's words. The original text must remain 100% identical
+   except for the inserted tags. This is a markup pass, not an editing pass.
+2. Tags must feel natural and editorially justified — driven by what the
+   sentence is actually saying (a joke, a shocking reveal, a quiet
+   confession, a building excitement) — never decorative or random.
+3. Do NOT overuse tags. A well-tagged script has tags at genuine emotional
+   or rhythmic turning points only — roughly one tag per 40-80 words is a
+   reasonable density for a documentary-style narration, but let the
+   content dictate it, don't force a fixed rate.
+4. Never place two tags back-to-back with nothing between them.
+5. Never tag every sentence — most sentences should carry no tag at all.
+   Reserve tags for moments where a human narrator would audibly shift tone,
+   pace, volume, or add a vocalization (breath, chuckle, pause, etc.).
+6. Preserve all existing paragraph breaks and formatting exactly.
+7. Tags are inserted as literal bracketed text directly in the string,
+   e.g. "[chuckle] When you're creating something new..." — not as a
+   separate list, not as JSON annotations, not as footnotes.
+
+---
+
+## OUTPUT
+
+Return ONLY the tagged script as plain text — no preamble, no explanation,
+no markdown fences, no notes, no JSON. Just the script with tags inserted
+inline exactly as they should appear for the narrator/TTS engine to read.
+""".strip()
+
+
+def _validate_tagged_script(original: str, tagged: str) -> bool:
+   
+    if not tagged or not tagged.strip():
+        return False
+
+    stripped = re.sub(r"\[[a-zA-Z0-9 \-']+\]", "", tagged)
+    stripped_words = stripped.split()
+    original_words = original.split()
+
+    if not original_words:
+        return False
+
+    len_ratio = len(stripped_words) / len(original_words)
+    if len_ratio < 0.9 or len_ratio > 1.1:
+        return False
+
+    return True
+
+
+async def generate_tagged_script(script_text: str) -> str:
+    user_prompt = f"""Script to tag:
+
+{script_text}
+"""
+
+    async def _call():
+        completion = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": SCRIPT_TAG_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+                temperature=0.4,
+                top_p=0.9,
+            ),
+            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
+        )
+        _record_token_usage("generate_tagged_script", completion)
+        return (completion.choices[0].message.content or "").strip()
+
+    raw = ""
+    try:
+        raw = await _call()
+    except Exception as e:
+        print(f"[TAG-SCRIPT] generation failed: {e}")
+        return script_text
+
+    if not _validate_tagged_script(script_text, raw):
+        print(
+            f"[TAG-SCRIPT] validation failed (tagged output diverged too far "
+            f"from original word count) — retrying once. Raw (truncated): {raw[:300]}"
+        )
+        try:
+            raw = await _call()
+        except Exception as e:
+            print(f"[TAG-SCRIPT] retry call failed: {e}")
+            return script_text
+
+        if not _validate_tagged_script(script_text, raw):
+            print("[TAG-SCRIPT] still invalid after retry — returning original untagged script")
+            return script_text
+
+    return raw
+
+
+@app.post("/add-script-tags")
+async def add_script_tags(request: AddScriptTagsRequest):
+    await require_valid_user(request.userId)
+
+    _start_token_tracking()
+
+    script_text = (request.script or "").strip()
+    if not script_text:
+        raise HTTPException(status_code=400, detail="script must be a non-empty string")
+
+    print(f"\n[TAG-SCRIPT] tagging script ({_word_count(script_text)} word(s)) for userId={request.userId}")
+
+    try:
+        tagged_script = await generate_tagged_script(script_text)
+    except Exception as exc:
+        print(f"--- /add-script-tags failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": "Failed to generate tagged script.",
+            "detail": str(exc),
+            "script": script_text,
+            "token_usage": _get_token_usage_summary(),
+        }
+
+    tag_count = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", tagged_script))
+    token_usage = _get_token_usage_summary()
+
+    print(f"[TAG-SCRIPT] done — {tag_count} tag(s) inserted")
+
+    return {
+        "tagged_script": tagged_script,
+        "tag_count": tag_count,
+        "word_count": _word_count(script_text),
+        "token_usage": token_usage,
+    }
+
+
+
+
 @app.get('/trending-data')
 def content_radar():
     res = supabase.table("content_radar").select("*").execute()
@@ -7766,6 +8423,9 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
     asyncio.create_task(run_intelligence_for_user(userId))
 
     return {"message": "Uploaded and processed"}
+
+
+
 
 
 
