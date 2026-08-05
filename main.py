@@ -8166,210 +8166,6 @@ async def save_audio(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-class AddScriptTagsRequest(BaseModel):
-    userId: str
-    script: str
-
-
-SCRIPT_TAG_LIST = [
-    "pause", "emphasis", "laughing", "inhale", "chuckle", "tsk", "singing",
-    "excited", "laughing tone", "interrupting", "chuckling", "excited tone",
-    "volume up", "echo", "angry", "low volume", "sigh", "low voice", "whisper",
-    "screaming", "shouting", "loud", "surprised", "short pause", "exhale",
-    "delight", "panting", "audience laughter", "with strong accent",
-    "volume down", "clearing throat", "sad", "moaning", "shocked",
-]
-
-SCRIPT_TAG_SYSTEM_PROMPT = f"""
-## ROLE
-
-You are a professional voice-direction editor. You take a finished narration
-script and mark it up with inline delivery/emotion tags for a text-to-speech
-engine (Fish Audio style), so the narrator/TTS model knows exactly how to
-perform each moment.
-
----
-
-## SUPPORTED TAGS
-
-You may ONLY use tags from this list (this is not exhaustive of what the
-engine supports — it supports 15,000+ tags — but for this task, restrict
-yourself to the tags below so output stays consistent and predictable):
-
-{", ".join(f"[{t}]" for t in SCRIPT_TAG_LIST)}
-
-Do not invent new tags. Do not use any tag not in this list. Do not use a
-tag whose emotional/delivery meaning does not genuinely fit the moment.
-
----
-
-## TASK
-
-Read the script and insert tags inline, directly into the text, at the exact
-point where that delivery should occur. A tag can appear:
-- before a word or phrase it modifies (e.g. "[whisper] I never told anyone")
-- before a punctuation-marked pause point (e.g. "[short pause] And then—")
-- standalone between sentences/clauses where a vocal beat belongs
-  (e.g. "[sigh] It wasn't supposed to happen this way.")
-
----
-
-## RULES
-
-1. NEVER alter, remove, add, paraphrase, reorder, or "fix" any of the
-   original script's words. The original text must remain 100% identical
-   except for the inserted tags. This is a markup pass, not an editing pass.
-2. Tags must feel natural and editorially justified — driven by what the
-   sentence is actually saying (a joke, a shocking reveal, a quiet
-   confession, a building excitement) — never decorative or random.
-3. Do NOT overuse tags. A well-tagged script has tags at genuine emotional
-   or rhythmic turning points only — roughly one tag per 40-80 words is a
-   reasonable density for a documentary-style narration, but let the
-   content dictate it, don't force a fixed rate.
-4. Never place two tags back-to-back with nothing between them.
-5. Never tag every sentence — most sentences should carry no tag at all.
-   Reserve tags for moments where a human narrator would audibly shift tone,
-   pace, volume, or add a vocalization (breath, chuckle, pause, etc.).
-6. Preserve all existing paragraph breaks and formatting exactly.
-7. Tags are inserted as literal bracketed text directly in the string,
-   e.g. "[chuckle] When you're creating something new..." — not as a
-   separate list, not as JSON annotations, not as footnotes.
-
----
-
-## OUTPUT
-
-Return ONLY the tagged script as plain text — no preamble, no explanation,
-no markdown fences, no notes, no JSON. Just the script with tags inserted
-inline exactly as they should appear for the narrator/TTS engine to read.
-""".strip()
-
-
-def _validate_tagged_script(original: str, tagged: str) -> bool:
-   
-    if not tagged or not tagged.strip():
-        return False
-
-    stripped = re.sub(r"\[[a-zA-Z0-9 \-']+\]", "", tagged)
-    stripped_words = stripped.split()
-    original_words = original.split()
-
-    if not original_words:
-        return False
-
-    len_ratio = len(stripped_words) / len(original_words)
-    if len_ratio < 0.9 or len_ratio > 1.1:
-        return False
-
-    return True
-
-
-async def generate_tagged_script(script_text: str) -> str:
-    user_prompt = f"""Script to tag:
-
-{script_text}
-"""
-
-    async def _call():
-        completion = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": SCRIPT_TAG_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                stream=False,
-                temperature=0.4,
-                top_p=0.9,
-            ),
-            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
-        )
-        _record_token_usage("generate_tagged_script", completion)
-        return (completion.choices[0].message.content or "").strip()
-
-    raw = ""
-    try:
-        raw = await _call()
-    except Exception as e:
-        print(f"[TAG-SCRIPT] generation failed: {e}")
-        return script_text
-
-    if not _validate_tagged_script(script_text, raw):
-        print(
-            f"[TAG-SCRIPT] validation failed (tagged output diverged too far "
-            f"from original word count) — retrying once. Raw (truncated): {raw[:300]}"
-        )
-        try:
-            raw = await _call()
-        except Exception as e:
-            print(f"[TAG-SCRIPT] retry call failed: {e}")
-            return script_text
-
-        if not _validate_tagged_script(script_text, raw):
-            print("[TAG-SCRIPT] still invalid after retry — returning original untagged script")
-            return script_text
-
-    return raw
-
-
-@app.post("/add-script-tags")
-async def add_script_tags(request: AddScriptTagsRequest):
-    await require_valid_user(request.userId)
-
-    _start_token_tracking()
-
-    script_text = (request.script or "").strip()
-    if not script_text:
-        raise HTTPException(status_code=400, detail="script must be a non-empty string")
-
-    print(f"\n[TAG-SCRIPT] tagging script ({_word_count(script_text)} word(s)) for userId={request.userId}")
-
-    try:
-        tagged_script = await generate_tagged_script(script_text)
-    except Exception as exc:
-        print(f"--- /add-script-tags failed: {exc} ---")
-        import traceback
-        traceback.print_exc()
-        return {
-            "error": "Failed to generate tagged script.",
-            "detail": str(exc),
-            "script": script_text,
-            "token_usage": _get_token_usage_summary(),
-        }
-
-    tag_count = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", tagged_script))
-    token_usage = _get_token_usage_summary()
-
-    print(f"[TAG-SCRIPT] done — {tag_count} tag(s) inserted")
-
-    return {
-        "tagged_script": tagged_script,
-        "tag_count": tag_count,
-        "word_count": _word_count(script_text),
-        "token_usage": token_usage,
-    }
-
-
-
 @app.get('/trending-data')
 def content_radar():
     res = supabase.table("content_radar").select("*").execute()
@@ -8415,6 +8211,165 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
     return {"message": "Uploaded and processed"}
 
 
+FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
+FISH_AUDIO_TTS_URL = "https://api.fish.audio/v1/tts"
+
+import httpx
+import base64
+from fish_audio_sdk import Session, TTSRequest
+
+fish_session = Session(FISH_AUDIO_API_KEY)
+
+GENERATED_AUDIO_BUCKET = "generated-audio"
+
+
+class GenerateSpeechRequest(BaseModel):
+    userId: str
+    script: str
+    voice: str  # "user" -> clone the user's own uploaded reference audio
+                # anything else -> treated as an existing Fish Audio reference_id (character voice)
+
+
+async def _download_bytes(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content
+
+
+def _create_fish_model_sync(ref_audio_bytes: bytes, title: str) -> str:
+    model = fish_session.create_model(
+        title=title,
+        description="Auto-created voice clone",
+        voices=[ref_audio_bytes],
+        visibility="private",
+    )
+    return model.id
+
+
+def _run_fish_tts_sync(script: str, reference_id: str) -> bytes:
+    tts_request = TTSRequest(text=script, reference_id=reference_id)
+    audio_chunks = []
+    for chunk in fish_session.tts(tts_request):
+        audio_chunks.append(chunk)
+    return b"".join(audio_chunks)
+
+
+def _get_public_url_sync(bucket: str, path: str) -> str:
+    # Bucket is public, so this is a static URL that never expires
+    # (no network call, just string formatting from the project URL).
+    res = supabase.storage.from_(bucket).get_public_url(path)
+    # supabase-py returns either a str or a dict depending on version
+    if isinstance(res, dict):
+        return res.get("publicUrl") or res.get("public_url")
+    return res
+
+
+@app.post("/generate-speech")
+async def generate_speech(body: GenerateSpeechRequest):
+    userId = body.userId
+    script = body.script
+    voice = body.voice.strip() if body.voice else ""
+
+    await require_valid_user(userId)
+
+    if not script.strip():
+        raise HTTPException(status_code=400, detail="script cannot be empty")
+
+    if not voice:
+        raise HTTPException(status_code=400, detail="voice cannot be empty")
+
+    if not FISH_AUDIO_API_KEY:
+        raise HTTPException(status_code=500, detail="Fish Audio API key not configured")
+
+    if voice.lower() == "user":
+        # Clone the user's own uploaded reference audio
+        try:
+            result = await asyncio.to_thread(
+                lambda: supabase.table("user_profiles")
+                .select("audio-url")
+                .eq("id", userId)
+                .maybe_single()
+                .execute()
+            )
+        except Exception as e:
+            print(f"[TTS] failed to fetch user_profiles row: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to fetch user profile: {e}")
+
+        row = result.data if result else None
+        audio_url = row.get("audio-url") if row else None
+
+        if not audio_url:
+            raise HTTPException(
+                status_code=400,
+                detail="No reference audio on file for this user. Upload one via /save-audio first.",
+            )
+
+        try:
+            ref_audio_bytes = await _download_bytes(audio_url)
+        except Exception as e:
+            print(f"[TTS] failed to download user reference audio: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to download user reference audio: {e}")
+
+        try:
+            reference_id = await asyncio.to_thread(
+                _create_fish_model_sync, ref_audio_bytes, f"user-{userId}"
+            )
+        except Exception as e:
+            print(f"[TTS] failed to create Fish Audio model: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=502, detail=f"Failed to create voice model: {e}")
+    else:
+        # Character/preset voice: `voice` IS the Fish Audio reference_id, use it directly
+        reference_id = voice
+
+    try:
+        audio_bytes = await asyncio.to_thread(_run_fish_tts_sync, script, reference_id)
+    except Exception as e:
+        print(f"[TTS] Fish Audio TTS failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Fish Audio TTS failed: {e}")
+
+    if not audio_bytes:
+        raise HTTPException(status_code=502, detail="Fish Audio returned empty audio")
+
+    storage_path = f"{userId}/{uuid.uuid4().hex}.mp3"
+
+    try:
+        await asyncio.to_thread(
+            _upload_audio_to_storage_sync,
+            GENERATED_AUDIO_BUCKET,
+            storage_path,
+            audio_bytes,
+            "audio/mpeg",
+        )
+    except Exception as e:
+        print(f"[TTS] failed to upload generated audio to storage: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to save generated audio: {e}")
+
+    try:
+        public_url = await asyncio.to_thread(
+            _get_public_url_sync, GENERATED_AUDIO_BUCKET, storage_path
+        )
+    except Exception as e:
+        print(f"[TTS] failed to build public URL: {e}")
+        raise HTTPException(status_code=500, detail="Generated audio saved but failed to create URL")
+
+    if not public_url:
+        raise HTTPException(status_code=500, detail="Generated audio saved but failed to create URL")
+
+    return {
+        "message": "Speech generated successfully",
+        "userId": userId,
+        "voice": voice,
+        "reference_id": reference_id,
+        "storage_path": storage_path,
+        "url": public_url,
+    }
 
 
 
@@ -8434,3 +8389,359 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class AddScriptTagsRequest(BaseModel):
+    userId: str
+    script: str
+
+
+SCRIPT_TAG_LIST = [
+    "pause", "emphasis", "laughing", "inhale", "chuckle", "tsk", "singing",
+    "excited", "laughing tone", "interrupting", "chuckling", "excited tone",
+    "volume up", "echo", "angry", "low volume", "sigh", "low voice", "whisper",
+    "screaming", "shouting", "loud", "surprised", "short pause", "exhale",
+    "delight", "panting", "audience laughter", "with strong accent",
+    "volume down", "clearing throat", "sad", "moaning", "shocked",
+]
+
+SCRIPT_TAG_FEWSHOT_EXAMPLE = """
+## EXAMPLE (for calibration only — do not reuse this text or these exact tag placements)
+
+INPUT:
+"The factory had been silent for six years. When Marcus finally opened the doors, dust rolled out like smoke. Nobody expected the company to survive this long. But somehow, against every prediction, it did. And that raises an obvious question: how?"
+
+OUTPUT:
+"[pause] The factory had been silent for six years. When Marcus finally opened the doors, dust rolled out like smoke. [short pause] Nobody expected the company to survive this long. But somehow, [emphasis] against every prediction, it did. And that raises an obvious question: [pause] how?"
+
+Notice: tags are inserted at genuine rhythmic beats (a dramatic pause before a reveal, emphasis on a contrasting claim, a beat before a question) — not on every sentence, and never altering a single word of the original text.
+""".strip()
+
+SCRIPT_TAG_SYSTEM_PROMPT = f"""
+## ROLE
+
+You are a professional voice-direction editor. You take a finished narration
+script and mark it up with inline delivery/emotion tags for a text-to-speech
+engine (Fish Audio style), so the narrator/TTS model knows exactly how to
+perform each moment.
+
+---
+
+## SUPPORTED TAGS
+
+You may ONLY use tags from this list (this is not exhaustive of what the
+engine supports — it supports 15,000+ tags — but for this task, restrict
+yourself to the tags below so output stays consistent and predictable):
+
+{", ".join(f"[{t}]" for t in SCRIPT_TAG_LIST)}
+
+Do not invent new tags. Do not use any tag not in this list. Do not use a
+tag whose emotional/delivery meaning does not genuinely fit the moment.
+
+---
+
+{SCRIPT_TAG_FEWSHOT_EXAMPLE}
+
+---
+
+## TASK
+
+Read the script and insert tags inline, directly into the text, at the exact
+point where that delivery should occur. A tag can appear:
+- before a word or phrase it modifies (e.g. "[whisper] I never told anyone")
+- before a punctuation-marked pause point (e.g. "[short pause] And then—")
+- standalone between sentences/clauses where a vocal beat belongs
+  (e.g. "[sigh] It wasn't supposed to happen this way.")
+
+---
+
+## RULES
+
+1. NEVER alter, remove, add, paraphrase, reorder, or "fix" any of the
+   original script's words. The original text must remain 100% identical
+   except for the inserted tags. This is a markup pass, not an editing pass.
+2. Tags must feel natural and editorially justified — driven by what the
+   sentence is actually saying (a joke, a shocking reveal, a quiet
+   confession, a building excitement) — never decorative or random.
+3. This is a MANDATORY markup pass. Returning the script with zero tags,
+   or too few tags, is an INVALID response and will be rejected — you must
+   always find genuine, justified moments to tag. Every script, no matter
+   how neutral in tone, has at least a few natural pause points, moments of
+   emphasis, or breath beats a real narrator would use.
+4. Roughly one tag per 40-80 words is a reasonable density for a
+   documentary-style narration — let the content dictate exact placement,
+   but do not fall meaningfully below this density.
+5. Never place two tags back-to-back with nothing between them.
+6. Never tag every sentence — most sentences should carry no tag at all.
+   Reserve tags for moments where a human narrator would audibly shift tone,
+   pace, volume, or add a vocalization (breath, chuckle, pause, etc.).
+7. Preserve all existing paragraph breaks and formatting exactly.
+8. Tags are inserted as literal bracketed text directly in the string,
+   e.g. "[chuckle] When you're creating something new..." — not as a
+   separate list, not as JSON annotations, not as footnotes.
+
+---
+
+## OUTPUT
+
+Return ONLY the tagged script as plain text — no preamble, no explanation,
+no markdown fences, no notes, no JSON. Just the script with tags inserted
+inline exactly as they should appear for the narrator/TTS engine to read.
+""".strip()
+
+
+def _validate_tagged_script(original: str, tagged: str, min_tags: int = 3) -> bool:
+    if not tagged or not tagged.strip():
+        return False
+
+    tag_matches = re.findall(r"\[[a-zA-Z0-9 \-']+\]", tagged)
+
+    if len(tag_matches) < min_tags:
+        print(
+            f"[TAG-SCRIPT] validation failed: only {len(tag_matches)} tag(s) found "
+            f"(minimum required: {min_tags})"
+        )
+        return False
+
+    allowed_lower = {t.lower() for t in SCRIPT_TAG_LIST}
+    invalid_tags = [t for t in tag_matches if t.strip("[]").lower() not in allowed_lower]
+    if invalid_tags:
+        print(f"[TAG-SCRIPT] validation failed: unsupported tag(s) used: {invalid_tags[:5]}")
+        return False
+
+    stripped = re.sub(r"\[[a-zA-Z0-9 \-']+\]", "", tagged)
+    stripped_words = stripped.split()
+    original_words = original.split()
+
+    if not original_words:
+        return False
+
+    len_ratio = len(stripped_words) / len(original_words)
+    if len_ratio < 0.9 or len_ratio > 1.1:
+        print(
+            f"[TAG-SCRIPT] validation failed: word count ratio {len_ratio:.3f} "
+            f"outside [0.9, 1.1] ({len(stripped_words)} vs {len(original_words)} words)"
+        )
+        return False
+
+    return True
+
+
+def _min_expected_tags(word_count: int) -> int:
+    return max(2, word_count // 100)
+
+
+def _insert_fallback_tags(script_text: str, min_tags: int) -> str:
+    paragraphs = script_text.split("\n\n")
+    if len(paragraphs) < 2:
+        sentences = re.split(r"(?<=[.!?])\s+", script_text.strip())
+        tagged_sentences = []
+        tags_used = 0
+        interval = max(2, len(sentences) // max(min_tags, 1))
+        for i, sentence in enumerate(sentences):
+            if i > 0 and i % interval == 0 and tags_used < min_tags:
+                tagged_sentences.append("[pause] " + sentence)
+                tags_used += 1
+            else:
+                tagged_sentences.append(sentence)
+        return " ".join(tagged_sentences)
+
+    tagged_paragraphs = [paragraphs[0]]
+    tags_used = 0
+    for para in paragraphs[1:]:
+        if tags_used < min_tags and para.strip():
+            tagged_paragraphs.append("[short pause] " + para)
+            tags_used += 1
+        else:
+            tagged_paragraphs.append(para)
+    return "\n\n".join(tagged_paragraphs)
+
+
+async def generate_tagged_script(script_text: str) -> str:
+    word_count = _word_count(script_text)
+    min_tags = _min_expected_tags(word_count)
+
+    user_prompt = f"""Script to tag (this script contains {word_count} words — you MUST insert at least {min_tags} tags total, distributed naturally throughout, not clustered):
+
+{script_text}
+"""
+
+    async def _call(extra_instruction: str = ""):
+        messages = [
+            {"role": "system", "content": SCRIPT_TAG_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt + extra_instruction},
+        ]
+        completion = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=messages,
+                stream=False,
+                temperature=0.5,
+                top_p=0.9,
+            ),
+            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
+        )
+        _record_token_usage("generate_tagged_script", completion)
+        return (completion.choices[0].message.content or "").strip()
+
+    raw = ""
+    try:
+        raw = await _call()
+    except Exception as e:
+        print(f"[TAG-SCRIPT] generation failed: {e}")
+        raw = ""
+
+    if raw and not _validate_tagged_script(script_text, raw, min_tags=min_tags):
+        tag_count_found = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", raw))
+        print(
+            f"[TAG-SCRIPT] attempt 1 invalid ({tag_count_found} tag(s) found, "
+            f"need >= {min_tags}) — retrying with explicit correction. "
+            f"Raw (truncated): {raw[:300]}"
+        )
+        try:
+            raw = await _call(
+                extra_instruction=(
+                    f"\n\nIMPORTANT CORRECTION: Your previous attempt returned "
+                    f"{tag_count_found} tag(s), which is BELOW the required minimum "
+                    f"of {min_tags}. This is not optional — you must scan the entire "
+                    f"script from beginning to end and insert at least {min_tags} tags "
+                    f"from the supported list at genuine emotional or rhythmic turning "
+                    f"points (paragraph openings, contrasts introduced by 'but'/'yet', "
+                    f"rhetorical questions, reveals, transitions). Do not return the "
+                    f"script with fewer tags than required. Preserve every original "
+                    f"word exactly — only insert bracketed tags."
+                )
+            )
+        except Exception as e:
+            print(f"[TAG-SCRIPT] retry call failed: {e}")
+            raw = ""
+
+    if raw and _validate_tagged_script(script_text, raw, min_tags=min_tags):
+        return raw
+
+    tag_count_found = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", raw)) if raw else 0
+    print(
+        f"[TAG-SCRIPT] still invalid after retry ({tag_count_found} tag(s)) — "
+        f"applying deterministic fallback tagging instead of returning "
+        f"a fully untagged script"
+    )
+    return _insert_fallback_tags(script_text, min_tags)
+
+
+@app.post("/add-script-tags")
+async def add_script_tags(request: AddScriptTagsRequest):
+    await require_valid_user(request.userId)
+
+    _start_token_tracking()
+
+    script_text = (request.script or "").strip()
+    if not script_text:
+        raise HTTPException(status_code=400, detail="script must be a non-empty string")
+
+    print(f"\n[TAG-SCRIPT] tagging script ({_word_count(script_text)} word(s)) for userId={request.userId}")
+
+    try:
+        tagged_script = await generate_tagged_script(script_text)
+    except Exception as exc:
+        print(f"--- /add-script-tags failed: {exc} ---")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": "Failed to generate tagged script.",
+            "detail": str(exc),
+            "script": script_text,
+            "token_usage": _get_token_usage_summary(),
+        }
+
+    tag_count = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", tagged_script))
+    token_usage = _get_token_usage_summary()
+
+    print(f"[TAG-SCRIPT] done — {tag_count} tag(s) inserted")
+
+    return {
+        "tagged_script": tagged_script,
+        "tag_count": tag_count,
+        "word_count": _word_count(script_text),
+        "token_usage": token_usage,
+    }
