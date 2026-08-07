@@ -3458,41 +3458,41 @@ class CheckCreditsRequest(BaseModel):
     userId: str
 
 
-# @app.post("/check-credits")
-# async def check_credits(request: CheckCreditsRequest):
-#     try:
-#         profile_res = supabase.table('user_profiles') \
-#             .select('id, credit_batches') \
-#             .eq('id', request.userId) \
-#             .maybe_single() \
-#             .execute()
+@app.post("/check-credits")
+async def check_credits(request: CheckCreditsRequest):
+    try:
+        profile_res = supabase.table('user_profiles') \
+            .select('id, credit_batches') \
+            .eq('id', request.userId) \
+            .maybe_single() \
+            .execute()
 
-#         if not profile_res.data:
-#             raise HTTPException(status_code=404, detail="user profile not found")
+        if not profile_res.data:
+            raise HTTPException(status_code=404, detail="user profile not found")
 
-#         batches = profile_res.data.get('credit_batches') or []
-#         now = datetime.datetime.now(datetime.timezone.utc)
-#         active_batches = _expire_stale_batches(batches, now)
+        batches = profile_res.data.get('credit_batches') or []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        active_batches = _expire_stale_batches(batches, now)
 
-#         new_total = _sum_batches(active_batches)
+        new_total = _sum_batches(active_batches)
 
-#         if active_batches != batches:
-#             supabase.table('user_profiles').update({
-#                 'credit_batches': active_batches,
-#                 'credits_remaining': new_total,
-#             }).eq('id', request.userId).execute()
+        if active_batches != batches:
+            supabase.table('user_profiles').update({
+                'credit_batches': active_batches,
+                'credits_remaining': new_total,
+            }).eq('id', request.userId).execute()
 
-#         return {
-#             "message": "success",
-#             "remaining_credits": new_total,
-#             "expired_removed": len(batches) - len(active_batches),
-#         }
+        return {
+            "message": "success",
+            "remaining_credits": new_total,
+            "expired_removed": len(batches) - len(active_batches),
+        }
 
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         print("error:", e)
-#         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/unlock")
