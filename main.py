@@ -3454,9 +3454,6 @@ class UnlockRequest(BaseModel):
 CREDITS_PER_MINUTE = 3
 
 
-
-
-
 class CheckCreditsRequest(BaseModel):
     userId: str
 
