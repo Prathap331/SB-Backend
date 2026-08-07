@@ -3461,41 +3461,41 @@ class CheckCreditsRequest(BaseModel):
     userId: str
 
 
-@app.post("/check-credits")
-async def check_credits(request: CheckCreditsRequest):
-    try:
-        profile_res = supabase.table('user_profiles') \
-            .select('id, credit_batches') \
-            .eq('id', request.userId) \
-            .maybe_single() \
-            .execute()
+# @app.post("/check-credits")
+# async def check_credits(request: CheckCreditsRequest):
+#     try:
+#         profile_res = supabase.table('user_profiles') \
+#             .select('id, credit_batches') \
+#             .eq('id', request.userId) \
+#             .maybe_single() \
+#             .execute()
 
-        if not profile_res.data:
-            raise HTTPException(status_code=404, detail="user profile not found")
+#         if not profile_res.data:
+#             raise HTTPException(status_code=404, detail="user profile not found")
 
-        batches = profile_res.data.get('credit_batches') or []
-        now = datetime.datetime.now(datetime.timezone.utc)
-        active_batches = _expire_stale_batches(batches, now)
+#         batches = profile_res.data.get('credit_batches') or []
+#         now = datetime.datetime.now(datetime.timezone.utc)
+#         active_batches = _expire_stale_batches(batches, now)
 
-        new_total = _sum_batches(active_batches)
+#         new_total = _sum_batches(active_batches)
 
-        if active_batches != batches:
-            supabase.table('user_profiles').update({
-                'credit_batches': active_batches,
-                'credits_remaining': new_total,
-            }).eq('id', request.userId).execute()
+#         if active_batches != batches:
+#             supabase.table('user_profiles').update({
+#                 'credit_batches': active_batches,
+#                 'credits_remaining': new_total,
+#             }).eq('id', request.userId).execute()
 
-        return {
-            "message": "success",
-            "remaining_credits": new_total,
-            "expired_removed": len(batches) - len(active_batches),
-        }
+#         return {
+#             "message": "success",
+#             "remaining_credits": new_total,
+#             "expired_removed": len(batches) - len(active_batches),
+#         }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("error:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         print("error:", e)
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/unlock")
@@ -7684,13 +7684,6 @@ async def _get_legacy_batch_expiry(user_id: str, now: datetime.datetime) -> date
 async def _get_active_batches_with_legacy_migration(
     user_id: str, current_batches: list[dict], credits_remaining: int, now: datetime.datetime,
 ) -> list[dict]:
-    """Ensures any pre-migration flat credit balance is folded into a batch
-    BEFORE new batches are added on top, so nothing gets silently dropped.
-
-    This is what was missing before: credits_remaining was never checked
-    against what's actually accounted for in credit_batches, so a user's
-    pre-existing balance (recorded only in the flat column, never in a
-    batch) got overwritten and lost the moment a new batch was added."""
     active = _expire_stale_batches(current_batches or [], now)
 
     already_migrated_total = _sum_batches(active)
@@ -8003,14 +7996,6 @@ async def razorpay_webhook(
 
 
 
-
-
-
-
-
-
-
-
 from fastapi import UploadFile, File, Form
 
 AUDIO_BUCKET = "user-audio"
@@ -8161,11 +8146,6 @@ async def save_audio(
 
 
 
-
-
-
-
-
 @app.get('/trending-data')
 def content_radar():
     res = supabase.table("content_radar").select("*").execute()
@@ -8226,9 +8206,8 @@ GENERATED_AUDIO_BUCKET = "generated-audio"
 class GenerateSpeechRequest(BaseModel):
     userId: str
     script: str
-    voice: str  # "user" -> clone the user's own uploaded reference audio
-                # anything else -> treated as an existing Fish Audio reference_id (character voice)
-
+    voice: str 
+               
 
 async def _download_bytes(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=60) as client:
@@ -8256,10 +8235,7 @@ def _run_fish_tts_sync(script: str, reference_id: str) -> bytes:
 
 
 def _get_public_url_sync(bucket: str, path: str) -> str:
-    # Bucket is public, so this is a static URL that never expires
-    # (no network call, just string formatting from the project URL).
     res = supabase.storage.from_(bucket).get_public_url(path)
-    # supabase-py returns either a str or a dict depending on version
     if isinstance(res, dict):
         return res.get("publicUrl") or res.get("public_url")
     return res

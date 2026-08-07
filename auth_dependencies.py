@@ -14,20 +14,13 @@ if not supabase_url or not supabase_key:
 
 supabase: Client = create_client(supabase_url, supabase_key)
 
-# Swagger will call POST /token
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
-# 🔐 LOGIN ENDPOINT LOGIC (for Swagger form)
 async def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
-    """
-    Takes username + password from Swagger form.
-    Uses Supabase to authenticate.
-    Returns access_token for Swagger.
-    """
     try:
         response = supabase.auth.sign_in_with_password({
-            "email": form_data.username,  # Swagger uses 'username' field
+            "email": form_data.username, 
             "password": form_data.password
         })
 
@@ -66,7 +59,6 @@ async def refresh_access_token(refresh_token: str) -> dict:
             detail="refresh_token is required",
         )
     try:
-        # supabase-py accepts refresh token as argument in current SDK versions.
         response = supabase.auth.refresh_session(refresh_token)
         session = getattr(response, "session", None)
         if not session:
@@ -92,11 +84,7 @@ async def refresh_access_token(refresh_token: str) -> dict:
         )
 
 
-# 🔐 VERIFY TOKEN FOR PROTECTED ROUTES
 async def get_current_user(token: str = Depends(oauth2_scheme)):
-    """
-    Validates Bearer token sent from Swagger or frontend.
-    """
     try:
         user_response = supabase.auth.get_user(token)
         user = user_response.user
