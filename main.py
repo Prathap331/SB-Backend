@@ -1818,13 +1818,6 @@ def _sparse_row_to_dict(sparse_row) -> dict:
     return {str(int(idx)): float(val) for idx, val in zip(coo.col, coo.data)}
 
 
-def _sparse_cosine(query_sparse: dict, doc_sparse: dict) -> float:
-    if not query_sparse or not doc_sparse:
-        return 0.0
-    shared_keys = query_sparse.keys() & doc_sparse.keys()
-    return sum(query_sparse[k] * doc_sparse[k] for k in shared_keys)
-
-
 TOPIC_SIMILARITY_THRESHOLD = 0.55
 SUMMARY_SIMILARITY_THRESHOLD = 0.45
 RPC_RAW_FETCH_THRESHOLD = 0.0
@@ -5034,39 +5027,18 @@ async def get_books_for_chunks(
     return books
 
 
-async def _fetch_books_with_backfill(
+async def _fetch_books(
     all_db_chunks_seen: list,
     all_db_md5s_seen: set,
     topic_text: str,
     combined_hyde_doc: str,
     table_name: str | None,
 ) -> list[dict]:
-    """
-    Book Title/Author/Year lookup (+ backfill to MAX_BOOKS). Depends only on
-    DB chunk results — available right after DB retrieval, well before the
-    script is generated — so this is launched as a background task early and
-    runs CONCURRENTLY with web search / script generation instead of serially
-    after them.
-    """
+
     try:
-        books = await get_books_for_chunks(
+        return await get_books_for_chunks(
             all_db_chunks_seen, topic_text=topic_text, script_text=""
         )
-
-        if len(books) < MAX_BOOKS:
-            print(
-                f"[MAIN] Only {len(books)}/{MAX_BOOKS} real book(s) found from the initial "
-                f"chunk pool — widening DB search to try to reach {MAX_BOOKS}."
-            )
-            books = await _backfill_books_to_target(
-                books,
-                all_db_md5s_seen,
-                topic_text,
-                combined_hyde_doc,
-                table_name,
-                target_count=MAX_BOOKS,
-            )
-        return books
     except Exception as exc:
         print(f"--- MySQL book lookup failed: {exc} ---")
         import traceback
@@ -5897,7 +5869,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
     # =========================================================================
     print("\n[STAGE 5] Looking up book metadata for retrieved chunks...")
     try:
-        books = await _fetch_books_with_backfill(
+        books = await _fetch_books(
             all_db_chunks_seen, all_db_md5s_seen, topic_text, combined_hyde_doc, table_name
         )
         print(f"[STAGE 5] done — {len(books)} book(s) resolved")
@@ -5999,28 +5971,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -8188,6 +8138,82 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
     return {"message": "Uploaded and processed"}
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
 FISH_AUDIO_TTS_URL = "https://api.fish.audio/v1/tts"
 
@@ -8200,11 +8226,25 @@ fish_session = Session(FISH_AUDIO_API_KEY)
 GENERATED_AUDIO_BUCKET = "generated-audio"
 
 
+_LANG_CODE_TO_NAME = {v.lower(): k for k, v in SUPPORTED_LANGUAGES.items()}
+
+
+def _lang_name_from_code(lang_code: str) -> str:
+    if not lang_code or not lang_code.strip():
+        return DEFAULT_LANGUAGE
+    name = _LANG_CODE_TO_NAME.get(lang_code.strip().lower())
+    if not name:
+        print(f"[TTS] unrecognized langCode '{lang_code}', defaulting to English")
+        return DEFAULT_LANGUAGE
+    return _normalize_language(name)
+
+
 class GenerateSpeechRequest(BaseModel):
     userId: str
     script: str
-    voice: str 
-               
+    voice: str
+    langCode: str = "en"   
+
 
 async def _download_bytes(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=60) as client:
@@ -8243,6 +8283,7 @@ async def generate_speech(body: GenerateSpeechRequest):
     userId = body.userId
     script = body.script
     voice = body.voice.strip() if body.voice else ""
+    lang_code = (body.langCode or "en").strip()
 
     await require_valid_user(userId)
 
@@ -8255,8 +8296,15 @@ async def generate_speech(body: GenerateSpeechRequest):
     if not FISH_AUDIO_API_KEY:
         raise HTTPException(status_code=500, detail="Fish Audio API key not configured")
 
+    target_language = _lang_name_from_code(lang_code)
+    if target_language != "English":
+        try:
+            print(f"[TTS] translating script into {target_language} (langCode='{lang_code}') before TTS")
+            script = await translate_text_full_pipeline(script, target_language)
+        except Exception as e:
+            print(f"[TTS] translation to {target_language} failed, using original script as-is: {e}")
+
     if voice.lower() == "user":
-        # Clone the user's own uploaded reference audio
         try:
             result = await asyncio.to_thread(
                 lambda: supabase.table("user_profiles")
@@ -8294,7 +8342,6 @@ async def generate_speech(body: GenerateSpeechRequest):
             traceback.print_exc()
             raise HTTPException(status_code=502, detail=f"Failed to create voice model: {e}")
     else:
-        # Character/preset voice: `voice` IS the Fish Audio reference_id, use it directly
         reference_id = voice
 
     try:
@@ -8339,13 +8386,11 @@ async def generate_speech(body: GenerateSpeechRequest):
         "message": "Speech generated successfully",
         "userId": userId,
         "voice": voice,
+        "langCode": lang_code,
         "reference_id": reference_id,
         "storage_path": storage_path,
         "url": public_url,
     }
-
-
-
 
 
 
