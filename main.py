@@ -13,10 +13,6 @@ from openai import OpenAI
 from channelMemory.aiIntel import get_intelligence
 from researchAgent.tss_v4 import get_trends_serpapi,build_trend_dashboard , build_youtube_summary , scan_topic , build_news_summary
 from researchAgent.eci import get_google_trends_serpapi,get_youtube_data
-
-from shared.schemas.pipeline_context import (
-    AgentPipelineContext,
-)
 from ddgs import DDGS
 import asyncio
 import time
@@ -1813,10 +1809,18 @@ def get_sparse_vectorizer() -> HashingVectorizer:
     return _sparse_vectorizer
 
 
-def _sparse_row_to_dict(sparse_row) -> dict:
+QUERY_SPARSE_TOP_K = 100
+def _sparse_row_to_dict(sparse_row, top_k: int = QUERY_SPARSE_TOP_K) -> dict:
     coo = sparse_row.tocoo()
-    return {str(int(idx)): float(val) for idx, val in zip(coo.col, coo.data)}
+    indices = coo.col
+    values = coo.data
 
+    if len(values) > top_k:
+        keep = np.argpartition(-np.abs(values), top_k - 1)[:top_k]
+    else:
+        keep = np.arange(len(values))
+
+    return {str(int(indices[i])): float(values[i]) for i in keep}
 
 TOPIC_SIMILARITY_THRESHOLD = 0.55
 SUMMARY_SIMILARITY_THRESHOLD = 0.45
@@ -1912,7 +1916,6 @@ async def select_table_for_topic(topic: str) -> str:
     return category
 
 SCRIPT_TEMPLATE_MATCH_COUNT = 1
-
 
 async def generate_topic_embedding(topic: str) -> np.ndarray:
     model = _get_st_model()
@@ -3597,14 +3600,21 @@ def _strip_json_fences(raw: str) -> str:
 
 RRF_K = 60  
 
+SCRIPT_RAG_POOL_PER_DOC = 40
+SCRIPT_TOP_K_PER_DOC = 2       
+
+DENSE_SCORE_THRESHOLD = 0.30
+SPARSE_SCORE_THRESHOLD = 0.20
 
 async def get_context_from_db_segment(
     hyde_document: str,
     keywords: list[str],
     table_name: str,
-    dense_k: int = 10,
-    sparse_k: int = 10,
+    dense_k: int = SCRIPT_RAG_POOL_PER_DOC,
+    sparse_k: int = SCRIPT_RAG_POOL_PER_DOC,
     rrf_k: int = RRF_K,
+    dense_score_threshold: float = DENSE_SCORE_THRESHOLD,
+    sparse_score_threshold: float = SPARSE_SCORE_THRESHOLD,
 ) -> list[dict]:
     category = table_name
     collection_name = _qdrant_collection_name(category)
@@ -3626,6 +3636,7 @@ async def get_context_from_db_segment(
                 query=dense_embedding,
                 using=QDRANT_DENSE_VECTOR_NAME,
                 limit=dense_k,
+                score_threshold=dense_score_threshold,   # Fix 2: quality floor, dense branch
                 with_payload=True,
             )
         )
@@ -3651,6 +3662,7 @@ async def get_context_from_db_segment(
                 ),
                 using=QDRANT_SPARSE_VECTOR_NAME,
                 limit=sparse_k,
+                score_threshold=sparse_score_threshold,   # Fix 2: quality floor, sparse branch
                 with_payload=True,
             )
         )
@@ -3659,6 +3671,7 @@ async def get_context_from_db_segment(
         print(f"[QDRANT-SEG] sparse query FAILED against '{collection_name}': {e}")
         sparse_points = []
 
+    # --- everything below (rank building, RRF fusion, supabase content lookup) is unchanged ---
     dense_raw_scores: dict = {}
     sparse_raw_scores: dict = {}
     dense_ranks: dict = {}
@@ -3699,7 +3712,6 @@ async def get_context_from_db_segment(
         print(f"[QDRANT-SEG] Supabase content lookup against '{supabase_table}' failed: {e}")
         return []
 
-    # ---------------- RRF: score = sum over channels of 1 / (rrf_k + rank) ----------------
     matches = []
     for row in rows:
         chunk_id = row.get("chunk_id")
@@ -3711,6 +3723,8 @@ async def get_context_from_db_segment(
         d_rank = dense_ranks.get(chunk_id)
         s_rank = sparse_ranks.get(chunk_id)
 
+        # NOTE: rrf_score is RANK-based (1/(rrf_k+rank)) — never threshold on this,
+        # it is not comparable to the dense/sparse similarity scores above.
         rrf_score = 0.0
         if d_rank is not None:
             rrf_score += 1.0 / (rrf_k + d_rank)
@@ -3732,7 +3746,8 @@ async def get_context_from_db_segment(
     matches.sort(key=lambda r: r["combined_score"], reverse=True)
 
     print(
-        f"[QDRANT-SEG] dense={len(dense_points)} sparse={len(sparse_points)} "
+        f"[QDRANT-SEG] dense={len(dense_points)}(thr={dense_score_threshold}) "
+        f"sparse={len(sparse_points)}(thr={sparse_score_threshold}) "
         f"-> {len(chunk_ids)} unique candidate(s) in combined pool (RRF, k={rrf_k})"
     )
     for i, m in enumerate(matches[:5], start=1):
@@ -3751,8 +3766,8 @@ async def get_context_from_db_segment_with_timeout(
     keywords: list[str],
     table_name: str,
     timeout: float = 20.0,
-    dense_k: int = 10,
-    sparse_k: int = 10,
+    dense_k: int = SCRIPT_RAG_POOL_PER_DOC,   # was 10
+    sparse_k: int = SCRIPT_RAG_POOL_PER_DOC,  # was 10
 ) -> list[dict]:
     task = asyncio.create_task(
         get_context_from_db_segment(hyde_document, keywords, table_name, dense_k, sparse_k)
@@ -3770,6 +3785,20 @@ async def get_context_from_db_segment_with_timeout(
     else:
         print("[DB-SEG] task still running after timeout, proceeding without it for now.")
         return []
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 async def generate_hyde_docs_for_script(
     title: str,
@@ -5546,24 +5575,32 @@ def _extract_source_links(articles: list[dict]) -> list[str]:
 
 
 
-SCRIPT_RAG_POOL_PER_DOC = 10   # 
-SCRIPT_TOP_K_PER_DOC = 2       
+# SCRIPT_RAG_POOL_PER_DOC = 40 
+# SCRIPT_TOP_K_PER_DOC = 2       
 
 
-def _pick_top_k_unique(pool: list[dict], k: int) -> list[dict]:
+def pick_topk_with_backfill(
+    ranked_pool: list[dict],
+    top_k: int,
+    globally_claimed_md5s: set,
+) -> list[dict]:
+    """
+    ranked_pool: this segment's candidates, already sorted by combined_score (RRF) desc.
+    globally_claimed_md5s: set shared across ALL segments in this script request,
+    mutated in place so a later segment can't re-claim a chunk already picked.
+    Returns up to top_k unclaimed chunks — falls short of top_k only when this
+    segment's own pool is genuinely exhausted of unclaimed candidates.
+    """
     picked = []
-    seen_keys = set()
-    for item in pool:
-        key = item.get("md5") or item.get("content")
-        if key and key in seen_keys:
+    for chunk in ranked_pool:
+        key = chunk.get("md5") or chunk.get("content")
+        if not key or key in globally_claimed_md5s:
             continue
-        if key:
-            seen_keys.add(key)
-        picked.append(item)
-        if len(picked) >= k:
+        picked.append(chunk)
+        globally_claimed_md5s.add(key)
+        if len(picked) >= top_k:
             break
     return picked
-
 
 
 async def _generate_script_impl(request: "ScriptRequest"):
@@ -5571,7 +5608,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
     total_start_time = time.time()
     topic_text = build_topic_text(request)
-    print(f"SCRIPT GENERATION: Received request for title: '{request.title}'")
+    print(f"[SCRIPT] ===== NEW REQUEST ===== title='{request.title}' time={request.time}min userId={request.userId}")
 
     selected_template = await retrieve_best_script_template(topic_text)
 
@@ -5582,25 +5619,28 @@ async def _generate_script_impl(request: "ScriptRequest"):
             "best_fit_categories": [], "human_texture_tier": None,
             "segments": [], "template_text": "", "similarity": None,
         }
+    else:
+        print(
+            f"[SCRIPT] template matched: key='{selected_template.get('key')}' "
+            f"title='{selected_template.get('title')}' "
+            f"similarity={selected_template.get('similarity')}"
+        )
 
     category = selected_template.get("cluster") or (
         (selected_template.get("best_fit_categories") or ["UNKNOWN"])[0]
     )
-    print(f"Category (from selected template): {category}")
+    print(f"[SCRIPT] category (from selected template): {category}")
 
     segments = selected_template.get("segments", [])
+    print(f"[SCRIPT] template has {len(segments)} segment(s)")
 
     try:
         channel_profile = await get_channel_profile(request.userId)
         summary = channel_profile[0]["Summary"] if channel_profile else None
+        print(f"[SCRIPT] channel profile fetched (summary present: {bool(summary)})")
     except Exception as exc:
-        print(f"--- error fetching channel profile: {exc} ---")
+        print(f"[SCRIPT] error fetching channel profile: {exc}")
         summary = None
-
-    print(f"Planning HyDE generation for {len(segments)} template segment(s)")
-
-    SCRIPT_RAG_POOL_PER_DOC = 10
-    SCRIPT_TOP_K_PER_DOC = 2
 
     hyde_documents: list[dict] = []
     db_results: list = []
@@ -5624,7 +5664,10 @@ async def _generate_script_impl(request: "ScriptRequest"):
     # list of {"hyde_document", "keywords"} dicts. Nothing else may start
     # until this stage has produced usable output.
     # =========================================================================
-    print("\n[STAGE 1] Generating HyDE documents + keywords...")
+    stage1_start = time.time()
+    print("\n" + "=" * 90)
+    print("[STAGE 1] Generating HyDE documents + keywords...")
+    print("=" * 90)
     try:
         hyde_documents = await generate_hyde_docs_for_script(
             request.title,
@@ -5633,7 +5676,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
             segments,
         )
     except Exception as exc:
-        print(f"--- [STAGE 1] HyDE generation failed: {exc} ---")
+        print(f"[STAGE 1] FAILED — HyDE generation raised: {exc}")
         import traceback
         traceback.print_exc()
         hyde_documents = []
@@ -5644,41 +5687,49 @@ async def _generate_script_impl(request: "ScriptRequest"):
     hyde_docs_usable = any((d.get("hyde_document") or "").strip() for d in hyde_documents)
 
     if not hyde_docs_usable:
-        print("[STAGE 1] FAILED — no usable HyDE document was produced, aborting pipeline before Stage 2")
+        print("[STAGE 1] ABORT — no usable HyDE document was produced, aborting pipeline before Stage 2")
         return {
             "error": "Failed to generate HyDE documents required for retrieval.",
             "token_usage": _get_token_usage_summary(),
         }
 
-    print(f"[STAGE 1] done — {len(hyde_documents)} HyDE segment(s) generated")
+    print(f"[STAGE 1] done in {time.time() - stage1_start:.2f}s — {len(hyde_documents)} HyDE segment(s) generated")
+    for i, seg in enumerate(hyde_documents, start=1):
+        doc_preview = (seg.get("hyde_document") or "").strip().replace("\n", " ")
+        kw = seg.get("keywords") or []
+        print(f"  [HYDE-{i}] ({_count_tokens(doc_preview)} tok, {len(kw)} kw) \"{doc_preview}\"")
 
     # =========================================================================
     # STAGE 2 — Category selection + RAG chunk retrieval. Per segment, DENSE
-    # search runs on the segment's hyde_document (top 10) and SPARSE search
-    # runs on the segment's keywords (top 10) as two SEPARATE Qdrant queries
-    # (no RRF fusion). The two result sets are merged/deduped into a pool of
-    # up to 20 candidates per segment, and the top 2 are picked from that
-    # pool. Total RAG chunks = up to len(hyde_documents) * SCRIPT_TOP_K_PER_DOC,
-    # deduped ACROSS segments. NO BACKFILL — if a segment's top picks turn
-    # out to be duplicates of chunks another segment already claimed, they
-    # are simply dropped rather than replaced with lower-relevance chunks
-    # pulled deeper from the pool just to hit a target count. Runs only
-    # after Stage 1 completes.
+    # search runs on the segment's hyde_document (top SCRIPT_RAG_POOL_PER_DOC)
+    # and SPARSE search runs on the segment's keywords (top
+    # SCRIPT_RAG_POOL_PER_DOC) as two SEPARATE Qdrant queries, each filtered
+    # by its own native score_threshold BEFORE RRF fusion (RRF itself is
+    # rank-based and never thresholded). The two result sets are merged/
+    # deduped into a combined pool per segment, sorted by RRF score, and the
+    # top SCRIPT_TOP_K_PER_DOC are picked from that pool. If a segment's
+    # top pick was already claimed by an earlier segment, it backfills from
+    # its OWN ranked pool (pick_topk_with_backfill) instead of silently
+    # dropping the slot — a segment only ends up short if its own pool is
+    # genuinely exhausted of unclaimed candidates.
     # =========================================================================
-    print("\n[STAGE 2] Selecting category and retrieving RAG chunks (dense + sparse, separately) using HyDE segments...")
+    stage2_start = time.time()
+    print("\n" + "=" * 90)
+    print("[STAGE 2] Selecting category and retrieving RAG chunks (dense + sparse, thresholded, RRF-fused)...")
+    print("=" * 90)
     try:
         table_name = await select_table_for_topic(topic_text)
     except Exception as exc:
-        print(f"--- [STAGE 2] category selection failed, defaulting to {RAG_CATEGORIES[0]}: {exc} ---")
+        print(f"[STAGE 2] category selection failed, defaulting to '{RAG_CATEGORIES[0]}': {exc}")
         table_name = RAG_CATEGORIES[0]
 
     script_rag_target = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC
     print(
         f"[STAGE 2] category='{table_name}' | {len(hyde_documents)} segment(s) x "
-        f"(dense-{SCRIPT_RAG_POOL_PER_DOC} + sparse-{SCRIPT_RAG_POOL_PER_DOC} = up to "
-        f"{SCRIPT_RAG_POOL_PER_DOC * 2} pooled) -> top {SCRIPT_TOP_K_PER_DOC} unique-md5 "
-        f"pick per segment = up to {script_rag_target} chunk(s) (no cross-segment "
-        f"backfill — duplicates across segments are dropped, not replaced)"
+        f"(dense-{SCRIPT_RAG_POOL_PER_DOC}@thr{DENSE_SCORE_THRESHOLD} + "
+        f"sparse-{SCRIPT_RAG_POOL_PER_DOC}@thr{SPARSE_SCORE_THRESHOLD}) -> RRF fuse -> "
+        f"top {SCRIPT_TOP_K_PER_DOC} pick per segment, backfilling within segment on "
+        f"cross-segment collision = target {script_rag_target} chunk(s) total"
     )
 
     try:
@@ -5695,6 +5746,9 @@ async def _generate_script_impl(request: "ScriptRequest"):
             ]
         )
 
+        # Track every unique chunk seen across ALL segment pools (used later
+        # for book metadata lookups) — separate from the globally-claimed set
+        # used for picking, since a chunk can be "seen" without being "picked".
         seen_md5_all = set()
         for doc_results in db_results_per_doc:
             for item in doc_results:
@@ -5707,93 +5761,94 @@ async def _generate_script_impl(request: "ScriptRequest"):
                         all_db_md5s_seen.add(md5_val)
 
         db_results = []
-        seen_md5_context = set()
+        globally_claimed_md5s = set()
 
-        print(f"\n{'=' * 90}")
-        print(f"[HYDE-RAG] {len(hyde_documents)} segment(s) — dense+sparse pool -> top-{SCRIPT_TOP_K_PER_DOC} unique picks")
-        print(f"{'=' * 90}")
+        print(f"\n{'-' * 90}")
+        print(f"[STAGE 2] per-segment pool -> pick-with-backfill (top-{SCRIPT_TOP_K_PER_DOC})")
+        print(f"{'-' * 90}")
 
         for doc_idx, doc_results in enumerate(db_results_per_doc, start=1):
-            top_for_doc = _pick_top_k_unique(doc_results, SCRIPT_TOP_K_PER_DOC)
-            kept_this_segment = 0
-            for item in top_for_doc:
-                key = item.get("md5") or item.get("content")
-                if key and key not in seen_md5_context:
-                    seen_md5_context.add(key)
-                    db_results.append(item)
-                    kept_this_segment += 1
-
             hyde_full = (hyde_documents[doc_idx - 1].get("hyde_document") or "").strip().replace("\n", " ")
             kw_full = hyde_documents[doc_idx - 1].get("keywords") or []
-            print(f"\n[SEGMENT #{doc_idx}] HyDE: \"{hyde_full}\"")
+            print(f"\n[STAGE 2 | SEGMENT #{doc_idx}] HyDE: \"{hyde_full}\"")
             print(f"  keywords: {kw_full}")
-            print(f"  pooled candidates: {len(doc_results)} (dense+sparse, deduped by chunk_id)")
+            print(f"  pooled candidates after threshold+RRF: {len(doc_results)}")
+
+            top_for_doc = pick_topk_with_backfill(
+                doc_results, SCRIPT_TOP_K_PER_DOC, globally_claimed_md5s
+            )
+            db_results.extend(top_for_doc)
 
             picked_ids = {item.get("chunk_id") for item in top_for_doc}
             for rank, item in enumerate(doc_results, start=1):
-                marker = "→ PICKED (unique)" if item.get("chunk_id") in picked_ids else ""
+                marker = "→ PICKED" if item.get("chunk_id") in picked_ids else ""
                 print(
                     f"    [{rank}] rrf={item.get('combined_score'):.5f} "
-                    f"via={item.get('matched_via')} dense_rank={item.get('dense_rank')} "
-                    f"sparse_rank={item.get('sparse_rank')} md5={item.get('md5')} {marker}"
+                    f"via={item.get('matched_via')} dense={item.get('dense_score')} "
+                    f"sparse={item.get('sparse_score')} md5={item.get('md5')} {marker}"
                 )
 
-            print(f"  picked (unique-md5, within-segment): {len(top_for_doc)} | kept after cross-segment dedup: {kept_this_segment}")
             if not top_for_doc:
-                print("    (no chunks retrieved for this segment)")
-            for rank, item in enumerate(top_for_doc, start=1):
-                content_full = (item.get("content") or "").strip().replace("\n", " ")
-                print(f"    #{rank} rrf={item.get('combined_score'):.5f} md5={item.get('md5')}")
-                print(f"        \"{content_full}\"")
+                print(
+                    f"  RESULT: 0/{SCRIPT_TOP_K_PER_DOC} picked — this segment's entire pool "
+                    f"was already claimed by earlier segments (genuinely exhausted, not a bug)"
+                )
+            else:
+                print(f"  RESULT: {len(top_for_doc)}/{SCRIPT_TOP_K_PER_DOC} picked (globally unique, backfilled within segment)")
+                for rank, item in enumerate(top_for_doc, start=1):
+                    content_full = (item.get("content") or "").strip().replace("\n", " ")
+                    print(f"    #{rank} rrf={item.get('combined_score'):.5f} md5={item.get('md5')} \"{content_full}\"")
 
-        print(f"\n{'=' * 90}")
+        print(f"\n{'-' * 90}")
         print(
-            f"[HYDE-RAG] TOTAL: {len(db_results)}/{script_rag_target} unique chunk(s) selected "
-            f"for script generation (unique within each segment's own pool, then deduped "
-            f"across segments, no backfill applied) "
-            f"({len(all_db_chunks_seen)} unique chunk(s) seen across all pools, kept for book lookups)"
+            f"[STAGE 2] TOTAL: {len(db_results)}/{script_rag_target} chunk(s) selected for script generation "
+            f"({len(all_db_chunks_seen)} unique chunk(s) seen across all pools, kept for book lookups) "
+            f"— completed in {time.time() - stage2_start:.2f}s"
         )
-        print(f"{'=' * 90}\n")
+        print(f"{'-' * 90}\n")
 
         if len(db_results) < script_rag_target:
             print(
-                f"[HYDE-RAG] NOTE: {len(db_results)}/{script_rag_target} unique chunk(s) — "
-                f"this is expected when segments share overlapping top-ranked source "
-                f"material; no lower-relevance chunks were pulled in to pad the count."
+                f"[STAGE 2] NOTE: {len(db_results)}/{script_rag_target} chunk(s) — some segment pools "
+                f"were exhausted of unclaimed candidates after thresholding; no low-relevance filler was added."
             )
     except Exception as exc:
-        print(f"--- [STAGE 2] DB retrieval failed: {exc} ---")
+        print(f"[STAGE 2] FAILED — DB retrieval raised: {exc}")
         import traceback
         traceback.print_exc()
+
     # =========================================================================
     # STAGE 3 — Web search keyword generation, searching each keyword, and
     # matching the retrieved website content against the HyDE documents.
     # Runs only after Stage 2 completes.
     # =========================================================================
+    stage3_start = time.time()
     script_web_source_target = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC
 
-    print("\n[STAGE 3] Generating web search keywords...")
+    print("\n" + "=" * 90)
+    print("[STAGE 3] Web search: keyword generation -> fetch -> match against HyDE docs")
+    print("=" * 90)
     try:
         script_search_keywords = await _generate_search_keywords_for_script(
             request.title, request.description, selected_template, request.time
         )
-        print(f"[STAGE 3] {len(script_search_keywords)} keyword(s) generated")
+        print(f"[STAGE 3] {len(script_search_keywords)} search keyword(s) generated:")
+        for i, kw in enumerate(script_search_keywords, start=1):
+            print(f"    [KW-{i}] {kw}")
     except Exception as exc:
-        print(f"--- [STAGE 3] keyword generation failed: {exc} ---")
+        print(f"[STAGE 3] keyword generation failed: {exc}")
         script_search_keywords = [f"{request.title} latest news today", f"{request.title} 2026 update"]
 
-    print("[STAGE 3] Searching the web using generated keywords...")
     shared_pool: list[dict] = []
     try:
         shared_pool = await build_shared_web_pool(script_search_keywords, scraped_urls)
-        print(f"[STAGE 3] {len(shared_pool)} article(s) fetched/chunked/embedded")
+        print(f"[STAGE 3] shared web pool built: {len(shared_pool)} article(s) fetched/chunked/embedded")
     except Exception as exc:
-        print(f"--- [STAGE 3] shared web pool build failed: {exc} ---")
+        print(f"[STAGE 3] shared web pool build failed: {exc}")
         import traceback
         traceback.print_exc()
         shared_pool = []
 
-    print("[STAGE 3] Matching web content against HyDE documents...")
     try:
         model = _get_st_model()
         new_articles = []
@@ -5807,21 +5862,24 @@ async def _generate_script_impl(request: "ScriptRequest"):
             top_for_doc = rank_pool_for_hyde_doc(
                 shared_pool, hyde_embedding, WEB_CONTENT_SIMILARITY_THRESHOLD, SCRIPT_TOP_K_PER_DOC
             )
+            newly_added = 0
             for article in top_for_doc:
                 url = article.get("url")
                 if url and url not in seen_urls_final:
                     seen_urls_final.add(url)
                     new_articles.append(article)
+                    newly_added += 1
             print(
-                f"[STAGE 3] HyDE segment #{doc_idx}: matched top {len(top_for_doc)} "
-                f"from the pool of {len(shared_pool)}"
+                f"[STAGE 3 | SEGMENT #{doc_idx}] matched {newly_added} new source(s) from the "
+                f"pool of {len(shared_pool)} (running unique total: {len(seen_urls_final)})"
             )
 
         unique_source_count = _unique_url_count(new_articles)
+        print(f"[STAGE 3] direct matching done: {unique_source_count}/{script_web_source_target} unique source(s)")
+
         if unique_source_count < script_web_source_target:
             print(
-                f"[STAGE 3] Only {unique_source_count} unique source URL(s) matched, "
-                f"backfilling to reach the target {script_web_source_target}."
+                f"[STAGE 3] below target — backfilling ({unique_source_count} -> {script_web_source_target})"
             )
             try:
                 new_articles = await _backfill_sources_to_target(
@@ -5832,6 +5890,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
                     keywords=script_search_keywords,
                     target_count=script_web_source_target,
                 )
+                print(f"[STAGE 3] backfill done — now {_unique_url_count(new_articles)}/{script_web_source_target}")
             except Exception as backfill_exc:
                 print(f"[STAGE 3] backfill failed: {backfill_exc}")
                 import traceback
@@ -5845,9 +5904,11 @@ async def _generate_script_impl(request: "ScriptRequest"):
                 f"unique semantically relevant web source(s) available even after backfill."
             )
 
-        print(f"[STAGE 3] done — final unique source count: {_unique_url_count(new_articles)}/{script_web_source_target}")
+        print(f"[STAGE 3] done in {time.time() - stage3_start:.2f}s — final unique source count: {_unique_url_count(new_articles)}/{script_web_source_target}")
+        for i, a in enumerate(new_articles, start=1):
+            print(f"    [SRC-{i}] sim={a.get('similarity'):.4f} {a.get('url')}")
     except Exception as exc:
-        print(f"--- [STAGE 3] web content matching failed: {exc} ---")
+        print(f"[STAGE 3] FAILED — web content matching raised: {exc}")
         import traceback
         traceback.print_exc()
 
@@ -5855,26 +5916,36 @@ async def _generate_script_impl(request: "ScriptRequest"):
     # STAGE 4 — YouTube search keyword generation + YouTube Data API search.
     # Runs only after Stage 3 completes.
     # =========================================================================
-    print("\n[STAGE 4] Generating YouTube search keywords and fetching results...")
+    stage4_start = time.time()
+    print("\n" + "=" * 90)
+    print("[STAGE 4] YouTube search: keyword generation -> Data API search")
+    print("=" * 90)
     try:
         new_videos = await get_youtube_context(request.title, request.description, scraped_urls)
-        print(f"[STAGE 4] done — {len(new_videos)} YouTube video(s) found")
+        print(f"[STAGE 4] done in {time.time() - stage4_start:.2f}s — {len(new_videos)} YouTube video(s) found")
+        for i, v in enumerate(new_videos, start=1):
+            print(f"    [YT-{i}] views={v.get('view_count')} {v.get('title')} ({v.get('url')})")
     except Exception as exc:
-        print(f"--- [STAGE 4] YouTube search failed: {exc} ---")
+        print(f"[STAGE 4] FAILED — YouTube search raised: {exc}")
         new_videos = []
 
     # =========================================================================
     # STAGE 5 — Book metadata lookup (depends on Stage 2's DB chunks).
     # Runs only after Stage 4 completes.
     # =========================================================================
-    print("\n[STAGE 5] Looking up book metadata for retrieved chunks...")
+    stage5_start = time.time()
+    print("\n" + "=" * 90)
+    print("[STAGE 5] Book metadata lookup")
+    print("=" * 90)
     try:
         books = await _fetch_books(
             all_db_chunks_seen, all_db_md5s_seen, topic_text, combined_hyde_doc, table_name
         )
-        print(f"[STAGE 5] done — {len(books)} book(s) resolved")
+        print(f"[STAGE 5] done in {time.time() - stage5_start:.2f}s — {len(books)} book(s) resolved")
+        for i, b in enumerate(books, start=1):
+            print(f"    [BOOK-{i}] \"{b.get('title')}\" by {b.get('author')} ({b.get('year')})")
     except Exception as exc:
-        print(f"--- [STAGE 5] book lookup failed: {exc} ---")
+        print(f"[STAGE 5] FAILED — book lookup raised: {exc}")
         import traceback
         traceback.print_exc()
         books = []
@@ -5883,18 +5954,31 @@ async def _generate_script_impl(request: "ScriptRequest"):
     # STAGE 6 — Script generation, using Stage 2's DB chunks + Stage 3's web
     # sources. Runs only after Stage 5 completes.
     # =========================================================================
-    print("\n[STAGE 6] Generating script...")
+    stage6_start = time.time()
+    print("\n" + "=" * 90)
+    print("[STAGE 6] Script generation")
+    print("=" * 90)
     try:
         target_word_count = target_word_count_for_time(request.time)
+        print(f"[STAGE 6] target word count: {target_word_count} (±3%) for {request.time} minute(s)")
         script_result = await generate_script_from_context(
             request, selected_template, db_results, new_articles, target_word_count
         )
         script_text = script_result["script"]
         script_metrics = script_result["metrics"]
         classification = script_result["classification"]
-        print(f"[STAGE 6] done — {_word_count(script_text)} word(s) generated")
+        actual_words = _word_count(script_text)
+        deviation_pct = (
+            abs(actual_words - target_word_count) / target_word_count * 100
+            if target_word_count else 0
+        )
+        print(
+            f"[STAGE 6] done in {time.time() - stage6_start:.2f}s — {actual_words} word(s) generated "
+            f"(target {target_word_count}, deviation {deviation_pct:.1f}%)"
+        )
+        print(f"[STAGE 6] classification: category='{classification.get('category')}' subcategories={classification.get('subcategories')}")
     except Exception as exc:
-        print(f"--- [STAGE 6] script generation failed: {exc} ---")
+        print(f"[STAGE 6] FAILED — script generation raised: {exc}")
         import traceback
         traceback.print_exc()
         script_metrics = dict(_DEFAULT_SCRIPT_METRICS)
@@ -5904,12 +5988,21 @@ async def _generate_script_impl(request: "ScriptRequest"):
     # STAGE 7 — YouTube SEO metadata generation, using the FINISHED script
     # from Stage 6 (not an empty placeholder). Runs only after Stage 6.
     # =========================================================================
-    print("\n[STAGE 7] Generating YouTube SEO metadata...")
+    stage7_start = time.time()
+    print("\n" + "=" * 90)
+    print("[STAGE 7] YouTube SEO metadata generation")
+    print("=" * 90)
     try:
         youtube_metadata = await generate_youtube_seo_metadata(request, script_text, new_videos)
-        print("[STAGE 7] done")
+        print(
+            f"[STAGE 7] done in {time.time() - stage7_start:.2f}s — "
+            f"{len(youtube_metadata.get('titles', []))} title(s), "
+            f"{len(youtube_metadata.get('descriptions', []))} description(s), "
+            f"{len(youtube_metadata.get('hashtags', []))} hashtag set(s), "
+            f"{len(youtube_metadata.get('thumbnail_text', []))} thumbnail text(s)"
+        )
     except Exception as exc:
-        print(f"--- [STAGE 7] YouTube SEO metadata generation failed: {exc} ---")
+        print(f"[STAGE 7] FAILED — YouTube SEO metadata generation raised: {exc}")
         import traceback
         traceback.print_exc()
         youtube_metadata = _build_fallback_youtube_metadata(request)
@@ -5918,8 +6011,12 @@ async def _generate_script_impl(request: "ScriptRequest"):
     # STAGE 8 — Final QC pass cross-checking script + metadata. Runs only
     # after Stage 7 completes.
     # =========================================================================
-    print("\n[STAGE 8] Running final QC pass (script + YouTube metadata cross-check)...")
+    stage8_start = time.time()
+    print("\n" + "=" * 90)
+    print("[STAGE 8] Final QC pass (script + YouTube metadata cross-check)")
+    print("=" * 90)
     try:
+        pre_qc_words = _word_count(script_text)
         qc_result = await run_final_qc_pass(
             idea_title=request.title,
             idea_description=request.description,
@@ -5930,9 +6027,13 @@ async def _generate_script_impl(request: "ScriptRequest"):
         youtube_metadata["titles"] = qc_result["titles"]
         youtube_metadata["descriptions"] = qc_result["descriptions"]
         youtube_metadata["thumbnail_text"] = qc_result["thumbnail_text"]
-        print("[STAGE 8] done")
+        post_qc_words = _word_count(script_text)
+        print(
+            f"[STAGE 8] done in {time.time() - stage8_start:.2f}s — "
+            f"script words {pre_qc_words} -> {post_qc_words} after QC"
+        )
     except Exception as exc:
-        print(f"--- [STAGE 8] final QC pass failed, keeping pre-QC script/metadata: {exc} ---")
+        print(f"[STAGE 8] FAILED — final QC pass raised: {exc} — keeping pre-QC script/metadata")
         import traceback
         traceback.print_exc()
 
@@ -5941,12 +6042,19 @@ async def _generate_script_impl(request: "ScriptRequest"):
     total_words = _word_count(script_text) if script_text else 0
     token_usage = _get_token_usage_summary()
 
-    print(f"Total time: {time.time() - total_start_time:.2f}s")
+    total_elapsed = time.time() - total_start_time
+    print("\n" + "=" * 90)
+    print(f"[SCRIPT] ===== REQUEST COMPLETE ===== total time: {total_elapsed:.2f}s")
+    print(
+        f"[SCRIPT] final: {total_words} word(s) | {len(sources)} source(s) | {len(books)} book(s) | "
+        f"category='{classification.get('category', 'UNKNOWN')}'"
+    )
     print(
         f"[TOKENS] /generate-script total — input: {token_usage['total_input_tokens']}, "
         f"output: {token_usage['total_output_tokens']}, total: {token_usage['total_tokens']} "
         f"across {len(token_usage['calls'])} LLM call(s)"
     )
+    print("=" * 90 + "\n")
 
     return {
         "script": script_text,
@@ -5971,6 +6079,139 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -6115,11 +6356,12 @@ async def get_user_face_photo_bytes(user_id: str, photo_key: str = FACE_PHOTO_DE
 
 
 STORY_ANALYST_SYSTEM_PROMPT = """
+
 # STORYBIT STORY ANALYST (SSL v1)
 
 ## ROLE
 
-You are **Storybit Story Analyst**, the first stage of the Storybit AI Pipeline. Your responsibility is to convert a YouTube documentary script into a compact **Story Semantic Language (SSL v1)**. You are **not** a script writer, thumbnail designer, or prompt engineer. You are a deterministic semantic compiler. Your output will be consumed only by the Storybit Thumbnail Intelligence Agent. Optimize for machine communication, not human readability.
+You are *Storybit Story Analyst, the first stage of the Storybit AI Pipeline. Your responsibility is to convert a YouTube documentary script into a compact **Story Semantic Language (SSL v1). You are **not* a script writer, thumbnail designer, or prompt engineer. You are a deterministic semantic compiler. Your output will be consumed only by the Storybit Thumbnail Intelligence Agent. Optimize for machine communication, not human readability.
 
 ## INPUT
 
@@ -6135,97 +6377,99 @@ Return valid JSON only. No markdown, explanations, reasoning, summaries, opinion
 
 ## OUTPUT
 
-```json
+json
 {"v":1,"core":{},"sub":[],"rel":[],"evt":[],"emo":{},"conf":{},"vis":{},"sig":{}}
-```
+
 
 ## core
 
 Story metadata.
 
-**Allowed fields:** `id cat era plot stage`
+*Allowed fields:* id cat era plot stage
 
-**Definitions:** `id` = canonical story identifier. `cat` = story category (`business, history, war, technology, biography, finance, politics, science, crime, sports`). `era` = relevant historical period (e.g., `1990s, 2010-2014, Cold War, Modern`). `plot` = ordered plot stages using concise keywords (`rise, growth, success, dominance, conflict, betrayal, crisis, decline, collapse, failure, recovery, innovation, sale, merger, victory, defeat`). `stage` = overall narrative state (`beginning, middle, ending`).
+*Definitions:* id = canonical story identifier. cat = story category (business, history, war, technology, biography, finance, politics, science, crime, sports). era = relevant historical period (e.g., 1990s, 2010-2014, Cold War, Modern). plot = ordered plot stages using concise keywords (rise, growth, success, dominance, conflict, betrayal, crisis, decline, collapse, failure, recovery, innovation, sale, merger, victory, defeat). stage = overall narrative state (beginning, middle, ending).
 
 ## sub
 
 Ordered subjects.
 
-```json
+json
 {"id":"","type":"","role":"","rank":1}
-```
 
-**Allowed types:** `person, company, country, organization, technology, product, place, event`
 
-**Maximum:** 8 subjects.
+*Allowed types:* person, company, country, organization, technology, product, place, event
+
+*Maximum:* 8 subjects.
 
 ## rel
 
 Relationships.
 
-```json
+json
 [source, relation, target]
-```
 
-**Relations:** `leads, owns, acquires, competes, defeats, supports, replaces, creates, invests, criticizes, wins, loses`
 
-**Maximum:** 20 relationships.
+*Relations:* leads, owns, acquires, competes, defeats, supports, replaces, creates, invests, criticizes, wins, loses
+
+*Maximum:* 20 relationships.
 
 ## evt
 
 Only visually important events.
 
-```json
+json
 {"id":"","type":"","rank":1}
-```
 
-**Event types:** `launch, bankruptcy, acquisition, war, speech, protest, accident, crash, announcement, lawsuit, election`
 
-**Maximum:** 10 events.
+*Event types:* launch, bankruptcy, acquisition, war, speech, protest, accident, crash, announcement, lawsuit, election
+
+*Maximum:* 10 events.
 
 ## emo
 
 Dominant emotional signals.
 
-**Fields:** `primary secondary viewer`
+*Fields:* primary secondary viewer
 
-**Allowed values:** `curiosity, fear, trust, hope, success, failure, anger, shock, nostalgia, excitement, uncertainty`
+*Allowed values:* curiosity, fear, trust, hope, success, failure, anger, shock, nostalgia, excitement, uncertainty
 
-**Maximum:** One value per field.
+*Maximum:* One value per field.
 
 ## conf
 
 Primary conflict.
 
-**Fields:** `type a b winner loser`
+*Fields:* type a b winner loser
 
-**Conflict types:** `market, political, military, technology, legal, social, economic, personal`
+*Conflict types:* market, political, military, technology, legal, social, economic, personal
 
 ## vis
 
 Visual candidates.
 
-**Fields:** `hero support objects symbols locations environment`
+*Fields:* hero support objects symbols locations environment
 
-**Limits:** Hero (2), Support (4), Objects (8), Symbols (5), Locations (5), Environment (1). Include only visually useful items. Ignore non-visual concepts.
+*Limits:* Hero (2), Support (4), Objects (8), Symbols (5), Locations (5), Environment (1). Include only visually useful items. Ignore non-visual concepts.
 
 ## sig
 
 Thumbnail signals.
 
-**Fields:** `hook contrast focus risk impact`
+*Fields:* hook contrast focus risk impact
 
-**Hook:** `why, how, secret, mistake, collapse, truth, inside`
+*Hook:* why, how, secret, mistake, collapse, truth, inside
 
-**Contrast:** `past_present, winner_loser, before_after, success_failure, small_big, old_new`
+*Contrast:* past_present, winner_loser, before_after, success_failure, small_big, old_new
 
-**Definitions:** `focus` = primary visual anchor, `risk` = main perceived danger, `impact` = main consequence. Maximum one value for each field.
+*Definitions:* focus = primary visual anchor, risk = main perceived danger, impact = main consequence. Maximum one value for each field.
 
 ## VALIDATION
 
 Before returning, verify: script is authoritative; plot stages are chronological; subjects are ranked by visual importance; relationships are unique; events are visually significant; exactly one primary emotion; exactly one primary conflict; hero subject exists whenever possible; thumbnail signals are consistent with the script; JSON is valid; no redundant fields remain.
 
-Return only the JSON.
+Return only the SSL v1 JSON.
+
+
 """
 
 
@@ -6241,11 +6485,11 @@ You are Storybit Thumbnail Intelligence Agent, Stage 2 of the Storybit Pipeline.
 Receive:
 
 * SSL v1
-* `user_image` (true|false)
+* user_image (true|false)
 
 SSL is the only story source of truth. Infer only when strongly supported. Omit uncertain information.
 
-If `user_image=true`, plan how the reference person should integrate into the thumbnail. Do not replace story subjects unless the story naturally requires it.
+If user_image=true, plan how the reference person should integrate into the thumbnail. Do not replace story subjects unless the story naturally requires it.
 
 ## OBJECTIVE
 
@@ -6257,64 +6501,64 @@ Return JSON only. No markdown. No explanations. No comments. No reasoning. No pr
 
 ## OUTPUT
 
-```json
+json
 {
   "v":1,
   "cs":{},
   "vb":{},
   "rs":{}
 }
-```
 
-If `user_image=true`, include:
 
-```json
+If user_image=true, include:
+
+json
 "idn":{}
-```
 
-between `vb` and `rs`.
+
+between vb and rs.
 
 ## cs (Creative Strategy)
 
 Keys:
 
-`goal promise emo psy hook style tone simp urg shock myst trust focus`
+goal promise emo psy hook style tone simp urg shock myst trust focus
 
 Populate only non-default values.
 
 ## vb (Visual Blueprint)
 
-Describe **what appears**, never **how it is rendered**.
+Describe *what appears, never **how it is rendered*.
 
 Keys:
 
-`sub obj sym loc env era expr pose fg bg focus layers layout text maxs maxo`
+sub obj sym loc env era expr pose fg bg focus layers layout text maxs maxo
 
 Subjects always represent the planned thumbnail composition, not the reference image.
 
 ## idn (Identity Integration)
 
-Generate only when `user_image=true`.
+Generate only when user_image=true.
 
 Purpose: Describe how the user's reference image integrates into the planned composition.
 
 Keys:
 
-`mode slot expr pose gaze scale interact blend occ`
+mode slot expr pose gaze scale interact blend occ
 
 Definitions:
 
-* mode → `replace insert foreground background observer group`
-* slot → `hero left right center foreground background`
+* mode → replace insert foreground background observer group
+* slot → hero left right center foreground background
 * expr → expression enum
 * pose → pose enum
-* gaze → `camera left right subject object up down`
-* scale → `primary secondary background`
-* interact → `none looking pointing holding shaking arguing celebrating`
-* blend → `match auto`
-* occ → `front partial behind`
+* gaze → camera left right subject object up down
+* scale → primary secondary background
+* interact → none looking pointing holding shaking arguing celebrating
+* blend → match auto
+* occ → front partial behind
 
-The `idn` section defines composition only. Never describe rendering.
+The idn section defines composition only. Never describe rendering.
 
 ## rs (Rendering Specification)
 
@@ -6322,17 +6566,17 @@ Populate only non-default values.
 
 Groups:
 
-`comp cam light clr txt fx neg`
+comp cam light clr txt fx neg
 
-comp → `rule balance depth crop`
+comp → rule balance depth crop
 
-cam → `shot angle lens dist dof`
+cam → shot angle lens dist dof
 
-light → `style dir temp contrast`
+light → style dir temp contrast
 
-clr → `pal accent`
+clr → pal accent
 
-txt → `pos size weight`
+txt → pos size weight
 
 fx → ordered rendering effect IDs
 
@@ -6342,19 +6586,19 @@ neg → ordered negative constraint IDs
 
 Always use predefined application enums.
 
-Emotion → `fear hope anger trust curiosity surprise success failure`
+Emotion → fear hope anger trust curiosity surprise success failure
 
-Style → `doc biz tech hist war editorial minimal`
+Style → doc biz tech hist war editorial minimal
 
-Layout → `hero left right center split triangle diagonal`
+Layout → hero left right center split triangle diagonal
 
-Shot → `close medium wide`
+Shot → close medium wide
 
-Angle → `low eye high`
+Angle → low eye high
 
-Lighting → `dramatic soft studio natural rim`
+Lighting → dramatic soft studio natural rim
 
-Palette → `warm cool mono neutral`
+Palette → warm cool mono neutral
 
 All subjects, objects, locations, symbols, typography, effects, constraints, poses, and expressions come from application dictionaries. Never invent enum values.
 
@@ -6368,7 +6612,7 @@ Before returning:
 * Maintain one dominant curiosity hook.
 * Preserve subject ranking.
 * Preserve composition hierarchy.
-* Emit `idn` only when `user_image=true`.
+* Emit idn only when user_image=true.
 * Ensure identity integration supports the story composition.
 * Remove defaults and redundancy.
 * Return valid JSON only.
@@ -6377,34 +6621,60 @@ Before returning:
 
 PROMPT_RENDERER_SYSTEM_PROMPT = """
 # STORYBIT PROMPT RENDERER (PR v2)
+
 ## ROLE
+
 Stage 3 of the Storybit Pipeline. Compile TSL v1 into an optimized prompt for the selected Image Model. Preserve all TSL decisions. Do not redesign, reinterpret, optimize, summarize or invent content. Deterministic compiler only.
+
 ## INPUT
+
 * TSL v1
 * Thumbnail Text
 * Image Model
 * Reference Image (optional)
-TSL is the only planning source. If Reference Image exists, apply `idn` while preserving facial identity.
+
+TSL is the only planning source. If Reference Image exists, apply idn while preserving facial identity.
+
 ## OBJECTIVE
+
 Generate the shortest high-fidelity prompt compatible with the selected Image Model while preserving composition, hierarchy, rendering intent and realism.
+
 ## RULES
+
 Return plain text only. No JSON, markdown, comments, explanations or reasoning. Expand TSL IDs using built-in dictionaries. Never expose internal fields. Remove duplicates. Merge compatible descriptors. Omit missing/default values. Never invent story facts. Never modify Thumbnail Text.
+
 ## MODEL
+
 Adapt descriptor ordering, syntax and rendering terms for the selected Image Model. Use only supported descriptors. Minimize prompt length without reducing fidelity.
+
 ## OUTPUT ORDER
+
 Style → Primary Subject → Supporting Subjects → Expression → Pose → Interaction → Objects → Symbols → Environment → Composition → Camera → Lighting → Color Palette → Foreground → Background → Thumbnail Text → Rendering Quality → Negative Constraints.
+
 ## COMPOSITION
+
 Preserve hierarchy, layout and focal point. Keep composition simple, clear and mobile-readable.
+
 ## REFERENCE IMAGE
-Ignore if absent. If present: preserve facial identity, proportions, approximate age, hairstyle and skin tone; apply `idn` pose, expression, gaze, placement and scale; match lighting, perspective and color; blend naturally; never duplicate user; `replace` replaces only hero subject; `insert` preserves story subjects.
+
+Ignore if absent. If present: preserve facial identity, proportions, approximate age, hairstyle and skin tone; apply idn pose, expression, gaze, placement and scale; match lighting, perspective and color; blend naturally; never duplicate user; replace replaces only hero subject; insert preserves story subjects.
+
 ## THUMBNAIL TEXT
+
 Render exactly as supplied. Never rewrite, translate or shorten. Follow TSL placement. Large bold typography, high contrast, safe margins, mobile readable.
+
 ## QUALITY
+
 Emit model-appropriate quality descriptors once only.
+
 ## NEGATIVE
+
 Expand negative IDs, merge duplicates, keep concise.
+
 ## VALIDATION
+
 Verify: TSL preserved; composition preserved; Thumbnail Text preserved; identity rules applied only when Reference Image exists; IDs expanded; no internal metadata; prompt optimized for selected Image Model.
+
 Return only the compiled prompt.
 """
 
@@ -6537,12 +6807,7 @@ Reference Image: {"provided" if has_reference_image else "none"}
 
 
 def _pick_thumbnail_text(thumbnail_text: str | None, request) -> str:
-    if isinstance(thumbnail_text, str) and thumbnail_text.strip():
         return thumbnail_text.strip()
-
-    base = (request.title or "Watch Now").strip()
-    return base[:28] if base else "Watch Now"
-
 
 def _fallback_thumbnail_prompt(request, chosen_thumbnail_text: str = None) -> str:
     base = (request.title or "this topic").strip()
@@ -6555,7 +6820,6 @@ def _fallback_thumbnail_prompt(request, chosen_thumbnail_text: str = None) -> st
         f"in a clear area of the composition that doesn't overlap the main subject. No other "
         f"text, letters, numbers, logos, or watermarks anywhere in the image."
     )
-
 
 
 def _generate_thumbnail_image_gpt_image_sync(
@@ -6771,7 +7035,7 @@ class ThumbnailRequest(BaseModel):
     isFace: bool
     script: str = ""
     thumbnail_text: str | None = None
-    language: str = "English"  
+    # language: str = "English"  
 
 
 @app.post("/generate-thumbnail")
@@ -6883,22 +7147,8 @@ async def _deduct_credits_for_action(user_id: str, amount: int, action_label: st
         print(f"[CREDITS] ({action_label}) amount <= 0 ({amount}), skipping deduction for user {user_id}")
         return
 
-    tier = await _get_user_tier(user_id)
-    is_free = tier in FREE_TIER_LABELS
-
     await _deduct_profile_credits(user_id, amount)
-
-    if not is_free:
-        print(
-            f"[CREDITS] ({action_label}) user {user_id} tier='{tier}' (non-free) — "
-            f"also deducting {amount} credits from subscriptions"
-        )
-        await _deduct_subscription_credits(user_id, amount)
-    else:
-        print(
-            f"[CREDITS] ({action_label}) user {user_id} tier='{tier or 'free (default)'}' — "
-            f"free tier, only user_profiles was deducted"
-        )
+    print(f"[CREDITS] ({action_label}) user {user_id} — deducted {amount} credits from user_profiles only")
 
 
 async def _deduct_thumbnail_credits(user_id: str, amount: int = THUMBNAIL_CREDITS_PER_IMAGE):
@@ -6911,18 +7161,18 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
     total_start_time = time.time()
     script_text = request.script or ""
 
-    target_language = _normalize_language(getattr(request, "language", None))
+    # target_language = _normalize_language(getattr(request, "language", None))
     chosen_thumbnail_text = _pick_thumbnail_text(request.thumbnail_text, request)
  
-    if target_language != "English" and chosen_thumbnail_text:
-        try:
-            print(f"[THUMBNAIL] Translating thumbnail text into {target_language}: '{chosen_thumbnail_text}'")
-            chosen_thumbnail_text = await translate_text_full_pipeline(
-                chosen_thumbnail_text, target_language
-            )
-            print(f"[THUMBNAIL] translated thumbnail text: '{chosen_thumbnail_text}'")
-        except Exception as exc:
-            print(f"--- thumbnail text translation failed, keeping English text: {exc} ---")
+    # if target_language != "English" and chosen_thumbnail_text:
+    #     try:
+    #         print(f"[THUMBNAIL] Translating thumbnail text into {target_language}: '{chosen_thumbnail_text}'")
+    #         chosen_thumbnail_text = await translate_text_full_pipeline(
+    #             chosen_thumbnail_text, target_language
+    #         )
+    #         print(f"[THUMBNAIL] translated thumbnail text: '{chosen_thumbnail_text}'")
+    #     except Exception as exc:
+    #         print(f"--- thumbnail text translation failed, keeping English text: {exc} ---")
     print(f"[THUMBNAIL] chosen thumbnail text to render into image: '{chosen_thumbnail_text}'")
 
     thumbnail_result = {"image_base64": None, "prompt": None, "error": "not attempted"}
@@ -8264,11 +8514,24 @@ def _create_fish_model_sync(ref_audio_bytes: bytes, title: str) -> str:
 
 
 def _run_fish_tts_sync(script: str, reference_id: str) -> bytes:
-    tts_request = TTSRequest(text=script, reference_id=reference_id)
+    tts_request = TTSRequest(
+        text=script,
+        reference_id=reference_id,
+        temperature=0.5,              
+        top_p=0.7,                    
+        repetition_penalty=1.2,     
+        chunk_length=300,           
+        latency="normal",             
+        normalize=True,              
+        format="mp3",             
+        mp3_bitrate=192,               
+        condition_on_previous_chunks=True,  
+    )
     audio_chunks = []
     for chunk in fish_session.tts(tts_request):
         audio_chunks.append(chunk)
     return b"".join(audio_chunks)
+
 
 
 def _get_public_url_sync(bucket: str, path: str) -> str:
@@ -8276,7 +8539,6 @@ def _get_public_url_sync(bucket: str, path: str) -> str:
     if isinstance(res, dict):
         return res.get("publicUrl") or res.get("public_url")
     return res
-
 
 @app.post("/generate-speech")
 async def generate_speech(body: GenerateSpeechRequest):
