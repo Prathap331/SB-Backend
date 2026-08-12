@@ -1307,8 +1307,6 @@ WORDS_PER_MINUTE = 140
 
 BOOKS_TABLE_NAME = "english_books"
 THUMBNAILS_BUCKET = "generated-thumbnails"
-SCRIPT_CREDITS_PER_MINUTE = 3
-THUMBNAIL_CREDITS_PER_IMAGE = 20
 
 
 def to_pgvector(embedding) -> str:
@@ -3447,7 +3445,7 @@ class UnlockRequest(BaseModel):
     userId: str
     duration: float 
 
-CREDITS_PER_MINUTE = 3
+CREDITS_PER_MINUTE = 1
 
 
 class CheckCreditsRequest(BaseModel):
@@ -5912,10 +5910,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         import traceback
         traceback.print_exc()
 
-    # =========================================================================
-    # STAGE 4 — YouTube search keyword generation + YouTube Data API search.
-    # Runs only after Stage 3 completes.
-    # =========================================================================
     stage4_start = time.time()
     print("\n" + "=" * 90)
     print("[STAGE 4] YouTube search: keyword generation -> Data API search")
@@ -6215,6 +6209,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
 
 
+THUMBNAIL_CREDITS_PER_IMAGE = 10
 
 FACE_THUMBNAILS_TABLE = "user_profiles"
 FACE_PHOTO_DEFAULT_KEY = "photo1"
@@ -7049,23 +7044,6 @@ async def generate_thumbnail_endpoint(request: ThumbnailRequest):
 FREE_TIER_LABELS = {"free", "free_tier", "free-tier", "trial", "none", ""}
 
 
-async def _get_user_tier(user_id: str) -> str:
-    try:
-        result = await asyncio.to_thread(
-            lambda: supabase.table("user_profiles")
-            .select("user_tier")
-            .eq("id", user_id)
-            .single()
-            .execute()
-        )
-        raw_tier = (result.data or {}).get("user_tier")
-        tier = (raw_tier or "").strip().lower()
-        print(f"[CREDITS] user {user_id} user_tier='{tier or 'free (default)'}'")
-        return tier
-    except Exception as exc:
-        print(f"[CREDITS] failed to fetch user_tier for user {user_id}, defaulting to 'free': {exc}")
-        return "free"
-
 async def _deduct_profile_credits(user_id: str, amount: int):
     try:
         result = (
@@ -7101,45 +7079,6 @@ async def _deduct_profile_credits(user_id: str, amount: int):
         import traceback
         traceback.print_exc()
 
-
-async def _deduct_subscription_credits(user_id: str, amount: int):
-    try:
-        sub_res = (
-            supabase.table("subscriptions")
-            .select("id, credits, created_at")
-            .eq("userId", user_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        rows = sub_res.data or []
-        if not rows:
-            print(f"[CREDITS] No subscription rows found for user {user_id} (non-free tier) — skipping subscriptions deduction.")
-            return
-
-        latest_subscription = rows[0]
-        subscription_id = latest_subscription["id"]
-        current_credits = latest_subscription.get("credits")
-        if current_credits is None:
-            print(f"[CREDITS] Latest subscription {subscription_id} for user {user_id} has no 'credits' value, skipping deduction.")
-            return
-
-        new_credits = max(current_credits - amount, 0)
-
-        supabase.table("subscriptions").update(
-            {"credits": new_credits}
-        ).eq("id", subscription_id).execute()
-
-        print(
-            f"[CREDITS] (subscriptions, most recent by created_at) "
-            f"Deducted {amount} credits from subscription {subscription_id} "
-            f"(user {user_id}): {current_credits} -> {new_credits}"
-        )
-    except Exception as exc:
-        print(f"[CREDITS] Failed to deduct subscription credits for user {user_id}: {exc}")
-        import traceback
-        traceback.print_exc()
 
 
 async def _deduct_credits_for_action(user_id: str, amount: int, action_label: str = "credits"):
@@ -7187,6 +7126,8 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
             thumbnail_url = await save_thumbnail_to_supabase(
                 request.userId, thumbnail_result["image_base64"]
             )
+            # 1 thumbnail = 10 credits, deducted only after a successful save,
+            # via the same batch-aware credit_batches FIFO logic used for voice generation.
             await _deduct_thumbnail_credits(request.userId, THUMBNAIL_CREDITS_PER_IMAGE)
         thumbnail_result["public_url"] = thumbnail_url
     except Exception as exc:
@@ -7213,15 +7154,6 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
-
 
 
 
@@ -7552,22 +7484,6 @@ async def search_pexels_videos(request: PexelsVideoSearchRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import datetime
 import string
 from reportlab.lib.pagesizes import A4
@@ -7704,14 +7620,9 @@ def generate_invoice_pdf(
     elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
     elements.append(Spacer(1, 7*mm))
 
-    # grand_total = round(amount, 2)
-    # base_price  = round(amount / 1.18, 2)
-    # gst_amount  = round(grand_total - base_price, 2)
-
     base_price  = amount / 1.18
     gst_amount  = base_price * 0.18
     grand_total = base_price + gst_amount
-
 
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
 
@@ -7803,8 +7714,6 @@ def generate_invoice_pdf(
     return file_path
 
 
-
-
 import uuid as uuid_lib
 
 
@@ -7836,7 +7745,7 @@ def _add_credit_batch(
         "expires_at": expires_at.isoformat(),
         "tier": tier,
     }
-    return batches + [new_batch]  
+    return batches + [new_batch]
 
 
 def _deduct_from_batches(batches: list[dict], amount: int) -> tuple[list[dict], int]:
@@ -7999,8 +7908,8 @@ async def razorpay_webhook(
                 return {"status": "error", "message": "Missing required order notes."}
 
             plan_config = {
-                'plus': {'credits': 500, 'validity_days': 30},
-                'pro':   {'credits': 1200, 'validity_days': 30},
+                'plus': {'credits': 600,  'price': 699,  'validity_days': 30},
+                'pro':  {'credits': 1200, 'price': 1299, 'validity_days': 30},
             }
             config = plan_config.get(target_tier.lower())
             if not config:
@@ -8188,6 +8097,17 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -8431,38 +8351,7 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+import math
 
 FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
 FISH_AUDIO_TTS_URL = "https://api.fish.audio/v1/tts"
@@ -8474,6 +8363,11 @@ from fish_audio_sdk import Session, TTSRequest
 fish_session = Session(FISH_AUDIO_API_KEY)
 
 GENERATED_AUDIO_BUCKET = "generated-audio"
+
+# ---- Credit pricing for voice generation ----
+# 1 minute of generated audio = 5 credits. Prorated per second and rounded up,
+# so e.g. 30s -> 3 credits, 61s -> 6 credits.
+VOICE_CREDITS_PER_MINUTE = 5
 
 
 _LANG_CODE_TO_NAME = {v.lower(): k for k, v in SUPPORTED_LANGUAGES.items()}
@@ -8493,7 +8387,8 @@ class GenerateSpeechRequest(BaseModel):
     userId: str
     script: str
     voice: str
-    langCode: str = "en"   
+    langCode: str = "en"
+    durationSeconds: int = 0  # audio length (seconds) reported by the frontend, used for credit billing
 
 
 async def _download_bytes(url: str) -> bytes:
@@ -8532,6 +8427,28 @@ def _run_fish_tts_sync(script: str, reference_id: str) -> bytes:
         audio_chunks.append(chunk)
     return b"".join(audio_chunks)
 
+
+def _credits_for_voice_duration(duration_seconds: float) -> int:
+    if duration_seconds <= 0:
+        return 0
+    minutes = duration_seconds / 60.0
+    credits = math.ceil(minutes * VOICE_CREDITS_PER_MINUTE)
+    return max(credits, 1)
+
+
+async def _deduct_voice_credits(user_id: str, duration_seconds: float):
+    credits_to_deduct = _credits_for_voice_duration(duration_seconds)
+    if credits_to_deduct <= 0:
+        print(f"[CREDITS] (voice_generation) nothing to deduct for user {user_id} (duration={duration_seconds:.2f}s)")
+        return
+    print(
+        f"[CREDITS] (voice_generation) user {user_id} — {duration_seconds:.2f}s of audio "
+        f"→ {credits_to_deduct} credits (rate: {VOICE_CREDITS_PER_MINUTE}/min)"
+    )
+    # Reuses the same batch-aware FIFO deduction (credit_batches) already used
+    # for thumbnail credits: _deduct_credits_for_action -> _deduct_profile_credits
+    # -> _expire_stale_batches / _deduct_from_batches / _sum_batches.
+    await _deduct_credits_for_action(user_id, credits_to_deduct, action_label="voice_generation")
 
 
 def _get_public_url_sync(bucket: str, path: str) -> str:
@@ -8644,6 +8561,18 @@ async def generate_speech(body: GenerateSpeechRequest):
     if not public_url:
         raise HTTPException(status_code=500, detail="Generated audio saved but failed to create URL")
 
+    # ---- Credit deduction: 5 credits per minute of generated audio ----
+    # Duration is provided by the frontend (body.durationSeconds), not measured server-side.
+    try:
+        duration_seconds = body.durationSeconds or 0
+        await _deduct_voice_credits(userId, duration_seconds)
+    except Exception as e:
+        # Never fail the request over billing bookkeeping — audio was already
+        # generated and saved successfully at this point.
+        print(f"[TTS] credit deduction failed for user {userId}: {e}")
+        import traceback
+        traceback.print_exc()
+
     return {
         "message": "Speech generated successfully",
         "userId": userId,
@@ -8653,23 +8582,6 @@ async def generate_speech(body: GenerateSpeechRequest):
         "storage_path": storage_path,
         "url": public_url,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
