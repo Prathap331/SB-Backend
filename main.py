@@ -1190,12 +1190,12 @@ GPT_IMAGE_QUALITY = os.getenv("GPT_IMAGE_QUALITY", "high")
 
 
 _ENCODE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=int(os.getenv("ENCODE_EXECUTOR_WORKERS", "4")),
+    max_workers=int(os.getenv("ENCODE_EXECUTOR_WORKERS", "1")),
     thread_name_prefix="encode",
 )
 
 _IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=int(os.getenv("IO_EXECUTOR_WORKERS", "48")),
+    max_workers=int(os.getenv("IO_EXECUTOR_WORKERS", "8")),
     thread_name_prefix="io",
 )
 
@@ -1210,12 +1210,12 @@ _http_adapter = requests.adapters.HTTPAdapter(
 _http_session.mount("https://", _http_adapter)
 _http_session.mount("http://", _http_adapter)
 
-_MAX_CONCURRENT_PIPELINES = int(os.getenv("MAX_CONCURRENT_PIPELINES", "20"))
+_MAX_CONCURRENT_PIPELINES = int(os.getenv("MAX_CONCURRENT_PIPELINES", "2"))
 _pipeline_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PIPELINES)
 
 _MAX_CONCURRENT_ENCODES = int(os.getenv("MAX_CONCURRENT_ENCODES", "4"))
 _encode_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ENCODES)
-_MAX_CONCURRENT_SCRAPES = int(os.getenv("MAX_CONCURRENT_SCRAPES", "16")) 
+_MAX_CONCURRENT_SCRAPES = int(os.getenv("MAX_CONCURRENT_SCRAPES", "6")) 
 _scrape_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SCRAPES)
 
 OPENAI_CALL_TIMEOUT = float(os.getenv("OPENAI_CALL_TIMEOUT", "45"))
@@ -2458,7 +2458,7 @@ async def _generate_youtube_search_keywords(topic: str, description: str = "") -
 PER_KEYWORD_SCRAPE_COUNT = 5
 
 _SCRAPE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=int(os.getenv("SCRAPE_EXECUTOR_WORKERS", "24")),  # bumped 12 -> 24
+    max_workers=int(os.getenv("SCRAPE_EXECUTOR_WORKERS", "8")),  # bumped 12 -> 24
     thread_name_prefix="scrape",
 )
 
