@@ -8388,7 +8388,7 @@ class GenerateSpeechRequest(BaseModel):
     script: str
     voice: str
     langCode: str = "en"
-    durationSeconds: int = 0  # audio length (seconds) reported by the frontend, used for credit billing
+    durationSeconds: int = 0  
 
 
 async def _download_bytes(url: str) -> bytes:
