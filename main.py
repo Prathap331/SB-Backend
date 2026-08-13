@@ -674,20 +674,7 @@ def _keyword_to_hashtag(keyword: str) -> str:
 
 
 
-
-
-
-
-
-
-
-
-
-
-
 def _normalize_language(language: str | None) -> str:
-    """Validate/normalize whatever the client sent. Falls back to English on
-    anything unrecognized so a bad value never breaks the pipeline."""
     if not language or not language.strip():
         return DEFAULT_LANGUAGE
     key = language.strip().lower()
@@ -1111,8 +1098,6 @@ DRAFT TRANSLATION ({target_language}):
  
 
 
-
-
 async def translate_text_full_pipeline(text_value: str, target_language: str) -> str:
     if not text_value:
         return text_value
@@ -1327,11 +1312,12 @@ def _get_st_model():
     global _bge_model
     if _bge_model is None:
         from sentence_transformers import SentenceTransformer
+        import torch
+        torch.set_num_threads(2)  
         print("[MODEL] Loading BAAI/bge-m3")
         _bge_model = SentenceTransformer("BAAI/bge-m3")
         print("[MODEL] BAAI/bge-m3 loaded")
     return _bge_model
-
 
 
 class Idea(BaseModel):
@@ -2143,8 +2129,6 @@ async def select_template_and_generate_hyde(topic: str) -> dict:
     }
 
 
-
-
 async def get_context_from_db(
     topic: str,
     hyde_doc: str = None,
@@ -2509,7 +2493,8 @@ async def build_shared_web_pool(
 
     print(f"[POOL] {len(keywords)} keyword(s) ({kw_failures} failed) -> {len(candidates)} unique URL(s) to prepare")
 
-    async def _prepare(url: str, fallback_snippet: str) -> dict | None:
+    # --- Stage A: fetch + chunk everything (I/O bound, already concurrent) ---
+    async def _fetch_and_chunk(url: str, fallback_snippet: str) -> dict | None:
         full_text = await _fetch_full_article_text_with_timeout(url)
         used_source = "full" if full_text else "fallback"
         content = full_text if full_text else fallback_snippet
@@ -2519,21 +2504,46 @@ async def build_shared_web_pool(
         chunks = _split_into_chunks(content, max_words_per_chunk=40)
         if not chunks:
             return None
-        try:
-            chunk_embeddings = await _run_encode(
-                lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
-            )
-        except Exception as e:
-            print(f"[POOL] embedding failed for {url}: {e}")
-            return None
-        return {"url": url, "chunks": chunks, "chunk_embeddings": chunk_embeddings, "source": used_source}
+        return {"url": url, "chunks": chunks, "source": used_source}
 
-    prepared = await asyncio.gather(*[_prepare(u, s) for u, s in candidates])
-    pool = [p for p in prepared if p is not None]
+    fetched_results = await asyncio.gather(
+        *[_fetch_and_chunk(u, s) for u, s in candidates]
+    )
+    fetched = [f for f in fetched_results if f is not None]
 
-    print(f"[POOL] prepared {len(pool)}/{len(candidates)} usable article(s) (fetched + chunked + embedded once)")
+    print(f"[POOL] fetched+chunked {len(fetched)}/{len(candidates)} usable article(s)")
+
+    if not fetched:
+        return []
+
+    flat_chunks: list[str] = []
+    boundaries: list[tuple[int, int]] = []
+    cursor = 0
+    for item in fetched:
+        n = len(item["chunks"])
+        boundaries.append((cursor, cursor + n))
+        cursor += n
+        flat_chunks.extend(item["chunks"])
+
+    try:
+        all_embeddings = await _run_encode(
+            lambda: model.encode(flat_chunks, normalize_embeddings=True, convert_to_numpy=True)
+        )
+    except Exception as e:
+        print(f"[POOL] batched embedding failed entirely ({len(flat_chunks)} chunks): {e}")
+        return []
+
+    pool: list[dict] = []
+    for item, (start, end) in zip(fetched, boundaries):
+        pool.append({
+            "url": item["url"],
+            "chunks": item["chunks"],
+            "chunk_embeddings": all_embeddings[start:end],
+            "source": item["source"],
+        })
+
+    print(f"[POOL] prepared {len(pool)}/{len(candidates)} usable article(s) (single batched embed call, {len(flat_chunks)} chunks total)")
     return pool
-
 
 def rank_pool_for_hyde_doc(
     pool: list[dict],
@@ -3771,19 +3781,6 @@ async def get_context_from_db_segment_with_timeout(
     else:
         print("[DB-SEG] task still running after timeout, proceeding without it for now.")
         return []
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 async def generate_hyde_docs_for_script(
@@ -5757,11 +5754,27 @@ async def _generate_script_impl(request: "ScriptRequest"):
             model = _get_st_model()
             seen_urls_final: set = set()
 
-            for doc_idx, seg in enumerate(hyde_documents, start=1):
-                doc = seg.get("hyde_document", "")
-                hyde_embedding = await _run_encode(
-                    lambda d=doc: model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
+            # Batch all segment HyDE embeddings in a single encode() call
+            # instead of one call per segment — same vectors, far fewer
+            # sequential model invocations on CPU.
+            hyde_texts = [seg.get("hyde_document", "") for seg in hyde_documents]
+            try:
+                hyde_embeddings_batch = await _run_encode(
+                    lambda: model.encode(hyde_texts, normalize_embeddings=True, convert_to_numpy=True)
                 )
+            except Exception as e:
+                print(f"[STAGE 3] batched hyde embedding failed, falling back to per-doc: {e}")
+                hyde_embeddings_batch = None
+
+            for doc_idx, seg in enumerate(hyde_documents, start=1):
+                if hyde_embeddings_batch is not None:
+                    hyde_embedding = hyde_embeddings_batch[doc_idx - 1]
+                else:
+                    doc = seg.get("hyde_document", "")
+                    hyde_embedding = await _run_encode(
+                        lambda d=doc: model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
+                    )
+
                 top_for_doc = rank_pool_for_hyde_doc(
                     shared_pool, hyde_embedding, WEB_CONTENT_SIMILARITY_THRESHOLD, SCRIPT_TOP_K_PER_DOC
                 )
@@ -6049,14 +6062,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
 
 
 
