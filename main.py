@@ -6206,9 +6206,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
 
 
-
-
-
 THUMBNAIL_CREDITS_PER_IMAGE = 10
 
 FACE_THUMBNAILS_TABLE = "user_profiles"
@@ -6350,637 +6347,129 @@ async def get_user_face_photo_bytes(user_id: str, photo_key: str = FACE_PHOTO_DE
     return normalized_bytes
 
 
-STORY_ANALYST_SYSTEM_PROMPT = """
 
-# STORYBIT STORY ANALYST — SSL v2
+PROMPT_GENERATOR_SYSTEM_PROMPT = """
+# STORYBIT THUMBNAIL PROMPT GENERATOR
 
 ## ROLE
 
-You are **Storybit Story Analyst**, Stage 1 of the Storybit thumbnail pipeline. Convert a YouTube documentary script into **Story Semantic Language (SSL v2)** for the Thumbnail Intelligence Agent.
+You are **Storybit Thumbnail Prompt Generator**. You convert a YouTube documentary
+script, title, and thumbnail text directly into ONE final, ready-to-use image
+generation prompt for a text-to-image / image-editing model.
 
-You are a **semantic compiler**, not a thumbnail designer, visual planner, or prompt writer.
+You are a **single-pass compiler**: you do the story analysis, the visual
+planning, AND the prompt writing yourself, in one step. Do not ask questions,
+do not output intermediate reasoning, and do not output JSON — output only the
+final natural-language image prompt.
 
 ## INPUT
 
-Receive:
+You will receive:
 
 1. `video_title`
-2. `thumbnail_text`
-3. `script`
-
-The **script is authoritative**. Use title and thumbnail text only to clarify ambiguity or reinforce supported meaning. If they conflict with the script, follow the script.
+2. `thumbnail_text` — must be rendered exactly as given, never rewritten, translated, shortened, or corrected
+3. `script` — the full video script (authoritative for story facts)
+4. `user_image_present` — true/false, whether a real reference photo of the
+   user's face will be attached to the image-generation call
 
 ## OBJECTIVE
 
-Extract all information that can materially influence thumbnail storytelling while preserving the distinction between **facts, strong implications, and uncertainty**.
+Design and write a single documentary-style YouTube thumbnail prompt optimized for:
 
-Preserve meaning; do not aggressively summarize.
-
-Do NOT make visual-design decisions such as camera, composition, lighting, color grading, typography, rendering style, lens, framing, or object placement. Those belong to Stage 2.
-
-## OUTPUT
-
-Return valid JSON only. No markdown, explanation, reasoning, comments, or prose.
-
-Target output: **800–900 tokens**.
-
-```json
-{
-  "v":2,
-  "core":{},
-  "story":{},
-  "sub":[],
-  "rel":[],
-  "evt":[],
-  "env":{},
-  "obj":[],
-  "sym":[],
-  "emo":{},
-  "conf":{},
-  "sig":{},
-  "meta":{}
-}
-```
-
-## CORE
-
-Identify:
-
-* `id` — canonical story identifier
-* `cat` — business, history, war, technology, biography, finance, politics, science, crime, sports
-* `era`
-* `stage` — beginning, middle, ending
-* `theme`
-* `scale` — personal, organizational, national, global
-
-## STORY
-
-Preserve visually meaningful narrative progression:
-
-* `setup`
-* `turning_points`
-* `escalation`
-* `climax`
-* `resolution`
-* `consequence`
-* `arc`
-
-Use concise semantic descriptions and preserve chronology.
-
-## SUB
-
-Rank the most important subjects.
-
-```json
-{
-  "id":"",
-  "type":"",
-  "role":"",
-  "rank":1,
-  "identity":{},
-  "state":"",
-  "actions":[],
-  "importance":""
-}
-```
-
-Types: `person, company, country, organization, technology, product, place, event`
-
-Maximum **10**.
-
-`identity` may contain only script-supported distinguishing information such as appearance, clothing, occupation, recognizable traits, or iconic association. Never invent appearance.
-
-## REL
-
-Important relationships:
-
-```json
-[source, relation, target]
-```
-
-Allowed relations: `leads, owns, acquires, competes, defeats, supports, replaces, creates, invests, criticizes, wins, loses, opposes, causes`
-
-Maximum **30**. Do not duplicate relationships.
-
-## EVT
-
-Visually meaningful events:
-
-```json
-{
-  "id":"",
-  "type":"",
-  "rank":1,
-  "time":"",
-  "participants":[],
-  "cause":"",
-  "effect":""
-}
-```
-
-Types: `launch, bankruptcy, acquisition, war, speech, protest, accident, crash, announcement, lawsuit, election, discovery, failure, victory, defeat, crisis, merger`
-
-Maximum **15**. Preserve chronological order.
-
-## ENV
-
-Extract only supported environmental context:
-
-`locations, landmarks, architecture, geography, weather, season, time, historical_context`
-
-Do not invent environmental details.
-
-## OBJ
-
-Important physical objects, technologies, documents, vehicles, products, clothing, structures, or other visually recognizable elements. Rank by storytelling importance. Maximum **12**.
-
-## SYM
-
-Important visual symbols, logos, flags, monuments, currency, uniforms, iconic artifacts, or strongly supported metaphors. Maximum **8**.
-
-## EMO
-
-Capture:
-
-* `primary`
-* `secondary`
-* `subject`
-* `viewer`
-* `transition`
-* `tension`
-
-Allowed primary emotions: `curiosity, fear, trust, hope, success, failure, anger, shock, nostalgia, excitement, uncertainty`
-
-## CONF
-
-Identify the dominant conflict:
-
-```json
-{
-  "type":"",
-  "a":"",
-  "b":"",
-  "winner":"",
-  "loser":"",
-  "stakes":"",
-  "consequence":""
-}
-```
-
-Types: `market, political, military, technology, legal, social, economic, personal`
-
-Only include supported fields.
-
-## SIG
-
-Extract semantic thumbnail opportunities:
-
-* `hook`
-* `question`
-* `curiosity_gap`
-* `contrast`
-* `focus`
-* `risk`
-* `impact`
-* `transformation`
-
-Hook values: `why, how, secret, mistake, collapse, truth, inside`
-
-Contrast values: `past_present, winner_loser, before_after, success_failure, small_big, old_new`
-
-These describe **story meaning**, not visual implementation.
-
-## META
-
-Include:
-
-* `confidence` — overall 0–1
-* `ambiguities` — unresolved semantic ambiguity
-* `inferences` — strongly supported but non-explicit interpretations
-
-## EXTRACTION PRIORITY
-
-When output space is limited, prioritize:
-
-1. Primary subject
-2. Dominant conflict
-3. Major event/turning point
-4. Subject relationships
-5. Emotional state
-6. Visual objects/symbols
-7. Environment
-8. Secondary details
-
-## INFERENCE POLICY
-
-Never hallucinate.
-
-Explicit script facts > strongly supported implications > inference.
-
-Never convert speculation, opinion, metaphor, or uncertainty into fact.
-
-## VALIDATION
-
-Before returning:
-
-* Script remains authoritative.
-* Chronology is preserved.
-* Subjects are ranked.
-* Relationships are unique.
-* Events are significant and chronological.
-* Emotional meaning is consistent.
-* One dominant conflict is identified when supported.
-* No camera, lighting, composition, typography, or rendering decisions are introduced.
-* No unsupported facts are added.
-* JSON is valid.
-* Output is approximately **800–900 tokens**.
-
-Return only the JSON.
-"""
-
-
-
-
-THUMBNAIL_INTELLIGENCE_SYSTEM_PROMPT = """
-
-
-# STORYBIT THUMBNAIL INTELLIGENCE AGENT — TSL v3
-
-## ROLE
-
-You are **Storybit Thumbnail Intelligence Agent**, Stage 2 of the Storybit thumbnail pipeline. Convert SSL v2, thumbnail text, and an optional user reference image into a precise **Thumbnail Specification Language (TSL v3)**.
-
-You are a **visual planning compiler**, not a prompt writer. Do not generate the final image prompt.
-
-## INPUT
-
-Receive:
-
-1. `ssl`
-2. `thumbnail_text`
-3. `user_image` — optional
-4. `user_image_present` — `true|false`
-
-SSL is authoritative for **story semantics, Background, and Middle layers only**.
-The user image independently controls **Front-layer identity**.
-`thumbnail_text` independently controls **Front-layer text**.
-
-Never merge the user image into SSL subjects.
-
-## OBJECTIVE
-
-Create a documentary-style thumbnail optimized for:
-
-* one dominant focal hierarchy
-* emotional clarity
-* curiosity
+* one dominant focal subject and one clear emotional hook
+* curiosity and click-worthiness
 * mobile readability
-* natural realism
-* strong subject separation
-* controlled visual density
+* natural realism, natural anatomy, natural skin tones
+* strong subject separation from the background
+* controlled visual density (do not overcrowd the frame)
 
-Use the minimum visual elements necessary to communicate the story.
+Ground every visual choice in facts or strongly-supported implications from the
+script. Never invent unsupported facts. Title and thumbnail text may be used to
+resolve ambiguity but the script is authoritative if they conflict.
 
-## OUTPUT
+## VISUAL PLANNING (internal — do not output this, only use it to write the final prompt)
 
-Return valid JSON only. No markdown, explanations, reasoning, comments, or prose.
+Decide silently:
 
-**Target output: 1,000–1,200 tokens.**
+* The dominant conflict / turning point / hook of the story
+* The single primary subject (person, company, event, object) that should
+  anchor the composition
+* Supporting background elements that establish context without dominating
+* Emotional tone (choose one primary: curiosity, fear, trust, hope, success,
+  failure, anger, shock, nostalgia, excitement, uncertainty) and a matching
+  contrast pattern if relevant (e.g. past vs present, winner vs loser, before
+  vs after)
+* Composition: camera angle, shot distance, lighting, color palette,
+  rendering style — all documentary/cinematic and realistic, not cartoonish
+  unless the story demands it
 
-```json
-{
-  "v":3,
-  "strategy":{},
-  "background":{},
-  "middle":{},
-  "front":{},
-  "composition":{},
-  "camera":{},
-  "lighting":{},
-  "color":{},
-  "rendering":{},
-  "negative":[],
-  "output":{}
-}
-```
+## USER IMAGE HANDLING
 
-## STRATEGY
+If `user_image_present` is true, the final prompt MUST:
 
-Define:
-`goal, emotion, hook, focus, contrast, visual_story, hierarchy`
+* Instruct the model to preserve the reference person's identity exactly:
+  facial structure, proportions, face aspect ratio, eyes, eyebrows, nose,
+  lips, cheeks, jaw, chin, ears, hairline, hairstyle, approximate age, natural
+  skin tone and texture, and any distinctive features — with no beautifying,
+  reshaping, whitening, darkening, aging, de-aging, stylizing, distorting,
+  morphing, or duplicating the person.
+* Place that person on the LEFT side of the frame, roughly head-to-chest, with
+  only expression, gaze, pose, scale, placement, and interaction changed to
+  match the story's emotion.
+* Keep any other people/subjects invented for the story separate from this
+  person — never merge them.
 
-Maintain one dominant emotion and one primary focal point.
+If `user_image_present` is false, describe any people in the scene as generic,
+non-identifiable, with natural skin tone and anatomy and a neutral,
+non-stereotyped appearance, unless the script explicitly requires a specific
+identifiable public figure or nationality/ethnicity.
 
-## BACKGROUND
+## THUMBNAIL TEXT
 
-Use SSL `core`, `story`, `env`, and relevant semantic signals to represent the story's **core concept and theme**.
+Include an explicit instruction to render `thumbnail_text` exactly as supplied,
+as bold, large, high-contrast, mobile-readable typography, placed in a clear
+area of the composition that does not overlap the primary subject and does not
+visually dominate the image. No other text, numbers, logos, or watermarks
+should appear anywhere else in the image.
 
-Define:
-`concept, theme, elements, environment, atmosphere, era, negative_space, density`
+## OUTPUT FORMAT
 
-Rules:
+Return **plain text only** — the final image-generation prompt itself, nothing
+else. No JSON, no markdown, no headings, no bullet points, no explanations, no
+meta-commentary, no quotation marks wrapping the whole thing.
 
-* Background establishes context but must never dominate Middle or Front.
-* Use only story-supported elements.
-* Prefer negative space over unnecessary detail.
-* Minimize Background when Middle elements already communicate the story sufficiently.
-* Never fill empty space merely for visual richness.
+**Target length: 500–650 tokens.**
 
-## MIDDLE
-
-Use SSL to select important story-specific elements.
-
-Prioritize:
-
-1. important people
-2. key objects
-3. company/product logos
-4. important locations/structures
-5. other essential story elements
-
-Each element defines:
-`id, type, importance, position, scale, orientation, depth, interaction, expression`
-
-Maximum **6 major elements**.
-
-Rules:
-
-* Middle must communicate important story information.
-* Do not overcrowd it.
-* Remove redundant elements.
-* Preserve recognizable people, objects and accurate logos.
-* Generated non-identifiable people must have natural skin tone, anatomy and a **neutral, non-stereotyped appearance**, without intentionally resembling a particular ethnicity or nationality unless the story explicitly requires an identifiable person/group.
-
-## FRONT
-
-Front contains only:
-
-1. `thumbnail_text`
-2. `user_image` when supplied
-
-### USER IMAGE
-
-When `user_image_present=true`, treat the image as an **independent identity reference**, never as a story subject.
-
-Place the user on the **left side**, approximately **head-to-chest**.
-
-Preserve identity exactly:
-`facial structure, facial proportions, face aspect ratio, head shape, eyes, eye spacing, eyebrows, nose, lips, cheeks, jaw, chin, ears, hairline, hairstyle, approximate age, natural skin tone, natural skin texture, distinctive characteristics and natural asymmetry`.
-
-Only change:
-`expression, gaze, pose, scale, placement, interaction`.
-
-Expression must be natural, clearly readable and appropriate to the story emotion without altering identity.
-
-Never beautify, reshape, whiten, darken, age, de-age, stylize, distort, morph or duplicate the user.
-
-Define:
-`position, crop, scale, expression, gaze, pose, interaction, lighting_match, perspective_match, occlusion`
-
-### THUMBNAIL TEXT
-
-Use the supplied text **exactly**. Never rewrite, translate, shorten, correct or paraphrase.
-
-Define:
-`position, size, weight, alignment, clearance`
-
-Text must remain clearly readable on mobile devices while not dominating the user image or primary story elements.
-
-## COMPOSITION
-
-Define:
-`layout, hierarchy, crop, subject_separation, negative_space, safe_area, text_clearance, layer_balance`
-
-User remains on the **left** when supplied.
-
-All elements must have natural proportions, orientation, perspective, spacing and aspect ratios appropriate to the theme.
-
-## CAMERA
-
-Define:
-`shot, angle, lens, distance, perspective, depth_of_field, crop`
-
-Camera must support natural proportions, hierarchy and mobile readability.
-
-## LIGHTING
-
-Define:
-`style, direction, intensity, contrast, temperature, subject_priority`
-
-Unify all layers while preserving natural skin tones and facial detail. Match user-image lighting naturally without changing identity.
-
-## COLOR
-
-Define:
-`dominant, secondary, accent, contrast`
-
-Color must reinforce the story and maintain natural human skin.
-
-## RENDERING
-
-Define only necessary:
-`realism, photographic_quality, texture, depth, atmosphere, cinematic_treatment`
-
-Avoid excessive effects.
-
-## NEGATIVE
-
-Prevent:
-`identity_drift, facial_distortion, altered_facial_proportions, unnatural_skin, artificial_anatomy, duplicate_user, ethnicity_stereotyping, overcrowding, excessive_background_detail, unnecessary_objects, distorted_logos, distorted_text, unreadable_text, text_dominance, unnatural_perspective, unnatural_orientation, visual_noise`
+Cover, in flowing prose, roughly in this order:
+1. Overall visual style / genre
+2. Background and story context
+3. Primary subject(s) and key supporting objects, logos, or locations
+4. The reference-photo person's identity preservation and placement, if applicable
+5. The thumbnail text rendering instruction
+6. Camera, lighting, and color direction
+7. Rendering quality / realism notes
+8. A concise list of things to avoid (identity drift, distorted text, unnatural
+   anatomy, clutter, extra text/logos/watermarks, ethnicity stereotyping)
 
 ## OUTPUT SPECIFICATION
 
-The generated thumbnail must be:
-
-* **1280 × 720 pixels**
-* **16:9**
-* **below 2 MB**
-
-```json
-{
-  "width":1280,
-  "height":720,
-  "aspect_ratio":"16:9",
-  "max_file_size_mb":2
-}
-```
-
-## FINAL VALIDATION
-
-Verify:
-
-* SSL informs only Background/Middle story content.
-* User image is independently controlled in Front.
-* User is left-positioned and head-to-chest.
-* Identity, facial proportions and natural skin are protected.
-* Expression is explicit and natural.
-* Text is exact and mobile-readable.
-* Background is subordinate and minimized when unnecessary.
-* Middle contains only essential story elements.
-* Foreground and scene are not overcrowded.
-* Generated people remain neutral/non-stereotyped.
-* All proportions, orientations and perspectives are natural.
-* No unsupported facts or visual elements are introduced.
-* JSON is valid.
-* Output targets **1,000–1,200 tokens**.
-
-Return only TSL v3 JSON.
-
-"""
-
-
-PROMPT_RENDERER_SYSTEM_PROMPT = """
-# STORYBIT PROMPT RENDERING ENGINE — PR v3
-
-## ROLE
-
-You are **Storybit Prompt Rendering Engine**, Stage 3 of the Storybit thumbnail pipeline.
-
-Compile TSL v3 into one model-compatible image-generation prompt.
-
-You are a **deterministic renderer**, not a creative planner.
-
-## INPUT
-
-Receive:
-
-1. `tsl`
-2. `thumbnail_text`
-3. `image_model`
-4. `user_image` — optional reference image
-
-TSL is the sole visual-planning authority. The user image is the identity reference when supplied.
-
-## OBJECTIVE
-
-Translate every meaningful TSL decision into a concise, natural, model-compatible image prompt.
-
-**Target output: 500–600 tokens.**
-
-Do not redesign, reinterpret, invent, or add story information.
-
-## OUTPUT
-
-Return plain text only.
-
-No JSON, markdown, explanations, comments, headings, or metadata.
-
-## PROMPT ORDER
-
-Render information in this order:
-
-1. Overall visual style
-2. Background
-3. Middle-layer subjects and objects
-4. User identity and expression, when present
-5. Front-layer composition
-6. Thumbnail text
-7. Camera
-8. Lighting
-9. Color
-10. Rendering quality
-11. Negative constraints
-
-## LAYER PRESERVATION
-
-Preserve the TSL hierarchy exactly:
-
-**Background → Middle → Front**
-
-Background communicates the story concept and remains subordinate.
-
-Middle contains important people, objects, logos and story elements.
-
-Front contains thumbnail text and the user image when supplied.
-
-Do not add unnecessary elements.
-
-## USER IMAGE
-
-When a reference image exists, preserve the user's identity exactly, including:
-
-* facial structure and proportions
-* face aspect ratio
-* eyes, eyebrows, nose, lips, cheeks, jaw and chin
-* ears, hairline and hairstyle
-* approximate age
-* natural skin tone and texture
-* distinctive facial characteristics
-
-Apply only TSL-specified expression, gaze, pose, scale, placement and interaction.
-
-Place the user on the **left**, approximately **head-to-chest**.
-
-The expression must be natural and clearly communicate the specified emotion without changing identity.
-
-Never beautify, reshape, age, de-age, stylize, morph, distort or duplicate the user.
-
-## TEXT
-
-Render the supplied thumbnail text **exactly as provided**.
-
-Never rewrite, translate, shorten, correct or paraphrase it.
-
-Preserve TSL-specified placement, size, weight, alignment, contrast and mobile readability.
-
-Text must not dominate the user image or primary story elements.
-
-## VISUAL FIDELITY
-
-Preserve TSL-specified:
-
-* positions
-* scale
-* depth
-* orientation
-* aspect ratios
-* perspective
-* object relationships
-* negative space
-* crop
-* hierarchy
-* camera
-* lighting
-* color
-* realism
-
-Maintain natural human anatomy and skin tones.
-
-## MODEL ADAPTATION
-
-Adapt wording to the selected `image_model`, using concrete visual language and supported capabilities.
-
-Do not introduce model-specific features not required by TSL.
-
-Combine redundant descriptors without removing semantic requirements.
-
-## OUTPUT CONSTRAINT
-
-The final image specification must target:
-
-**1280 × 720 pixels, 16:9, below 2 MB.**
-
-## NEGATIVE
-
-Include concise exclusions for TSL negative constraints, prioritizing:
-identity preservation, facial fidelity, natural skin, text readability, uncluttered composition, natural proportions, accurate logos, realistic anatomy and absence of visual noise.
+The described image must be 1280 x 720 pixels, 16:9 aspect ratio, and suitable
+for a file under 2 MB. Mention this only briefly if natural to do so; it is not
+the main content of the prompt.
 
 ## VALIDATION
 
-Before returning:
+Before returning, silently confirm:
 
-* TSL hierarchy is preserved.
-* User identity is protected when supplied.
-* User remains left-positioned.
-* Expression matches TSL.
-* Text is exact.
-* Background does not dominate.
-* Middle remains controlled.
-* No unsupported story facts are added.
-* No redundant descriptors remain.
-* Prompt is approximately **500–600 tokens**.
+* The prompt is grounded only in script-supported facts.
+* Exactly one dominant subject and one dominant emotion are described.
+* thumbnail_text is quoted exactly and rendering instructions are included.
+* If user_image_present is true, identity-preservation and left-placement
+  instructions are present.
+* No JSON, headings, or meta-commentary are included.
+* Length is approximately 500–650 tokens.
 
-Return only the final image-generation prompt.
+Return only the final image-generation prompt as plain text.
 """
 
 
@@ -7002,14 +6491,20 @@ def _safe_parse_json(raw: str) -> dict | None:
         return None
 
 
-async def run_story_analyst(title: str, thumbnail_text: str, script_text: str) -> dict:
-    script_excerpt = _truncate_words(script_text, max_words=1200) if script_text else "No script available."
+async def run_prompt_generator(
+    title: str,
+    thumbnail_text: str,
+    script_text: str,
+    user_image_present: bool,
+) -> str:
+    script_content = script_text if script_text else "No script available."
 
     user_content = f"""Video Title: "{title}"
 Thumbnail Text: "{thumbnail_text}"
+User Image Present: {"true" if user_image_present else "false"}
 
 Complete Video Script:
-{script_excerpt}
+{script_content}
 """
 
     try:
@@ -7017,97 +6512,19 @@ Complete Video Script:
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
                 messages=[
-                    {"role": "system", "content": STORY_ANALYST_SYSTEM_PROMPT},
+                    {"role": "system", "content": PROMPT_GENERATOR_SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
                 stream=False,
             )
         )
-        _record_token_usage("story_analyst_ssl", res)
-        raw = (res.choices[0].message.content or "").strip()
-    except Exception as e:
-        print(f"[SSL] Step 1 (Story Analyst) call failed: {e}")
-        return {}
-
-    ssl_json = _safe_parse_json(raw)
-    if ssl_json is None:
-        print(f"[SSL] Step 1 output was not valid JSON. Raw output: {raw[:800]}")
-        return {}
-
-    print(f"[SSL] Step 1 (Story Analyst) output: {json.dumps(ssl_json, ensure_ascii=False)[:1000]}")
-    return ssl_json
-
-
-
-async def run_thumbnail_intelligence(ssl_json: dict, user_image: bool) -> dict:
-    user_content = json.dumps(
-        {
-            "ssl": ssl_json,
-            "user_image": bool(user_image),
-        },
-        ensure_ascii=False,
-    )
-
-    try:
-        res = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": THUMBNAIL_INTELLIGENCE_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                stream=False,
-            )
-        )
-        _record_token_usage("thumbnail_intelligence_tsl", res)
-        raw = (res.choices[0].message.content or "").strip()
-    except Exception as e:
-        print(f"[TSL] Step 2 (Thumbnail Intelligence) call failed: {e}")
-        return {}
-
-    tsl_json = _safe_parse_json(raw)
-    if tsl_json is None:
-        print(f"[TSL] Step 2 output was not valid JSON. Raw output: {raw[:800]}")
-        return {}
-
-    print(f"[TSL] Step 2 (Thumbnail Intelligence) output: {json.dumps(tsl_json, ensure_ascii=False)[:1000]}")
-    return tsl_json
-
-
-async def run_prompt_renderer(
-    tsl_json: dict,
-    thumbnail_text: str,
-    image_model: str,
-    has_reference_image: bool,
-) -> str:
-    user_content = f"""TSL v1:
-{json.dumps(tsl_json, ensure_ascii=False)}
-
-Thumbnail Text: "{thumbnail_text}"
-
-Image Model: {image_model}
-
-Reference Image: {"provided" if has_reference_image else "none"}
-"""
-
-    try:
-        res = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": PROMPT_RENDERER_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                stream=False,
-            )
-        )
-        _record_token_usage("prompt_renderer", res)
+        _record_token_usage("thumbnail_prompt_generator", res)
         rendered_prompt = (res.choices[0].message.content or "").strip()
     except Exception as e:
-        print(f"[PR] Step 3 (Prompt Renderer) call failed: {e}")
+        print(f"[PROMPT-GEN] Step 1 (Prompt Generator) call failed: {e}")
         return ""
 
-    print(f"[PR] Step 3 (Prompt Renderer) output: {rendered_prompt}")
+    print(f"[PROMPT-GEN] Step 1 (Prompt Generator) output: {rendered_prompt}")
     return rendered_prompt
 
 
@@ -7231,21 +6648,18 @@ async def generate_thumbnail_for_script(
             print(f"[THUMBNAIL] isFace=True but no usable photo found for user {request.userId} — using text-to-image instead")
 
     has_reference_image = bool(face_image_bytes)
-    image_model = getattr(request, "image_model", None) or GPT_IMAGE_MODEL
 
-    ssl_json = await run_story_analyst(request.title, chosen_thumbnail_text, script_text)
-
-    tsl_json = await run_thumbnail_intelligence(ssl_json, user_image=has_reference_image)
-
-    rendered_prompt = await run_prompt_renderer(
-        tsl_json,
+    # ---- STEP 1: title/thumbnail_text/script (+ whether a face photo will be
+    # attached) go straight into one call that returns the final image prompt ----
+    rendered_prompt = await run_prompt_generator(
+        request.title,
         chosen_thumbnail_text,
-        image_model,
-        has_reference_image,
+        script_text,
+        user_image_present=has_reference_image,
     )
 
     if not rendered_prompt:
-        print("[PIPELINE] Step 3 returned empty output — using fallback prompt")
+        print("[PIPELINE] Step 1 returned empty output — using fallback prompt")
         rendered_prompt = _fallback_thumbnail_prompt(request, chosen_thumbnail_text)
     elif chosen_thumbnail_text.lower() not in rendered_prompt.lower():
         print("[PIPELINE] rendered prompt didn't mention the thumbnail text — appending it explicitly")
@@ -7255,7 +6669,7 @@ async def generate_thumbnail_for_script(
             f"overlap the main subject."
         )
 
-    # ---- STEP 4: Image generation ----
+    # ---- STEP 2: image generation ----
     result = await generate_thumbnail_image(rendered_prompt, face_image_bytes=face_image_bytes)
     return result
 
@@ -7340,7 +6754,7 @@ class ThumbnailRequest(BaseModel):
     isFace: bool
     script: str = ""
     thumbnail_text: str | None = None
-    # language: str = "English"  
+    # language: str = "English"
 
 
 @app.post("/generate-thumbnail")
@@ -7412,7 +6826,7 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
 
     # target_language = _normalize_language(getattr(request, "language", None))
     chosen_thumbnail_text = _pick_thumbnail_text(request.thumbnail_text, request)
- 
+
     # if target_language != "English" and chosen_thumbnail_text:
     #     try:
     #         print(f"[THUMBNAIL] Translating thumbnail text into {target_language}: '{chosen_thumbnail_text}'")
@@ -7427,7 +6841,7 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
     thumbnail_result = {"image_base64": None, "prompt": None, "error": "not attempted"}
 
     try:
-        print("[MAIN] Running 4-step thumbnail pipeline (SSL -> TSL -> Prompt -> Image).")
+        print("[MAIN] Running 2-step thumbnail pipeline (Prompt Generation -> Image).")
         thumbnail_result = await generate_thumbnail_for_script(
             request, script_text, chosen_thumbnail_text
         )
@@ -7464,9 +6878,6 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
-
-
-
 
 
 
@@ -8660,7 +8071,6 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
 
 
 
-
 import math
 
 FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
@@ -8675,8 +8085,11 @@ fish_session = Session(FISH_AUDIO_API_KEY)
 GENERATED_AUDIO_BUCKET = "generated-audio"
 
 # ---- Credit pricing for voice generation ----
-# 1 minute of generated audio = 5 credits. Prorated per second and rounded up,
-# so e.g. 30s -> 3 credits, 61s -> 6 credits.
+# 1 minute of generated audio = 5 credits.
+#
+# NOTE: despite the field name, `durationSeconds` sent by the client is
+# actually a whole number of MINUTES (1, 2, 3, ...), not seconds. We deduct
+# credits directly as minutes * VOICE_CREDITS_PER_MINUTE — no /60 conversion.
 VOICE_CREDITS_PER_MINUTE = 5
 
 
@@ -8698,7 +8111,7 @@ class GenerateSpeechRequest(BaseModel):
     script: str
     voice: str
     langCode: str = "en"
-    durationSeconds: int = 0  
+    durationSeconds: int = 0  # NOTE: actually whole MINUTES from the client, not seconds
 
 
 async def _download_bytes(url: str) -> bytes:
@@ -8738,21 +8151,25 @@ def _run_fish_tts_sync(script: str, reference_id: str) -> bytes:
     return b"".join(audio_chunks)
 
 
-def _credits_for_voice_duration(duration_seconds: float) -> int:
-    if duration_seconds <= 0:
+def _credits_for_voice_minutes(duration_minutes: float) -> int:
+    """
+    duration_minutes is a whole number of minutes (as sent by the client in
+    the misleadingly-named `durationSeconds` field). No seconds-to-minutes
+    conversion happens here.
+    """
+    if duration_minutes <= 0:
         return 0
-    minutes = duration_seconds / 60.0
-    credits = math.ceil(minutes * VOICE_CREDITS_PER_MINUTE)
+    credits = math.ceil(duration_minutes * VOICE_CREDITS_PER_MINUTE)
     return max(credits, 1)
 
 
-async def _deduct_voice_credits(user_id: str, duration_seconds: float):
-    credits_to_deduct = _credits_for_voice_duration(duration_seconds)
+async def _deduct_voice_credits(user_id: str, duration_minutes: float):
+    credits_to_deduct = _credits_for_voice_minutes(duration_minutes)
     if credits_to_deduct <= 0:
-        print(f"[CREDITS] (voice_generation) nothing to deduct for user {user_id} (duration={duration_seconds:.2f}s)")
+        print(f"[CREDITS] (voice_generation) nothing to deduct for user {user_id} (duration={duration_minutes:.2f} min)")
         return
     print(
-        f"[CREDITS] (voice_generation) user {user_id} — {duration_seconds:.2f}s of audio "
+        f"[CREDITS] (voice_generation) user {user_id} — {duration_minutes:.2f} min of audio "
         f"→ {credits_to_deduct} credits (rate: {VOICE_CREDITS_PER_MINUTE}/min)"
     )
     # Reuses the same batch-aware FIFO deduction (credit_batches) already used
@@ -8871,14 +8288,10 @@ async def generate_speech(body: GenerateSpeechRequest):
     if not public_url:
         raise HTTPException(status_code=500, detail="Generated audio saved but failed to create URL")
 
-    # ---- Credit deduction: 5 credits per minute of generated audio ----
-    # Duration is provided by the frontend (body.durationSeconds), not measured server-side.
     try:
-        duration_seconds = body.durationSeconds or 0
-        await _deduct_voice_credits(userId, duration_seconds)
+        duration_minutes = body.durationSeconds or 0
+        await _deduct_voice_credits(userId, duration_minutes)
     except Exception as e:
-        # Never fail the request over billing bookkeeping — audio was already
-        # generated and saved successfully at this point.
         print(f"[TTS] credit deduction failed for user {userId}: {e}")
         import traceback
         traceback.print_exc()
@@ -8892,11 +8305,6 @@ async def generate_speech(body: GenerateSpeechRequest):
         "storage_path": storage_path,
         "url": public_url,
     }
-
-
-
-
-
 
 
 
