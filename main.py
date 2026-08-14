@@ -236,32 +236,6 @@ async def eci(request: PromptRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import io
 import os
 import re
@@ -1221,14 +1195,6 @@ async def _run_encode(fn):
         return await loop.run_in_executor(_ENCODE_EXECUTOR, fn)
 
 
-async def _run_scrape(fn, *args, **kwargs):
-    """Run a blocking network call (DDGS search, trafilatura fetch,
-    scrapetube search) gated by a semaphore to cap total concurrent
-    outbound connections."""
-    async with _scrape_semaphore:
-        return await asyncio.to_thread(fn, *args, **kwargs)
-
-
 async def _openai_create_with_timeout(call_fn, timeout: float = OPENAI_CALL_TIMEOUT):
     return await asyncio.wait_for(_run_io(call_fn), timeout=timeout)
 
@@ -1305,8 +1271,7 @@ WORDS_PER_MINUTE = 140
 
 BOOKS_TABLE_NAME = "english_books"
 THUMBNAILS_BUCKET = "generated-thumbnails"
-FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "15"))
-
+FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "6"))   # was 15
 
 def to_pgvector(embedding) -> str:
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
@@ -1327,6 +1292,31 @@ def _get_st_model():
         _bge_model = SentenceTransformer("BAAI/bge-m3")
         print("[MODEL] BAAI/bge-m3 loaded")
     return _bge_model
+
+
+# =============================================================================
+# _LogBuffer — collects log lines for one concurrently-running task and
+# flushes them as a single contiguous block when the task finishes. This is
+# purely cosmetic: it stops parallel tasks (Stage 2 / Stage 3 / Stage 4)
+# from interleaving their print() output on stdout. No timing, concurrency,
+# or retrieval logic is affected by this — lines are just buffered and
+# printed together instead of streamed live.
+# =============================================================================
+class _LogBuffer:
+    def __init__(self, label: str):
+        self.label = label
+        self.lines: list[str] = []
+
+    def log(self, msg: str):
+        self.lines.append(msg)
+
+    def flush(self):
+        print(f"\n{'=' * 90}")
+        print(f"[{self.label}] BEGIN")
+        print("=" * 90)
+        print("\n".join(self.lines))
+        print(f"[{self.label}] END")
+        print("=" * 90)
 
 
 class Idea(BaseModel):
@@ -2349,9 +2339,8 @@ def _extract_hashtags(*texts: str) -> list[str]:
 from trafilatura.settings import use_config
 
 _TRAFILATURA_CONFIG = use_config()
-_TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", "8")
-_TRAFILATURA_CONFIG.set("DEFAULT", "MAX_REDIRECTS", "3")
-
+_TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", "4")   # was 8
+_TRAFILATURA_CONFIG.set("DEFAULT", "MAX_REDIRECTS", "2")      # was 3, fewer hops = faster failure on redirect chains
 
 def _fetch_full_article_text(url: str) -> str:
     try:
@@ -2363,6 +2352,23 @@ def _fetch_full_article_text(url: str) -> str:
     except Exception as e:
         print(f"[FETCH] failed to extract {url}: {e}")
         return ""
+
+
+PER_KEYWORD_SCRAPE_COUNT = 5
+
+_SCRAPE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.getenv("SCRAPE_EXECUTOR_WORKERS", "8")),
+    thread_name_prefix="scrape",
+)
+
+
+async def _run_scrape(fn, *args, **kwargs):
+    """Run a blocking network call (DDGS search, trafilatura fetch,
+    scrapetube search) gated by a semaphore to cap total concurrent
+    outbound connections."""
+    async with _scrape_semaphore:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_SCRAPE_EXECUTOR, lambda: fn(*args, **kwargs))
 
 
 async def _fetch_full_article_text_with_timeout(url: str, timeout: float = FETCH_TIMEOUT_SECONDS) -> str:
@@ -2448,34 +2454,12 @@ async def _generate_youtube_search_keywords(topic: str, description: str = "") -
         print(f"--- YouTube keyword generation failed: {exc} ---")
         return [topic]
 
-PER_KEYWORD_SCRAPE_COUNT = 5
-
-_SCRAPE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=int(os.getenv("SCRAPE_EXECUTOR_WORKERS", "8")),  # bumped 12 -> 24
-    thread_name_prefix="scrape",
-)
-
-
-
-async def _run_scrape(fn, *args, **kwargs):
-    async with _scrape_semaphore:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_SCRAPE_EXECUTOR, lambda: fn(*args, **kwargs))
-
-async def _fetch_full_article_text_with_timeout(url: str, timeout: float = FETCH_TIMEOUT_SECONDS) -> str:
-    try:
-        return await asyncio.wait_for(
-            _run_scrape(_fetch_full_article_text, url),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        return ""
-
 
 async def build_shared_web_pool(
     keywords: list[str],
     scraped_urls: set,
     per_keyword_results: int = PER_KEYWORD_SCRAPE_COUNT,
+    overall_timeout: float = 20.0,   # NEW — hard cap for the whole pool-build stage
 ) -> list[dict]:
     model = _get_st_model()
 
@@ -2502,56 +2486,50 @@ async def build_shared_web_pool(
 
     print(f"[POOL] {len(keywords)} keyword(s) ({kw_failures} failed) -> {len(candidates)} unique URL(s) to prepare")
 
-    # --- Stage A: fetch + chunk everything (I/O bound, already concurrent) ---
-    async def _fetch_and_chunk(url: str, fallback_snippet: str) -> dict | None:
+    async def _prepare(url: str, fallback_snippet: str) -> dict | None:
+        t0 = time.time()
         full_text = await _fetch_full_article_text_with_timeout(url)
+        fetch_time = time.time() - t0
         used_source = "full" if full_text else "fallback"
         content = full_text if full_text else fallback_snippet
         if not content:
+            print(f"[POOL] SKIP (no content, {fetch_time:.1f}s) {url}")
             return None
         content = _truncate_words(content, max_words=600)
         chunks = _split_into_chunks(content, max_words_per_chunk=40)
         if not chunks:
+            print(f"[POOL] SKIP (no chunks, {fetch_time:.1f}s) {url}")
             return None
-        return {"url": url, "chunks": chunks, "source": used_source}
+        try:
+            chunk_embeddings = await _run_encode(
+                lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
+            )
+        except Exception as e:
+            print(f"[POOL] embedding failed for {url}: {e}")
+            return None
+        print(f"[POOL] OK ({fetch_time:.1f}s, {len(chunks)} chunks, source={used_source}) {url}")
+        return {"url": url, "chunks": chunks, "chunk_embeddings": chunk_embeddings, "source": used_source}
 
-    fetched_results = await asyncio.gather(
-        *[_fetch_and_chunk(u, s) for u, s in candidates]
-    )
-    fetched = [f for f in fetched_results if f is not None]
+    tasks = [asyncio.create_task(_prepare(u, s)) for u, s in candidates]
 
-    print(f"[POOL] fetched+chunked {len(fetched)}/{len(candidates)} usable article(s)")
+    stage_start = time.time()
+    done, pending = await asyncio.wait(tasks, timeout=overall_timeout)
 
-    if not fetched:
-        return []
+    for t in pending:
+        t.cancel()
+    if pending:
+        print(f"[POOL] deadline hit at {overall_timeout}s — cancelled {len(pending)}/{len(tasks)} still-in-flight fetch(es)")
 
-    flat_chunks: list[str] = []
-    boundaries: list[tuple[int, int]] = []
-    cursor = 0
-    for item in fetched:
-        n = len(item["chunks"])
-        boundaries.append((cursor, cursor + n))
-        cursor += n
-        flat_chunks.extend(item["chunks"])
+    pool = []
+    for t in done:
+        try:
+            r = t.result()
+            if r is not None:
+                pool.append(r)
+        except Exception:
+            pass
 
-    try:
-        all_embeddings = await _run_encode(
-            lambda: model.encode(flat_chunks, normalize_embeddings=True, convert_to_numpy=True)
-        )
-    except Exception as e:
-        print(f"[POOL] batched embedding failed entirely ({len(flat_chunks)} chunks): {e}")
-        return []
-
-    pool: list[dict] = []
-    for item, (start, end) in zip(fetched, boundaries):
-        pool.append({
-            "url": item["url"],
-            "chunks": item["chunks"],
-            "chunk_embeddings": all_embeddings[start:end],
-            "source": item["source"],
-        })
-
-    print(f"[POOL] prepared {len(pool)}/{len(candidates)} usable article(s) (single batched embed call, {len(flat_chunks)} chunks total)")
+    print(f"[POOL] prepared {len(pool)}/{len(candidates)} usable article(s) in {time.time() - stage_start:.1f}s (deadline={overall_timeout}s)")
     return pool
 
 def rank_pool_for_hyde_doc(
@@ -2919,7 +2897,7 @@ def _youtube_api_search_ids(keyword: str, max_results: int = 1) -> list[str]:
         print(f"[YT-API] failed to parse search JSON for '{keyword}': {e}")
         return []
 
-    print(f"[YT-API] RAW search.list response for '{keyword}':")
+    print(f"[YT-API] search.list for '{keyword}' returned {len(data.get('items', []))} item(s)")
 
     video_ids = []
     for item in data.get("items", []):
@@ -2955,26 +2933,39 @@ def _youtube_search_via_api(keyword: str, max_results: int = 1) -> list[dict]:
     return results
 
 
+# =============================================================================
+# get_youtube_context — scraping-optimized: the 10 keyword searches are now
+# fired CONCURRENTLY via asyncio.gather instead of sequentially in a for-loop
+# (each search.list + videos.list round trip no longer blocks the next).
+# All log lines are buffered and flushed as one block so they don't
+# interleave with Stage 2/3 output that runs at the same time. Ranking,
+# dedup, and truncation logic is unchanged.
+# =============================================================================
 async def get_youtube_context(
     topic: str, description: str, scraped_urls: set, max_results: int = 10
 ) -> list[dict]:
-    print(f"[YT] Starting YouTube search for topic: '{topic}'")
+    buf = _LogBuffer("STAGE 4 - YOUTUBE")
+    buf.log(f"Starting YouTube search for topic: '{topic}'")
 
     if not YOUTUBE_API_KEY:
-        print("[YT] YOUTUBE_API_KEY not set, skipping YouTube search")
+        buf.log("YOUTUBE_API_KEY not set, skipping YouTube search")
+        buf.flush()
         return []
 
     keywords = await _generate_youtube_search_keywords(topic, description)
 
-    raw_candidates: list[dict] = []
-
-    for keyword in keywords:
+    async def _search_one(keyword: str) -> list[dict]:
         try:
-            results = await _run_scrape(_youtube_search_via_api, keyword, 1)
+            return await _run_scrape(_youtube_search_via_api, keyword, 1)
         except Exception as e:
-            print(f"[YT] search failed for '{keyword}': {e}")
-            results = []
+            buf.log(f"search failed for '{keyword}': {e}")
+            return []
 
+    all_results = await asyncio.gather(*[_search_one(kw) for kw in keywords])
+
+    raw_candidates: list[dict] = []
+    for keyword, results in zip(keywords, all_results):
+        buf.log(f"search.list for '{keyword}' returned {len(results)} item(s)")
         for r in results:
             url = r["url"]
             if url in scraped_urls:
@@ -2999,11 +2990,12 @@ async def get_youtube_context(
     raw_candidates.sort(key=lambda v: v.get("view_count") or 0, reverse=True)
     videos = raw_candidates[:MAX_YOUTUBE_SOURCES]
 
-    print(
-        f"[YT] fetched {len(raw_candidates)} unique candidate video(s) via YouTube Data API "
+    buf.log(
+        f"fetched {len(raw_candidates)} unique candidate video(s) via YouTube Data API "
         f"from {len(keywords)} keyword(s), returning top {len(videos)} "
         f"(capped at {MAX_YOUTUBE_SOURCES})"
     )
+    buf.flush()
 
     return videos
 
@@ -4655,150 +4647,7 @@ def _unique_url_count(articles: list[dict]) -> int:
 _MIN_ACCEPTABLE_SIMILARITY = 0.30
 
 
-async def _score_and_filter_url(
-    url: str,
-    fallback_snippet: str,
-    hyde_embedding,
-    model,
-    similarity_threshold: float,
-) -> dict | None:
-    similarity_threshold = max(similarity_threshold, _MIN_ACCEPTABLE_SIMILARITY)
 
-    full_text = await _fetch_full_article_text_with_timeout(url)
-    used_source = "full" if full_text else "fallback"
-    content = full_text if full_text else fallback_snippet
-    if not content:
-        print(f"[SCORE] SKIP (no content at all) {url}")
-        return None
-
-    content = _truncate_words(content, max_words=600)
-    chunks = _split_into_chunks(content, max_words_per_chunk=40)
-    if not chunks:
-        print(f"[SCORE] SKIP (no chunks) {url}")
-        return None
-
-    try:
-        chunk_embeddings = await _run_encode(
-            lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
-        )
-    except Exception as e:
-        print(f"[SCORE] SKIP (embedding failed: {e}) {url}")
-        return None
-
-    chunk_similarities = np.dot(chunk_embeddings, hyde_embedding)
-    picked = [
-        (chunk, float(sim))
-        for chunk, sim in zip(chunks, chunk_similarities)
-        if sim >= similarity_threshold
-    ]
-
-    if not picked:
-        best_sim = float(np.max(chunk_similarities)) if len(chunk_similarities) else 0.0
-        print(
-            f"[SCORE] REJECT (best_sim={best_sim:.4f} < required {similarity_threshold:.4f}, "
-            f"{len(chunks)} passage(s) checked, used_source={used_source}) {url}"
-        )
-        return None
-
-    picked.sort(key=lambda p: p[1], reverse=True)
-    picked_text = _truncate_words(" ".join(c for c, _ in picked), max_words=200)
-    overall_similarity = picked[0][1]
-
-    print(f"[SCORE] ACCEPT (sim={overall_similarity:.4f}, {len(picked)}/{len(chunks)} passages matched) {url}")
-
-    return {
-        "url": url,
-        "snippet": picked_text,
-        "source": used_source,
-        "similarity": overall_similarity,
-        "picked_passage_count": len(picked),
-        "total_passage_count": len(chunks),
-    }
-
-
-async def _backfill_sources_to_target(
-    new_articles: list[dict],
-    scraped_urls: set,
-    title: str,
-    hyde_doc: str,
-    keywords: list[str] | None = None,
-    target_count: int = MAX_WEB_SOURCES,
-    max_rounds: int = 8,
-) -> list[dict]:
-
-    def _existing_urls() -> set:
-        return {a.get("url") for a in new_articles if a.get("url")}
-
-    model = _get_st_model()
-    hyde_embedding = await _run_encode(
-        lambda: model.encode(hyde_doc, normalize_embeddings=True, convert_to_numpy=True)
-    )
-
-    relax_schedule = [
-        WEB_CONTENT_SIMILARITY_THRESHOLD,
-        max(WEB_CONTENT_SIMILARITY_THRESHOLD * 0.75, _MIN_ACCEPTABLE_SIMILARITY),  
-    ]
-
-    round_num = 0
-    while _unique_url_count(new_articles) < target_count and round_num < max_rounds:
-        round_num += 1
-        added_this_round = 0
-        current_threshold = relax_schedule[min(round_num - 1, len(relax_schedule) - 1)]
-
-        if round_num == 1:
-            candidate_pairs = []
-            for kw in (keywords or [title]):
-                try:
-                    pairs = await _run_scrape(_ddgs_search_for_script, kw, 20)
-                    candidate_pairs.extend(pairs)
-                except Exception as e:
-                    print(f"[MAIN] backfill round {round_num} search failed for '{kw}': {e}")
-        else:
-            generic_queries = [
-                title, f"{title} history", f"{title} overview", f"{title} explained",
-                f"{title} background", f"{title} facts", f"{title} details",
-                f"{title} analysis", f"{title} biography", f"{title} encyclopedia",
-            ]
-            candidate_pairs = []
-            for query in generic_queries:
-                if _unique_url_count(new_articles) >= target_count:
-                    break
-                try:
-                    pairs = await _run_scrape(_ddgs_search_for_script, query, 20)
-                    candidate_pairs.extend(pairs)
-                except Exception as e:
-                    print(f"[MAIN] backfill generic query '{query}' failed: {e}")
-
-        existing_urls = _existing_urls()
-        for url, snippet in candidate_pairs:
-            if _unique_url_count(new_articles) >= target_count:
-                break
-            if not url or url in scraped_urls or url in existing_urls or _is_blocked_source_url(url):
-                continue
-            scraped_urls.add(url)
-
-            scored = await _score_and_filter_url(url, snippet, hyde_embedding, model, current_threshold)
-            if scored is None:
-                continue
-
-            existing_urls.add(url)
-            new_articles.append(scored)
-            added_this_round += 1
-
-        if added_this_round == 0:
-            print(f"[MAIN] backfill round {round_num} added 0 new relevant source(s), stopping this round type")
-
-    final_count = _unique_url_count(new_articles)
-    if final_count < target_count:
-        print(
-            f"[MAIN] Only {final_count}/{target_count} unique SEMANTICALLY RELEVANT source(s) found — "
-            f"the web genuinely doesn't have more on-topic results for this query. "
-            f"(Not filled with junk to hit the number.)"
-        )
-    else:
-        print(f"[MAIN] backfill reached target with {final_count}/{target_count} semantically relevant source(s)")
-
-    return new_articles
 
 
 SCRIPT_METRICS_SYSTEM_PROMPT = """
@@ -5081,7 +4930,6 @@ async def _backfill_books_to_target(
                 query,
                 final_k=100,
                 table_name=table_name,
-                similarity_threshold=0.0,
                 match_count=100,
             )
         except Exception as e:
@@ -5582,6 +5430,11 @@ def pick_topk_with_backfill(
     return picked
 
 
+
+
+
+
+
 async def _generate_script_impl(request: "ScriptRequest"):
     _start_token_tracking()
 
@@ -5801,32 +5654,12 @@ async def _generate_script_impl(request: "ScriptRequest"):
             unique_source_count = _unique_url_count(articles)
             print(f"[STAGE 3] direct matching done: {unique_source_count}/{script_web_source_target} unique source(s)")
 
-            if unique_source_count < script_web_source_target:
-                print(
-                    f"[STAGE 3] below target — backfilling ({unique_source_count} -> {script_web_source_target})"
-                )
-                try:
-                    articles = await _backfill_sources_to_target(
-                        articles,
-                        scraped_urls,
-                        request.title,
-                        combined_hyde_doc,
-                        keywords=script_search_keywords,
-                        target_count=script_web_source_target,
-                    )
-                    print(f"[STAGE 3] backfill done — now {_unique_url_count(articles)}/{script_web_source_target}")
-                except Exception as backfill_exc:
-                    print(f"[STAGE 3] backfill failed: {backfill_exc}")
-                    import traceback
-                    traceback.print_exc()
-
             articles.sort(key=lambda a: a.get("similarity", 0.0), reverse=True)
             articles = articles[:script_web_source_target]
-            if _unique_url_count(articles) < script_web_source_target:
-                print(
-                    f"[STAGE 3] WARNING: only {_unique_url_count(articles)}/{script_web_source_target} "
-                    f"unique semantically relevant web source(s) available even after backfill."
-                )
+            print(
+                f"[STAGE 3] {_unique_url_count(articles)}/{script_web_source_target} "
+                f"unique semantically relevant web source(s) available (no backfill)."
+            )
         except Exception as exc:
             print(f"[STAGE 3] FAILED — web content matching raised: {exc}")
             import traceback
@@ -6070,15 +5903,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
-
 
 
 
