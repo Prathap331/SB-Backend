@@ -2,7 +2,7 @@ from fastapi import Depends, HTTPException, Request, Header,UploadFile, File,For
 from fastapi import FastAPI
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel,Field
 from dotenv import load_dotenv
 from supabase import create_client
 from postgrest.exceptions import APIError
@@ -127,11 +127,20 @@ class PromptRequest(BaseModel):
     topic: str
 
 
+# class CreateOrderRequest(BaseModel):
+#     amount: float
+#     currency: str = "INR"
+#     receipt: str | None = None
+#     target_tier: str
+
+from typing import Literal
+
 class CreateOrderRequest(BaseModel):
-    amount: float
-    currency: str = "INR"
+    amount: float = Field(gt=0)
+    currency: Literal["INR", "USD"] = "USD"
+    billing_cycle: Literal["monthly", "annual"] = "monthly"
     receipt: str | None = None
-    target_tier: str
+    target_tier: Literal["plus", "pro"]
 
 
 class RefreshTokenRequest(BaseModel):
@@ -3440,7 +3449,6 @@ async def get_channel_profile(userId: str):
         print(e)
         return None
     
-from pydantic import BaseModel
 from fastapi import HTTPException
 
 
@@ -7178,8 +7186,9 @@ async def search_pexels_videos(request: PexelsVideoSearchRequest):
 
 
 
-
 import datetime
+import random
+import re
 import string
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -7197,6 +7206,90 @@ def generate_invoice_number():
     return f"INV-{year}-{random_part}"
 
 
+# ---------------------------------------------------------------------------
+# Plan configuration: currency -> billing_cycle -> tier -> {price, credits, validity_days}
+# ---------------------------------------------------------------------------
+PLAN_CONFIG = {
+    "INR": {
+        "monthly": {
+            "plus": {"price": 699,   "credits": 600,      "validity_days": 30},
+            "pro":  {"price": 1299,  "credits": 1200,     "validity_days": 30},
+        },
+        "annual": {
+            "plus": {"price": 7381,  "credits": 600 * 12, "validity_days": 365},
+            "pro":  {"price": 13717, "credits": 1200 * 12, "validity_days": 365},
+        },
+    },
+    "USD": {
+        "monthly": {
+            "plus": {"price": 7,     "credits": 600,      "validity_days": 30},
+            "pro":  {"price": 15.5,  "credits": 1200,     "validity_days": 30},
+        },
+        "annual": {
+            "plus": {"price": 71.4,  "credits": 600 * 12, "validity_days": 365},
+            "pro":  {"price": 132.6, "credits": 1200 * 12, "validity_days": 365},
+        },
+    },
+}
+
+CURRENCY_SYMBOL = {"INR": "Rs.", "USD": "$"}
+
+GST_APPLICABLE_CURRENCIES = {"INR"}
+
+
+def _is_domestic_customer(payment_entity: dict, customer_phone: str | None) -> bool:
+    """
+    Decide whether a payment should be treated as domestic (India) for GST
+    purposes, using signals that are hard for the customer to fake:
+
+      1. Payment rail — UPI, Netbanking, and most wallets only work with
+         Indian bank accounts, so these are always domestic. This can't be
+         spoofed by picking a different order currency.
+      2. Card issuing country — Razorpay reports `card.international`
+         (true/false), sourced from the card network/issuing bank, not
+         anything the customer types in.
+      3. Phone number country code, as a corroborating / fallback signal
+         (e.g. "+91XXXXXXXXXX" -> India). Weaker on its own (numbers can be
+         ported or VOIP), so it's combined with — not a replacement for —
+         the payment-rail/card signal.
+
+    Policy: if ANY signal indicates India, treat as domestic (GST charged).
+    Only skip GST if every available signal points outside India. If no
+    signal is available at all, default to domestic/GST-charged — safer
+    for compliance and revenue than silently zero-rating.
+    """
+    method = (payment_entity.get('method') or '').lower()
+
+    # Rails that are physically India-only — definitive, unspoofable.
+    if method in ('upi', 'netbanking', 'wallet'):
+        return True
+
+    signals = []
+
+    if method == 'card':
+        card = payment_entity.get('card') or {}
+        international = card.get('international')
+        if international is not None:
+            signals.append(not international)  # not international == domestic
+
+    if customer_phone:
+        digits = re.sub(r'\D', '', customer_phone)
+        stripped = customer_phone.strip()
+        if stripped.startswith('+91') or (digits.startswith('91') and len(digits) == 12):
+            signals.append(True)
+        elif stripped.startswith('+') and not stripped.startswith('+91'):
+            signals.append(False)
+
+    if any(signals):
+        return True
+    if signals:
+        # We had signals and none of them said India.
+        return False
+
+    # No usable signal at all — default to charging GST.
+    return True
+
+
 def generate_invoice_pdf(
     invoice_no,
     customer_name,
@@ -7205,6 +7298,8 @@ def generate_invoice_pdf(
     item_name,
     amount,
     plan,
+    currency="INR",
+    gst_applicable=None,
     due_date=None,
     output_dir="invoices",
 ):
@@ -7315,9 +7410,25 @@ def generate_invoice_pdf(
     elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
     elements.append(Spacer(1, 7*mm))
 
-    base_price  = amount / 1.18
-    gst_amount  = base_price * 0.18
-    grand_total = base_price + gst_amount
+    symbol = CURRENCY_SYMBOL.get(currency, f"{currency} ")
+
+    # Prefer the explicit domestic/international determination passed in by
+    # the caller (based on payment rail + card issuer + phone signals).
+    # Falling back to currency alone is intentionally a last resort — it's
+    # the one signal a customer can freely choose, so it's the least
+    # trustworthy for this decision.
+    if gst_applicable is None:
+        gst_applicable = currency in GST_APPLICABLE_CURRENCIES
+
+    if gst_applicable:
+        base_price  = amount / 1.18
+        gst_amount  = base_price * 0.18
+        grand_total = base_price + gst_amount
+    else:
+        # International (export of service) — no GST applied.
+        base_price  = amount
+        gst_amount  = 0
+        grand_total = amount
 
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
 
@@ -7342,26 +7453,13 @@ def generate_invoice_pdf(
                               fontName='Helvetica-Bold' if bold else 'Helvetica',
                               textColor=tc, alignment=TA_RIGHT)
 
+    # Header + item row (always present, identical to before)
     table_data = [
         ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],
-        [item_name, plan.title(), f"Rs. {base_price:.2f}", "1", f"Rs. {base_price:.2f}"],
-        [
-            Paragraph("", lp()),
-            "",
-            "",
-            Paragraph("GST (18%)", rp(False, colors.HexColor('#555555'))),
-            Paragraph(f"Rs. {gst_amount:.2f}", rp(False, TEXT_DARK)),
-        ],
-        [
-            Paragraph("GRAND TOTAL", lp(True)),
-            "",
-            "",
-            "",
-            Paragraph(f"Rs. {grand_total:.2f}", rp(True, TEXT_DARK)),
-        ],
+        [item_name, plan.title(), f"{symbol} {base_price:.2f}", "1", f"{symbol} {base_price:.2f}"],
     ]
 
-    ts = TableStyle([
+    ts_commands = [
         ('BACKGROUND',    (0,0),(-1,0), LIGHT_GRAY),
         ('TEXTCOLOR',     (0,0),(-1,0), TEXT_DARK),
         ('FONTNAME',      (0,0),(-1,0), 'Helvetica-Bold'),
@@ -7383,22 +7481,52 @@ def generate_invoice_pdf(
         ('ALIGN',         (2,1),(-1,1), 'RIGHT'),
         ('ALIGN',         (3,1),(3,1),  'CENTER'),
         ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
-        ('SPAN',          (0,2),(2,2)),
-        ('BACKGROUND',    (0,2),(-1,2), LIGHT_GRAY),
-        ('TOPPADDING',    (0,2),(-1,2), 8),
-        ('BOTTOMPADDING', (0,2),(-1,2), 8),
-        ('LINEBELOW',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
-        ('LINEABOVE',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
-        ('VALIGN',        (0,2),(-1,2), 'MIDDLE'),
-        ('SPAN',          (0,3),(3,3)),
-        ('BACKGROUND',    (0,3),(-1,3), MID_GRAY),
-        ('TOPPADDING',    (0,3),(-1,3), 10),
-        ('BOTTOMPADDING', (0,3),(-1,3), 10),
-        ('LINEBELOW',     (0,3),(-1,3), 1.0, colors.HexColor('#cccccc')),
-        ('VALIGN',        (0,3),(-1,3), 'MIDDLE'),
+    ]
+
+    # GST row — only added for INR (domestic) invoices.
+    if gst_applicable:
+        gst_row_idx = len(table_data)
+        table_data.append([
+            Paragraph("", lp()),
+            "",
+            "",
+            Paragraph("GST (18%)", rp(False, colors.HexColor('#555555'))),
+            Paragraph(f"{symbol} {gst_amount:.2f}", rp(False, TEXT_DARK)),
+        ])
+        ts_commands += [
+            ('SPAN',          (0,gst_row_idx),(2,gst_row_idx)),
+            ('BACKGROUND',    (0,gst_row_idx),(-1,gst_row_idx), LIGHT_GRAY),
+            ('TOPPADDING',    (0,gst_row_idx),(-1,gst_row_idx), 8),
+            ('BOTTOMPADDING', (0,gst_row_idx),(-1,gst_row_idx), 8),
+            ('LINEBELOW',     (0,gst_row_idx),(-1,gst_row_idx), 0.5, colors.HexColor('#dddddd')),
+            ('LINEABOVE',     (0,gst_row_idx),(-1,gst_row_idx), 0.5, colors.HexColor('#dddddd')),
+            ('VALIGN',        (0,gst_row_idx),(-1,gst_row_idx), 'MIDDLE'),
+        ]
+
+    # Grand total row (always present)
+    total_row_idx = len(table_data)
+    table_data.append([
+        Paragraph("GRAND TOTAL", lp(True)),
+        "",
+        "",
+        "",
+        Paragraph(f"{symbol} {grand_total:.2f}", rp(True, TEXT_DARK)),
+    ])
+    ts_commands += [
+        ('SPAN',          (0,total_row_idx),(3,total_row_idx)),
+        ('BACKGROUND',    (0,total_row_idx),(-1,total_row_idx), MID_GRAY),
+        ('TOPPADDING',    (0,total_row_idx),(-1,total_row_idx), 10),
+        ('BOTTOMPADDING', (0,total_row_idx),(-1,total_row_idx), 10),
+        ('LINEBELOW',     (0,total_row_idx),(-1,total_row_idx), 1.0, colors.HexColor('#cccccc')),
+        ('VALIGN',        (0,total_row_idx),(-1,total_row_idx), 'MIDDLE'),
+    ]
+
+    ts_commands += [
         ('LEFTPADDING',   (0,0),(-1,-1), 8),
         ('RIGHTPADDING',  (0,0),(-1,-1), 8),
-    ])
+    ]
+
+    ts = TableStyle(ts_commands)
 
     combined = Table(table_data, colWidths=CW)
     combined.setStyle(ts)
@@ -7519,25 +7647,35 @@ async def create_razorpay_order(
 
     user_id = current_user.id
     amount = request_data.amount
-    currency = request_data.currency
+    currency = (request_data.currency or "INR").upper()
+
+    # NOTE: `CreateOrderRequest` is defined elsewhere in the codebase (not in
+    # this file). It needs a `billing_cycle: str` field added to it — e.g.
+    # billing_cycle: Literal["monthly", "annual"] = "monthly"
+    billing_cycle = (getattr(request_data, "billing_cycle", None) or "monthly").lower()
 
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount.")
     if request_data.target_tier not in ['plus', 'pro']:
         raise HTTPException(status_code=400, detail="Invalid target tier.")
+    if currency not in PLAN_CONFIG:
+        raise HTTPException(status_code=400, detail="Unsupported currency. Supported: INR, USD.")
+    if billing_cycle not in ('monthly', 'annual'):
+        raise HTTPException(status_code=400, detail="Invalid billing cycle. Must be 'monthly' or 'annual'.")
 
     order_data = {
-        "amount": int(float(amount) * 100),
+        "amount": int(round(float(amount) * 100)),
         "currency": currency,
         "receipt": request_data.receipt or f"rec_{int(time.time())}",
         "notes": {
             "user_id": str(user_id),
             "target_tier": request_data.target_tier,
+            "billing_cycle": billing_cycle,
         },
     }
     try:
         order = razorpay_client.order.create(data=order_data)
-        print(f"Created Razorpay order {order['id']} for user {user_id}")
+        print(f"Created Razorpay order {order['id']} for user {user_id} ({currency}, {billing_cycle})")
         return {
             "order_id": order['id'],
             "key_id": RAZORPAY_KEY_ID,
@@ -7593,20 +7731,28 @@ async def razorpay_webhook(
             order_id    = order_entity.get('id', 'unknown')
             payment_id  = payment_entity.get('id', 'unknown')
             amount_paid = order_entity.get('amount', 0) / 100
+            currency    = (order_entity.get('currency') or 'INR').upper()
 
-            notes       = order_entity.get('notes', {})
-            user_id     = notes.get('user_id')
-            target_tier = notes.get('target_tier')
+            notes         = order_entity.get('notes', {})
+            user_id       = notes.get('user_id')
+            target_tier   = notes.get('target_tier')
+            billing_cycle = (notes.get('billing_cycle') or 'monthly').lower()
 
             if not user_id or not target_tier:
                 print(f"ERROR: Missing notes in order {order_id}.")
                 return {"status": "error", "message": "Missing required order notes."}
 
-            plan_config = {
-                'plus': {'credits': 600,  'price': 699,  'validity_days': 30},
-                'pro':  {'credits': 1200, 'price': 1299, 'validity_days': 30},
-            }
-            config = plan_config.get(target_tier.lower())
+            currency_config = PLAN_CONFIG.get(currency)
+            if not currency_config:
+                print(f"ERROR: Unsupported currency '{currency}' in order {order_id}.")
+                return {"status": "error", "message": "Unsupported currency."}
+
+            cycle_config = currency_config.get(billing_cycle)
+            if not cycle_config:
+                print(f"ERROR: Unknown billing cycle '{billing_cycle}' in order {order_id}.")
+                return {"status": "error", "message": "Unknown billing cycle."}
+
+            config = cycle_config.get(target_tier.lower())
             if not config:
                 print(f"ERROR: Unknown tier '{target_tier}' in order {order_id}.")
                 return {"status": "error", "message": "Unknown plan tier."}
@@ -7655,7 +7801,7 @@ async def razorpay_webhook(
                     updated_row = update_result.data[0]
                     if updated_row.get('credits_remaining') == new_total_credits:
                         print(
-                            f"Confirmed: user {user_id} → tier '{target_tier}', "
+                            f"Confirmed: user {user_id} → tier '{target_tier}' ({billing_cycle}, {currency}), "
                             f"added batch of {credits_to_add} (expires {updated_batches[-1]['expires_at']}), "
                             f"new total={new_total_credits}"
                         )
@@ -7673,7 +7819,9 @@ async def razorpay_webhook(
                 subscription_row = {
                     "userId":               user_id,
                     "amount":               amount_paid,
+                    "currency":             currency,
                     "plan":                 target_tier.lower(),
+                    "billing_cycle":        billing_cycle,
                     "purchased_date":       now.isoformat(),
                     "validity":             validity_date.isoformat(),
                     "credits":              credits_to_add,
@@ -7704,14 +7852,25 @@ async def razorpay_webhook(
                         customer_phone   = profile.get("phone", "")
                         customer_address = profile.get("billing_address", "")
 
+                        is_domestic = _is_domestic_customer(payment_entity, customer_phone)
+                        print(
+                            f"[GST] user {user_id}: currency={currency}, "
+                            f"method={payment_entity.get('method')}, "
+                            f"card_international={(payment_entity.get('card') or {}).get('international')}, "
+                            f"phone_prefix={(customer_phone or '')[:3]} -> "
+                            f"gst_applicable={is_domestic}"
+                        )
+
                         invoice_path = generate_invoice_pdf(
                             invoice_no=generate_invoice_number(),
                             customer_name=customer_name,
                             customer_address=customer_address,
                             customer_phone=customer_phone,
-                            item_name=f"Storio AI {target_tier.title()} Plan",
+                            item_name=f"Storio AI {target_tier.title()} Plan ({billing_cycle.title()})",
                             amount=amount_paid,
                             plan=target_tier,
+                            currency=currency,
+                            gst_applicable=is_domestic,
                             due_date=validity_date,
                         )
 
@@ -7759,17 +7918,21 @@ async def razorpay_webhook(
 
             print(f"Payment failed for order {failed_order_id}. Reason: {error_desc}")
 
-            notes       = payment_entity.get('notes', {})
-            user_id     = notes.get('user_id')
-            target_tier = notes.get('target_tier')
-            amount_paid = payment_entity.get('amount', 0) / 100
+            notes         = payment_entity.get('notes', {})
+            user_id       = notes.get('user_id')
+            target_tier   = notes.get('target_tier')
+            billing_cycle = (notes.get('billing_cycle') or 'monthly').lower()
+            amount_paid   = payment_entity.get('amount', 0) / 100
+            failed_currency = (payment_entity.get('currency') or 'INR').upper()
 
             if user_id:
                 try:
                     failed_row = {
                         "userId":               user_id,
                         "amount":               amount_paid,
+                        "currency":             failed_currency,
                         "plan":                 (target_tier or 'unknown').lower(),
+                        "billing_cycle":        billing_cycle,
                         "purchased_date":       datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         "validity":             None,
                         "credits":              0,
@@ -7792,6 +7955,163 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
