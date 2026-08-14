@@ -7005,9 +7005,6 @@ async def search_pexels_videos(request: PexelsVideoSearchRequest):
 
 
 
-
-
-
 import os
 import time
 import json
@@ -7038,6 +7035,11 @@ def generate_invoice_number():
 # Amount and GST are now pulled live from Supabase (`subscriptions_plan`)
 # via get_plan_pricing() below — no more hardcoded PLAN_CONFIG prices/GST,
 # and no caching layer in front of Supabase.
+#
+# IMPORTANT (fixed): the `amount` returned by get_plan_pricing() /
+# stored in Supabase is the GST-EXCLUSIVE rate. GST is added ON TOP of it
+# to get the amount actually charged/invoiced — it is NOT backed out of
+# `amount` as if `amount` were tax-inclusive.
 # ---------------------------------------------------------------------------
 CREDIT_CONFIG = {
     "monthly": {
@@ -7055,6 +7057,11 @@ SUPPORTED_CURRENCIES = ("INR", "USD")
 
 
 async def get_plan_pricing(tier: str, currency: str, billing_cycle: str) -> dict:
+    """
+    Returns the GST-EXCLUSIVE rate for the tier/currency/cycle, plus the
+    applicable gst_rate (percentage, e.g. 18.0). GST is added on top of
+    `price` by the caller — `price` itself is never tax-inclusive.
+    """
     tier = (tier or "").lower()
     currency = (currency or "").upper()
     billing_cycle = (billing_cycle or "").lower()
@@ -7099,36 +7106,36 @@ async def get_plan_pricing(tier: str, currency: str, billing_cycle: str) -> dict
     }
 
 
-def _is_domestic_customer(payment_entity: dict, customer_phone: str | None) -> bool:
+def _is_domestic_customer(payment_entity: dict, customer_phone: str | None, currency: str) -> bool:
+    """
+    GST applicability = place of supply.
+
+    Fixed: currency is now the primary signal. For INR orders we charge GST
+    by default unless there's clear evidence the customer is outside India
+    (a non-+91 phone). We deliberately do NOT use card.international as a
+    signal that can override this — that field reflects the card's issuing
+    country, not the customer's location, and was causing GST to be
+    incorrectly dropped on legitimate INR transactions (e.g. cards Razorpay
+    flags as "international" in test mode). Non-INR currency is treated as
+    export of service — no GST.
+    """
+    currency = (currency or "").upper()
+    if currency != "INR":
+        return False
+
     method = (payment_entity.get('method') or '').lower()
-
-    # Rails that are physically India-only — definitive, unspoofable.
     if method in ('upi', 'netbanking', 'wallet'):
-        return True
-
-    signals = []
-
-    if method == 'card':
-        card = payment_entity.get('card') or {}
-        international = card.get('international')
-        if international is not None:
-            signals.append(not international)  # not international == domestic
+        return True  # India-only rails — definitive.
 
     if customer_phone:
         digits = re.sub(r'\D', '', customer_phone)
         stripped = customer_phone.strip()
         if stripped.startswith('+91') or (digits.startswith('91') and len(digits) == 12):
-            signals.append(True)
+            return True
         elif stripped.startswith('+') and not stripped.startswith('+91'):
-            signals.append(False)
+            return False
 
-    if any(signals):
-        return True
-    if signals:
-        # We had signals and none of them said India.
-        return False
-
-    # No usable signal at all — default to charging GST.
+    # No usable signal, but currency is INR — default to domestic/GST.
     return True
 
 
@@ -7147,8 +7154,15 @@ def generate_invoice_pdf(
     output_dir="invoices",
 ):
     """
-    gst_rate is a percentage (e.g. 18.0 for 18%) — pulled from Supabase via
-    get_plan_pricing() by the caller and passed in here.
+    `amount` is the GST-EXCLUSIVE rate (pulled from Supabase via
+    get_plan_pricing() by the caller). gst_rate is a percentage
+    (e.g. 18.0 for 18%). GST is calculated ON TOP of `amount`:
+
+        base_price  = amount
+        gst_amount  = amount * gst_rate / 100   (if applicable)
+        grand_total = base_price + gst_amount
+
+    grand_total is the amount the customer actually pays / is invoiced for.
     """
     styles = getSampleStyleSheet()
 
@@ -7259,7 +7273,7 @@ def generate_invoice_pdf(
 
     symbol = CURRENCY_SYMBOL.get(currency, f"{currency} ")
 
-    # gst_applicable is decided by the caller (payment rail + card issuer +
+    # gst_applicable is decided by the caller (currency + payment rail +
     # phone signals via _is_domestic_customer). gst_rate is the live rate
     # pulled from Supabase for this tier/currency (percentage, e.g. 18.0).
     if gst_applicable is None:
@@ -7267,15 +7281,14 @@ def generate_invoice_pdf(
 
     rate_fraction = (gst_rate or 0.0) / 100
 
+    # --- FIXED: `amount` is GST-EXCLUSIVE. Add GST on top instead of
+    # backing it out of `amount`. ---
+    base_price = amount
     if gst_applicable and rate_fraction > 0:
-        base_price  = amount / (1 + rate_fraction)
-        gst_amount  = base_price * rate_fraction
-        grand_total = base_price + gst_amount
+        gst_amount = base_price * rate_fraction
     else:
-        # International (export of service), or a 0% rate from the DB.
-        base_price  = amount
-        gst_amount  = 0
-        grand_total = amount
+        gst_amount = 0
+    grand_total = base_price + gst_amount
 
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
 
@@ -7502,16 +7515,29 @@ async def create_razorpay_order(
     if billing_cycle not in ('monthly', 'annual'):
         raise HTTPException(status_code=400, detail="Invalid billing cycle. Must be 'monthly' or 'annual'.")
 
-    # Amount is pulled live from Supabase (`subscriptions_plan`) — not
-    # trusted from the client, and not cached.
+    # Rate is pulled live from Supabase (`subscriptions_plan`) — not
+    # trusted from the client, and not cached. This is the GST-EXCLUSIVE
+    # rate; GST is added on top to get what's actually charged.
     pricing = await get_plan_pricing(target_tier, currency, billing_cycle)
-    amount = pricing["price"]
+    base_price = pricing["price"]
+    gst_rate = pricing["gst_rate"]
 
-    if amount <= 0:
+    if base_price <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount configured for this plan.")
 
+    # GST only applies to domestic (INR) orders — see _is_domestic_customer.
+    # At order-creation time we don't yet have payment method / customer
+    # phone (those only exist once the payment is attempted), so we apply
+    # GST here based on currency alone, matching the default in
+    # generate_invoice_pdf(). The webhook re-derives the precise
+    # domestic/export determination once payment_entity is available and
+    # that's what actually appears on the invoice.
+    gst_applicable = currency == "INR" and gst_rate > 0
+    gst_amount = base_price * (gst_rate / 100) if gst_applicable else 0.0
+    charge_amount = base_price + gst_amount
+
     order_data = {
-        "amount": int(round(amount * 100)),
+        "amount": int(round(charge_amount * 100)),
         "currency": currency,
         "receipt": request_data.receipt or f"rec_{int(time.time())}",
         "notes": {
@@ -7522,11 +7548,14 @@ async def create_razorpay_order(
     }
     try:
         order = razorpay_client.order.create(data=order_data)
-        print(f"Created Razorpay order {order['id']} for user {user_id} ({currency}, {billing_cycle})")
+        print(
+            f"Created Razorpay order {order['id']} for user {user_id} "
+            f"({currency}, {billing_cycle}): base={base_price}, gst={gst_amount}, charge={charge_amount}"
+        )
         return {
             "order_id": order['id'],
             "key_id": RAZORPAY_KEY_ID,
-            "amount": amount,
+            "amount": charge_amount,
             "currency": currency,
         }
     except Exception as e:
@@ -7577,7 +7606,7 @@ async def razorpay_webhook(
 
             order_id    = order_entity.get('id', 'unknown')
             payment_id  = payment_entity.get('id', 'unknown')
-            amount_paid = order_entity.get('amount', 0) / 100
+            amount_paid = order_entity.get('amount', 0) / 100  # this is base + GST (see create-order)
             currency    = (order_entity.get('currency') or 'INR').upper()
 
             notes         = order_entity.get('notes', {})
@@ -7603,9 +7632,11 @@ async def razorpay_webhook(
             try:
                 pricing = await get_plan_pricing(target_tier, currency, billing_cycle)
                 gst_rate = pricing["gst_rate"]
+                base_price = pricing["price"]  # GST-exclusive rate, for the invoice line item
             except HTTPException as e:
                 print(f"ERROR: Could not fetch pricing for order {order_id}: {e.detail}")
                 gst_rate = 18.0 if currency == "INR" else 0.0
+                base_price = amount_paid  # best-effort fallback
 
             credits_to_add = credit_config['credits']
             validity_days  = credit_config['validity_days']
@@ -7702,22 +7733,25 @@ async def razorpay_webhook(
                         customer_phone   = profile.get("phone", "")
                         customer_address = profile.get("billing_address", "")
 
-                        is_domestic = _is_domestic_customer(payment_entity, customer_phone)
+                        is_domestic = _is_domestic_customer(payment_entity, customer_phone, currency)
                         print(
                             f"[GST] user {user_id}: currency={currency}, "
                             f"method={payment_entity.get('method')}, "
-                            f"card_international={(payment_entity.get('card') or {}).get('international')}, "
                             f"phone_prefix={(customer_phone or '')[:3]}, gst_rate={gst_rate} -> "
                             f"gst_applicable={is_domestic}"
                         )
 
+                        # NOTE: amount_paid is base+GST (charged via Razorpay).
+                        # generate_invoice_pdf expects the GST-EXCLUSIVE rate
+                        # in `amount` and adds GST on top itself, so we pass
+                        # base_price here, not amount_paid.
                         invoice_path = generate_invoice_pdf(
                             invoice_no=generate_invoice_number(),
                             customer_name=customer_name,
                             customer_address=customer_address,
                             customer_phone=customer_phone,
                             item_name=f"Storio AI {target_tier.title()} Plan ({billing_cycle.title()})",
-                            amount=amount_paid,
+                            amount=base_price,
                             plan=target_tier,
                             currency=currency,
                             gst_applicable=is_domestic,
@@ -7806,15 +7840,6 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
-
-
-
-
-
-
-
-
-
 
 
 
