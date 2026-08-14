@@ -7008,12 +7008,15 @@ async def search_pexels_videos(request: PexelsVideoSearchRequest):
 
 
 
-
-
+import os
+import time
+import json
 import datetime
 import random
 import re
 import string
+import uuid as uuid_lib
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
@@ -7031,57 +7034,72 @@ def generate_invoice_number():
 
 
 # ---------------------------------------------------------------------------
-# Plan configuration: currency -> billing_cycle -> tier -> {price, credits, validity_days}
+# Credits / validity are still config-driven (not part of this change).
+# Amount and GST are now pulled live from Supabase (`subscriptions_plan`)
+# via get_plan_pricing() below — no more hardcoded PLAN_CONFIG prices/GST,
+# and no caching layer in front of Supabase.
 # ---------------------------------------------------------------------------
-PLAN_CONFIG = {
-    "INR": {
-        "monthly": {
-            "plus": {"price": 699,   "credits": 600,      "validity_days": 30},
-            "pro":  {"price": 1299,  "credits": 1200,     "validity_days": 30},
-        },
-        "annual": {
-            "plus": {"price": 7381,  "credits": 600 * 12, "validity_days": 365},
-            "pro":  {"price": 13717, "credits": 1200 * 12, "validity_days": 365},
-        },
+CREDIT_CONFIG = {
+    "monthly": {
+        "plus": {"credits": 600,       "validity_days": 30},
+        "pro":  {"credits": 1200,      "validity_days": 30},
     },
-    "USD": {
-        "monthly": {
-            "plus": {"price": 7,     "credits": 600,      "validity_days": 30},
-            "pro":  {"price": 15.5,  "credits": 1200,     "validity_days": 30},
-        },
-        "annual": {
-            "plus": {"price": 71.4,  "credits": 600 * 12, "validity_days": 365},
-            "pro":  {"price": 132.6, "credits": 1200 * 12, "validity_days": 365},
-        },
+    "annual": {
+        "plus": {"credits": 600 * 12,  "validity_days": 365},
+        "pro":  {"credits": 1200 * 12, "validity_days": 365},
     },
 }
 
 CURRENCY_SYMBOL = {"INR": "Rs.", "USD": "$"}
+SUPPORTED_CURRENCIES = ("INR", "USD")
 
-GST_APPLICABLE_CURRENCIES = {"INR"}
+
+async def get_plan_pricing(tier: str, currency: str, billing_cycle: str) -> dict:
+    tier = (tier or "").lower()
+    currency = (currency or "").upper()
+    billing_cycle = (billing_cycle or "").lower()
+
+    if currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=400, detail="Unsupported currency. Supported: INR, USD.")
+    if billing_cycle not in ("monthly", "annual"):
+        raise HTTPException(status_code=400, detail="Invalid billing cycle. Must be 'monthly' or 'annual'.")
+
+    try:
+        resp = (
+            supabase.table('subscriptions_plan')
+            .select('plan_name, plan_amount, annual_amount, gst, usd_planamount, usd_annualamount, usd_gst')
+            .ilike('plan_name', tier)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[PRICING] Supabase error fetching plan '{tier}': {e}")
+        raise HTTPException(status_code=503, detail="Could not fetch plan pricing.")
+
+    row = resp.data
+    if not row:
+        raise HTTPException(status_code=400, detail=f"No pricing found for tier '{tier}'.")
+
+    if currency == "INR":
+        amount = row.get('plan_amount') if billing_cycle == "monthly" else row.get('annual_amount')
+        gst_rate = row.get('gst')
+    else:  # USD
+        amount = row.get('usd_planamount') if billing_cycle == "monthly" else row.get('usd_annualamount')
+        gst_rate = row.get('usd_gst')
+
+    if amount is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No {billing_cycle} price configured for tier '{tier}' in {currency}.",
+        )
+
+    return {
+        "price": float(amount),
+        "gst_rate": float(gst_rate) if gst_rate is not None else 0.0,
+    }
 
 
 def _is_domestic_customer(payment_entity: dict, customer_phone: str | None) -> bool:
-    """
-    Decide whether a payment should be treated as domestic (India) for GST
-    purposes, using signals that are hard for the customer to fake:
-
-      1. Payment rail — UPI, Netbanking, and most wallets only work with
-         Indian bank accounts, so these are always domestic. This can't be
-         spoofed by picking a different order currency.
-      2. Card issuing country — Razorpay reports `card.international`
-         (true/false), sourced from the card network/issuing bank, not
-         anything the customer types in.
-      3. Phone number country code, as a corroborating / fallback signal
-         (e.g. "+91XXXXXXXXXX" -> India). Weaker on its own (numbers can be
-         ported or VOIP), so it's combined with — not a replacement for —
-         the payment-rail/card signal.
-
-    Policy: if ANY signal indicates India, treat as domestic (GST charged).
-    Only skip GST if every available signal points outside India. If no
-    signal is available at all, default to domestic/GST-charged — safer
-    for compliance and revenue than silently zero-rating.
-    """
     method = (payment_entity.get('method') or '').lower()
 
     # Rails that are physically India-only — definitive, unspoofable.
@@ -7124,9 +7142,14 @@ def generate_invoice_pdf(
     plan,
     currency="INR",
     gst_applicable=None,
+    gst_rate=18.0,
     due_date=None,
     output_dir="invoices",
 ):
+    """
+    gst_rate is a percentage (e.g. 18.0 for 18%) — pulled from Supabase via
+    get_plan_pricing() by the caller and passed in here.
+    """
     styles = getSampleStyleSheet()
 
     brand_style         = ParagraphStyle('Brand',        parent=styles['Normal'], fontSize=24,  fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_LEFT)
@@ -7236,20 +7259,20 @@ def generate_invoice_pdf(
 
     symbol = CURRENCY_SYMBOL.get(currency, f"{currency} ")
 
-    # Prefer the explicit domestic/international determination passed in by
-    # the caller (based on payment rail + card issuer + phone signals).
-    # Falling back to currency alone is intentionally a last resort — it's
-    # the one signal a customer can freely choose, so it's the least
-    # trustworthy for this decision.
+    # gst_applicable is decided by the caller (payment rail + card issuer +
+    # phone signals via _is_domestic_customer). gst_rate is the live rate
+    # pulled from Supabase for this tier/currency (percentage, e.g. 18.0).
     if gst_applicable is None:
-        gst_applicable = currency in GST_APPLICABLE_CURRENCIES
+        gst_applicable = currency == "INR"
 
-    if gst_applicable:
-        base_price  = amount / 1.18
-        gst_amount  = base_price * 0.18
+    rate_fraction = (gst_rate or 0.0) / 100
+
+    if gst_applicable and rate_fraction > 0:
+        base_price  = amount / (1 + rate_fraction)
+        gst_amount  = base_price * rate_fraction
         grand_total = base_price + gst_amount
     else:
-        # International (export of service) — no GST applied.
+        # International (export of service), or a 0% rate from the DB.
         base_price  = amount
         gst_amount  = 0
         grand_total = amount
@@ -7307,14 +7330,14 @@ def generate_invoice_pdf(
         ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
     ]
 
-    # GST row — only added for INR (domestic) invoices.
-    if gst_applicable:
+    # GST row — only added when GST actually applies for this invoice.
+    if gst_applicable and rate_fraction > 0:
         gst_row_idx = len(table_data)
         table_data.append([
             Paragraph("", lp()),
             "",
             "",
-            Paragraph("GST (18%)", rp(False, colors.HexColor('#555555'))),
+            Paragraph(f"GST ({gst_rate:g}%)", rp(False, colors.HexColor('#555555'))),
             Paragraph(f"{symbol} {gst_amount:.2f}", rp(False, TEXT_DARK)),
         ])
         ts_commands += [
@@ -7359,9 +7382,6 @@ def generate_invoice_pdf(
 
     doc.build(elements, onFirstPage=draw_footer, onLaterPages=draw_footer)
     return file_path
-
-
-import uuid as uuid_lib
 
 
 def _expire_stale_batches(batches: list[dict], now: datetime.datetime) -> list[dict]:
@@ -7470,30 +7490,33 @@ async def create_razorpay_order(
         raise HTTPException(status_code=503, detail="Payment service unavailable.")
 
     user_id = current_user.id
-    amount = request_data.amount
     currency = (request_data.currency or "INR").upper()
 
-    # NOTE: `CreateOrderRequest` is defined elsewhere in the codebase (not in
-    # this file). It needs a `billing_cycle: str` field added to it — e.g.
-    # billing_cycle: Literal["monthly", "annual"] = "monthly"
     billing_cycle = (getattr(request_data, "billing_cycle", None) or "monthly").lower()
+    target_tier = (request_data.target_tier or "").lower()
 
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid amount.")
-    if request_data.target_tier not in ['plus', 'pro']:
+    if target_tier not in ('plus', 'pro'):
         raise HTTPException(status_code=400, detail="Invalid target tier.")
-    if currency not in PLAN_CONFIG:
+    if currency not in SUPPORTED_CURRENCIES:
         raise HTTPException(status_code=400, detail="Unsupported currency. Supported: INR, USD.")
     if billing_cycle not in ('monthly', 'annual'):
         raise HTTPException(status_code=400, detail="Invalid billing cycle. Must be 'monthly' or 'annual'.")
 
+    # Amount is pulled live from Supabase (`subscriptions_plan`) — not
+    # trusted from the client, and not cached.
+    pricing = await get_plan_pricing(target_tier, currency, billing_cycle)
+    amount = pricing["price"]
+
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount configured for this plan.")
+
     order_data = {
-        "amount": int(round(float(amount) * 100)),
+        "amount": int(round(amount * 100)),
         "currency": currency,
         "receipt": request_data.receipt or f"rec_{int(time.time())}",
         "notes": {
             "user_id": str(user_id),
-            "target_tier": request_data.target_tier,
+            "target_tier": target_tier,
             "billing_cycle": billing_cycle,
         },
     }
@@ -7566,23 +7589,26 @@ async def razorpay_webhook(
                 print(f"ERROR: Missing notes in order {order_id}.")
                 return {"status": "error", "message": "Missing required order notes."}
 
-            currency_config = PLAN_CONFIG.get(currency)
-            if not currency_config:
+            target_tier = target_tier.lower()
+
+            if currency not in SUPPORTED_CURRENCIES:
                 print(f"ERROR: Unsupported currency '{currency}' in order {order_id}.")
                 return {"status": "error", "message": "Unsupported currency."}
 
-            cycle_config = currency_config.get(billing_cycle)
-            if not cycle_config:
-                print(f"ERROR: Unknown billing cycle '{billing_cycle}' in order {order_id}.")
-                return {"status": "error", "message": "Unknown billing cycle."}
+            credit_config = CREDIT_CONFIG.get(billing_cycle, {}).get(target_tier)
+            if not credit_config:
+                print(f"ERROR: Unknown tier '{target_tier}' or cycle '{billing_cycle}' in order {order_id}.")
+                return {"status": "error", "message": "Unknown plan tier or billing cycle."}
 
-            config = cycle_config.get(target_tier.lower())
-            if not config:
-                print(f"ERROR: Unknown tier '{target_tier}' in order {order_id}.")
-                return {"status": "error", "message": "Unknown plan tier."}
+            try:
+                pricing = await get_plan_pricing(target_tier, currency, billing_cycle)
+                gst_rate = pricing["gst_rate"]
+            except HTTPException as e:
+                print(f"ERROR: Could not fetch pricing for order {order_id}: {e.detail}")
+                gst_rate = 18.0 if currency == "INR" else 0.0
 
-            credits_to_add = config['credits']
-            validity_days  = config['validity_days']
+            credits_to_add = credit_config['credits']
+            validity_days  = credit_config['validity_days']
             now            = datetime.datetime.now(datetime.timezone.utc)
             validity_date  = now + datetime.timedelta(days=validity_days)
 
@@ -7644,7 +7670,7 @@ async def razorpay_webhook(
                     "userId":               user_id,
                     "amount":               amount_paid,
                     "currency":             currency,
-                    "plan":                 target_tier.lower(),
+                    "plan":                 target_tier,
                     "billing_cycle":        billing_cycle,
                     "purchased_date":       now.isoformat(),
                     "validity":             validity_date.isoformat(),
@@ -7681,7 +7707,7 @@ async def razorpay_webhook(
                             f"[GST] user {user_id}: currency={currency}, "
                             f"method={payment_entity.get('method')}, "
                             f"card_international={(payment_entity.get('card') or {}).get('international')}, "
-                            f"phone_prefix={(customer_phone or '')[:3]} -> "
+                            f"phone_prefix={(customer_phone or '')[:3]}, gst_rate={gst_rate} -> "
                             f"gst_applicable={is_domestic}"
                         )
 
@@ -7695,6 +7721,7 @@ async def razorpay_webhook(
                             plan=target_tier,
                             currency=currency,
                             gst_applicable=is_domestic,
+                            gst_rate=gst_rate,
                             due_date=validity_date,
                         )
 
@@ -7779,21 +7806,6 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
