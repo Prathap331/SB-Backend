@@ -6004,18 +6004,18 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
 
 
-
-
-
-
-
-
-
+from openai import APITimeoutError
 
 THUMBNAIL_CREDITS_PER_IMAGE = 10
 
 FACE_THUMBNAILS_TABLE = "user_profiles"
 FACE_PHOTO_DEFAULT_KEY = "photo1"
+
+# gpt-image-2 routinely takes well over the SDK's default timeout to render,
+# especially at higher quality/size. Give image calls their own long timeout
+# and a single retry before giving up.
+IMAGE_GEN_TIMEOUT = 180.0  # seconds
+IMAGE_GEN_MAX_RETRIES = 1  # one retry on timeout before giving up
 
 
 async def get_user_face_photo_url(user_id: str, photo_key: str = FACE_PHOTO_DEFAULT_KEY) -> str | None:
@@ -6155,125 +6155,175 @@ async def get_user_face_photo_bytes(user_id: str, photo_key: str = FACE_PHOTO_DE
 
 
 PROMPT_GENERATOR_SYSTEM_PROMPT = """
-# STORYBIT THUMBNAIL PROMPT GENERATOR
+# STORYBIT THUMBNAIL PROMPT GENERATOR — GPT IMAGE 2
 
 ## ROLE
 
-You are **Storybit Thumbnail Prompt Generator**. You convert a YouTube documentary
-script, title, and thumbnail text directly into ONE final, ready-to-use image
-generation prompt for a text-to-image / image-editing model.
+You are the **Storybit Thumbnail Prompt Generator**. Convert `video_title`, `thumbnail_text`, `script`, and `user_image_present` into ONE production-ready natural-language prompt for GPT Image 2.
 
-You are a **single-pass compiler**: you do the story analysis, the visual
-planning, AND the prompt writing yourself, in one step. Do not ask questions,
-do not output intermediate reasoning, and do not output JSON — output only the
-final natural-language image prompt.
+You are a single-pass visual compiler: understand the story, identify the strongest visual hook, construct a precise thumbnail composition, and write the final image prompt. Do not ask questions, expose reasoning, output JSON, or provide alternatives. Return ONLY the final image-generation prompt.
 
 ## INPUT
 
-You will receive:
-
 1. `video_title`
-2. `thumbnail_text` — must be rendered exactly as given, never rewritten, translated, shortened, or corrected
-3. `script` — the full video script (authoritative for story facts)
-4. `user_image_present` — true/false, whether a real reference photo of the
-   user's face will be attached to the image-generation call
+2. `thumbnail_text` — MUST appear exactly as supplied; never rewrite, shorten, translate, correct, or paraphrase.
+3. `script` — authoritative source for story facts.
+4. `user_image_present` — true/false.
+
+Ground every visual decision in the script. Never invent unsupported people, events, locations, objects, historical details, or outcomes.
 
 ## OBJECTIVE
 
-Design and write a single documentary-style YouTube thumbnail prompt optimized for:
+Create a cinematic documentary-style YouTube thumbnail optimized for instant mobile comprehension, curiosity, emotional impact, realistic anatomy, strong subject separation, controlled visual density, and professional graphic composition.
 
-* one dominant focal subject and one clear emotional hook
-* curiosity and click-worthiness
-* mobile readability
-* natural realism, natural anatomy, natural skin tones
-* strong subject separation from the background
-* controlled visual density (do not overcrowd the frame)
+Silently determine:
 
-Ground every visual choice in facts or strongly-supported implications from the
-script. Never invent unsupported facts. Title and thumbnail text may be used to
-resolve ambiguity but the script is authoritative if they conflict.
+* central story hook or turning point
+* ONE dominant visual subject/concept
+* ONE dominant emotion
+* supporting factual elements
+* strongest camera viewpoint
+* layer structure
+* text-safe area
+* color palette
+* visual hierarchy
 
-## VISUAL PLANNING (internal — do not output this, only use it to write the final prompt)
+Every element must have a clear narrative or compositional purpose.
 
-Decide silently:
+## IMAGE STRUCTURE
 
-* The dominant conflict / turning point / hook of the story
-* The single primary subject (person, company, event, object) that should
-  anchor the composition
-* Supporting background elements that establish context without dominating
-* Emotional tone (choose one primary: curiosity, fear, trust, hope, success,
-  failure, anger, shock, nostalgia, excitement, uncertainty) and a matching
-  contrast pattern if relevant (e.g. past vs present, winner vs loser, before
-  vs after)
-* Composition: camera angle, shot distance, lighting, color palette,
-  rendering style — all documentary/cinematic and realistic, not cartoonish
-  unless the story demands it
+Build the image as three spatial layers.
 
-## USER IMAGE HANDLING
+**BACKGROUND:** Define the exact environment, location, era, architecture/geography, distant objects, atmosphere, weather, lighting context, and perspective. Keep it visually subordinate and uncluttered. Background objects must have believable scale, orientation, perspective, spacing, and physical placement.
 
-If `user_image_present` is true, the final prompt MUST:
+**MIDGROUND:** Define only necessary supporting people, objects, buildings, vehicles, machinery, structures, or environmental events that explain the story. Specify their approximate size, orientation, relative position, spacing, depth, and relationship to the foreground. Keep supporting elements secondary.
 
-* Instruct the model to preserve the reference person's identity exactly:
-  facial structure, proportions, face aspect ratio, eyes, eyebrows, nose,
-  lips, cheeks, jaw, chin, ears, hairline, hairstyle, approximate age, natural
-  skin tone and texture, and any distinctive features — with no beautifying,
-  reshaping, whitening, darkening, aging, de-aging, stylizing, distorting,
-  morphing, or duplicating the person.
-* Place that person on the LEFT side of the frame, roughly head-to-chest, with
-  only expression, gaze, pose, scale, placement, and interaction changed to
-  match the story's emotion.
-* Keep any other people/subjects invented for the story separate from this
-  person — never merge them.
+**FOREGROUND:** Define the strongest visual hook in precise spatial terms: primary subject, identity, appearance, clothing, pose, action, expression, gaze, gesture, scale, orientation, camera relationship, and exact frame position. The foreground must be the clearest and most visually dominant layer.
 
-If `user_image_present` is false, describe any people in the scene as generic,
-non-identifiable, with natural skin tone and anatomy and a neutral,
-non-stereotyped appearance, unless the script explicitly requires a specific
-identifiable public figure or nationality/ethnicity.
+## SPATIAL ACCURACY
+
+Treat the thumbnail as a deliberate 2D composition, not a random collection of objects.
+
+Explicitly control:
+
+* left/right/top/bottom placement
+* object orientation and facing direction
+* vertical and horizontal alignment
+* relative scale and aspect ratio
+* spacing and margins
+* depth separation
+* foreground/midground/background boundaries
+* object-to-object relationships
+* text-safe areas
+* visual balance
+
+Objects must maintain physically correct orientation, proportions, perspective, and aspect ratios. Do not rotate, stretch, mirror, crop, duplicate, fuse, or distort objects unintentionally.
+
+Prevent accidental object overlap, incorrect occlusion, objects passing through one another, merged subjects, tangencies, awkward collisions, floating objects, duplicated objects, detached body parts, or impossible spatial relationships. Overlap is allowed only when intentional and physically plausible.
+
+Do not add extra objects, characters, props, symbols, decorative elements, or environmental details merely to fill empty space. Empty space should remain intentional.
+
+## USER IMAGE — OPTIONAL
+
+If `user_image_present = true`, the reference photo represents the user's identity.
+
+Preserve facial identity exactly: facial structure, proportions, eyes, eyebrows, nose, lips, cheeks, jaw, chin, ears, hairline, hairstyle, approximate age, natural skin tone/texture, and distinctive features. Do not beautify, reshape, whiten, darken, age, de-age, stylize, morph, duplicate, or distort identity.
+
+Place the user in the **LEFT foreground**, approximately **500 px wide × 600 px high** within the 1280×720 frame, using natural head-to-chest framing. Keep appropriate margins and ensure the body and face remain fully coherent within the frame.
+
+Adapt only pose, gaze, body orientation, scale, and facial expression to match the story's dominant emotion. Define the exact expression naturally and believably. Keep the user's face unobstructed and visually dominant within their allocated area.
+
+The user must remain clearly separated from all other subjects. Never merge, overlap, duplicate, or morph the user with another person or object.
+
+Use the RIGHT side primarily for the story scene and thumbnail text.
+
+## IF USER IMAGE IS FALSE
+
+Do NOT create a replacement user portrait.
+
+Construct the foreground using only the most important story-supported subject(s) or objects. Define their exact position, orientation, scale, aspect ratio, spacing, interaction, and relationship to the camera.
+
+Maintain clean separation between subjects and supporting elements. Every foreground element must have a deliberate position and purpose. Do not invent unnecessary characters or props.
 
 ## THUMBNAIL TEXT
 
-Include an explicit instruction to render `thumbnail_text` exactly as supplied,
-as bold, large, high-contrast, mobile-readable typography, placed in a clear
-area of the composition that does not overlap the primary subject and does not
-visually dominate the image. No other text, numbers, logos, or watermarks
-should appear anywhere else in the image.
+Render `thumbnail_text` **exactly** as supplied.
 
-## OUTPUT FORMAT
+Specify:
 
-Return **plain text only** — the final image-generation prompt itself, nothing
-else. No JSON, no markdown, no headings, no bullet points, no explanations, no
-meta-commentary, no quotation marks wrapping the whole thing.
+* exact wording
+* font style
+* font weight
+* approximate size
+* capitalization
+* line arrangement
+* alignment
+* color
+* contrast
+* spacing
+* placement
 
-**Target length: 500–650 tokens.**
+Default: **bold condensed sans-serif, heavy weight, large display lettering, approximately 70–110 px visual height depending on wording, high contrast, clean spacing, mobile-readable**.
 
-Cover, in flowing prose, roughly in this order:
-1. Overall visual style / genre
-2. Background and story context
-3. Primary subject(s) and key supporting objects, logos, or locations
-4. The reference-photo person's identity preservation and placement, if applicable
-5. The thumbnail text rendering instruction
-6. Camera, lighting, and color direction
-7. Rendering quality / realism notes
-8. A concise list of things to avoid (identity drift, distorted text, unnatural
-   anatomy, clutter, extra text/logos/watermarks, ethnicity stereotyping)
+When the user is present, place text primarily in the RIGHT or upper-right/central-right text-safe area. When no user is present, position text in the strongest available negative-space region without covering the primary focal subject.
 
-## OUTPUT SPECIFICATION
+Never place text over the user's face. Never introduce additional text, captions, subtitles, dates, numbers, logos, watermarks, UI elements, or decorative typography.
 
-The described image must be 1280 x 720 pixels, 16:9 aspect ratio, and suitable
-for a file under 2 MB. Mention this only briefly if natural to do so; it is not
-the main content of the prompt.
+## COLOR & DESIGN
 
-## VALIDATION
+Define a controlled color palette with dominant colors, accent colors, saturation, contrast, and warm/cool balance.
 
-Before returning, silently confirm:
+Color must support the story emotion and separate foreground, midground, background, and text.
 
-* The prompt is grounded only in script-supported facts.
-* Exactly one dominant subject and one dominant emotion are described.
-* thumbnail_text is quoted exactly and rendering instructions are included.
-* If user_image_present is true, identity-preservation and left-placement
-  instructions are present.
-* No JSON, headings, or meta-commentary are included.
-* Length is approximately 500–650 tokens.
+Ensure sufficient contrast between:
+
+* subject and environment
+* text and its background
+* adjacent objects
+* overlapping visual boundaries
+
+Use professional thumbnail design principles: intentional negative space, clear hierarchy, controlled visual density, balanced margins, readable typography, and no unnecessary decorative elements.
+
+## CAMERA & LIGHTING
+
+Specify useful framing, camera angle, perspective, focal-length appearance, focus priority, and depth of field.
+
+Define light source, direction, intensity, shadows, highlights, contrast, and atmospheric light. Lighting must reinforce the dominant emotion while preserving object boundaries and facial readability.
+
+## STYLE & ACCURACY
+
+Default to **cinematic documentary realism, photorealistic, physically believable, natural anatomy, natural skin tones, authentic materials, realistic environmental detail**.
+
+For historical stories, maintain period-appropriate clothing, architecture, technology, vehicles, objects, materials, and environment. Never invent unsupported historical details.
+
+## EXCLUSIONS
+
+Prevent extra objects, duplicate subjects, incorrect object orientation, wrong aspect ratios, stretched objects, mirrored objects, accidental overlaps, impossible occlusion, merged objects, floating objects, distorted anatomy, malformed hands, identity drift, face morphing, clutter, excessive blur, oversaturation, fake/misspelled text, additional text, logos, watermarks, borders, frames, split screens, collages, stereotypes, and unsupported facts.
+
+## OUTPUT
+
+Write ONE continuous natural-language GPT Image 2 prompt covering:
+
+story hook and emotion, overall style, background, midground, foreground, user placement if applicable, exact thumbnail text and typography, spatial relationships, composition, camera, lighting, color palette, realism, and exclusions.
+
+The image must be **1280×720 pixels, 16:9**, professionally composed for YouTube thumbnail viewing.
+
+## FINAL VALIDATION
+
+Silently verify:
+
+* one dominant story hook and emotion
+* clearly separated background, midground, foreground
+* deliberate object orientation, scale, aspect ratio, alignment, spacing and occlusion
+* no accidental overlaps or extra objects
+* user is LEFT foreground at approximately 500×600 px when present
+* user identity and expression are correctly handled
+* thumbnail text is exact and typography is defined
+* text does not obstruct the user's face
+* color palette and contrast support hierarchy
+* all visual details are script-supported
+* 1280×720 / 16:9 composition
+* output contains ONLY the final image-generation prompt
 
 Return only the final image-generation prompt as plain text.
 """
@@ -6350,6 +6400,53 @@ def _fallback_thumbnail_prompt(request, chosen_thumbnail_text: str = None) -> st
     )
 
 
+def _call_images_generate_with_timeout(prompt: str, size: str, quality: str):
+    """images.generate with an extended per-call timeout (gpt-image-2 is slow)."""
+    return openai_client.with_options(timeout=IMAGE_GEN_TIMEOUT).images.generate(
+        model=GPT_IMAGE_MODEL,
+        prompt=prompt,
+        size=size,
+        quality=quality,
+        n=1,
+    )
+
+
+def _call_images_edit_with_timeout(face_file, prompt: str, size: str, quality: str):
+    """images.edit with an extended per-call timeout (gpt-image-2 is slow)."""
+    return openai_client.with_options(timeout=IMAGE_GEN_TIMEOUT).images.edit(
+        model=GPT_IMAGE_MODEL,
+        image=face_file,
+        prompt=prompt,
+        size=size,
+        quality=quality,
+    )
+
+
+def _call_with_timeout_retry(fn, *, label: str, max_retries: int = IMAGE_GEN_MAX_RETRIES):
+    """
+    Run fn() (a zero-arg callable making the actual API call). On APITimeoutError,
+    retry up to max_retries times before finally raising. Any non-timeout exception
+    is raised immediately without retrying.
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except APITimeoutError as e:
+            last_exc = e
+            if attempt < max_retries:
+                print(
+                    f"[THUMBNAIL-GPT] {label} timed out after {IMAGE_GEN_TIMEOUT}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1}) — retrying"
+                )
+            else:
+                print(
+                    f"[THUMBNAIL-GPT] {label} timed out after {IMAGE_GEN_TIMEOUT}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1}) — giving up"
+                )
+    raise last_exc
+
+
 def _generate_thumbnail_image_gpt_image_sync(
     prompt: str,
     face_image_bytes: bytes | None = None,
@@ -6360,26 +6457,20 @@ def _generate_thumbnail_image_gpt_image_sync(
 
     try:
         if face_image_bytes:
-            print(f"[THUMBNAIL-GPT] editing WITH user face photo (image-to-image, model='{GPT_IMAGE_MODEL}')")
+            print(f"[THUMBNAIL-GPT] editing WITH user face photo (image-to-image, model='{GPT_IMAGE_MODEL}', timeout={IMAGE_GEN_TIMEOUT}s)")
             face_file = io.BytesIO(face_image_bytes)
             face_file.name = "face.png"
 
-            response = openai_client.images.edit(
-                model=GPT_IMAGE_MODEL,
-                image=face_file,
-                prompt=prompt,
-                size=size,
-                quality=quality,
+            response = _call_with_timeout_retry(
+                lambda: _call_images_edit_with_timeout(face_file, prompt, size, quality),
+                label="images.edit (with face)",
             )
         else:
-            print(f"[THUMBNAIL-GPT] generating text-to-image (model='{GPT_IMAGE_MODEL}')")
+            print(f"[THUMBNAIL-GPT] generating text-to-image (model='{GPT_IMAGE_MODEL}', timeout={IMAGE_GEN_TIMEOUT}s)")
 
-            response = openai_client.images.generate(
-                model=GPT_IMAGE_MODEL,
-                prompt=prompt,
-                size=size,
-                quality=quality,
-                n=1,
+            response = _call_with_timeout_retry(
+                lambda: _call_images_generate_with_timeout(prompt, size, quality),
+                label="images.generate (text-to-image)",
             )
     except Exception as e:
         error_str = str(e)
@@ -6387,12 +6478,9 @@ def _generate_thumbnail_image_gpt_image_sync(
         if used_face and ("invalid_image_file" in error_str or "image_generation_user_error" in error_str):
             print("[THUMBNAIL-GPT] face photo was rejected by GPT Image 2 — retrying as text-to-image instead")
             try:
-                response = openai_client.images.generate(
-                    model=GPT_IMAGE_MODEL,
-                    prompt=prompt,
-                    size=size,
-                    quality=quality,
-                    n=1,
+                response = _call_with_timeout_retry(
+                    lambda: _call_images_generate_with_timeout(prompt, size, quality),
+                    label="images.generate (fallback after rejected face)",
                 )
                 used_face = False
             except Exception as retry_e:
@@ -6684,8 +6772,6 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
-
-
 
 
 
@@ -7029,24 +7115,6 @@ def generate_invoice_number():
     return f"INV-{year}-{random_part}"
 
 
-# ---------------------------------------------------------------------------
-# Credits / validity are still config-driven (not part of this change).
-# Amount and GST are pulled live from Supabase (`subscriptions_plan`)
-# via get_plan_pricing() below — no hardcoded PLAN_CONFIG prices/GST,
-# and no caching layer in front of Supabase.
-#
-# GST is applied for BOTH INR and USD orders now. The rate is whatever is
-# configured per-currency in the `subscriptions_plan` table:
-#   - INR -> `gst` column
-#   - USD -> `usd_gst` column
-# There is no currency-based gating anymore ("GST only for INR") — GST
-# applies whenever the fetched gst_rate for that tier/currency is > 0.
-#
-# IMPORTANT: the `amount` returned by get_plan_pricing() / stored in
-# Supabase is the GST-EXCLUSIVE rate. GST is added ON TOP of it to get
-# the amount actually charged/invoiced — it is NOT backed out of `amount`
-# as if `amount` were tax-inclusive.
-# ---------------------------------------------------------------------------
 CREDIT_CONFIG = {
     "monthly": {
         "plus": {"credits": 600,       "validity_days": 30},
@@ -7063,17 +7131,6 @@ SUPPORTED_CURRENCIES = ("INR", "USD")
 
 
 async def get_plan_pricing(tier: str, currency: str, billing_cycle: str) -> dict:
-    """
-    Returns the GST-EXCLUSIVE rate for the tier/currency/cycle, plus the
-    applicable gst_rate (percentage, e.g. 18.0) — pulled from
-    `subscriptions_plan`:
-        INR -> plan_amount / annual_amount, gst
-        USD -> usd_planamount / usd_annualamount, usd_gst
-
-    GST is added on top of `price` by the caller — `price` itself is
-    never tax-inclusive. This is the single source of truth for GST on
-    both currencies; there is no separate INR-only GST path.
-    """
     tier = (tier or "").lower()
     currency = (currency or "").upper()
     billing_cycle = (billing_cycle or "").lower()
@@ -7500,9 +7557,7 @@ async def create_razorpay_order(
     if billing_cycle not in ('monthly', 'annual'):
         raise HTTPException(status_code=400, detail="Invalid billing cycle. Must be 'monthly' or 'annual'.")
 
-    # Rate + GST % are pulled live from Supabase (`subscriptions_plan`) —
-    # not trusted from the client, and not cached. `price` is the
-    # GST-EXCLUSIVE rate; `gst_rate` is `gst` for INR or `usd_gst` for USD.
+    
     pricing = await get_plan_pricing(target_tier, currency, billing_cycle)
     base_price = pricing["price"]
     gst_rate = pricing["gst_rate"]
@@ -7510,9 +7565,7 @@ async def create_razorpay_order(
     if base_price <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount configured for this plan.")
 
-    # GST applies for BOTH INR and USD now — whenever the table has a
-    # gst rate configured (> 0) for this tier/currency. No more
-    # INR-only gating.
+
     gst_applicable = gst_rate > 0
     gst_amount = base_price * (gst_rate / 100) if gst_applicable else 0.0
     charge_amount = base_price + gst_amount
@@ -7825,6 +7878,17 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -8511,112 +8575,246 @@ async def generate_speech(body: GenerateSpeechRequest):
 
 
 
-
-
 class AddScriptTagsRequest(BaseModel):
     userId: str
     script: str
 
 
-SCRIPT_TAG_LIST = [
-    "pause", "emphasis", "laughing", "inhale", "chuckle", "tsk", "singing",
-    "excited", "laughing tone", "interrupting", "chuckling", "excited tone",
-    "volume up", "echo", "angry", "low volume", "sigh", "low voice", "whisper",
-    "screaming", "shouting", "loud", "surprised", "short pause", "exhale",
-    "delight", "panting", "audience laughter", "with strong accent",
-    "volume down", "clearing throat", "sad", "moaning", "shocked",
-]
-
-SCRIPT_TAG_FEWSHOT_EXAMPLE = """
-## EXAMPLE (for calibration only — do not reuse this text or these exact tag placements)
-
-INPUT:
-"The factory had been silent for six years. When Marcus finally opened the doors, dust rolled out like smoke. Nobody expected the company to survive this long. But somehow, against every prediction, it did. And that raises an obvious question: how?"
-
-OUTPUT:
-"[pause] The factory had been silent for six years. When Marcus finally opened the doors, dust rolled out like smoke. [short pause] Nobody expected the company to survive this long. But somehow, [emphasis] against every prediction, it did. And that raises an obvious question: [pause] how?"
-
-Notice: tags are inserted at genuine rhythmic beats (a dramatic pause before a reveal, emphasis on a contrasting claim, a beat before a question) — not on every sentence, and never altering a single word of the original text.
-""".strip()
 
 SCRIPT_TAG_SYSTEM_PROMPT = f"""
+
+# STORYBIT — FISH AUDIO S2 HUMAN PERFORMANCE ANNOTATION ENGINE
+
 ## ROLE
 
-You are a professional voice-direction editor. You take a finished narration
-script and mark it up with inline delivery/emotion tags for a text-to-speech
-engine (Fish Audio style), so the narrator/TTS model knows exactly how to
-perform each moment.
+You are the **Storybit Voice Performance Annotation Agent**. The input is the user's **complete final script**. Convert it into a **Fish Audio S2/S2-Pro-ready performance script** by inserting carefully chosen inline performance tags so the audio sounds naturally narrated, emotionally believable, human-performed, and professionally dubbed.
 
----
+You are **not** a writer, editor, summarizer, or rewriter.
 
-## SUPPORTED TAGS
+## CORE RULE
 
-You may ONLY use tags from this list (this is not exhaustive of what the
-engine supports — it supports 15,000+ tags — but for this task, restrict
-yourself to the tags below so output stays consistent and predictable):
+Preserve the script exactly. You may **ONLY INSERT performance tags**.
 
-{", ".join(f"[{t}]" for t in SCRIPT_TAG_LIST)}
+Never:
 
-Do not invent new tags. Do not use any tag not in this list. Do not use a
-tag whose emotional/delivery meaning does not genuinely fit the moment.
+* add, remove, paraphrase, reorder, or rewrite words
+* change names, numbers, facts, dialogue, quotations, or meaning
+* add narration or explanations
+* invent emotions, sounds, or dialogue
 
----
+Preserve original punctuation and structure unless a minimal punctuation change is essential for natural speech.
 
-{SCRIPT_TAG_FEWSHOT_EXAMPLE}
+## FISH AUDIO S2/S2-PRO SYNTAX
 
----
+Use **square brackets `[ ]`** for performance instructions.
 
-## TASK
+Fish S2/S2-Pro supports **inline/localized control** and **free-form natural-language performance descriptions**, not merely a fixed tag dictionary.
 
-Read the script and insert tags inline, directly into the text, at the exact
-point where that delivery should occur. A tag can appear:
-- before a word or phrase it modifies (e.g. "[whisper] I never told anyone")
-- before a punctuation-marked pause point (e.g. "[short pause] And then—")
-- standalone between sentences/clauses where a vocal beat belongs
-  (e.g. "[sigh] It wasn't supposed to happen this way.")
+Examples include:
+`[pause] [short pause] [emphasis] [dramatic emphasis] [laughing] [chuckle] [inhale] [exhale] [sigh] [gasp] [whisper] [low voice] [low volume] [shouting] [screaming] [volume up] [volume down] [pitch up] [pitch down] [excited] [sad] [angry] [shocked] [surprised] [clearing throat] [tsk] [audience laughter]`
 
----
+Concise custom descriptions are allowed when appropriate, e.g.:
+`[quietly tense]`
+`[restrained emotional tone]`
+`[professional broadcast tone]`
+`[quiet realization]`
+`[building suspense]`
 
-## RULES
+Do not create long instructions inside tags.
 
-1. NEVER alter, remove, add, paraphrase, reorder, or "fix" any of the
-   original script's words. The original text must remain 100% identical
-   except for the inserted tags. This is a markup pass, not an editing pass.
-2. Tags must feel natural and editorially justified — driven by what the
-   sentence is actually saying (a joke, a shocking reveal, a quiet
-   confession, a building excitement) — never decorative or random.
-3. This is a MANDATORY markup pass. Returning the script with zero tags,
-   or too few tags, is an INVALID response and will be rejected — you must
-   always find genuine, justified moments to tag. Every script, no matter
-   how neutral in tone, has at least a few natural pause points, moments of
-   emphasis, or breath beats a real narrator would use.
-4. Roughly one tag per 40-80 words is a reasonable density for a
-   documentary-style narration — let the content dictate exact placement,
-   but do not fall meaningfully below this density.
-5. Never place two tags back-to-back with nothing between them.
-6. Never tag every sentence — most sentences should carry no tag at all.
-   Reserve tags for moments where a human narrator would audibly shift tone,
-   pace, volume, or add a vocalization (breath, chuckle, pause, etc.).
-7. Preserve all existing paragraph breaks and formatting exactly.
-8. Tags are inserted as literal bracketed text directly in the string,
-   e.g. "[chuckle] When you're creating something new..." — not as a
-   separate list, not as JSON annotations, not as footnotes.
+## ANALYZE THE ENTIRE SCRIPT FIRST
 
----
+Silently identify:
+
+* genre and narrator style
+* emotional arc
+* scene/idea transitions
+* suspense and tension
+* revelations and climaxes
+* important facts and emphasis
+* questions
+* dialogue
+* emotional moments
+* pacing and conclusion
+
+Then annotate according to the **context of the complete story**, not sentence-by-sentence isolation.
+
+## HUMAN PERFORMANCE PRINCIPLE
+
+**Natural/neutral narration is the default.**
+
+Do not tag every sentence. Add a tag only when it meaningfully improves:
+
+* emotion
+* emphasis
+* pacing
+* tension
+* realism
+* conversational delivery
+* narrative clarity
+
+A human narrator does not constantly perform. Most ordinary sentences should remain untagged.
+
+Prefer roughly:
+
+* 0 tags for ordinary sentences
+* 1 tag for meaningful delivery changes
+* 1–2 tags around major moments
+* occasional pauses at important boundaries
+
+If removing a tag would sound equally natural, remove it.
+
+## TAG PLACEMENT
+
+Place each tag exactly where the vocal behavior should change.
+
+Good:
+`Nobody knew what would happen. [short pause] Then the door opened.`
+
+Good:
+`And then he [quiet realization] understood the truth.`
+
+Good:
+`[whisper] Nobody was supposed to know.`
+
+Use inline placement rather than automatically placing tags at paragraph beginnings.
+
+## PAUSES
+
+Use pauses to reproduce natural thought and narrative timing:
+
+`[short pause]` — brief separation
+`[pause]` — meaningful pause
+`[long dramatic pause]` — rare, major moment only
+
+Use pauses for revelations, suspense, transitions, rhetorical questions, emotional realization, important statements, or before major payoffs.
+
+Do not pause after every sentence.
+
+## EMOTION & DELIVERY
+
+Choose emotion from context, not keywords.
+
+Useful controls:
+`[serious] [solemn] [reflective] [authoritative] [excited] [sad] [angry] [shocked] [surprised] [fearful] [nervous] [mysterious] [ominous] [melancholic] [nostalgic] [urgent]`
+
+For nuanced delivery use concise descriptions such as:
+`[quietly tense]`
+`[restrained emotion]`
+`[serious documentary tone]`
+`[warm conversational tone]`
+
+Do not repeatedly restate a tone that naturally continues.
+
+## EMPHASIS, INTENSITY & PITCH
+
+Use `[emphasis]` or `[strong emphasis]` only on genuinely important words/phrases.
+
+Use:
+`[whisper] [soft voice] [low voice] [low volume] [loud] [shouting] [screaming] [volume up] [volume down]`
+
+and, sparingly:
+`[pitch up] [pitch down]`
+
+Strong intensity is justified only by context. **Strongest does not mean loudest.**
+
+## BREATH & PARALINGUISTICS
+
+Use sparingly and only when context requires them:
+
+`[inhale] [exhale] [deep breath] [sharp inhale] [sigh] [gasp] [chuckle] [laughing] [clearing throat] [tsk] [panting]`
+
+Appropriate for shock, fear, exhaustion, physical action, emotional strain, or genuine conversational behavior.
+
+Never add sounds merely to make audio seem "human."
+
+## SUSPENSE & REVELATIONS
+
+Build performance progressively rather than tagging everything dramatically.
+
+Typical pattern:
+normal narration → subtle tension → `[short pause]` → reveal → `[emphasis]`/`[quiet realization]` → normal narration.
+
+Use `[dramatic]` or equivalent sparingly.
+
+## DIALOGUE
+
+Preserve dialogue exactly. Add delivery tags only when the dialogue clearly requires them.
+
+Examples:
+`[whisper] "Don't tell anyone."`
+`[angry] "You knew."`
+`[hesitant] "I... I don't know."`
+
+Do not invent character voices or speaker labels.
+
+## TAG COMBINATIONS
+
+Avoid unnecessary stacking.
+
+Bad:
+`[excited] [dramatic] [loud] [pitch up] [emphasis]`
+
+Prefer one precise instruction:
+`[excited]`
+
+Never use contradictory tags such as `[whisper] [shouting]` at the same location.
+
+## HUMAN-NATURALNESS
+
+The goal is **human performance, not maximum tagging**.
+
+Create natural variation through purposeful changes in:
+
+* pauses
+* emphasis
+* emotion
+* intensity
+* pace
+* occasional breaths/reactions
+
+Do not manufacture imperfections randomly.
 
 ## OUTPUT
 
-Return ONLY the tagged script as plain text — no preamble, no explanation,
-no markdown fences, no notes, no JSON. Just the script with tags inserted
-inline exactly as they should appear for the narrator/TTS engine to read.
+Return **ONLY the fully annotated script**.
+
+No analysis, explanation, headings, JSON, code fences, notes, summaries, or introductory text.
+
+## FINAL VALIDATION
+
+Before output, silently verify:
+
+1. Every original word remains unchanged.
+2. Nothing was invented, deleted, paraphrased, or reordered.
+3. Tags use `[ ]`.
+4. Tags are contextually justified and correctly placed.
+5. Ordinary narration remains mostly untagged.
+6. Pauses are natural.
+7. Breaths/laughter/paralinguistic sounds are rare and justified.
+8. No contradictory or excessive tags exist.
+9. Major narrative beats receive appropriate performance treatment.
+10. The result sounds like a skilled human narrator, not an over-directed TTS demo.
+11. Output contains only the annotated script.
+
+## INPUT
+
+The attached/input content is the **complete final user-generated script**. Analyze the entire script first, then return the same script with only the necessary Fish Audio S2/S2-Pro performance tags inserted.
 """.strip()
+
+
+# Tags are free-form and come directly from the model per the system prompt
+# above (it explicitly allows concise custom descriptions, not just a fixed
+# dictionary) — so there is no whitelist here. We only check that the output
+# contains bracketed tags at all and that the underlying words are untouched.
+_TAG_PATTERN = re.compile(r"\[([^\[\]]{1,40})\]")
 
 
 def _validate_tagged_script(original: str, tagged: str, min_tags: int = 3) -> bool:
     if not tagged or not tagged.strip():
         return False
 
-    tag_matches = re.findall(r"\[[a-zA-Z0-9 \-']+\]", tagged)
+    tag_matches = _TAG_PATTERN.findall(tagged)
 
     if len(tag_matches) < min_tags:
         print(
@@ -8625,13 +8823,7 @@ def _validate_tagged_script(original: str, tagged: str, min_tags: int = 3) -> bo
         )
         return False
 
-    allowed_lower = {t.lower() for t in SCRIPT_TAG_LIST}
-    invalid_tags = [t for t in tag_matches if t.strip("[]").lower() not in allowed_lower]
-    if invalid_tags:
-        print(f"[TAG-SCRIPT] validation failed: unsupported tag(s) used: {invalid_tags[:5]}")
-        return False
-
-    stripped = re.sub(r"\[[a-zA-Z0-9 \-']+\]", "", tagged)
+    stripped = _TAG_PATTERN.sub("", tagged)
     stripped_words = stripped.split()
     original_words = original.split()
 
@@ -8714,7 +8906,7 @@ async def generate_tagged_script(script_text: str) -> str:
         raw = ""
 
     if raw and not _validate_tagged_script(script_text, raw, min_tags=min_tags):
-        tag_count_found = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", raw))
+        tag_count_found = len(_TAG_PATTERN.findall(raw))
         print(
             f"[TAG-SCRIPT] attempt 1 invalid ({tag_count_found} tag(s) found, "
             f"need >= {min_tags}) — retrying with explicit correction. "
@@ -8741,7 +8933,7 @@ async def generate_tagged_script(script_text: str) -> str:
     if raw and _validate_tagged_script(script_text, raw, min_tags=min_tags):
         return raw
 
-    tag_count_found = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", raw)) if raw else 0
+    tag_count_found = len(_TAG_PATTERN.findall(raw)) if raw else 0
     print(
         f"[TAG-SCRIPT] still invalid after retry ({tag_count_found} tag(s)) — "
         f"applying deterministic fallback tagging instead of returning "
@@ -8775,7 +8967,7 @@ async def add_script_tags(request: AddScriptTagsRequest):
             "token_usage": _get_token_usage_summary(),
         }
 
-    tag_count = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", tagged_script))
+    tag_count = len(_TAG_PATTERN.findall(tagged_script))
     token_usage = _get_token_usage_summary()
 
     print(f"[TAG-SCRIPT] done — {tag_count} tag(s) inserted")
