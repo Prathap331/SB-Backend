@@ -110,8 +110,8 @@ app = FastAPI(lifespan=lifespan)
 
 origins = [
     "http://localhost:3000",
-    "https://www.testing.storio.tech",
-    "https://testing.storio.tech",
+    "https://www.storio.tech",
+    "https://storio.tech",
 ]
 
 app.add_middleware(
@@ -178,7 +178,6 @@ async def token(form_data: OAuth2PasswordRequestForm = Depends()):
 @app.post("/refresh-token")
 async def refresh_token(request: RefreshTokenRequest):
     return await refresh_access_token(request.refresh_token)
-
 
 @app.post("/analyze")
 async def analyze(request: PromptRequest):
