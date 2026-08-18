@@ -2,7 +2,7 @@ from fastapi import Depends, HTTPException, Request, Header,UploadFile, File,For
 from fastapi import FastAPI
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel,Field
 from dotenv import load_dotenv
 from supabase import create_client
 from postgrest.exceptions import APIError
@@ -127,11 +127,20 @@ class PromptRequest(BaseModel):
     topic: str
 
 
+# class CreateOrderRequest(BaseModel):
+#     amount: float
+#     currency: str = "INR"
+#     receipt: str | None = None
+#     target_tier: str
+
+from typing import Literal
+
 class CreateOrderRequest(BaseModel):
-    amount: float
-    currency: str = "INR"
+    amount: float = Field(gt=0)
+    currency: Literal["INR", "USD"] = "USD"
+    billing_cycle: Literal["monthly", "annual"] = "monthly"
     receipt: str | None = None
-    target_tier: str
+    target_tier: Literal["plus", "pro"]
 
 
 class RefreshTokenRequest(BaseModel):
@@ -218,32 +227,6 @@ async def eci(request: PromptRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1212,14 +1195,6 @@ async def _run_encode(fn):
         return await loop.run_in_executor(_ENCODE_EXECUTOR, fn)
 
 
-async def _run_scrape(fn, *args, **kwargs):
-    """Run a blocking network call (DDGS search, trafilatura fetch,
-    scrapetube search) gated by a semaphore to cap total concurrent
-    outbound connections."""
-    async with _scrape_semaphore:
-        return await asyncio.to_thread(fn, *args, **kwargs)
-
-
 async def _openai_create_with_timeout(call_fn, timeout: float = OPENAI_CALL_TIMEOUT):
     return await asyncio.wait_for(_run_io(call_fn), timeout=timeout)
 
@@ -1296,8 +1271,7 @@ WORDS_PER_MINUTE = 140
 
 BOOKS_TABLE_NAME = "english_books"
 THUMBNAILS_BUCKET = "generated-thumbnails"
-FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "15"))
-
+FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "6"))   # was 15
 
 def to_pgvector(embedding) -> str:
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
@@ -1318,6 +1292,31 @@ def _get_st_model():
         _bge_model = SentenceTransformer("BAAI/bge-m3")
         print("[MODEL] BAAI/bge-m3 loaded")
     return _bge_model
+
+
+# =============================================================================
+# _LogBuffer — collects log lines for one concurrently-running task and
+# flushes them as a single contiguous block when the task finishes. This is
+# purely cosmetic: it stops parallel tasks (Stage 2 / Stage 3 / Stage 4)
+# from interleaving their print() output on stdout. No timing, concurrency,
+# or retrieval logic is affected by this — lines are just buffered and
+# printed together instead of streamed live.
+# =============================================================================
+class _LogBuffer:
+    def __init__(self, label: str):
+        self.label = label
+        self.lines: list[str] = []
+
+    def log(self, msg: str):
+        self.lines.append(msg)
+
+    def flush(self):
+        print(f"\n{'=' * 90}")
+        print(f"[{self.label}] BEGIN")
+        print("=" * 90)
+        print("\n".join(self.lines))
+        print(f"[{self.label}] END")
+        print("=" * 90)
 
 
 class Idea(BaseModel):
@@ -2340,9 +2339,8 @@ def _extract_hashtags(*texts: str) -> list[str]:
 from trafilatura.settings import use_config
 
 _TRAFILATURA_CONFIG = use_config()
-_TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", "8")
-_TRAFILATURA_CONFIG.set("DEFAULT", "MAX_REDIRECTS", "3")
-
+_TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", "4")   # was 8
+_TRAFILATURA_CONFIG.set("DEFAULT", "MAX_REDIRECTS", "2")      # was 3, fewer hops = faster failure on redirect chains
 
 def _fetch_full_article_text(url: str) -> str:
     try:
@@ -2354,6 +2352,23 @@ def _fetch_full_article_text(url: str) -> str:
     except Exception as e:
         print(f"[FETCH] failed to extract {url}: {e}")
         return ""
+
+
+PER_KEYWORD_SCRAPE_COUNT = 5
+
+_SCRAPE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.getenv("SCRAPE_EXECUTOR_WORKERS", "8")),
+    thread_name_prefix="scrape",
+)
+
+
+async def _run_scrape(fn, *args, **kwargs):
+    """Run a blocking network call (DDGS search, trafilatura fetch,
+    scrapetube search) gated by a semaphore to cap total concurrent
+    outbound connections."""
+    async with _scrape_semaphore:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_SCRAPE_EXECUTOR, lambda: fn(*args, **kwargs))
 
 
 async def _fetch_full_article_text_with_timeout(url: str, timeout: float = FETCH_TIMEOUT_SECONDS) -> str:
@@ -2439,34 +2454,12 @@ async def _generate_youtube_search_keywords(topic: str, description: str = "") -
         print(f"--- YouTube keyword generation failed: {exc} ---")
         return [topic]
 
-PER_KEYWORD_SCRAPE_COUNT = 5
-
-_SCRAPE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=int(os.getenv("SCRAPE_EXECUTOR_WORKERS", "8")),  # bumped 12 -> 24
-    thread_name_prefix="scrape",
-)
-
-
-
-async def _run_scrape(fn, *args, **kwargs):
-    async with _scrape_semaphore:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_SCRAPE_EXECUTOR, lambda: fn(*args, **kwargs))
-
-async def _fetch_full_article_text_with_timeout(url: str, timeout: float = FETCH_TIMEOUT_SECONDS) -> str:
-    try:
-        return await asyncio.wait_for(
-            _run_scrape(_fetch_full_article_text, url),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        return ""
-
 
 async def build_shared_web_pool(
     keywords: list[str],
     scraped_urls: set,
     per_keyword_results: int = PER_KEYWORD_SCRAPE_COUNT,
+    overall_timeout: float = 20.0,   # NEW — hard cap for the whole pool-build stage
 ) -> list[dict]:
     model = _get_st_model()
 
@@ -2493,56 +2486,50 @@ async def build_shared_web_pool(
 
     print(f"[POOL] {len(keywords)} keyword(s) ({kw_failures} failed) -> {len(candidates)} unique URL(s) to prepare")
 
-    # --- Stage A: fetch + chunk everything (I/O bound, already concurrent) ---
-    async def _fetch_and_chunk(url: str, fallback_snippet: str) -> dict | None:
+    async def _prepare(url: str, fallback_snippet: str) -> dict | None:
+        t0 = time.time()
         full_text = await _fetch_full_article_text_with_timeout(url)
+        fetch_time = time.time() - t0
         used_source = "full" if full_text else "fallback"
         content = full_text if full_text else fallback_snippet
         if not content:
+            print(f"[POOL] SKIP (no content, {fetch_time:.1f}s) {url}")
             return None
         content = _truncate_words(content, max_words=600)
         chunks = _split_into_chunks(content, max_words_per_chunk=40)
         if not chunks:
+            print(f"[POOL] SKIP (no chunks, {fetch_time:.1f}s) {url}")
             return None
-        return {"url": url, "chunks": chunks, "source": used_source}
+        try:
+            chunk_embeddings = await _run_encode(
+                lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
+            )
+        except Exception as e:
+            print(f"[POOL] embedding failed for {url}: {e}")
+            return None
+        print(f"[POOL] OK ({fetch_time:.1f}s, {len(chunks)} chunks, source={used_source}) {url}")
+        return {"url": url, "chunks": chunks, "chunk_embeddings": chunk_embeddings, "source": used_source}
 
-    fetched_results = await asyncio.gather(
-        *[_fetch_and_chunk(u, s) for u, s in candidates]
-    )
-    fetched = [f for f in fetched_results if f is not None]
+    tasks = [asyncio.create_task(_prepare(u, s)) for u, s in candidates]
 
-    print(f"[POOL] fetched+chunked {len(fetched)}/{len(candidates)} usable article(s)")
+    stage_start = time.time()
+    done, pending = await asyncio.wait(tasks, timeout=overall_timeout)
 
-    if not fetched:
-        return []
+    for t in pending:
+        t.cancel()
+    if pending:
+        print(f"[POOL] deadline hit at {overall_timeout}s — cancelled {len(pending)}/{len(tasks)} still-in-flight fetch(es)")
 
-    flat_chunks: list[str] = []
-    boundaries: list[tuple[int, int]] = []
-    cursor = 0
-    for item in fetched:
-        n = len(item["chunks"])
-        boundaries.append((cursor, cursor + n))
-        cursor += n
-        flat_chunks.extend(item["chunks"])
+    pool = []
+    for t in done:
+        try:
+            r = t.result()
+            if r is not None:
+                pool.append(r)
+        except Exception:
+            pass
 
-    try:
-        all_embeddings = await _run_encode(
-            lambda: model.encode(flat_chunks, normalize_embeddings=True, convert_to_numpy=True)
-        )
-    except Exception as e:
-        print(f"[POOL] batched embedding failed entirely ({len(flat_chunks)} chunks): {e}")
-        return []
-
-    pool: list[dict] = []
-    for item, (start, end) in zip(fetched, boundaries):
-        pool.append({
-            "url": item["url"],
-            "chunks": item["chunks"],
-            "chunk_embeddings": all_embeddings[start:end],
-            "source": item["source"],
-        })
-
-    print(f"[POOL] prepared {len(pool)}/{len(candidates)} usable article(s) (single batched embed call, {len(flat_chunks)} chunks total)")
+    print(f"[POOL] prepared {len(pool)}/{len(candidates)} usable article(s) in {time.time() - stage_start:.1f}s (deadline={overall_timeout}s)")
     return pool
 
 def rank_pool_for_hyde_doc(
@@ -2910,7 +2897,7 @@ def _youtube_api_search_ids(keyword: str, max_results: int = 1) -> list[str]:
         print(f"[YT-API] failed to parse search JSON for '{keyword}': {e}")
         return []
 
-    print(f"[YT-API] RAW search.list response for '{keyword}':")
+    print(f"[YT-API] search.list for '{keyword}' returned {len(data.get('items', []))} item(s)")
 
     video_ids = []
     for item in data.get("items", []):
@@ -2946,26 +2933,39 @@ def _youtube_search_via_api(keyword: str, max_results: int = 1) -> list[dict]:
     return results
 
 
+# =============================================================================
+# get_youtube_context — scraping-optimized: the 10 keyword searches are now
+# fired CONCURRENTLY via asyncio.gather instead of sequentially in a for-loop
+# (each search.list + videos.list round trip no longer blocks the next).
+# All log lines are buffered and flushed as one block so they don't
+# interleave with Stage 2/3 output that runs at the same time. Ranking,
+# dedup, and truncation logic is unchanged.
+# =============================================================================
 async def get_youtube_context(
     topic: str, description: str, scraped_urls: set, max_results: int = 10
 ) -> list[dict]:
-    print(f"[YT] Starting YouTube search for topic: '{topic}'")
+    buf = _LogBuffer("STAGE 4 - YOUTUBE")
+    buf.log(f"Starting YouTube search for topic: '{topic}'")
 
     if not YOUTUBE_API_KEY:
-        print("[YT] YOUTUBE_API_KEY not set, skipping YouTube search")
+        buf.log("YOUTUBE_API_KEY not set, skipping YouTube search")
+        buf.flush()
         return []
 
     keywords = await _generate_youtube_search_keywords(topic, description)
 
-    raw_candidates: list[dict] = []
-
-    for keyword in keywords:
+    async def _search_one(keyword: str) -> list[dict]:
         try:
-            results = await _run_scrape(_youtube_search_via_api, keyword, 1)
+            return await _run_scrape(_youtube_search_via_api, keyword, 1)
         except Exception as e:
-            print(f"[YT] search failed for '{keyword}': {e}")
-            results = []
+            buf.log(f"search failed for '{keyword}': {e}")
+            return []
 
+    all_results = await asyncio.gather(*[_search_one(kw) for kw in keywords])
+
+    raw_candidates: list[dict] = []
+    for keyword, results in zip(keywords, all_results):
+        buf.log(f"search.list for '{keyword}' returned {len(results)} item(s)")
         for r in results:
             url = r["url"]
             if url in scraped_urls:
@@ -2990,11 +2990,12 @@ async def get_youtube_context(
     raw_candidates.sort(key=lambda v: v.get("view_count") or 0, reverse=True)
     videos = raw_candidates[:MAX_YOUTUBE_SOURCES]
 
-    print(
-        f"[YT] fetched {len(raw_candidates)} unique candidate video(s) via YouTube Data API "
+    buf.log(
+        f"fetched {len(raw_candidates)} unique candidate video(s) via YouTube Data API "
         f"from {len(keywords)} keyword(s), returning top {len(videos)} "
         f"(capped at {MAX_YOUTUBE_SOURCES})"
     )
+    buf.flush()
 
     return videos
 
@@ -3440,7 +3441,6 @@ async def get_channel_profile(userId: str):
         print(e)
         return None
     
-from pydantic import BaseModel
 from fastapi import HTTPException
 
 
@@ -4647,150 +4647,7 @@ def _unique_url_count(articles: list[dict]) -> int:
 _MIN_ACCEPTABLE_SIMILARITY = 0.30
 
 
-async def _score_and_filter_url(
-    url: str,
-    fallback_snippet: str,
-    hyde_embedding,
-    model,
-    similarity_threshold: float,
-) -> dict | None:
-    similarity_threshold = max(similarity_threshold, _MIN_ACCEPTABLE_SIMILARITY)
 
-    full_text = await _fetch_full_article_text_with_timeout(url)
-    used_source = "full" if full_text else "fallback"
-    content = full_text if full_text else fallback_snippet
-    if not content:
-        print(f"[SCORE] SKIP (no content at all) {url}")
-        return None
-
-    content = _truncate_words(content, max_words=600)
-    chunks = _split_into_chunks(content, max_words_per_chunk=40)
-    if not chunks:
-        print(f"[SCORE] SKIP (no chunks) {url}")
-        return None
-
-    try:
-        chunk_embeddings = await _run_encode(
-            lambda c=chunks: model.encode(c, normalize_embeddings=True, convert_to_numpy=True)
-        )
-    except Exception as e:
-        print(f"[SCORE] SKIP (embedding failed: {e}) {url}")
-        return None
-
-    chunk_similarities = np.dot(chunk_embeddings, hyde_embedding)
-    picked = [
-        (chunk, float(sim))
-        for chunk, sim in zip(chunks, chunk_similarities)
-        if sim >= similarity_threshold
-    ]
-
-    if not picked:
-        best_sim = float(np.max(chunk_similarities)) if len(chunk_similarities) else 0.0
-        print(
-            f"[SCORE] REJECT (best_sim={best_sim:.4f} < required {similarity_threshold:.4f}, "
-            f"{len(chunks)} passage(s) checked, used_source={used_source}) {url}"
-        )
-        return None
-
-    picked.sort(key=lambda p: p[1], reverse=True)
-    picked_text = _truncate_words(" ".join(c for c, _ in picked), max_words=200)
-    overall_similarity = picked[0][1]
-
-    print(f"[SCORE] ACCEPT (sim={overall_similarity:.4f}, {len(picked)}/{len(chunks)} passages matched) {url}")
-
-    return {
-        "url": url,
-        "snippet": picked_text,
-        "source": used_source,
-        "similarity": overall_similarity,
-        "picked_passage_count": len(picked),
-        "total_passage_count": len(chunks),
-    }
-
-
-async def _backfill_sources_to_target(
-    new_articles: list[dict],
-    scraped_urls: set,
-    title: str,
-    hyde_doc: str,
-    keywords: list[str] | None = None,
-    target_count: int = MAX_WEB_SOURCES,
-    max_rounds: int = 8,
-) -> list[dict]:
-
-    def _existing_urls() -> set:
-        return {a.get("url") for a in new_articles if a.get("url")}
-
-    model = _get_st_model()
-    hyde_embedding = await _run_encode(
-        lambda: model.encode(hyde_doc, normalize_embeddings=True, convert_to_numpy=True)
-    )
-
-    relax_schedule = [
-        WEB_CONTENT_SIMILARITY_THRESHOLD,
-        max(WEB_CONTENT_SIMILARITY_THRESHOLD * 0.75, _MIN_ACCEPTABLE_SIMILARITY),  
-    ]
-
-    round_num = 0
-    while _unique_url_count(new_articles) < target_count and round_num < max_rounds:
-        round_num += 1
-        added_this_round = 0
-        current_threshold = relax_schedule[min(round_num - 1, len(relax_schedule) - 1)]
-
-        if round_num == 1:
-            candidate_pairs = []
-            for kw in (keywords or [title]):
-                try:
-                    pairs = await _run_scrape(_ddgs_search_for_script, kw, 20)
-                    candidate_pairs.extend(pairs)
-                except Exception as e:
-                    print(f"[MAIN] backfill round {round_num} search failed for '{kw}': {e}")
-        else:
-            generic_queries = [
-                title, f"{title} history", f"{title} overview", f"{title} explained",
-                f"{title} background", f"{title} facts", f"{title} details",
-                f"{title} analysis", f"{title} biography", f"{title} encyclopedia",
-            ]
-            candidate_pairs = []
-            for query in generic_queries:
-                if _unique_url_count(new_articles) >= target_count:
-                    break
-                try:
-                    pairs = await _run_scrape(_ddgs_search_for_script, query, 20)
-                    candidate_pairs.extend(pairs)
-                except Exception as e:
-                    print(f"[MAIN] backfill generic query '{query}' failed: {e}")
-
-        existing_urls = _existing_urls()
-        for url, snippet in candidate_pairs:
-            if _unique_url_count(new_articles) >= target_count:
-                break
-            if not url or url in scraped_urls or url in existing_urls or _is_blocked_source_url(url):
-                continue
-            scraped_urls.add(url)
-
-            scored = await _score_and_filter_url(url, snippet, hyde_embedding, model, current_threshold)
-            if scored is None:
-                continue
-
-            existing_urls.add(url)
-            new_articles.append(scored)
-            added_this_round += 1
-
-        if added_this_round == 0:
-            print(f"[MAIN] backfill round {round_num} added 0 new relevant source(s), stopping this round type")
-
-    final_count = _unique_url_count(new_articles)
-    if final_count < target_count:
-        print(
-            f"[MAIN] Only {final_count}/{target_count} unique SEMANTICALLY RELEVANT source(s) found — "
-            f"the web genuinely doesn't have more on-topic results for this query. "
-            f"(Not filled with junk to hit the number.)"
-        )
-    else:
-        print(f"[MAIN] backfill reached target with {final_count}/{target_count} semantically relevant source(s)")
-
-    return new_articles
 
 
 SCRIPT_METRICS_SYSTEM_PROMPT = """
@@ -5073,7 +4930,6 @@ async def _backfill_books_to_target(
                 query,
                 final_k=100,
                 table_name=table_name,
-                similarity_threshold=0.0,
                 match_count=100,
             )
         except Exception as e:
@@ -5574,6 +5430,11 @@ def pick_topk_with_backfill(
     return picked
 
 
+
+
+
+
+
 async def _generate_script_impl(request: "ScriptRequest"):
     _start_token_tracking()
 
@@ -5793,32 +5654,12 @@ async def _generate_script_impl(request: "ScriptRequest"):
             unique_source_count = _unique_url_count(articles)
             print(f"[STAGE 3] direct matching done: {unique_source_count}/{script_web_source_target} unique source(s)")
 
-            if unique_source_count < script_web_source_target:
-                print(
-                    f"[STAGE 3] below target — backfilling ({unique_source_count} -> {script_web_source_target})"
-                )
-                try:
-                    articles = await _backfill_sources_to_target(
-                        articles,
-                        scraped_urls,
-                        request.title,
-                        combined_hyde_doc,
-                        keywords=script_search_keywords,
-                        target_count=script_web_source_target,
-                    )
-                    print(f"[STAGE 3] backfill done — now {_unique_url_count(articles)}/{script_web_source_target}")
-                except Exception as backfill_exc:
-                    print(f"[STAGE 3] backfill failed: {backfill_exc}")
-                    import traceback
-                    traceback.print_exc()
-
             articles.sort(key=lambda a: a.get("similarity", 0.0), reverse=True)
             articles = articles[:script_web_source_target]
-            if _unique_url_count(articles) < script_web_source_target:
-                print(
-                    f"[STAGE 3] WARNING: only {_unique_url_count(articles)}/{script_web_source_target} "
-                    f"unique semantically relevant web source(s) available even after backfill."
-                )
+            print(
+                f"[STAGE 3] {_unique_url_count(articles)}/{script_web_source_target} "
+                f"unique semantically relevant web source(s) available (no backfill)."
+            )
         except Exception as exc:
             print(f"[STAGE 3] FAILED — web content matching raised: {exc}")
             import traceback
@@ -6080,110 +5921,18 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+from openai import APITimeoutError
 
 THUMBNAIL_CREDITS_PER_IMAGE = 10
 
 FACE_THUMBNAILS_TABLE = "user_profiles"
 FACE_PHOTO_DEFAULT_KEY = "photo1"
+
+# gpt-image-2 routinely takes well over the SDK's default timeout to render,
+# especially at higher quality/size. Give image calls their own long timeout
+# and a single retry before giving up.
+IMAGE_GEN_TIMEOUT = 180.0  # seconds
+IMAGE_GEN_MAX_RETRIES = 1  # one retry on timeout before giving up
 
 
 async def get_user_face_photo_url(user_id: str, photo_key: str = FACE_PHOTO_DEFAULT_KEY) -> str | None:
@@ -6321,134 +6070,287 @@ async def get_user_face_photo_bytes(user_id: str, photo_key: str = FACE_PHOTO_DE
     return normalized_bytes
 
 
-
 PROMPT_GENERATOR_SYSTEM_PROMPT = """
-# STORYBIT THUMBNAIL PROMPT GENERATOR
+
+# STORYBIT THUMBNAIL PROMPT GENERATOR — GPT IMAGE 2
 
 ## ROLE
 
-You are **Storybit Thumbnail Prompt Generator**. You convert a YouTube documentary
-script, title, and thumbnail text directly into ONE final, ready-to-use image
-generation prompt for a text-to-image / image-editing model.
+You are the **Storybit Thumbnail Prompt Generator**. Convert `video_title`, `thumbnail_text`, `script`, and `user_image_present` into ONE production-ready natural-language prompt for GPT Image 2.
 
-You are a **single-pass compiler**: you do the story analysis, the visual
-planning, AND the prompt writing yourself, in one step. Do not ask questions,
-do not output intermediate reasoning, and do not output JSON — output only the
-final natural-language image prompt.
+Understand the story first, design the thumbnail around its strongest visual hook, then optionally add the user's image as a presenter overlay. Do not ask questions, expose reasoning, output JSON, or provide alternatives. Return ONLY the final image-generation prompt.
 
 ## INPUT
 
-You will receive:
-
 1. `video_title`
-2. `thumbnail_text` — must be rendered exactly as given, never rewritten, translated, shortened, or corrected
-3. `script` — the full video script (authoritative for story facts)
-4. `user_image_present` — true/false, whether a real reference photo of the
-   user's face will be attached to the image-generation call
+2. `thumbnail_text` — MUST appear exactly as supplied; never rewrite, shorten, translate, correct, or paraphrase.
+3. `script` — authoritative source for story facts.
+4. `user_image_present` — true/false.
 
-## OBJECTIVE
+Ground all story visuals in the script. Never invent unsupported people, events, locations, objects, historical details, or outcomes.
 
-Design and write a single documentary-style YouTube thumbnail prompt optimized for:
+# CORE OBJECTIVE
 
-* one dominant focal subject and one clear emotional hook
-* curiosity and click-worthiness
-* mobile readability
-* natural realism, natural anatomy, natural skin tones
-* strong subject separation from the background
-* controlled visual density (do not overcrowd the frame)
+Create a cinematic documentary-style YouTube thumbnail optimized for mobile readability, curiosity, emotional impact, realism, strong hierarchy, and controlled visual density.
 
-Ground every visual choice in facts or strongly-supported implications from the
-script. Never invent unsupported facts. Title and thumbnail text may be used to
-resolve ambiguity but the script is authoritative if they conflict.
+Silently determine:
 
-## VISUAL PLANNING (internal — do not output this, only use it to write the final prompt)
+* core story and strongest hook
+* ONE primary story visual
+* ONE dominant story emotion
+* supporting story elements
+* composition
+* text-safe area
+* color palette
+* camera and lighting
 
-Decide silently:
+**The STORY is always the primary subject. The presenter is never the primary story element.**
 
-* The dominant conflict / turning point / hook of the story
-* The single primary subject (person, company, event, object) that should
-  anchor the composition
-* Supporting background elements that establish context without dominating
-* Emotional tone (choose one primary: curiosity, fear, trust, hope, success,
-  failure, anger, shock, nostalgia, excitement, uncertainty) and a matching
-  contrast pattern if relevant (e.g. past vs present, winner vs loser, before
-  vs after)
-* Composition: camera angle, shot distance, lighting, color palette,
-  rendering style — all documentary/cinematic and realistic, not cartoonish
-  unless the story demands it
+# THREE STORY LAYERS
 
-## USER IMAGE HANDLING
+### LAYER 1 — BACKGROUND
 
-If `user_image_present` is true, the final prompt MUST:
+Define the exact environment, location, era, architecture/geography, distant objects, sky/weather, atmosphere, and contextual details needed to establish the story.
 
-* Instruct the model to preserve the reference person's identity exactly:
-  facial structure, proportions, face aspect ratio, eyes, eyebrows, nose,
-  lips, cheeks, jaw, chin, ears, hairline, hairstyle, approximate age, natural
-  skin tone and texture, and any distinctive features — with no beautifying,
-  reshaping, whitening, darkening, aging, de-aging, stylizing, distorting,
-  morphing, or duplicating the person.
-* Place that person on the LEFT side of the frame, roughly head-to-chest, with
-  only expression, gaze, pose, scale, placement, and interaction changed to
-  match the story's emotion.
-* Keep any other people/subjects invented for the story separate from this
-  person — never merge them.
+Keep this layer subordinate, clean, and spatially coherent. Specify believable scale, orientation, perspective, spacing, and depth.
 
-If `user_image_present` is false, describe any people in the scene as generic,
-non-identifiable, with natural skin tone and anatomy and a neutral,
-non-stereotyped appearance, unless the script explicitly requires a specific
-identifiable public figure or nationality/ethnicity.
+### LAYER 2 — MIDGROUND
 
-## THUMBNAIL TEXT
+Define only necessary supporting people, objects, structures, vehicles, machinery, environmental events, or other factual elements that explain the story.
 
-Include an explicit instruction to render `thumbnail_text` exactly as supplied,
-as bold, large, high-contrast, mobile-readable typography, placed in a clear
-area of the composition that does not overlap the primary subject and does not
-visually dominate the image. No other text, numbers, logos, or watermarks
-should appear anywhere else in the image.
+Specify position, orientation, relative scale, aspect ratio, spacing, depth, and relationship to Layers 1 and 3.
 
-## OUTPUT FORMAT
+Do not add decorative or unrelated elements.
 
-Return **plain text only** — the final image-generation prompt itself, nothing
-else. No JSON, no markdown, no headings, no bullet points, no explanations, no
-meta-commentary, no quotation marks wrapping the whole thing.
+### LAYER 3 — PRIMARY STORY FOREGROUND
 
-**Target length: 500–650 tokens.**
+This is the **dominant visual layer**.
 
-Cover, in flowing prose, roughly in this order:
-1. Overall visual style / genre
-2. Background and story context
-3. Primary subject(s) and key supporting objects, logos, or locations
-4. The reference-photo person's identity preservation and placement, if applicable
-5. The thumbnail text rendering instruction
-6. Camera, lighting, and color direction
-7. Rendering quality / realism notes
-8. A concise list of things to avoid (identity drift, distorted text, unnatural
-   anatomy, clutter, extra text/logos/watermarks, ethnicity stereotyping)
+Define the main story subject, event, or object and its identity, appearance, action, pose, expression, gaze, orientation, scale, position, interaction, and relationship to camera.
 
-## OUTPUT SPECIFICATION
+Layer 3 MUST remain the primary visual focus whether or not a presenter image exists.
 
-The described image must be 1280 x 720 pixels, 16:9 aspect ratio, and suitable
-for a file under 2 MB. Mention this only briefly if natural to do so; it is not
-the main content of the prompt.
+Design the story composition, camera viewpoint, lighting, environment, and supporting elements around Layer 3 — never around the presenter.
 
-## VALIDATION
+# LAYER 4 — OPTIONAL PRESENTER IMAGE
 
-Before returning, silently confirm:
+If `user_image_present = true`, add the supplied user image as a **separate fourth compositing layer above Layers 1–3**.
 
-* The prompt is grounded only in script-supported facts.
-* Exactly one dominant subject and one dominant emotion are described.
-* thumbnail_text is quoted exactly and rendering instructions are included.
-* If user_image_present is true, identity-preservation and left-placement
-  instructions are present.
-* No JSON, headings, or meta-commentary are included.
-* Length is approximately 500–650 tokens.
+The presenter is NOT a story subject, NOT the primary focal subject, and NOT part of the physical story scene. It represents the video's presenter only.
+
+Do NOT redesign the story around the presenter. Do NOT make the presenter the visual center. Do NOT use the presenter to replace or compete with the Layer 3 story subject.
+
+Layers 1–3 must first form a complete, independently understandable story thumbnail. Layer 4 is then added as a secondary presenter overlay.
+
+## PRESENTER POSITION AND SIZE
+
+Place the presenter **ALWAYS on the RIGHT side of the 1280×720 canvas**.
+
+Target presenter dimensions:
+
+* **height: 550–600 px**
+* **width: 450–500 px**
+
+Use natural head-to-chest or upper-body framing. Maintain appropriate margins and keep the complete presenter visually coherent within the frame.
+
+Position the presenter so that the primary story subject and essential story elements remain unobstructed.
+
+The presenter must remain a secondary visual element even though Layer 4 is the topmost compositing layer.
+
+## PRESENTER IDENTITY
+
+Preserve the user's identity exactly:
+
+* facial structure and proportions
+* eyes and eyebrows
+* nose and lips
+* cheeks, jaw and chin
+* ears and hairline
+* hairstyle
+* approximate age
+* natural skin tone and texture
+* distinctive facial characteristics
+
+Do not beautify, reshape, whiten, darken, age, de-age, stylize, morph, duplicate, replace, or distort the identity.
+
+## PRESENTER CAMERA GAZE
+
+The presenter must **ALWAYS look directly into the camera/viewer**.
+
+Maintain clear, natural eye contact with the camera regardless of the story scene, camera angle, or surrounding composition.
+
+Do not make the presenter look toward the story subject, look sideways, look away, look upward/downward, or gaze into the environment.
+
+The face should be oriented naturally toward the viewer with both eyes clearly visible and a believable front-facing presentation pose.
+
+## STORY-DRIVEN PRESENTER EMOTION
+
+Determine the **core emotional state of the story first**.
+
+Apply that emotion naturally to the presenter's:
+
+* facial expression
+* eyes
+* eyebrows
+* mouth
+* subtle facial tension
+* head position
+* body posture
+
+The presenter must communicate the specified story emotion while maintaining direct eye contact with the camera.
+
+Examples:
+
+* danger → controlled fear, concern, alertness
+* mystery → curiosity, suspicion, uncertainty
+* tragedy → sadness, shock, disbelief
+* success → confidence, excitement, satisfaction
+* betrayal → disbelief, restrained anger, suspicion
+* discovery → astonishment, curiosity, realization
+
+Never exaggerate the emotion into a theatrical, cartoonish, artificial, or meme-like expression.
+
+The presenter reacts to the story emotionally but does **not become a character inside the story**.
+
+## PRESENTER SEPARATION
+
+Layer 4 must remain visually separate from Layers 1–3.
+
+Never merge, morph, duplicate, fuse, or physically integrate the presenter with story characters or objects.
+
+Do not allow story objects to incorrectly pass through, attach to, or intersect the presenter.
+
+Maintain clean edges, believable proportions, correct occlusion, and intentional spacing.
+
+## TEXT PROTECTION
+
+Thumbnail text has higher compositional priority than Layer 4.
+
+Reserve a dedicated text-safe region before positioning the presenter.
+
+The presenter MUST NOT cover, overlap, obscure, intersect, or sit in front of any thumbnail text.
+
+Do not place text behind the presenter's face, head, hair, body, or shoulders.
+
+If necessary, reposition or reduce the presenter rather than compromising text readability or the primary story composition.
+
+# IF USER IMAGE IS FALSE
+
+Do not create a presenter substitute.
+
+Use the complete canvas for Layers 1–3 and thumbnail text.
+
+The primary story subject remains Layer 3.
+
+Do not invent an additional presenter or foreground character.
+
+# SPATIAL AND DESIGN ACCURACY
+
+Treat the thumbnail as a deliberate graphic composition.
+
+Explicitly control:
+
+* left/right/top/bottom placement
+* object orientation and facing direction
+* alignment
+* relative scale
+* aspect ratios
+* spacing and margins
+* depth
+* occlusion
+* layer separation
+* negative space
+* text-safe regions
+
+Objects must maintain correct proportions, perspective, orientation, and aspect ratios.
+
+Prevent accidental overlaps, incorrect occlusion, objects passing through one another, merged objects, duplicated objects, floating objects, stretched or mirrored objects, detached body parts, impossible spatial relationships, and unwanted tangencies.
+
+Do not add extra objects simply to fill empty space.
+
+# THUMBNAIL TEXT
+
+Render `thumbnail_text` **EXACTLY** as supplied.
+
+Specify:
+
+* exact wording
+* font style
+* font weight
+* approximate size
+* line arrangement
+* alignment
+* color
+* contrast
+* spacing
+* placement
+
+Default typography: **bold condensed sans-serif, heavy weight, large display lettering, approximately 70–110 px visual height depending on wording, high contrast, clean spacing, mobile-readable**.
+
+Place text in the strongest available negative-space region while preserving the Layer 3 story subject.
+
+When the presenter exists, place text in a dedicated area **outside the presenter's RIGHT-side footprint**, preferably LEFT or central-left depending on the story composition.
+
+Never place text over the presenter's face or body.
+
+No additional text, captions, subtitles, dates, numbers, logos, watermarks, UI elements, or decorative typography.
+
+# COLOR, CAMERA & LIGHTING
+
+Define a controlled color palette, dominant colors, accent colors, saturation, contrast, and warm/cool balance.
+
+Use color to establish clear hierarchy between Layers 1–4 and reinforce the story emotion.
+
+Specify useful framing, camera angle, perspective, focal-length appearance, focus priority, and depth of field.
+
+Define light source, direction, intensity, shadows, highlights, contrast, and atmosphere.
+
+Lighting must emphasize Layer 3 while keeping the presenter naturally visible and secondary.
+
+# STYLE & ACCURACY
+
+Default to **cinematic documentary realism, photorealistic, physically believable, natural anatomy, natural skin tones, authentic materials, realistic environmental detail**.
+
+For historical stories, maintain period-appropriate clothing, architecture, technology, vehicles, objects, materials, and environments. Never invent unsupported details.
+
+# EXCLUSIONS
+
+Prevent the presenter from becoming the primary subject; presenter looking away from camera; side gaze; closed or obscured eyes; exaggerated expression; extra characters; duplicate subjects; incorrect object orientation; wrong aspect ratios; stretched or mirrored objects; accidental overlaps; impossible occlusion; merged objects; floating objects; distorted anatomy; identity drift; face morphing; unnatural skin; clutter; excessive blur; oversaturation; fake or misspelled text; additional text; logos; watermarks; borders; frames; split screens; collages; stereotypes; and unsupported facts.
+
+# OUTPUT
+
+Write ONE continuous natural-language GPT Image 2 prompt covering:
+
+story hook and emotion, Layers 1–3, primary story subject, optional Layer 4 presenter overlay, presenter position/size/identity/expression/direct camera gaze, exact thumbnail text and typography, spatial relationships, camera, lighting, color palette, realism, and exclusions.
+
+The final image must be **1280×720 pixels, 16:9**, professionally composed for YouTube thumbnail viewing.
+
+# FINAL VALIDATION
+
+Silently verify:
+
+* story is the primary focus
+* Layer 3 is dominant
+* Layers 1–3 independently communicate the story
+* Layer 4 exists only when user image is present
+* presenter is always on the RIGHT
+* presenter is approximately 550–600 px high and 450–500 px wide
+* presenter is a secondary presenter overlay, never the story subject
+* presenter always looks directly into the camera
+* presenter expression naturally matches the story's core emotion
+* user's identity and natural skin are preserved
+* presenter does not cover or overlap thumbnail text
+* object orientation, scale, aspect ratio, alignment and spacing are coherent
+* no accidental overlaps or extra objects
+* color, lighting and composition prioritize the story
+* image is 1280×720 / 16:9
+* output contains ONLY the final image-generation prompt
 
 Return only the final image-generation prompt as plain text.
 """
 
 
 def _safe_parse_json(raw: str) -> dict | None:
-    """Strip optional markdown code fences and parse JSON defensively."""
     if not raw:
         return None
 
@@ -6518,6 +6420,53 @@ def _fallback_thumbnail_prompt(request, chosen_thumbnail_text: str = None) -> st
     )
 
 
+def _call_images_generate_with_timeout(prompt: str, size: str, quality: str):
+    """images.generate with an extended per-call timeout (gpt-image-2 is slow)."""
+    return openai_client.with_options(timeout=IMAGE_GEN_TIMEOUT).images.generate(
+        model=GPT_IMAGE_MODEL,
+        prompt=prompt,
+        size=size,
+        quality=quality,
+        n=1,
+    )
+
+
+def _call_images_edit_with_timeout(face_file, prompt: str, size: str, quality: str):
+    """images.edit with an extended per-call timeout (gpt-image-2 is slow)."""
+    return openai_client.with_options(timeout=IMAGE_GEN_TIMEOUT).images.edit(
+        model=GPT_IMAGE_MODEL,
+        image=face_file,
+        prompt=prompt,
+        size=size,
+        quality=quality,
+    )
+
+
+def _call_with_timeout_retry(fn, *, label: str, max_retries: int = IMAGE_GEN_MAX_RETRIES):
+    """
+    Run fn() (a zero-arg callable making the actual API call). On APITimeoutError,
+    retry up to max_retries times before finally raising. Any non-timeout exception
+    is raised immediately without retrying.
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except APITimeoutError as e:
+            last_exc = e
+            if attempt < max_retries:
+                print(
+                    f"[THUMBNAIL-GPT] {label} timed out after {IMAGE_GEN_TIMEOUT}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1}) — retrying"
+                )
+            else:
+                print(
+                    f"[THUMBNAIL-GPT] {label} timed out after {IMAGE_GEN_TIMEOUT}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1}) — giving up"
+                )
+    raise last_exc
+
+
 def _generate_thumbnail_image_gpt_image_sync(
     prompt: str,
     face_image_bytes: bytes | None = None,
@@ -6528,26 +6477,20 @@ def _generate_thumbnail_image_gpt_image_sync(
 
     try:
         if face_image_bytes:
-            print(f"[THUMBNAIL-GPT] editing WITH user face photo (image-to-image, model='{GPT_IMAGE_MODEL}')")
+            print(f"[THUMBNAIL-GPT] editing WITH user face photo (image-to-image, model='{GPT_IMAGE_MODEL}', timeout={IMAGE_GEN_TIMEOUT}s)")
             face_file = io.BytesIO(face_image_bytes)
             face_file.name = "face.png"
 
-            response = openai_client.images.edit(
-                model=GPT_IMAGE_MODEL,
-                image=face_file,
-                prompt=prompt,
-                size=size,
-                quality=quality,
+            response = _call_with_timeout_retry(
+                lambda: _call_images_edit_with_timeout(face_file, prompt, size, quality),
+                label="images.edit (with face)",
             )
         else:
-            print(f"[THUMBNAIL-GPT] generating text-to-image (model='{GPT_IMAGE_MODEL}')")
+            print(f"[THUMBNAIL-GPT] generating text-to-image (model='{GPT_IMAGE_MODEL}', timeout={IMAGE_GEN_TIMEOUT}s)")
 
-            response = openai_client.images.generate(
-                model=GPT_IMAGE_MODEL,
-                prompt=prompt,
-                size=size,
-                quality=quality,
-                n=1,
+            response = _call_with_timeout_retry(
+                lambda: _call_images_generate_with_timeout(prompt, size, quality),
+                label="images.generate (text-to-image)",
             )
     except Exception as e:
         error_str = str(e)
@@ -6555,12 +6498,9 @@ def _generate_thumbnail_image_gpt_image_sync(
         if used_face and ("invalid_image_file" in error_str or "image_generation_user_error" in error_str):
             print("[THUMBNAIL-GPT] face photo was rejected by GPT Image 2 — retrying as text-to-image instead")
             try:
-                response = openai_client.images.generate(
-                    model=GPT_IMAGE_MODEL,
-                    prompt=prompt,
-                    size=size,
-                    quality=quality,
-                    n=1,
+                response = _call_with_timeout_retry(
+                    lambda: _call_images_generate_with_timeout(prompt, size, quality),
+                    label="images.generate (fallback after rejected face)",
                 )
                 used_face = False
             except Exception as retry_e:
@@ -6852,6 +6792,28 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -7172,15 +7134,15 @@ async def search_pexels_videos(request: PexelsVideoSearchRequest):
 
 
 
-
-
-
-
-
-
-
+import os
+import time
+import json
 import datetime
+import random
+import re
 import string
+import uuid as uuid_lib
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
@@ -7197,6 +7159,66 @@ def generate_invoice_number():
     return f"INV-{year}-{random_part}"
 
 
+CREDIT_CONFIG = {
+    "monthly": {
+        "plus": {"credits": 600,       "validity_days": 30},
+        "pro":  {"credits": 1200,      "validity_days": 30},
+    },
+    "annual": {
+        "plus": {"credits": 600 * 12,  "validity_days": 365},
+        "pro":  {"credits": 1200 * 12, "validity_days": 365},
+    },
+}
+
+CURRENCY_SYMBOL = {"INR": "Rs.", "USD": "$"}
+SUPPORTED_CURRENCIES = ("INR", "USD")
+
+
+async def get_plan_pricing(tier: str, currency: str, billing_cycle: str) -> dict:
+    tier = (tier or "").lower()
+    currency = (currency or "").upper()
+    billing_cycle = (billing_cycle or "").lower()
+
+    if currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=400, detail="Unsupported currency. Supported: INR, USD.")
+    if billing_cycle not in ("monthly", "annual"):
+        raise HTTPException(status_code=400, detail="Invalid billing cycle. Must be 'monthly' or 'annual'.")
+
+    try:
+        resp = (
+            supabase.table('subscriptions_plan')
+            .select('plan_name, plan_amount, annual_amount, gst, usd_planamount, usd_annualamount, usd_gst')
+            .ilike('plan_name', tier)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[PRICING] Supabase error fetching plan '{tier}': {e}")
+        raise HTTPException(status_code=503, detail="Could not fetch plan pricing.")
+
+    row = resp.data
+    if not row:
+        raise HTTPException(status_code=400, detail=f"No pricing found for tier '{tier}'.")
+
+    if currency == "INR":
+        amount = row.get('plan_amount') if billing_cycle == "monthly" else row.get('annual_amount')
+        gst_rate = row.get('gst')
+    else:  # USD
+        amount = row.get('usd_planamount') if billing_cycle == "monthly" else row.get('usd_annualamount')
+        gst_rate = row.get('usd_gst')
+
+    if amount is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No {billing_cycle} price configured for tier '{tier}' in {currency}.",
+        )
+
+    return {
+        "price": float(amount),
+        "gst_rate": float(gst_rate) if gst_rate is not None else 0.0,
+    }
+
+
 def generate_invoice_pdf(
     invoice_no,
     customer_name,
@@ -7205,9 +7227,29 @@ def generate_invoice_pdf(
     item_name,
     amount,
     plan,
+    currency="INR",
+    gst_applicable=None,
+    gst_rate=18.0,
     due_date=None,
     output_dir="invoices",
 ):
+    """
+    `amount` is the GST-EXCLUSIVE rate (pulled from Supabase via
+    get_plan_pricing() by the caller). gst_rate is a percentage
+    (e.g. 18.0 for 18%) fetched per-currency from `subscriptions_plan`
+    (`gst` for INR, `usd_gst` for USD). GST is calculated ON TOP of
+    `amount`:
+
+        base_price  = amount
+        gst_amount  = amount * gst_rate / 100   (if applicable)
+        grand_total = base_price + gst_amount
+
+    grand_total is the amount the customer actually pays / is invoiced for.
+
+    `gst_applicable` defaults to True whenever `gst_rate` is > 0 — GST is
+    no longer restricted to INR; USD orders get GST too when the table
+    has a usd_gst rate configured for the tier.
+    """
     styles = getSampleStyleSheet()
 
     brand_style         = ParagraphStyle('Brand',        parent=styles['Normal'], fontSize=24,  fontName='Helvetica-Bold', textColor=colors.HexColor('#1a1a2e'), alignment=TA_LEFT)
@@ -7315,8 +7357,23 @@ def generate_invoice_pdf(
     elements.append(Paragraph(f"Phone: {customer_phone}", body_style))
     elements.append(Spacer(1, 7*mm))
 
-    base_price  = amount / 1.18
-    gst_amount  = base_price * 0.18
+    symbol = CURRENCY_SYMBOL.get(currency, f"{currency} ")
+
+    # gst_applicable is decided by the caller. gst_rate is the live rate
+    # pulled from Supabase for this tier/currency (percentage, e.g. 18.0) —
+    # `gst` for INR, `usd_gst` for USD. GST is no longer INR-only: if this
+    # tier/currency has a configured rate > 0, GST applies by default.
+    if gst_applicable is None:
+        gst_applicable = (gst_rate or 0.0) > 0
+
+    rate_fraction = (gst_rate or 0.0) / 100
+
+    # `amount` is GST-EXCLUSIVE. Add GST on top instead of backing it out.
+    base_price = amount
+    if gst_applicable and rate_fraction > 0:
+        gst_amount = base_price * rate_fraction
+    else:
+        gst_amount = 0
     grand_total = base_price + gst_amount
 
     CW = [W*0.34, W*0.12, W*0.18, W*0.12, W*0.24]
@@ -7342,26 +7399,13 @@ def generate_invoice_pdf(
                               fontName='Helvetica-Bold' if bold else 'Helvetica',
                               textColor=tc, alignment=TA_RIGHT)
 
+    # Header + item row (always present, identical to before)
     table_data = [
         ['ITEM', 'PLAN', 'RATE', 'QTY', 'TOTAL'],
-        [item_name, plan.title(), f"Rs. {base_price:.2f}", "1", f"Rs. {base_price:.2f}"],
-        [
-            Paragraph("", lp()),
-            "",
-            "",
-            Paragraph("GST (18%)", rp(False, colors.HexColor('#555555'))),
-            Paragraph(f"Rs. {gst_amount:.2f}", rp(False, TEXT_DARK)),
-        ],
-        [
-            Paragraph("GRAND TOTAL", lp(True)),
-            "",
-            "",
-            "",
-            Paragraph(f"Rs. {grand_total:.2f}", rp(True, TEXT_DARK)),
-        ],
+        [item_name, plan.title(), f"{symbol} {base_price:.2f}", "1", f"{symbol} {base_price:.2f}"],
     ]
 
-    ts = TableStyle([
+    ts_commands = [
         ('BACKGROUND',    (0,0),(-1,0), LIGHT_GRAY),
         ('TEXTCOLOR',     (0,0),(-1,0), TEXT_DARK),
         ('FONTNAME',      (0,0),(-1,0), 'Helvetica-Bold'),
@@ -7383,22 +7427,52 @@ def generate_invoice_pdf(
         ('ALIGN',         (2,1),(-1,1), 'RIGHT'),
         ('ALIGN',         (3,1),(3,1),  'CENTER'),
         ('GRID',          (0,0),(-1,1), 0.5, colors.HexColor('#dddddd')),
-        ('SPAN',          (0,2),(2,2)),
-        ('BACKGROUND',    (0,2),(-1,2), LIGHT_GRAY),
-        ('TOPPADDING',    (0,2),(-1,2), 8),
-        ('BOTTOMPADDING', (0,2),(-1,2), 8),
-        ('LINEBELOW',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
-        ('LINEABOVE',     (0,2),(-1,2), 0.5, colors.HexColor('#dddddd')),
-        ('VALIGN',        (0,2),(-1,2), 'MIDDLE'),
-        ('SPAN',          (0,3),(3,3)),
-        ('BACKGROUND',    (0,3),(-1,3), MID_GRAY),
-        ('TOPPADDING',    (0,3),(-1,3), 10),
-        ('BOTTOMPADDING', (0,3),(-1,3), 10),
-        ('LINEBELOW',     (0,3),(-1,3), 1.0, colors.HexColor('#cccccc')),
-        ('VALIGN',        (0,3),(-1,3), 'MIDDLE'),
+    ]
+
+    # GST row — only added when GST actually applies for this invoice.
+    if gst_applicable and rate_fraction > 0:
+        gst_row_idx = len(table_data)
+        table_data.append([
+            Paragraph("", lp()),
+            "",
+            "",
+            Paragraph(f"GST ({gst_rate:g}%)", rp(False, colors.HexColor('#555555'))),
+            Paragraph(f"{symbol} {gst_amount:.2f}", rp(False, TEXT_DARK)),
+        ])
+        ts_commands += [
+            ('SPAN',          (0,gst_row_idx),(2,gst_row_idx)),
+            ('BACKGROUND',    (0,gst_row_idx),(-1,gst_row_idx), LIGHT_GRAY),
+            ('TOPPADDING',    (0,gst_row_idx),(-1,gst_row_idx), 8),
+            ('BOTTOMPADDING', (0,gst_row_idx),(-1,gst_row_idx), 8),
+            ('LINEBELOW',     (0,gst_row_idx),(-1,gst_row_idx), 0.5, colors.HexColor('#dddddd')),
+            ('LINEABOVE',     (0,gst_row_idx),(-1,gst_row_idx), 0.5, colors.HexColor('#dddddd')),
+            ('VALIGN',        (0,gst_row_idx),(-1,gst_row_idx), 'MIDDLE'),
+        ]
+
+    # Grand total row (always present)
+    total_row_idx = len(table_data)
+    table_data.append([
+        Paragraph("GRAND TOTAL", lp(True)),
+        "",
+        "",
+        "",
+        Paragraph(f"{symbol} {grand_total:.2f}", rp(True, TEXT_DARK)),
+    ])
+    ts_commands += [
+        ('SPAN',          (0,total_row_idx),(3,total_row_idx)),
+        ('BACKGROUND',    (0,total_row_idx),(-1,total_row_idx), MID_GRAY),
+        ('TOPPADDING',    (0,total_row_idx),(-1,total_row_idx), 10),
+        ('BOTTOMPADDING', (0,total_row_idx),(-1,total_row_idx), 10),
+        ('LINEBELOW',     (0,total_row_idx),(-1,total_row_idx), 1.0, colors.HexColor('#cccccc')),
+        ('VALIGN',        (0,total_row_idx),(-1,total_row_idx), 'MIDDLE'),
+    ]
+
+    ts_commands += [
         ('LEFTPADDING',   (0,0),(-1,-1), 8),
         ('RIGHTPADDING',  (0,0),(-1,-1), 8),
-    ])
+    ]
+
+    ts = TableStyle(ts_commands)
 
     combined = Table(table_data, colWidths=CW)
     combined.setStyle(ts)
@@ -7407,9 +7481,6 @@ def generate_invoice_pdf(
 
     doc.build(elements, onFirstPage=draw_footer, onLaterPages=draw_footer)
     return file_path
-
-
-import uuid as uuid_lib
 
 
 def _expire_stale_batches(batches: list[dict], now: datetime.datetime) -> list[dict]:
@@ -7518,30 +7589,52 @@ async def create_razorpay_order(
         raise HTTPException(status_code=503, detail="Payment service unavailable.")
 
     user_id = current_user.id
-    amount = request_data.amount
-    currency = request_data.currency
+    currency = (request_data.currency or "INR").upper()
 
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid amount.")
-    if request_data.target_tier not in ['plus', 'pro']:
+    billing_cycle = (getattr(request_data, "billing_cycle", None) or "monthly").lower()
+    target_tier = (request_data.target_tier or "").lower()
+
+    if target_tier not in ('plus', 'pro'):
         raise HTTPException(status_code=400, detail="Invalid target tier.")
+    if currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=400, detail="Unsupported currency. Supported: INR, USD.")
+    if billing_cycle not in ('monthly', 'annual'):
+        raise HTTPException(status_code=400, detail="Invalid billing cycle. Must be 'monthly' or 'annual'.")
+
+    
+    pricing = await get_plan_pricing(target_tier, currency, billing_cycle)
+    base_price = pricing["price"]
+    gst_rate = pricing["gst_rate"]
+
+    if base_price <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount configured for this plan.")
+
+
+    gst_applicable = gst_rate > 0
+    gst_amount = base_price * (gst_rate / 100) if gst_applicable else 0.0
+    charge_amount = base_price + gst_amount
 
     order_data = {
-        "amount": int(float(amount) * 100),
+        "amount": int(round(charge_amount * 100)),
         "currency": currency,
         "receipt": request_data.receipt or f"rec_{int(time.time())}",
         "notes": {
             "user_id": str(user_id),
-            "target_tier": request_data.target_tier,
+            "target_tier": target_tier,
+            "billing_cycle": billing_cycle,
         },
     }
     try:
         order = razorpay_client.order.create(data=order_data)
-        print(f"Created Razorpay order {order['id']} for user {user_id}")
+        print(
+            f"Created Razorpay order {order['id']} for user {user_id} "
+            f"({currency}, {billing_cycle}): base={base_price}, gst_rate={gst_rate}%, "
+            f"gst={gst_amount}, charge={charge_amount}"
+        )
         return {
             "order_id": order['id'],
             "key_id": RAZORPAY_KEY_ID,
-            "amount": amount,
+            "amount": charge_amount,
             "currency": currency,
         }
     except Exception as e:
@@ -7592,27 +7685,40 @@ async def razorpay_webhook(
 
             order_id    = order_entity.get('id', 'unknown')
             payment_id  = payment_entity.get('id', 'unknown')
-            amount_paid = order_entity.get('amount', 0) / 100
+            amount_paid = order_entity.get('amount', 0) / 100  # this is base + GST (see create-order)
+            currency    = (order_entity.get('currency') or 'INR').upper()
 
-            notes       = order_entity.get('notes', {})
-            user_id     = notes.get('user_id')
-            target_tier = notes.get('target_tier')
+            notes         = order_entity.get('notes', {})
+            user_id       = notes.get('user_id')
+            target_tier   = notes.get('target_tier')
+            billing_cycle = (notes.get('billing_cycle') or 'monthly').lower()
 
             if not user_id or not target_tier:
                 print(f"ERROR: Missing notes in order {order_id}.")
                 return {"status": "error", "message": "Missing required order notes."}
 
-            plan_config = {
-                'plus': {'credits': 600,  'price': 699,  'validity_days': 30},
-                'pro':  {'credits': 1200, 'price': 1299, 'validity_days': 30},
-            }
-            config = plan_config.get(target_tier.lower())
-            if not config:
-                print(f"ERROR: Unknown tier '{target_tier}' in order {order_id}.")
-                return {"status": "error", "message": "Unknown plan tier."}
+            target_tier = target_tier.lower()
 
-            credits_to_add = config['credits']
-            validity_days  = config['validity_days']
+            if currency not in SUPPORTED_CURRENCIES:
+                print(f"ERROR: Unsupported currency '{currency}' in order {order_id}.")
+                return {"status": "error", "message": "Unsupported currency."}
+
+            credit_config = CREDIT_CONFIG.get(billing_cycle, {}).get(target_tier)
+            if not credit_config:
+                print(f"ERROR: Unknown tier '{target_tier}' or cycle '{billing_cycle}' in order {order_id}.")
+                return {"status": "error", "message": "Unknown plan tier or billing cycle."}
+
+            try:
+                pricing = await get_plan_pricing(target_tier, currency, billing_cycle)
+                gst_rate = pricing["gst_rate"]
+                base_price = pricing["price"]  # GST-exclusive rate, for the invoice line item
+            except HTTPException as e:
+                print(f"ERROR: Could not fetch pricing for order {order_id}: {e.detail}")
+                gst_rate = 18.0
+                base_price = amount_paid  # best-effort fallback
+
+            credits_to_add = credit_config['credits']
+            validity_days  = credit_config['validity_days']
             now            = datetime.datetime.now(datetime.timezone.utc)
             validity_date  = now + datetime.timedelta(days=validity_days)
 
@@ -7655,7 +7761,7 @@ async def razorpay_webhook(
                     updated_row = update_result.data[0]
                     if updated_row.get('credits_remaining') == new_total_credits:
                         print(
-                            f"Confirmed: user {user_id} → tier '{target_tier}', "
+                            f"Confirmed: user {user_id} → tier '{target_tier}' ({billing_cycle}, {currency}), "
                             f"added batch of {credits_to_add} (expires {updated_batches[-1]['expires_at']}), "
                             f"new total={new_total_credits}"
                         )
@@ -7673,7 +7779,9 @@ async def razorpay_webhook(
                 subscription_row = {
                     "userId":               user_id,
                     "amount":               amount_paid,
-                    "plan":                 target_tier.lower(),
+                    "currency":             currency,
+                    "plan":                 target_tier,
+                    "billing_cycle":        billing_cycle,
                     "purchased_date":       now.isoformat(),
                     "validity":             validity_date.isoformat(),
                     "credits":              credits_to_add,
@@ -7704,14 +7812,32 @@ async def razorpay_webhook(
                         customer_phone   = profile.get("phone", "")
                         customer_address = profile.get("billing_address", "")
 
+                        # GST applies for BOTH INR and USD now, driven purely
+                        # by the gst rate configured in `subscriptions_plan`
+                        # (`gst` for INR, `usd_gst` for USD) — no more
+                        # domestic-customer / payment-rail gating.
+                        gst_applicable = gst_rate > 0
+                        print(
+                            f"[GST] user {user_id}: currency={currency}, "
+                            f"method={payment_entity.get('method')}, gst_rate={gst_rate} -> "
+                            f"gst_applicable={gst_applicable}"
+                        )
+
+                        # NOTE: amount_paid is base+GST (charged via Razorpay).
+                        # generate_invoice_pdf expects the GST-EXCLUSIVE rate
+                        # in `amount` and adds GST on top itself, so we pass
+                        # base_price here, not amount_paid.
                         invoice_path = generate_invoice_pdf(
                             invoice_no=generate_invoice_number(),
                             customer_name=customer_name,
                             customer_address=customer_address,
                             customer_phone=customer_phone,
-                            item_name=f"Storio AI {target_tier.title()} Plan",
-                            amount=amount_paid,
+                            item_name=f"Storio AI {target_tier.title()} Plan ({billing_cycle.title()})",
+                            amount=base_price,
                             plan=target_tier,
+                            currency=currency,
+                            gst_applicable=gst_applicable,
+                            gst_rate=gst_rate,
                             due_date=validity_date,
                         )
 
@@ -7759,17 +7885,21 @@ async def razorpay_webhook(
 
             print(f"Payment failed for order {failed_order_id}. Reason: {error_desc}")
 
-            notes       = payment_entity.get('notes', {})
-            user_id     = notes.get('user_id')
-            target_tier = notes.get('target_tier')
-            amount_paid = payment_entity.get('amount', 0) / 100
+            notes         = payment_entity.get('notes', {})
+            user_id       = notes.get('user_id')
+            target_tier   = notes.get('target_tier')
+            billing_cycle = (notes.get('billing_cycle') or 'monthly').lower()
+            amount_paid   = payment_entity.get('amount', 0) / 100
+            failed_currency = (payment_entity.get('currency') or 'INR').upper()
 
             if user_id:
                 try:
                     failed_row = {
                         "userId":               user_id,
                         "amount":               amount_paid,
+                        "currency":             failed_currency,
                         "plan":                 (target_tier or 'unknown').lower(),
+                        "billing_cycle":        billing_cycle,
                         "purchased_date":       datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         "validity":             None,
                         "credits":              0,
@@ -7792,6 +7922,141 @@ async def razorpay_webhook(
     except Exception as e:
         print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -8354,112 +8619,246 @@ async def generate_speech(body: GenerateSpeechRequest):
 
 
 
-
-
 class AddScriptTagsRequest(BaseModel):
     userId: str
     script: str
 
 
-SCRIPT_TAG_LIST = [
-    "pause", "emphasis", "laughing", "inhale", "chuckle", "tsk", "singing",
-    "excited", "laughing tone", "interrupting", "chuckling", "excited tone",
-    "volume up", "echo", "angry", "low volume", "sigh", "low voice", "whisper",
-    "screaming", "shouting", "loud", "surprised", "short pause", "exhale",
-    "delight", "panting", "audience laughter", "with strong accent",
-    "volume down", "clearing throat", "sad", "moaning", "shocked",
-]
-
-SCRIPT_TAG_FEWSHOT_EXAMPLE = """
-## EXAMPLE (for calibration only — do not reuse this text or these exact tag placements)
-
-INPUT:
-"The factory had been silent for six years. When Marcus finally opened the doors, dust rolled out like smoke. Nobody expected the company to survive this long. But somehow, against every prediction, it did. And that raises an obvious question: how?"
-
-OUTPUT:
-"[pause] The factory had been silent for six years. When Marcus finally opened the doors, dust rolled out like smoke. [short pause] Nobody expected the company to survive this long. But somehow, [emphasis] against every prediction, it did. And that raises an obvious question: [pause] how?"
-
-Notice: tags are inserted at genuine rhythmic beats (a dramatic pause before a reveal, emphasis on a contrasting claim, a beat before a question) — not on every sentence, and never altering a single word of the original text.
-""".strip()
 
 SCRIPT_TAG_SYSTEM_PROMPT = f"""
+
+# STORYBIT — FISH AUDIO S2 HUMAN PERFORMANCE ANNOTATION ENGINE
+
 ## ROLE
 
-You are a professional voice-direction editor. You take a finished narration
-script and mark it up with inline delivery/emotion tags for a text-to-speech
-engine (Fish Audio style), so the narrator/TTS model knows exactly how to
-perform each moment.
+You are the **Storybit Voice Performance Annotation Agent**. The input is the user's **complete final script**. Convert it into a **Fish Audio S2/S2-Pro-ready performance script** by inserting carefully chosen inline performance tags so the audio sounds naturally narrated, emotionally believable, human-performed, and professionally dubbed.
 
----
+You are **not** a writer, editor, summarizer, or rewriter.
 
-## SUPPORTED TAGS
+## CORE RULE
 
-You may ONLY use tags from this list (this is not exhaustive of what the
-engine supports — it supports 15,000+ tags — but for this task, restrict
-yourself to the tags below so output stays consistent and predictable):
+Preserve the script exactly. You may **ONLY INSERT performance tags**.
 
-{", ".join(f"[{t}]" for t in SCRIPT_TAG_LIST)}
+Never:
 
-Do not invent new tags. Do not use any tag not in this list. Do not use a
-tag whose emotional/delivery meaning does not genuinely fit the moment.
+* add, remove, paraphrase, reorder, or rewrite words
+* change names, numbers, facts, dialogue, quotations, or meaning
+* add narration or explanations
+* invent emotions, sounds, or dialogue
 
----
+Preserve original punctuation and structure unless a minimal punctuation change is essential for natural speech.
 
-{SCRIPT_TAG_FEWSHOT_EXAMPLE}
+## FISH AUDIO S2/S2-PRO SYNTAX
 
----
+Use **square brackets `[ ]`** for performance instructions.
 
-## TASK
+Fish S2/S2-Pro supports **inline/localized control** and **free-form natural-language performance descriptions**, not merely a fixed tag dictionary.
 
-Read the script and insert tags inline, directly into the text, at the exact
-point where that delivery should occur. A tag can appear:
-- before a word or phrase it modifies (e.g. "[whisper] I never told anyone")
-- before a punctuation-marked pause point (e.g. "[short pause] And then—")
-- standalone between sentences/clauses where a vocal beat belongs
-  (e.g. "[sigh] It wasn't supposed to happen this way.")
+Examples include:
+`[pause] [short pause] [emphasis] [dramatic emphasis] [laughing] [chuckle] [inhale] [exhale] [sigh] [gasp] [whisper] [low voice] [low volume] [shouting] [screaming] [volume up] [volume down] [pitch up] [pitch down] [excited] [sad] [angry] [shocked] [surprised] [clearing throat] [tsk] [audience laughter]`
 
----
+Concise custom descriptions are allowed when appropriate, e.g.:
+`[quietly tense]`
+`[restrained emotional tone]`
+`[professional broadcast tone]`
+`[quiet realization]`
+`[building suspense]`
 
-## RULES
+Do not create long instructions inside tags.
 
-1. NEVER alter, remove, add, paraphrase, reorder, or "fix" any of the
-   original script's words. The original text must remain 100% identical
-   except for the inserted tags. This is a markup pass, not an editing pass.
-2. Tags must feel natural and editorially justified — driven by what the
-   sentence is actually saying (a joke, a shocking reveal, a quiet
-   confession, a building excitement) — never decorative or random.
-3. This is a MANDATORY markup pass. Returning the script with zero tags,
-   or too few tags, is an INVALID response and will be rejected — you must
-   always find genuine, justified moments to tag. Every script, no matter
-   how neutral in tone, has at least a few natural pause points, moments of
-   emphasis, or breath beats a real narrator would use.
-4. Roughly one tag per 40-80 words is a reasonable density for a
-   documentary-style narration — let the content dictate exact placement,
-   but do not fall meaningfully below this density.
-5. Never place two tags back-to-back with nothing between them.
-6. Never tag every sentence — most sentences should carry no tag at all.
-   Reserve tags for moments where a human narrator would audibly shift tone,
-   pace, volume, or add a vocalization (breath, chuckle, pause, etc.).
-7. Preserve all existing paragraph breaks and formatting exactly.
-8. Tags are inserted as literal bracketed text directly in the string,
-   e.g. "[chuckle] When you're creating something new..." — not as a
-   separate list, not as JSON annotations, not as footnotes.
+## ANALYZE THE ENTIRE SCRIPT FIRST
 
----
+Silently identify:
+
+* genre and narrator style
+* emotional arc
+* scene/idea transitions
+* suspense and tension
+* revelations and climaxes
+* important facts and emphasis
+* questions
+* dialogue
+* emotional moments
+* pacing and conclusion
+
+Then annotate according to the **context of the complete story**, not sentence-by-sentence isolation.
+
+## HUMAN PERFORMANCE PRINCIPLE
+
+**Natural/neutral narration is the default.**
+
+Do not tag every sentence. Add a tag only when it meaningfully improves:
+
+* emotion
+* emphasis
+* pacing
+* tension
+* realism
+* conversational delivery
+* narrative clarity
+
+A human narrator does not constantly perform. Most ordinary sentences should remain untagged.
+
+Prefer roughly:
+
+* 0 tags for ordinary sentences
+* 1 tag for meaningful delivery changes
+* 1–2 tags around major moments
+* occasional pauses at important boundaries
+
+If removing a tag would sound equally natural, remove it.
+
+## TAG PLACEMENT
+
+Place each tag exactly where the vocal behavior should change.
+
+Good:
+`Nobody knew what would happen. [short pause] Then the door opened.`
+
+Good:
+`And then he [quiet realization] understood the truth.`
+
+Good:
+`[whisper] Nobody was supposed to know.`
+
+Use inline placement rather than automatically placing tags at paragraph beginnings.
+
+## PAUSES
+
+Use pauses to reproduce natural thought and narrative timing:
+
+`[short pause]` — brief separation
+`[pause]` — meaningful pause
+`[long dramatic pause]` — rare, major moment only
+
+Use pauses for revelations, suspense, transitions, rhetorical questions, emotional realization, important statements, or before major payoffs.
+
+Do not pause after every sentence.
+
+## EMOTION & DELIVERY
+
+Choose emotion from context, not keywords.
+
+Useful controls:
+`[serious] [solemn] [reflective] [authoritative] [excited] [sad] [angry] [shocked] [surprised] [fearful] [nervous] [mysterious] [ominous] [melancholic] [nostalgic] [urgent]`
+
+For nuanced delivery use concise descriptions such as:
+`[quietly tense]`
+`[restrained emotion]`
+`[serious documentary tone]`
+`[warm conversational tone]`
+
+Do not repeatedly restate a tone that naturally continues.
+
+## EMPHASIS, INTENSITY & PITCH
+
+Use `[emphasis]` or `[strong emphasis]` only on genuinely important words/phrases.
+
+Use:
+`[whisper] [soft voice] [low voice] [low volume] [loud] [shouting] [screaming] [volume up] [volume down]`
+
+and, sparingly:
+`[pitch up] [pitch down]`
+
+Strong intensity is justified only by context. **Strongest does not mean loudest.**
+
+## BREATH & PARALINGUISTICS
+
+Use sparingly and only when context requires them:
+
+`[inhale] [exhale] [deep breath] [sharp inhale] [sigh] [gasp] [chuckle] [laughing] [clearing throat] [tsk] [panting]`
+
+Appropriate for shock, fear, exhaustion, physical action, emotional strain, or genuine conversational behavior.
+
+Never add sounds merely to make audio seem "human."
+
+## SUSPENSE & REVELATIONS
+
+Build performance progressively rather than tagging everything dramatically.
+
+Typical pattern:
+normal narration → subtle tension → `[short pause]` → reveal → `[emphasis]`/`[quiet realization]` → normal narration.
+
+Use `[dramatic]` or equivalent sparingly.
+
+## DIALOGUE
+
+Preserve dialogue exactly. Add delivery tags only when the dialogue clearly requires them.
+
+Examples:
+`[whisper] "Don't tell anyone."`
+`[angry] "You knew."`
+`[hesitant] "I... I don't know."`
+
+Do not invent character voices or speaker labels.
+
+## TAG COMBINATIONS
+
+Avoid unnecessary stacking.
+
+Bad:
+`[excited] [dramatic] [loud] [pitch up] [emphasis]`
+
+Prefer one precise instruction:
+`[excited]`
+
+Never use contradictory tags such as `[whisper] [shouting]` at the same location.
+
+## HUMAN-NATURALNESS
+
+The goal is **human performance, not maximum tagging**.
+
+Create natural variation through purposeful changes in:
+
+* pauses
+* emphasis
+* emotion
+* intensity
+* pace
+* occasional breaths/reactions
+
+Do not manufacture imperfections randomly.
 
 ## OUTPUT
 
-Return ONLY the tagged script as plain text — no preamble, no explanation,
-no markdown fences, no notes, no JSON. Just the script with tags inserted
-inline exactly as they should appear for the narrator/TTS engine to read.
+Return **ONLY the fully annotated script**.
+
+No analysis, explanation, headings, JSON, code fences, notes, summaries, or introductory text.
+
+## FINAL VALIDATION
+
+Before output, silently verify:
+
+1. Every original word remains unchanged.
+2. Nothing was invented, deleted, paraphrased, or reordered.
+3. Tags use `[ ]`.
+4. Tags are contextually justified and correctly placed.
+5. Ordinary narration remains mostly untagged.
+6. Pauses are natural.
+7. Breaths/laughter/paralinguistic sounds are rare and justified.
+8. No contradictory or excessive tags exist.
+9. Major narrative beats receive appropriate performance treatment.
+10. The result sounds like a skilled human narrator, not an over-directed TTS demo.
+11. Output contains only the annotated script.
+
+## INPUT
+
+The attached/input content is the **complete final user-generated script**. Analyze the entire script first, then return the same script with only the necessary Fish Audio S2/S2-Pro performance tags inserted.
 """.strip()
+
+
+# Tags are free-form and come directly from the model per the system prompt
+# above (it explicitly allows concise custom descriptions, not just a fixed
+# dictionary) — so there is no whitelist here. We only check that the output
+# contains bracketed tags at all and that the underlying words are untouched.
+_TAG_PATTERN = re.compile(r"\[([^\[\]]{1,40})\]")
 
 
 def _validate_tagged_script(original: str, tagged: str, min_tags: int = 3) -> bool:
     if not tagged or not tagged.strip():
         return False
 
-    tag_matches = re.findall(r"\[[a-zA-Z0-9 \-']+\]", tagged)
+    tag_matches = _TAG_PATTERN.findall(tagged)
 
     if len(tag_matches) < min_tags:
         print(
@@ -8468,13 +8867,7 @@ def _validate_tagged_script(original: str, tagged: str, min_tags: int = 3) -> bo
         )
         return False
 
-    allowed_lower = {t.lower() for t in SCRIPT_TAG_LIST}
-    invalid_tags = [t for t in tag_matches if t.strip("[]").lower() not in allowed_lower]
-    if invalid_tags:
-        print(f"[TAG-SCRIPT] validation failed: unsupported tag(s) used: {invalid_tags[:5]}")
-        return False
-
-    stripped = re.sub(r"\[[a-zA-Z0-9 \-']+\]", "", tagged)
+    stripped = _TAG_PATTERN.sub("", tagged)
     stripped_words = stripped.split()
     original_words = original.split()
 
@@ -8557,7 +8950,7 @@ async def generate_tagged_script(script_text: str) -> str:
         raw = ""
 
     if raw and not _validate_tagged_script(script_text, raw, min_tags=min_tags):
-        tag_count_found = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", raw))
+        tag_count_found = len(_TAG_PATTERN.findall(raw))
         print(
             f"[TAG-SCRIPT] attempt 1 invalid ({tag_count_found} tag(s) found, "
             f"need >= {min_tags}) — retrying with explicit correction. "
@@ -8584,7 +8977,7 @@ async def generate_tagged_script(script_text: str) -> str:
     if raw and _validate_tagged_script(script_text, raw, min_tags=min_tags):
         return raw
 
-    tag_count_found = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", raw)) if raw else 0
+    tag_count_found = len(_TAG_PATTERN.findall(raw)) if raw else 0
     print(
         f"[TAG-SCRIPT] still invalid after retry ({tag_count_found} tag(s)) — "
         f"applying deterministic fallback tagging instead of returning "
@@ -8618,7 +9011,7 @@ async def add_script_tags(request: AddScriptTagsRequest):
             "token_usage": _get_token_usage_summary(),
         }
 
-    tag_count = len(re.findall(r"\[[a-zA-Z0-9 \-']+\]", tagged_script))
+    tag_count = len(_TAG_PATTERN.findall(tagged_script))
     token_usage = _get_token_usage_summary()
 
     print(f"[TAG-SCRIPT] done — {tag_count} tag(s) inserted")
