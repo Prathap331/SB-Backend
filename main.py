@@ -6887,10 +6887,13 @@ async def _translate_script_impl(request: "TranslateScriptRequest"):
 
 
 
-
+import os
+import asyncio
+import requests
 from typing import Optional
 
-from pydantic import Field
+from fastapi import HTTPException
+from pydantic import BaseModel, Field
 
 _http_session = requests.Session()
 _http_adapter = requests.adapters.HTTPAdapter(
@@ -6902,10 +6905,15 @@ _http_session.mount("http://", _http_adapter)
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
+PEXELS_IMAGE_SEARCH_URL = "https://api.pexels.com/v1/search"
 
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
 
 class PexelsVideoSearchRequest(BaseModel):
-    userId : str
+    userId: str
     query: str = Field(..., description="Search term, e.g. 'ocean waves'")
     per_page: int = Field(50, ge=1, le=80, description="Results per page (max 80)")
     page: int = Field(1, ge=1, description="Page number")
@@ -6916,6 +6924,44 @@ class PexelsVideoSearchRequest(BaseModel):
         None, description="large | medium | small (optional, min video resolution)"
     )
 
+
+class PexelsImageSearchRequest(BaseModel):
+    userId: str
+    query: str = Field(..., description="Search term, e.g. 'ocean waves'")
+    per_page: int = Field(50, ge=1, le=80, description="Results per page (max 80)")
+    page: int = Field(1, ge=1, description="Page number")
+    orientation: Optional[str] = Field(
+        None, description="landscape | portrait | square (optional)"
+    )
+    size: Optional[str] = Field(
+        None, description="large | medium | small (optional, min photo resolution)"
+    )
+    color: Optional[str] = Field(
+        None,
+        description="Desired photo color, e.g. 'red', 'blue', or hex like '#ffffff' (optional)",
+    )
+
+
+class PexelsMediaSearchRequest(BaseModel):
+    """Used for the combined /search-pexels endpoint (videos + images)."""
+    userId: str
+    query: str = Field(..., description="Search term, e.g. 'ocean waves'")
+    per_page: int = Field(50, ge=1, le=80, description="Results per page (max 80)")
+    page: int = Field(1, ge=1, description="Page number")
+    orientation: Optional[str] = Field(
+        None, description="landscape | portrait | square (optional)"
+    )
+    size: Optional[str] = Field(
+        None, description="large | medium | small (optional, min resolution)"
+    )
+    color: Optional[str] = Field(
+        None, description="Photo color filter, e.g. 'red' or hex like '#ffffff' (images only)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sync HTTP calls (run via asyncio.to_thread)
+# ---------------------------------------------------------------------------
 
 def _pexels_search_videos_sync(
     query: str,
@@ -6945,6 +6991,41 @@ def _pexels_search_videos_sync(
     return resp.json()
 
 
+def _pexels_search_images_sync(
+    query: str,
+    per_page: int,
+    page: int,
+    orientation: Optional[str],
+    size: Optional[str],
+    color: Optional[str],
+) -> dict:
+    if not PEXELS_API_KEY:
+        raise RuntimeError("PEXELS_API_KEY not set")
+
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {
+        "query": query,
+        "per_page": per_page,
+        "page": page,
+    }
+    if orientation:
+        params["orientation"] = orientation
+    if size:
+        params["size"] = size
+    if color:
+        params["color"] = color
+
+    resp = _http_session.get(
+        PEXELS_IMAGE_SEARCH_URL, headers=headers, params=params, timeout=15
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Formatters
+# ---------------------------------------------------------------------------
+
 def _extract_video_files(video: dict) -> list[dict]:
     """Pick out the useful video_files entries (quality/resolution/link)."""
     files = []
@@ -6961,6 +7042,7 @@ def _extract_video_files(video: dict) -> list[dict]:
 
 def _format_video_result(video: dict) -> dict:
     return {
+        "type": "video",
         "id": video.get("id"),
         "url": video.get("url"),
         "width": video.get("width"),
@@ -6974,6 +7056,27 @@ def _format_video_result(video: dict) -> dict:
         "video_files": _extract_video_files(video),
     }
 
+
+def _format_image_result(photo: dict) -> dict:
+    return {
+        "type": "image",
+        "id": photo.get("id"),
+        "url": photo.get("url"),
+        "width": photo.get("width"),
+        "height": photo.get("height"),
+        "photographer": {
+            "name": photo.get("photographer"),
+            "url": photo.get("photographer_url"),
+        },
+        "avg_color": photo.get("avg_color"),
+        "alt": photo.get("alt"),
+        "src": photo.get("src", {}),  # original, large2x, large, medium, small, portrait, landscape, tiny
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 @app.post("/search-pexels-videos")
 async def search_pexels_videos(request: PexelsVideoSearchRequest):
@@ -7016,16 +7119,129 @@ async def search_pexels_videos(request: PexelsVideoSearchRequest):
     }
 
 
+@app.post("/search-pexels-images")
+async def search_pexels_images(request: PexelsImageSearchRequest):
+    await require_valid_user(request.userId)
+
+    if not PEXELS_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="PEXELS_API_KEY is not configured on the server.",
+        )
+
+    query = request.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must be a non-empty string")
+
+    try:
+        data = await asyncio.to_thread(
+            _pexels_search_images_sync,
+            query,
+            request.per_page,
+            request.page,
+            request.orientation,
+            request.size,
+            request.color,
+        )
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 502
+        detail = e.response.text[:300] if e.response is not None else str(e)
+        raise HTTPException(status_code=status, detail=f"Pexels API error: {detail}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pexels image search failed: {e}")
+
+    photos = [_format_image_result(p) for p in (data.get("photos") or [])]
+
+    return {
+        "query": query,
+        "page": data.get("page", request.page),
+        "per_page": data.get("per_page", request.per_page),
+        "total_results": data.get("total_results", 0),
+        "photos": photos,
+    }
 
 
+@app.post("/search-pexels")
+async def search_pexels_media(request: PexelsMediaSearchRequest):
+    """Combined search — fires video and image search concurrently and
+    returns both in one response."""
+    await require_valid_user(request.userId)
 
+    if not PEXELS_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="PEXELS_API_KEY is not configured on the server.",
+        )
 
+    query = request.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must be a non-empty string")
 
+    async def _get_videos():
+        try:
+            return await asyncio.to_thread(
+                _pexels_search_videos_sync,
+                query,
+                request.per_page,
+                request.page,
+                request.orientation,
+                request.size,
+            )
+        except Exception as e:
+            return {"error": str(e)}
 
+    async def _get_images():
+        try:
+            return await asyncio.to_thread(
+                _pexels_search_images_sync,
+                query,
+                request.per_page,
+                request.page,
+                request.orientation,
+                request.size,
+                request.color,
+            )
+        except Exception as e:
+            return {"error": str(e)}
 
+    video_data, image_data = await asyncio.gather(_get_videos(), _get_images())
 
+    videos = []
+    videos_error = None
+    if "error" in video_data:
+        videos_error = video_data["error"]
+    else:
+        videos = [_format_video_result(v) for v in (video_data.get("videos") or [])]
 
+    photos = []
+    images_error = None
+    if "error" in image_data:
+        images_error = image_data["error"]
+    else:
+        photos = [_format_image_result(p) for p in (image_data.get("photos") or [])]
 
+    if videos_error and images_error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Pexels search failed for both media types. "
+                   f"videos: {videos_error} | images: {images_error}",
+        )
+
+    return {
+        "query": query,
+        "page": request.page,
+        "per_page": request.per_page,
+        "videos": {
+            "total_results": video_data.get("total_results", 0) if not videos_error else 0,
+            "results": videos,
+            "error": videos_error,
+        },
+        "images": {
+            "total_results": image_data.get("total_results", 0) if not images_error else 0,
+            "results": photos,
+            "error": images_error,
+        },
+    }
 
 
 
@@ -8391,11 +8607,6 @@ def _run_fish_tts_sync(script: str, reference_id: str) -> bytes:
 
 
 def _credits_for_voice_minutes(duration_minutes: float) -> int:
-    """
-    duration_minutes is a whole number of minutes (as sent by the client in
-    the misleadingly-named `durationSeconds` field). No seconds-to-minutes
-    conversion happens here.
-    """
     if duration_minutes <= 0:
         return 0
     credits = math.ceil(duration_minutes * VOICE_CREDITS_PER_MINUTE)
@@ -8919,9 +9130,7 @@ async def generate_tagged_script(script_text: str) -> str:
     word_count = _word_count(script_text)
     min_tags = _min_expected_tags(word_count)
 
-    user_prompt = f"""Script to tag (this script contains {word_count} words — you MUST insert at least {min_tags} tags total, distributed naturally throughout, not clustered):
-
-{script_text}
+    user_prompt = f"""Script to tag (this script contains {word_count} words — you MUST insert at least {min_tags} tags total, distributed naturally throughout, not clustered):{script_text}
 """
 
     async def _call(extra_instruction: str = ""):
@@ -9022,3 +9231,162 @@ async def add_script_tags(request: AddScriptTagsRequest):
         "word_count": _word_count(script_text),
         "token_usage": token_usage,
     }
+
+
+
+
+
+class EditVideo(BaseModel):
+    userId : str
+    script:str
+
+
+
+SCRIPT_SCENE_PROMPT = f""" 
+System Prompt
+
+You are Storybit's Scene Planner, an AI that converts documentary-style narration into a structured scene manifest for an automated video editing pipeline.
+
+Your output is consumed directly by backend services, so it must be valid JSON only with no markdown, explanations, comments, or code fences.
+
+Objective
+
+Transform a narration script into a sequence of visually coherent scenes while preserving the original narration exactly.
+
+The output must contain no timestamps. Timing will be generated later from voiceover alignment.
+
+Scene Segmentation Rules
+
+Split whenever the spoken idea or visual changes.
+
+Most scenes should contain 1 sentence or a closely related pair of short sentences.
+
+Keep scene lengths balanced; avoid overly long scenes.
+
+Preserve the narration verbatim inside vo_text.
+
+Output Schema
+
+Return a JSON array where every object contains exactly these fields:
+
+{{
+  "scene_id": "s1",
+  "vo_text": "Exact narration for this scene.",
+  "visual_intent": "Concise documentary-style description of what should be shown.",
+  "on_screen_text": "Short text overlay or empty string.",
+  "requires_animation": true/false
+}}
+Field Guidelines
+
+scene_id
+
+Sequential: s1, s2, s3, ...
+
+vo_text
+
+Copy the narration exactly.
+
+Do not paraphrase or rewrite.
+
+visual_intent
+
+Write a concise documentary-style search query suitable for B-roll retrieval.
+
+Prefer real-world imagery.
+
+Mention important subjects, locations, time periods, or events.
+
+Avoid cinematic adjectives like "epic" or "dramatic" unless explicitly stated.
+
+on_screen_text
+
+Use only when helpful for viewers, such as:
+
+Years
+
+Dates
+
+Locations
+
+People's names
+
+Statistics
+
+Short titles
+
+Otherwise return "".
+
+requires_animation
+
+Return true only if the scene benefits from:
+
+Kinetic typography
+
+Lower-third text
+
+Maps
+
+Charts
+
+Timelines
+
+Infographics
+
+Otherwise return false.
+
+Constraints
+
+Do not invent facts.
+
+Do not create timestamps.
+
+Do not include camera directions unless they improve B-roll retrieval (e.g., "aerial view", "satellite map", "close-up").
+
+Keep visual_intent under roughly 15 words.
+
+Ensure the output is valid, parseable JSON.
+
+      """    
+
+
+@app.post("/edit-video")
+async def edit_video(request: EditVideo):
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": SCRIPT_SCENE_PROMPT},
+                    {"role": "user", "content": request.script},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("thumbnail_prompt_generator", res)
+
+        content = (res.choices[0].message.content or "").strip()
+
+        if content.startswith("```"):
+            content = content.strip("`")
+            if content.lower().startswith("json"):
+                content = content[4:].strip()
+
+        try:
+            parsed = json.loads(content)
+            full_vo_text = " ".join(scene["vo_text"] for scene in parsed["scenes"])
+            full_vo_text_with_tags = add_script_tags(request.userId,full_vo_text)
+        except json.JSONDecodeError as e:
+            print(f"JSON parse failed: {e} | raw content: {content[:500]}")
+            raise HTTPException(
+                status_code=502,
+                detail="Model did not return valid JSON",
+            )
+
+        return {"scenes": parsed,"full_vo_text_with_tags" : full_vo_text_with_tags}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate scenes")
+
