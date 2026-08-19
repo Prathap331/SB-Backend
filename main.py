@@ -238,14 +238,12 @@ async def eci(request: PromptRequest):
 
 import io
 import os
-import re
 import json
 import time
 import math
 import base64
 import uuid
 import hashlib
-import asyncio
 import contextvars
 import concurrent.futures
 from urllib.parse import urlparse
@@ -6888,7 +6886,6 @@ async def _translate_script_impl(request: "TranslateScriptRequest"):
 
 
 import os
-import asyncio
 import requests
 from typing import Optional
 
@@ -7355,7 +7352,6 @@ import time
 import json
 import datetime
 import random
-import re
 import string
 import uuid as uuid_lib
 
@@ -8542,7 +8538,7 @@ GENERATED_AUDIO_BUCKET = "generated-audio"
 # ---- Credit pricing for voice generation ----
 # 1 minute of generated audio = 5 credits.
 #
-# NOTE: despite the field name, `durationSeconds` sent by the client is
+# NOTE: despite the field name, `durationMinutes` sent by the client is
 # actually a whole number of MINUTES (1, 2, 3, ...), not seconds. We deduct
 # credits directly as minutes * VOICE_CREDITS_PER_MINUTE — no /60 conversion.
 VOICE_CREDITS_PER_MINUTE = 5
@@ -8566,7 +8562,7 @@ class GenerateSpeechRequest(BaseModel):
     script: str
     voice: str
     langCode: str = "en"
-    durationSeconds: int = 0  # NOTE: actually whole MINUTES from the client, not seconds
+    durationMinutes: int = 0  
 
 
 async def _download_bytes(url: str) -> bytes:
@@ -8739,7 +8735,7 @@ async def generate_speech(body: GenerateSpeechRequest):
         raise HTTPException(status_code=500, detail="Generated audio saved but failed to create URL")
 
     try:
-        duration_minutes = body.durationSeconds or 0
+        duration_minutes = body.durationMinutes or 0
         await _deduct_voice_credits(userId, duration_minutes)
     except Exception as e:
         print(f"[TTS] credit deduction failed for user {userId}: {e}")
@@ -9236,11 +9232,49 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-class EditVideo(BaseModel):
-    userId : str
-    script:str
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import re
+import tempfile
+import asyncio
+import whisperx
 
 SCRIPT_SCENE_PROMPT = f""" 
 System Prompt
@@ -9257,30 +9291,33 @@ The output must contain no timestamps. Timing will be generated later from voice
 
 Scene Segmentation Rules
 
-Split whenever the spoken idea or visual changes.
+Return AT MOST 5 scenes total, regardless of script length. This is a hard limit — never exceed 5.
 
-Most scenes should contain 1 sentence or a closely related pair of short sentences.
+If the narration would naturally split into more than 5 scenes, merge related sentences/ideas together until you have 5 or fewer scenes, rather than dropping any narration text.
+
+Split whenever the spoken idea or visual changes, but stay within the 5-scene limit.
 
 Keep scene lengths balanced; avoid overly long scenes.
 
-Preserve the narration verbatim inside vo_text.
+Preserve the narration verbatim inside vo_text. Every word of the original script must appear in exactly one scene's vo_text — do not drop or paraphrase any narration when merging scenes to fit the limit.
 
 Output Schema
 
-Return a JSON array where every object contains exactly these fields:
+Return a JSON array (5 objects or fewer) where every object contains exactly these fields:
 
 {{
   "scene_id": "s1",
   "vo_text": "Exact narration for this scene.",
   "visual_intent": "Concise documentary-style description of what should be shown.",
   "on_screen_text": "Short text overlay or empty string.",
-  "requires_animation": true/false
+  "requires_animation": true/false,
+  "broll_keywords": ["query one", "query two", "query three", "query four", "query five"]
 }}
 Field Guidelines
 
 scene_id
 
-Sequential: s1, s2, s3, ...
+Sequential: s1, s2, s3, s4, s5 (never more than 5).
 
 vo_text
 
@@ -9334,6 +9371,31 @@ Infographics
 
 Otherwise return false.
 
+broll_keywords
+
+Return a list of 5-6 distinct stock-footage search phrases for this scene,
+suitable for searching a stock video/photo API (e.g. Pexels).
+
+- Each phrase should be 2-6 words, concrete, and searchable (real-world
+  nouns: places, objects, actions, eras — not abstract concepts).
+- Each phrase should target a DIFFERENT visual angle on the same scene, so
+  together they widen the pool of usable B-roll rather than repeating the
+  same query. For example, for a scene about an ancient siege: one phrase
+  for the location/era ("ancient city siege"), one for a close-up/detail
+  ("stone fortress wall"), one for a wider establishing shot
+  ("ancient army marching"), one for the people/subjects involved
+  ("ancient soldiers formation"), one for the aftermath/mood
+  ("burning ancient city"), and one for a related object/symbol
+  ("ancient bronze sword").
+- Always return at least 5 phrases, and up to 6, even if some feel
+  repetitive in theme — variety in wording still broadens the search pool.
+- Do not invent specific names, dates, or facts not present in the narration.
+- Do not use cinematic adjectives like "epic" or "dramatic".
+- Prefer real, photographable subjects over metaphors.
+- These should be consistent with, but not identical to, visual_intent —
+  visual_intent is the single best description; broll_keywords are
+  alternate search angles on the same idea.
+
 Constraints
 
 Do not invent facts.
@@ -9344,9 +9406,905 @@ Do not include camera directions unless they improve B-roll retrieval (e.g., "ae
 
 Keep visual_intent under roughly 15 words.
 
+Never output more than 5 scenes.
+
 Ensure the output is valid, parseable JSON.
 
-      """    
+      """
+
+
+# ---------------------------------------------------------------------------
+# Animation planning taxonomy + prompt.
+# ---------------------------------------------------------------------------
+
+ANIMATION_TAXONOMY = {
+    "full_screen": [
+        "full_screen_broll",
+        "full_screen_title_card",
+        "full_screen_data_viz",
+        "full_screen_transition",
+        "full_screen_color_wash",
+        "full_screen_quote_card",
+    ],
+    "overlay_text": [
+        "lower_third",
+        "kinetic_caption",
+        "bullet_list_reveal",
+        "callout_textbox",
+        "stat_counter_overlay",
+    ],
+    "overlay_graphic": [
+        "icon_pop_in",
+        "icon_sequence",
+        "logo_watermark",
+        "emoji_reaction",
+        "arrow_highlight",
+        "badge_sticker",
+    ],
+    "pip": [
+        "pip_video",
+        "split_screen",
+        "multi_panel_grid",
+    ],
+    "branding": [
+        "avatar_overlay",
+        "mascot_animation",
+    ],
+    "transition": [
+        "ken_burns_pan_zoom",
+        "parallax_layering",
+        "shake_impact",
+        "speed_ramp_indicator",
+    ],
+}
+
+# Flat set of every valid animation_type, and a lookup back to its category.
+_ANIMATION_TYPE_TO_CATEGORY = {
+    anim_type: category
+    for category, anim_types in ANIMATION_TAXONOMY.items()
+    for anim_type in anim_types
+}
+_VALID_ANIMATION_TYPES = set(_ANIMATION_TYPE_TO_CATEGORY.keys())
+_VALID_PLACEMENTS = {
+    "top_left", "top_center", "top_right",
+    "center_left", "center", "center_right",
+    "bottom_left", "bottom_center", "bottom_right",
+    "full_frame",
+}
+_VALID_Z_LAYERS = {"background", "midground", "foreground"}
+_VALID_TRIGGERS = {"time_offset", "on_keyword", "on_beat", "scene_start"}
+_VALID_RENDER_HINTS = {"remotion", "ffmpeg"}
+
+ANIMATION_PLANNER_PROMPT = f"""
+System Prompt
+
+You are Storybit's Animation Director, an AI that selects ONE animation
+treatment for a single video scene, to be consumed directly by an automated
+rendering pipeline (hybrid Remotion + FFmpeg).
+
+Your output must be valid JSON only — no markdown, explanations, comments,
+or code fences.
+
+You will be given a scene's narration text, its B-roll search intent, any
+on-screen text, and whether the scene planner flagged it as needing
+animation. Choose the single best animation treatment for that scene.
+
+ALLOWED animation_type VALUES (grouped by category — you must pick exactly
+one animation_type, and its category must match the group it belongs to):
+
+FULL_SCREEN (category: "full_screen")
+- full_screen_broll          // full-bleed video/image with motion (Ken Burns, pan/zoom)
+- full_screen_title_card     // title/chapter text on solid or gradient background
+- full_screen_data_viz       // chart, counter, map reveal occupying entire frame
+- full_screen_transition     // wipe, zoom-through, glitch, whip-pan between scenes
+- full_screen_color_wash     // mood gradient/color animation, no foreground content
+- full_screen_quote_card     // centered typography quote/testimonial
+
+OVERLAY_TEXT (category: "overlay_text")
+- lower_third                // name/label anchored bottom-third
+- kinetic_caption            // word-by-word / line-by-line animated subtitle
+- bullet_list_reveal         // sequential list points, corner or side-panel
+- callout_textbox            // short annotation with leader line to a screen area
+- stat_counter_overlay       // small animated number/stat badge
+
+OVERLAY_GRAPHIC (category: "overlay_graphic")
+- icon_pop_in                // single icon animating in for emphasis
+- icon_sequence              // multiple icons animating in sequence
+- logo_watermark             // persistent corner-anchored brand mark
+- emoji_reaction             // punchy comedic emoji overlay
+- arrow_highlight            // arrow/circle/underline annotation pointing at content
+- badge_sticker               // "NEW"/"FACT"/ribbon-style graphic
+
+PICTURE_IN_PICTURE (category: "pip")
+- pip_video                   // small video window over main content
+- split_screen                // two sources side by side
+- multi_panel_grid            // 3-4 images/clips arranged as grid
+
+CHARACTER (category: "branding")
+- avatar_overlay              // talking-head/presenter avatar
+- mascot_animation             // branded character reacting/gesturing
+
+MOTION_EFFECT (category: "transition", applied to existing media, not a new element)
+- ken_burns_pan_zoom
+- parallax_layering
+- shake_impact
+- speed_ramp_indicator
+
+Selection Guidance
+
+If requires_animation is false, still choose the best-fit treatment — default
+to "full_screen_broll" with a subtle motion effect unless on_screen_text or
+visual_intent clearly calls for something else (e.g. a year/stat/name present
+in on_screen_text usually means lower_third, stat_counter_overlay, or
+full_screen_data_viz is a better fit than plain B-roll).
+
+If on_screen_text contains a year, date, or statistic, prefer
+stat_counter_overlay, lower_third, or full_screen_data_viz.
+
+If on_screen_text contains a name/title, prefer lower_third.
+
+If the scene text is a hook, question, or strong emotional beat, consider
+full_screen_quote_card, kinetic_caption, or emoji_reaction depending on tone.
+
+Do not pick pip_video, split_screen, multi_panel_grid, avatar_overlay, or
+mascot_animation unless the scene explicitly benefits from a
+presenter/character/comparison — these are situational, not defaults.
+
+Output Schema
+
+Return exactly one JSON object with these fields:
+
+{{
+  "animation_type": "icon_pop_in",
+  "category": "overlay_graphic",
+  "placement": "top_right",
+  "z_index_layer": "foreground",
+  "trigger": "on_keyword",
+  "duration_frames": 45,
+  "content_binding": "icon:lightbulb",
+  "render_engine_hint": "remotion"
+}}
+
+Field Guidelines
+
+animation_type
+One of the exact string values listed above. Never invent a new value.
+
+category
+Must be the matching group for animation_type:
+"full_screen", "overlay_text", "overlay_graphic", "pip", "branding", or
+"transition" (for MOTION_EFFECT types).
+
+placement
+One of: "top_left", "top_center", "top_right", "center_left", "center",
+"center_right", "bottom_left", "bottom_center", "bottom_right", "full_frame".
+Use "full_frame" for any FULL_SCREEN or MOTION_EFFECT animation_type.
+
+z_index_layer
+One of: "background", "midground", "foreground".
+FULL_SCREEN types are usually "background" or "midground".
+OVERLAY_TEXT / OVERLAY_GRAPHIC types are usually "foreground".
+
+trigger
+One of: "time_offset", "on_keyword", "on_beat", "scene_start".
+Use "scene_start" for FULL_SCREEN treatments that should appear immediately.
+Use "on_keyword" when the animation should sync to a specific word/phrase in
+the narration (e.g. a stat, a name, an emphasized word).
+
+duration_frames
+Integer, assume 30fps. Typical ranges:
+- full_screen_* : 90-240 (3-8 seconds)
+- overlay_text / overlay_graphic : 30-90 (1-3 seconds)
+- pip / branding : 60-180
+- transition/motion_effect : 15-45
+
+content_binding
+A short machine-readable reference to what fills the animation, e.g.
+"icon:lightbulb", "text:on_screen_text", "stat:{{value}}", "broll:visual_intent",
+"quote:vo_text". Keep it concise and consistent in format
+("type:reference").
+
+render_engine_hint
+"remotion" for anything with custom typography, data viz, icon animation,
+or multi-layer composition. "ffmpeg" for simple crossfades, basic
+pan/zoom-only motion effects, or plain overlay burns with no interactive
+layout.
+
+Constraints
+
+Return ONLY the JSON object. No markdown, no code fences, no commentary.
+Every field is required. Do not omit any field.
+"""
+
+
+class EditVideo(BaseModel):
+    userId: str
+    script: str
+    voice: str
+    langCode: str = "en"
+    durationMinutes: int = 0
+
+
+WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "small")
+WHISPERX_DEVICE = os.getenv("WHISPERX_DEVICE", "cpu")
+WHISPERX_COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "int8")
+
+# Final number of videos/images we want returned per scene, per media type.
+PEXELS_SCENE_RESULT_LIMIT = int(os.getenv("PEXELS_SCENE_RESULT_LIMIT", "6"))
+# How many results to request per individual keyword query (kept small since
+# we run several keywords per scene and then merge + trim to the limit above).
+PEXELS_SCENE_PER_KEYWORD_PER_PAGE = int(os.getenv("PEXELS_SCENE_PER_KEYWORD_PER_PAGE", "4"))
+PEXELS_SCENE_PAGE = 1
+PEXELS_SCENE_ORIENTATION = os.getenv("PEXELS_SCENE_ORIENTATION", None)  # e.g. "landscape"
+PEXELS_SCENE_SIZE = os.getenv("PEXELS_SCENE_SIZE", None)                # e.g. "large"
+PEXELS_SCENE_COLOR = os.getenv("PEXELS_SCENE_COLOR", None)              # images only
+
+# Max number of distinct keyword phrases we'll use to query Pexels, per
+# scene. Keywords now come directly from the scene-planning LLM call
+# (see `broll_keywords` in SCRIPT_SCENE_PROMPT) — no separate LLM call.
+BROLL_KEYWORDS_MAX = int(os.getenv("BROLL_KEYWORDS_MAX", "6"))
+BROLL_KEYWORDS_MIN = int(os.getenv("BROLL_KEYWORDS_MIN", "5"))
+
+_whisperx_model = None
+_whisperx_align_cache = {}
+
+_whisperx_lock = asyncio.Lock()
+
+
+def _get_whisperx_model():
+    global _whisperx_model
+    if _whisperx_model is None:
+        print(f"[WHISPERX] loading model '{WHISPERX_MODEL_SIZE}' on {WHISPERX_DEVICE}")
+        _whisperx_model = whisperx.load_model(
+            WHISPERX_MODEL_SIZE,
+            WHISPERX_DEVICE,
+            compute_type=WHISPERX_COMPUTE_TYPE,
+        )
+    return _whisperx_model
+
+
+def _preload_whisperx_align_model(language_code: str = "en"):
+    """Warms the alignment model cache for a given language. Used at startup."""
+    if language_code not in _whisperx_align_cache:
+        print(f"[WHISPERX] preloading alignment model for language '{language_code}'")
+        align_model, metadata = whisperx.load_align_model(
+            language_code=language_code, device=WHISPERX_DEVICE
+        )
+        _whisperx_align_cache[language_code] = (align_model, metadata)
+
+
+def _run_whisperx_sync(audio_bytes: bytes) -> dict:
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+
+        model = _get_whisperx_model()
+        audio = whisperx.load_audio(tmp.name)
+
+        result = model.transcribe(audio, batch_size=16)
+        language = result["language"]
+
+        if language not in _whisperx_align_cache:
+            print(f"[WHISPERX] loading alignment model for language '{language}'")
+            align_model, metadata = whisperx.load_align_model(
+                language_code=language, device=WHISPERX_DEVICE
+            )
+            _whisperx_align_cache[language] = (align_model, metadata)
+
+        align_model, metadata = _whisperx_align_cache[language]
+
+        aligned_result = whisperx.align(
+            result["segments"],
+            align_model,
+            metadata,
+            audio,
+            WHISPERX_DEVICE,
+            return_char_alignments=False,
+        )
+
+        return {
+            "language": language,
+            "segments": aligned_result["segments"],
+            "word_segments": aligned_result.get("word_segments", []),
+        }
+
+
+async def _generate_word_timestamps(audio_url: str) -> dict:
+    audio_bytes = await _download_bytes(audio_url)
+    async with _whisperx_lock:
+        return await asyncio.to_thread(_run_whisperx_sync, audio_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Pexels B-roll fetching.
+#
+# Flow per scene:
+#   1. Ask the LLM for 2-3 distinct keyword phrases covering different
+#      visual angles on the scene (location/era, detail shot, wide shot).
+#   2. Query Pexels (videos + images) for EACH keyword concurrently.
+#   3. Merge all results, dedupe by asset id, and trim to
+#      PEXELS_SCENE_RESULT_LIMIT (default 6) per media type.
+# Reuses the same sync helpers / formatters as the existing
+# /search-pexels-videos, /search-pexels-images, /search-pexels endpoints so
+# results stay consistent across the app.
+# ---------------------------------------------------------------------------
+
+def _get_scene_broll_keywords(scene: dict) -> list:
+    """
+    Reads `broll_keywords` produced by the scene-planning LLM call
+    (SCRIPT_SCENE_PROMPT). No separate LLM call here — this just validates
+    and tops up/falls back if the field is missing, empty, malformed, or
+    shorter than BROLL_KEYWORDS_MIN for this scene.
+    """
+    raw_keywords = scene.get("broll_keywords")
+
+    keywords = []
+    if isinstance(raw_keywords, list):
+        keywords = [k.strip() for k in raw_keywords if isinstance(k, str) and k.strip()]
+        # de-dupe while preserving order, in case the model repeated a phrase
+        seen = set()
+        deduped = []
+        for k in keywords:
+            key = k.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(k)
+        keywords = deduped
+
+    if len(keywords) >= BROLL_KEYWORDS_MIN:
+        return keywords[:BROLL_KEYWORDS_MAX]
+
+    # Model returned too few (or zero) usable keywords for this scene.
+    # Top up with visual_intent / a truncated vo_text snippet rather than
+    # searching with a thin, under-powered keyword set.
+    fallback_extras = []
+    visual_intent = (scene.get("visual_intent") or "").strip()
+    if visual_intent and visual_intent.lower() not in [k.lower() for k in keywords]:
+        fallback_extras.append(visual_intent)
+
+    vo_snippet = (scene.get("vo_text") or "").strip()[:60]
+    if vo_snippet and vo_snippet.lower() not in [k.lower() for k in keywords]:
+        fallback_extras.append(vo_snippet)
+
+    keywords = (keywords + fallback_extras)[:BROLL_KEYWORDS_MAX]
+
+    if not keywords:
+        print(f"[edit-video] scene {scene.get('scene_id')} has no usable broll_keywords or fallback text")
+
+    return keywords
+
+
+def _dedupe_and_trim(items: list, limit: int) -> list:
+    """
+    Dedupes a list of formatted Pexels result dicts, preserving first-seen
+    order (keyword search order), then trims to `limit`.
+
+    Tries common id field names first ("id", "video_id", "photo_id",
+    "asset_id"). Falls back to the item's url/src (whichever is present) if
+    none of those exist, so this keeps working regardless of the exact
+    shape _format_video_result / _format_image_result produce.
+    """
+    def _identity(item: dict):
+        for key in ("id", "video_id", "photo_id", "asset_id"):
+            if key in item:
+                return item[key]
+        for key in ("url", "src", "image", "video_url", "link"):
+            if key in item:
+                return item[key]
+        return None
+
+    seen = set()
+    deduped = []
+    for item in items:
+        item_id = _identity(item)
+        if item_id is not None:
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+async def _fetch_scene_media(scene: dict) -> dict:
+    """
+    Reads keyword phrases already produced by scene planning
+    (`broll_keywords`), queries Pexels (videos + images) for each keyword
+    concurrently, then merges/dedupes/trims to PEXELS_SCENE_RESULT_LIMIT
+    per media type.
+
+    Never raises — Pexels failures are captured per-type so an outage
+    degrades gracefully instead of failing the whole scene.
+    """
+    keywords = _get_scene_broll_keywords(scene)
+
+    empty_result = {
+        "keywords": keywords,
+        "videos": {"total_results": 0, "results": [], "error": None},
+        "images": {"total_results": 0, "results": [], "error": None},
+    }
+
+    if not keywords:
+        return empty_result
+
+    if not PEXELS_API_KEY:
+        empty_result["videos"]["error"] = "PEXELS_API_KEY is not configured on the server."
+        empty_result["images"]["error"] = "PEXELS_API_KEY is not configured on the server."
+        return empty_result
+
+    async def _get_videos_for(keyword: str):
+        try:
+            data = await asyncio.to_thread(
+                _pexels_search_videos_sync,
+                keyword,
+                PEXELS_SCENE_PER_KEYWORD_PER_PAGE,
+                PEXELS_SCENE_PAGE,
+                PEXELS_SCENE_ORIENTATION,
+                PEXELS_SCENE_SIZE,
+            )
+            return {"keyword": keyword, "data": data, "error": None}
+        except Exception as e:
+            return {"keyword": keyword, "data": None, "error": str(e)}
+
+    async def _get_images_for(keyword: str):
+        try:
+            data = await asyncio.to_thread(
+                _pexels_search_images_sync,
+                keyword,
+                PEXELS_SCENE_PER_KEYWORD_PER_PAGE,
+                PEXELS_SCENE_PAGE,
+                PEXELS_SCENE_ORIENTATION,
+                PEXELS_SCENE_SIZE,
+                PEXELS_SCENE_COLOR,
+            )
+            return {"keyword": keyword, "data": data, "error": None}
+        except Exception as e:
+            return {"keyword": keyword, "data": None, "error": str(e)}
+
+    # Fire every keyword's video search and every keyword's image search
+    # concurrently — for 3 keywords that's up to 6 simultaneous Pexels calls
+    # for this one scene.
+    video_tasks = [_get_videos_for(k) for k in keywords]
+    image_tasks = [_get_images_for(k) for k in keywords]
+    video_results, image_results = await asyncio.gather(
+        asyncio.gather(*video_tasks),
+        asyncio.gather(*image_tasks),
+    )
+
+    video_errors = [r["error"] for r in video_results if r["error"]]
+    videos_pool = []
+    for r in video_results:
+        if r["error"]:
+            continue
+        videos_pool.extend(_format_video_result(v) for v in (r["data"].get("videos") or []))
+
+    image_errors = [r["error"] for r in image_results if r["error"]]
+    images_pool = []
+    for r in image_results:
+        if r["error"]:
+            continue
+        images_pool.extend(_format_image_result(p) for p in (r["data"].get("photos") or []))
+
+    videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
+    photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
+
+    # Only surface an error if EVERY keyword failed for that media type —
+    # partial keyword failures just mean a smaller (but non-empty) pool.
+    videos_error = "; ".join(video_errors) if video_errors and not videos else None
+    images_error = "; ".join(image_errors) if image_errors and not photos else None
+
+    return {
+        "keywords": keywords,
+        "videos": {
+            "total_results": len(videos),
+            "results": videos,
+            "error": videos_error,
+        },
+        "images": {
+            "total_results": len(photos),
+            "results": photos,
+            "error": images_error,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Animation planning — one structured animation object per scene, chosen
+# from ANIMATION_TAXONOMY via LLM, with strict validation + a deterministic
+# fallback if the model output is missing/invalid/unparseable.
+# ---------------------------------------------------------------------------
+
+def _default_animation(scene: dict) -> dict:
+    """
+    Deterministic fallback used when the animation-planner LLM call fails,
+    returns invalid JSON, or picks a value outside the allowed taxonomy.
+    Keeps /edit-video resilient — a bad animation pick never fails the scene.
+    """
+    on_screen_text = (scene.get("on_screen_text") or "").strip()
+
+    if on_screen_text:
+        return {
+            "animation_type": "lower_third",
+            "category": "overlay_text",
+            "placement": "bottom_center",
+            "z_index_layer": "foreground",
+            "trigger": "scene_start",
+            "duration_frames": 60,
+            "content_binding": "text:on_screen_text",
+            "render_engine_hint": "remotion",
+        }
+
+    return {
+        "animation_type": "full_screen_broll",
+        "category": "full_screen",
+        "placement": "full_frame",
+        "z_index_layer": "background",
+        "trigger": "scene_start",
+        "duration_frames": 150,
+        "content_binding": "broll:visual_intent",
+        "render_engine_hint": "ffmpeg",
+    }
+
+
+def _validate_animation(raw: dict, scene: dict) -> dict:
+    """
+    Validates an LLM-produced animation object against the taxonomy and
+    field enums. Returns a corrected/sane object — falls back field-by-field
+    where possible instead of discarding the whole object on one bad field.
+    """
+    fallback = _default_animation(scene)
+
+    if not isinstance(raw, dict):
+        return fallback
+
+    animation_type = raw.get("animation_type")
+    if animation_type not in _VALID_ANIMATION_TYPES:
+        return fallback
+
+    # category must match the animation_type's real group — trust our own
+    # lookup over whatever the model claims, since this is deterministic.
+    category = _ANIMATION_TYPE_TO_CATEGORY[animation_type]
+
+    placement = raw.get("placement")
+    if placement not in _VALID_PLACEMENTS:
+        placement = "full_frame" if category in ("full_screen", "transition") else "bottom_center"
+
+    z_index_layer = raw.get("z_index_layer")
+    if z_index_layer not in _VALID_Z_LAYERS:
+        z_index_layer = "background" if category == "full_screen" else "foreground"
+
+    trigger = raw.get("trigger")
+    if trigger not in _VALID_TRIGGERS:
+        trigger = "scene_start"
+
+    duration_frames = raw.get("duration_frames")
+    try:
+        duration_frames = int(duration_frames)
+        if duration_frames <= 0 or duration_frames > 900:  # cap at 30s @30fps
+            raise ValueError
+    except (TypeError, ValueError):
+        duration_frames = fallback["duration_frames"]
+
+    content_binding = raw.get("content_binding")
+    if not isinstance(content_binding, str) or not content_binding.strip():
+        content_binding = fallback["content_binding"]
+
+    render_engine_hint = raw.get("render_engine_hint")
+    if render_engine_hint not in _VALID_RENDER_HINTS:
+        render_engine_hint = "remotion" if category in ("overlay_text", "overlay_graphic", "pip", "branding") else "ffmpeg"
+
+    return {
+        "animation_type": animation_type,
+        "category": category,
+        "placement": placement,
+        "z_index_layer": z_index_layer,
+        "trigger": trigger,
+        "duration_frames": duration_frames,
+        "content_binding": content_binding,
+        "render_engine_hint": render_engine_hint,
+    }
+
+
+async def _plan_scene_animation(scene: dict) -> dict:
+    """
+    Calls the animation-planner LLM for a single scene and returns a
+    validated animation object. Never raises — any failure (API error,
+    bad JSON, invalid enum values) falls back to _default_animation.
+    """
+    scene_context = {
+        "scene_id": scene.get("scene_id"),
+        "vo_text": scene.get("vo_text", ""),
+        "visual_intent": scene.get("visual_intent", ""),
+        "on_screen_text": scene.get("on_screen_text", ""),
+        "requires_animation": scene.get("requires_animation", False),
+    }
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": ANIMATION_PLANNER_PROMPT},
+                    {"role": "user", "content": json.dumps(scene_context)},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("edit video - animation plan", res)
+
+        content = (res.choices[0].message.content or "").strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            if content.lower().startswith("json"):
+                content = content[4:].strip()
+
+        raw = json.loads(content)
+
+    except Exception as e:
+        print(f"[edit-video] scene {scene.get('scene_id')} animation planning failed, using fallback: {e}")
+        return _default_animation(scene)
+
+    return _validate_animation(raw, scene)
+
+
+# ---------------------------------------------------------------------------
+# Remotion infographic matching.
+#
+# Not every scene needs an infographic — only the ones whose chosen
+# `animation` treatment is actually a data/graphic-driven type (data viz,
+# stat counter, bullet list, icon sequence, quote card, title card). For
+# those, we resolve the animation_type to a specific Remotion composition
+# from a fixed library and fill its props from data already on the scene
+# (on_screen_text, vo_text) — no extra LLM call, purely deterministic.
+# ---------------------------------------------------------------------------
+
+# Registry of available Remotion compositions. `composition_id` must match
+# a real <Composition id="..."> registered in your Remotion project (e.g.
+# src/Root.tsx). `props_builder` is a function(scene, animation) -> dict
+# producing that composition's input props.
+
+def _props_title_card(scene: dict, animation: dict) -> dict:
+    return {
+        "title": (scene.get("on_screen_text") or "").strip() or (scene.get("scene_id") or ""),
+        "subtitle": "",
+    }
+
+
+def _props_quote_card(scene: dict, animation: dict) -> dict:
+    vo_text = (scene.get("vo_text") or "").strip()
+    # Trim to the first sentence-ish chunk so the quote card isn't overloaded
+    # with a full paragraph of narration.
+    quote = vo_text.split(". ")[0].strip()
+    if quote and not quote.endswith((".", "!", "?")):
+        quote += "."
+    return {
+        "quote": quote,
+        "attribution": "",
+    }
+
+
+def _props_stat_counter(scene: dict, animation: dict) -> dict:
+    on_screen_text = (scene.get("on_screen_text") or "").strip()
+    # Pull the first number-like token (year, stat, count) out of
+    # on_screen_text, e.g. "324 BCE" -> "324", "12,000 soldiers" -> "12,000".
+    match = re.search(r"[\d,]+(?:\.\d+)?", on_screen_text)
+    value = match.group(0) if match else on_screen_text
+    label = on_screen_text.replace(value, "").strip(" •-") if match else ""
+    return {
+        "value": value,
+        "label": label or on_screen_text,
+    }
+
+
+def _props_bullet_list(scene: dict, animation: dict) -> dict:
+    on_screen_text = (scene.get("on_screen_text") or "").strip()
+    # on_screen_text may already be bullet-separated ("A • B • C"); fall back
+    # to splitting the narration into short clauses if not.
+    if "•" in on_screen_text:
+        items = [item.strip() for item in on_screen_text.split("•") if item.strip()]
+    elif on_screen_text:
+        items = [on_screen_text]
+    else:
+        vo_text = (scene.get("vo_text") or "").strip()
+        items = [s.strip() for s in re.split(r"[.;]", vo_text) if s.strip()][:4]
+    return {
+        "title": "",
+        "items": items,
+    }
+
+
+def _props_data_viz(scene: dict, animation: dict) -> dict:
+    return {
+        "label": (scene.get("on_screen_text") or "").strip(),
+        "caption": (scene.get("visual_intent") or "").strip(),
+    }
+
+
+def _props_icon_sequence(scene: dict, animation: dict) -> dict:
+    binding = animation.get("content_binding", "")
+    icon = binding.split(":", 1)[1] if ":" in binding else "circle"
+    return {
+        "icons": [icon],
+        "label": (scene.get("on_screen_text") or "").strip(),
+    }
+
+
+REMOTION_INFOGRAPHIC_LIBRARY = {
+    "full_screen_title_card": {
+        "composition_id": "TitleCard",
+        "props_builder": _props_title_card,
+    },
+    "full_screen_quote_card": {
+        "composition_id": "QuoteCard",
+        "props_builder": _props_quote_card,
+    },
+    "full_screen_data_viz": {
+        "composition_id": "DataVizFullScreen",
+        "props_builder": _props_data_viz,
+    },
+    "stat_counter_overlay": {
+        "composition_id": "StatCounterOverlay",
+        "props_builder": _props_stat_counter,
+    },
+    "bullet_list_reveal": {
+        "composition_id": "BulletListReveal",
+        "props_builder": _props_bullet_list,
+    },
+    "icon_sequence": {
+        "composition_id": "IconSequenceOverlay",
+        "props_builder": _props_icon_sequence,
+    },
+    "icon_pop_in": {
+        "composition_id": "IconPopIn",
+        "props_builder": _props_icon_sequence,
+    },
+}
+
+
+def _get_scene_infographic(scene: dict, animation: dict) -> dict:
+    """
+    Resolves the scene's chosen animation_type to a Remotion composition +
+    filled props, if that animation_type is infographic-driven. Returns
+    None if the animation type has no matching Remotion template (e.g.
+    plain full_screen_broll, lower_third, transitions) — those scenes just
+    don't need an infographics entry.
+
+    Purely deterministic — no LLM call, no network, cannot fail. Uses
+    animation["duration_frames"] / ["trigger"] / ["placement"] already
+    decided by animation planning so the infographic timing stays in sync
+    with the rest of the scene's animation plan.
+    """
+    animation_type = animation.get("animation_type")
+    template = REMOTION_INFOGRAPHIC_LIBRARY.get(animation_type)
+
+    if not template:
+        return None
+
+    try:
+        props = template["props_builder"](scene, animation)
+    except Exception as e:
+        print(f"[edit-video] scene {scene.get('scene_id')} infographic prop-building failed: {e}")
+        props = {}
+
+    return {
+        "composition_id": template["composition_id"],
+        "animation_type": animation_type,
+        "props": props,
+        "duration_frames": animation.get("duration_frames"),
+        "trigger": animation.get("trigger"),
+        "placement": animation.get("placement"),
+        "render_engine_hint": "remotion",
+    }
+
+
+async def _process_scene(scene: dict, request: EditVideo) -> dict:
+    """Tags, generates speech, timestamps, fetches B-roll, and plans the
+    animation treatment for a single scene."""
+    scene_out = dict(scene)
+    vo_text = scene.get("vo_text", "")
+
+    # Both of these only depend on data already present on the scene object
+    # (broll_keywords / visual_intent / vo_text / on_screen_text /
+    # requires_animation, all produced by the scene-planning call), so they
+    # run concurrently with tagging/TTS/WhisperX instead of after it.
+    # _fetch_scene_media reads broll_keywords straight off the scene dict —
+    # no extra LLM call, see _get_scene_broll_keywords.
+    media_task = asyncio.create_task(_fetch_scene_media(scene))
+    animation_task = asyncio.create_task(_plan_scene_animation(scene))
+
+    if not vo_text.strip():
+        scene_out["voiceover"] = None
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = None
+        scene_out["media"] = await media_task
+        scene_out["animation"] = await animation_task
+        scene_out["infographics"] = _get_scene_infographic(scene, scene_out["animation"])
+        return scene_out
+
+    try:
+        tags_request = AddScriptTagsRequest(
+            userId=request.userId,
+            script=vo_text,
+        )
+        tags_result = await add_script_tags(tags_request)
+        tagged_text = tags_result["tagged_script"]
+    except Exception as e:
+        print(f"[edit-video] scene {scene.get('scene_id')} tagging failed, using raw text: {e}")
+        tagged_text = vo_text
+
+    speech_request = GenerateSpeechRequest(
+        userId=request.userId,
+        script=tagged_text,
+        voice=request.voice,
+        langCode=request.langCode,
+        durationMinutes=0,
+    )
+
+    try:
+        speech_result = await generate_speech(speech_request)
+    except Exception as e:
+        print(f"[edit-video] scene {scene.get('scene_id')} voice generation failed: {e}")
+        scene_out["tagged_vo_text"] = tagged_text
+        scene_out["voiceover"] = None
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = f"voice generation failed: {e}"
+        scene_out["media"] = await media_task
+        scene_out["animation"] = await animation_task
+        scene_out["infographics"] = _get_scene_infographic(scene, scene_out["animation"])
+        return scene_out
+
+    try:
+        scene_timestamps = await _generate_word_timestamps(speech_result["url"])
+    except Exception as e:
+        print(f"[edit-video] scene {scene.get('scene_id')} whisperx alignment failed: {e}")
+        scene_out["tagged_vo_text"] = tagged_text
+        scene_out["voiceover"] = speech_result
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = f"timestamp alignment failed: {e}"
+        scene_out["media"] = await media_task
+        scene_out["animation"] = await animation_task
+        scene_out["infographics"] = _get_scene_infographic(scene, scene_out["animation"])
+        return scene_out
+
+    word_segments = scene_timestamps.get("word_segments", [])
+    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+
+    scene_out["tagged_vo_text"] = tagged_text
+    scene_out["voiceover"] = speech_result
+    scene_out["start"] = timed_words[0]["start"] if timed_words else None
+    scene_out["end"] = timed_words[-1]["end"] if timed_words else None
+    scene_out["word_segments"] = word_segments
+    scene_out["error"] = None
+    scene_out["media"] = await media_task
+    scene_out["animation"] = await animation_task
+    scene_out["infographics"] = _get_scene_infographic(scene, scene_out["animation"])
+
+    return scene_out
+
+
+def _enforce_scene_limit(scenes: list, max_scenes: int = 5) -> list:
+    if len(scenes) <= max_scenes:
+        return scenes
+
+    print(f"[edit-video] model returned {len(scenes)} scenes, merging down to {max_scenes}")
+
+    kept = scenes[: max_scenes - 1]
+    overflow = scenes[max_scenes - 1:]
+
+    merged_vo_text = " ".join(s.get("vo_text", "").strip() for s in overflow if s.get("vo_text"))
+    last_scene = dict(overflow[0]) if overflow else {}
+    last_scene["scene_id"] = f"s{max_scenes}"
+    last_scene["vo_text"] = merged_vo_text
+
+    return kept + [last_scene]
 
 
 @app.post("/edit-video")
@@ -9362,7 +10320,7 @@ async def edit_video(request: EditVideo):
                 stream=False,
             )
         )
-        _record_token_usage("thumbnail_prompt_generator", res)
+        _record_token_usage("edit video", res)
 
         content = (res.choices[0].message.content or "").strip()
 
@@ -9371,22 +10329,38 @@ async def edit_video(request: EditVideo):
             if content.lower().startswith("json"):
                 content = content[4:].strip()
 
-        try:
-            parsed = json.loads(content)
-            full_vo_text = " ".join(scene["vo_text"] for scene in parsed["scenes"])
-            full_vo_text_with_tags = add_script_tags(request.userId,full_vo_text)
-        except json.JSONDecodeError as e:
-            print(f"JSON parse failed: {e} | raw content: {content[:500]}")
-            raise HTTPException(
-                status_code=502,
-                detail="Model did not return valid JSON",
-            )
-
-        return {"scenes": parsed,"full_vo_text_with_tags" : full_vo_text_with_tags}
-
     except HTTPException:
         raise
     except Exception as e:
-        print(f"failed: {e}")
+        print(f"[edit-video] scene generation failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate scenes")
 
+    try:
+        parsed = json.loads(content)
+
+        if isinstance(parsed, dict) and "scenes" in parsed:
+            scenes = parsed["scenes"]
+        elif isinstance(parsed, list):
+            scenes = parsed
+        else:
+            raise ValueError(f"Unexpected JSON shape: {type(parsed)}")
+
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[edit-video] JSON parse failed: {e} | raw content: {content[:500]}")
+        raise HTTPException(status_code=502, detail="Model did not return valid JSON")
+
+    scenes = _enforce_scene_limit(scenes, max_scenes=5)
+
+    scenes_with_voice_and_timestamps = []
+    for scene in scenes:
+        scene_result = await _process_scene(scene, request)
+        scenes_with_voice_and_timestamps.append(scene_result)
+
+    failed_scenes = [s["scene_id"] for s in scenes_with_voice_and_timestamps if s.get("error")]
+    if failed_scenes:
+        print(f"[edit-video] completed with {len(failed_scenes)} failed scene(s): {failed_scenes}")
+
+    return {
+        "scenes": scenes_with_voice_and_timestamps,
+        "failed_scene_ids": failed_scenes,
+    }
