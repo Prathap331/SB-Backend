@@ -9257,10 +9257,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
 import re
 import os
 import json
@@ -9277,29 +9273,6 @@ import whisperx
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-
-# ---------------------------------------------------------------------------
-# SHARED HELPER — used by both the scene-planning/timeline-builder code
-# (build_timeline_from_scenes) and the renderer (_render_scene /
-# _prepare_broll_clip). Defined once, up top, so both halves of this file
-# agree on where a broll candidate's real, playable file lives.
-#
-# BUG THIS FIXES (root cause of "video still blank after first fix"):
-# The raw Pexels candidate's "url" field is the pexels.com PAGE link
-# (e.g. https://www.pexels.com/video/drone-footage-..._10207167/), not a
-# downloadable file — actual files live at videos.pexels.com/... (for
-# video_files[].link) or images.pexels.com/... (for src.large2x etc).
-# The original build_timeline_from_scenes did
-#   "file_url": candidate.get("url") or candidate.get("video_url")
-# which happily stored that unplayable page link as if it were resolved.
-# Any code that later saw a truthy file_url and trusted it blindly (as the
-# first render fix did) would try to download an HTML page as an mp4/jpg,
-# fail, and silently fall back to the solid-color card — even though the
-# fix "worked" in the sense that it always tried something.
-# The guard below only trusts a pre-existing file_url if it's actually on
-# a CDN domain that serves real media; otherwise it re-derives the correct
-# link from video_files / src.
-# ---------------------------------------------------------------------------
 
 def _looks_like_playable_media_url(url: Optional[str]) -> bool:
     if not url:
@@ -9699,7 +9672,7 @@ class TrackPatch(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# NEW: per-scene edit models — voice swap, and text/background styling.
+# per-scene edit models — voice swap, and text/background styling.
 # ---------------------------------------------------------------------------
 
 _VALID_CAPTION_ANIMATION_TYPES = {
@@ -9746,6 +9719,18 @@ class SceneInfographicUpdate(BaseModel):
     duration_frames: Optional[int] = None
 
 
+class SceneBrollSelectUpdate(BaseModel):
+    # NEW: dedicated, typed endpoint for picking a specific candidate out
+    # of a scene's broll pool (instead of forcing callers to hand-build a
+    # generic PATCH /timeline/{video_id} body). Caller supplies the
+    # candidate's own id and which pool it came from; we look the full
+    # candidate object up server-side out of raw_scenes' media pool so we
+    # always resolve a real, playable file_url rather than trusting
+    # whatever the client sends.
+    asset_id: Any  # Pexels ids are ints, but be liberal about what we accept
+    source: str    # "video" or "image"
+
+
 def _hex_to_ass_color(hex_color: str, alpha_hex: str = "00") -> str:
     """
     Convert '#RRGGBB' (or 'RRGGBB') into libass's '&HAABBGGRR' format.
@@ -9764,6 +9749,19 @@ def _normalize_ffmpeg_color(hex_color: str) -> str:
     if len(h) != 6:
         h = "111827"
     return f"0x{h}"
+
+
+_HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
+
+
+def _validate_hex_color(value: Optional[str], field_name: str) -> None:
+    if value is None:
+        return
+    if not _HEX_COLOR_RE.match(value.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} must be a 6-digit hex color like '#111827', got {value!r}",
+        )
 
 
 WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "small")
@@ -10338,12 +10336,70 @@ def _enforce_scene_limit(scenes: list, max_scenes: int = 5) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Timeline builder — converts the flat, per-scene-isolated scene list into a
-# single frame-based EDL (Edit Decision List) with global offsets. This is
-# the object persisted as `videos.timeline_json`, and the single source of
-# truth both the frontend preview player and the eventual FFmpeg/Remotion
-# render step consume.
+# NEW: resolve a scene's broll selection, honoring a manually-picked
+# override before falling back to the top auto-fetched candidate.
+#
+# WHY THIS EXISTS (fixes the "edits vanish" bug):
+# Previously, whichever endpoint needed to know "what broll is this scene
+# using" either (a) always took candidates[0] fresh from scene['media'], or
+# (b) relied on timeline_json alone, which build_timeline_from_scenes()
+# overwrites from scratch on every voice/trim/infographic edit. Neither
+# path had anywhere durable to remember "the user manually picked candidate
+# #3" — so that pick silently reverted the next time ANY other scene's
+# voice/trim/infographic was edited (because those all call
+# build_timeline_from_scenes(raw_scenes) to rebuild the WHOLE timeline from
+# raw_scenes, and raw_scenes never had the override).
+#
+# Fix: persist the override directly on the scene dict inside raw_scenes
+# (scene['broll_override']), so every rebuild — no matter which endpoint
+# triggered it — can find and honor it.
 # ---------------------------------------------------------------------------
+
+def _resolve_scene_broll_selection(scene: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Returns (selected_asset_dict_with_source_and_file_url, source) or (None, None)."""
+    override = scene.get("broll_override")
+    if override and override.get("asset_id") is not None:
+        source = override.get("source")
+        file_url = _resolve_broll_file_url(override, source)
+        if file_url:
+            return (
+                {
+                    "id": override.get("asset_id"),
+                    "file_url": file_url,
+                    "source": source,
+                    # keep any extra fields the client/candidate had, for
+                    # renderer fallbacks (video_files/src etc.)
+                    **{k: v for k, v in override.items() if k not in ("asset_id", "source", "file_url")},
+                },
+                source,
+            )
+        print(
+            f"[timeline] scene {scene.get('scene_id')} has a broll_override "
+            f"that couldn't be resolved to a playable file — falling back to default candidate"
+        )
+
+    media = scene.get("media") or {}
+    video_candidates = (media.get("videos") or {}).get("results") or []
+    image_candidates = (media.get("images") or {}).get("results") or []
+
+    if video_candidates:
+        return video_candidates[0], "video"
+    if image_candidates:
+        return image_candidates[0], "image"
+    return None, None
+
+
+def _find_broll_candidate(scene: dict, asset_id: Any, source: str) -> Optional[dict]:
+    """Look up a specific candidate by id+source in a scene's fetched media pool."""
+    media = scene.get("media") or {}
+    pool_key = "videos" if source == "video" else "images"
+    candidates = (media.get(pool_key) or {}).get("results") or []
+    for c in candidates:
+        if str(c.get("id")) == str(asset_id):
+            return c
+    return None
+
+
 
 def _seconds_to_frames(seconds: float, fps: int = TIMELINE_FPS) -> int:
     return max(round((seconds or 0.0) * fps), 0)
@@ -10370,6 +10426,7 @@ def build_timeline_from_scenes(scenes: list[dict], fps: int = TIMELINE_FPS) -> d
                 "scene_id": scene_id,
                 "type": "audio",
                 "file_url": voiceover["url"],
+                "vo_text": scene.get("vo_text"),  # NEW: narration text for this scene's voiceover
                 "startFrame": scene_start_frame,
                 "endFrame": scene_end_frame,
             })
@@ -10386,28 +10443,35 @@ def build_timeline_from_scenes(scenes: list[dict], fps: int = TIMELINE_FPS) -> d
                 "endFrame": scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps),
             })
         if words:
-            tracks.append({
+            caption_track = {
                 "track_id": f"caption_{scene_id}",
                 "scene_id": scene_id,
                 "type": "caption_word",
                 "words": words,
-            })
+            }
+            # FIX: re-apply any persisted caption style override (font_size,
+            # text_color, outline_color, animation_type) set via
+            # PATCH /timeline/{video_id}/scene/{scene_id}/style. Previously
+            # this lived ONLY in timeline_json and was lost every time this
+            # function rebuilt the timeline from raw_scenes for an unrelated
+            # voice/trim/infographic edit.
+            caption_style = scene.get("caption_style")
+            if caption_style:
+                caption_track["style"] = caption_style
+            tracks.append(caption_track)
 
-        # --- broll track: candidate pool + a default selection ---
+        # --- broll track: candidate pool + a default (or overridden) selection ---
         media = scene.get("media") or {}
         video_candidates = (media.get("videos") or {}).get("results") or []
         image_candidates = (media.get("images") or {}).get("results") or []
 
-        default_asset = None
-        default_source = None
-        if video_candidates:
-            default_asset = video_candidates[0]
-            default_source = "video"
-        elif image_candidates:
-            default_asset = image_candidates[0]
-            default_source = "image"
+        # FIX: honor a manually-picked broll override (persisted on the
+        # scene itself) before falling back to the first auto-fetched
+        # candidate. See _resolve_scene_broll_selection for why this needs
+        # to live on the scene, not just in timeline_json.
+        default_asset, default_source = _resolve_scene_broll_selection(scene)
 
-        tracks.append({
+        broll_track = {
             "track_id": f"broll_{scene_id}",
             "scene_id": scene_id,
             "type": "broll",
@@ -10427,7 +10491,17 @@ def build_timeline_from_scenes(scenes: list[dict], fps: int = TIMELINE_FPS) -> d
                 "videos": video_candidates,
                 "images": image_candidates,
             },
-        })
+        }
+
+        # FIX: re-apply any persisted solid-background-color override
+        # (set via PATCH .../style) for the same reason as caption_style
+        # above — it used to only live in timeline_json and get wiped on
+        # every unrelated rebuild.
+        background_color = scene.get("background_color")
+        if background_color:
+            broll_track["background_color"] = background_color
+
+        tracks.append(broll_track)
 
         # --- animation / infographic overlay track ---
         animation = scene.get("animation") or {}
@@ -10474,6 +10548,10 @@ def build_timeline_from_scenes(scenes: list[dict], fps: int = TIMELINE_FPS) -> d
         "resolution": {"width": TIMELINE_WIDTH, "height": TIMELINE_HEIGHT},
         "tracks": tracks,
     }
+
+
+
+
 
 
 @app.post("/edit-video")
@@ -10570,10 +10648,38 @@ async def get_timeline(video_id: str):
     return row.data
 
 
+# ---------------------------------------------------------------------------
+# GENERIC low-level PATCH /timeline/{video_id}
+#
+# FIX (persistence bug): this used to patch ONLY timeline_json in place.
+# Any voice/trim/infographic edit afterward calls
+# build_timeline_from_scenes(raw_scenes) to rebuild the WHOLE timeline —
+# which has no idea this patch ever happened, because raw_scenes was never
+# updated. Result: a manually-picked broll asset, a background_color, or a
+# caption style set through this generic endpoint would silently vanish
+# the next time ANY other scene's voice/trim/infographic changed.
+#
+# Fix: after patching the track in timeline_json (unchanged behavior), we
+# best-effort mirror the same known, structurally-meaningful fields
+# (selected_asset -> broll_override, background_color, style ->
+# caption_style) back onto the matching scene in raw_scenes, so future
+# rebuilds keep honoring them. Unknown/arbitrary fields are still applied
+# to timeline_json as before (so this endpoint stays generic) but simply
+# won't survive a future rebuild if they aren't one of the known fields —
+# same as before, no regression there, just closing the specific gap that
+# caused edits to disappear.
+# ---------------------------------------------------------------------------
+
 @app.patch("/timeline/{video_id}")
 async def patch_timeline(video_id: str, patch: TrackPatch):
     try:
-        row = supabase.table("videos").select("timeline_json, timeline_version").eq("id", video_id).single().execute()
+        row = (
+            supabase.table("videos")
+            .select("timeline_json, timeline_version, raw_scenes")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
     except Exception as e:
         print(f"[patch-timeline] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -10583,46 +10689,97 @@ async def patch_timeline(video_id: str, patch: TrackPatch):
 
     timeline = row.data["timeline_json"]
     current_version = row.data.get("timeline_version", 1)
+    raw_scenes = row.data.get("raw_scenes") or []
 
-    track_found = False
+    track_found = None
     for track in timeline.get("tracks", []):
         if track.get("track_id") == patch.track_id:
             track.update(patch.updates)
-            track_found = True
+            track_found = track
             break
 
     if not track_found:
         raise HTTPException(status_code=404, detail=f"Track {patch.track_id} not found in timeline")
 
+    # --- FIX: mirror known fields back into raw_scenes so they survive a
+    # future full-timeline rebuild triggered by voice/trim/infographic edits.
+    scene_id = track_found.get("scene_id")
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+
+    visual_change = False
+    if scene_index is not None:
+        scene = dict(raw_scenes[scene_index])
+
+        if track_found.get("type") == "broll":
+            if "selected_asset" in patch.updates and patch.updates["selected_asset"]:
+                sel = patch.updates["selected_asset"]
+                scene["broll_override"] = {
+                    "asset_id": sel.get("asset_id") or sel.get("id"),
+                    "source": sel.get("source"),
+                    "file_url": sel.get("file_url"),
+                }
+                visual_change = True
+            if "background_color" in patch.updates:
+                if patch.updates["background_color"]:
+                    _validate_hex_color(patch.updates["background_color"], "background_color")
+                scene["background_color"] = patch.updates["background_color"]
+                visual_change = True
+
+        elif track_found.get("type") == "caption_word":
+            if "style" in patch.updates and isinstance(patch.updates["style"], dict):
+                existing_style = scene.get("caption_style") or {}
+                scene["caption_style"] = {**existing_style, **patch.updates["style"]}
+                visual_change = True
+
+        raw_scenes[scene_index] = scene
+
     new_version = current_version + 1
 
+    update_payload = {
+        "timeline_json": timeline,
+        "timeline_version": new_version,
+    }
+    if scene_index is not None:
+        update_payload["raw_scenes"] = raw_scenes
+    if visual_change:
+        # The rendered video no longer reflects this edit — flag it, same
+        # as every other scene-editing endpoint does.
+        update_payload["final_video_url"] = None
+        update_payload["render_status"] = "stale_needs_render"
+
     try:
-        supabase.table("videos").update({
-            "timeline_json": timeline,
-            "timeline_version": new_version,
-        }).eq("id", video_id).execute()
+        supabase.table("videos").update(update_payload).eq("id", video_id).execute()
     except Exception as e:
         print(f"[patch-timeline] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save edit")
 
-    return {"timeline_version": new_version, "track_id": patch.track_id}
+    return {
+        "timeline_version": new_version,
+        "track_id": patch.track_id,
+        "needs_render": visual_change,
+    }
 
 
 # ---------------------------------------------------------------------------
-# NEW: PATCH /timeline/{video_id}/scene/{scene_id}/style
+# PATCH /timeline/{video_id}/scene/{scene_id}/style
 #
 # Bundles caption text styling (font size, colors, animation_type) and
-# scene background color into one call — the friendly counterpart to the
-# generic track-level PATCH above, which requires the caller to already
-# know track_ids and the exact shape of "style"/"background_color".
+# scene background color into one call.
 #
-# This writes:
-#   - caption_<scene_id>.style      = {font_size, text_color, outline_color, animation_type}
-#   - broll_<scene_id>.background_color = <hex>
+# FIX (persistence bug): this used to write ONLY into timeline_json's
+# caption_<scene_id>.style and broll_<scene_id>.background_color fields.
+# Any later voice/trim/infographic edit on ANY scene calls
+# build_timeline_from_scenes(raw_scenes), which rebuilds every track from
+# scratch using only raw_scenes — so these style edits would silently
+# vanish. Now this endpoint follows the SAME pattern as
+# voice/trim/infographic: persist onto raw_scenes (scene['caption_style'],
+# scene['background_color']) and rebuild the full timeline via
+# build_timeline_from_scenes, so the style survives every future rebuild.
 #
-# Any field left as None in the request body is left untouched on the
-# existing track (so callers can update just one thing, e.g. only
-# background_color, without clobbering previously-set style fields).
+# Also FIX: now correctly flags final_video_url/render_status as stale,
+# same as the other scene-editing endpoints (previously this endpoint
+# forgot to do that, so a stale final_video_url kept being served as
+# "current" after a purely-visual edit).
 # ---------------------------------------------------------------------------
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/style")
@@ -10632,9 +10789,25 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
             status_code=422,
             detail=f"animation_type must be one of {sorted(_VALID_CAPTION_ANIMATION_TYPES)}",
         )
+    _validate_hex_color(update.text_color, "text_color")
+    _validate_hex_color(update.outline_color, "outline_color")
+    _validate_hex_color(update.background_color, "background_color")
+
+    if (
+        update.font_size is None and update.text_color is None
+        and update.outline_color is None and update.animation_type is None
+        and update.background_color is None
+    ):
+        raise HTTPException(status_code=422, detail="Provide at least one field to update")
 
     try:
-        row = supabase.table("videos").select("timeline_json, timeline_version").eq("id", video_id).single().execute()
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
     except Exception as e:
         print(f"[update-scene-style] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -10642,22 +10815,14 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     if not row.data:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    timeline = row.data["timeline_json"]
+    raw_scenes = row.data.get("raw_scenes") or []
     current_version = row.data.get("timeline_version", 1)
 
-    caption_track_id = f"caption_{scene_id}"
-    broll_track_id = f"broll_{scene_id}"
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
 
-    caption_track = None
-    broll_track = None
-    for track in timeline.get("tracks", []):
-        if track.get("track_id") == caption_track_id:
-            caption_track = track
-        elif track.get("track_id") == broll_track_id:
-            broll_track = track
-
-    if caption_track is None and broll_track is None:
-        raise HTTPException(status_code=404, detail=f"No tracks found for scene {scene_id}")
+    scene = dict(raw_scenes[scene_index])
 
     style_fields = {
         "font_size": update.font_size,
@@ -10667,37 +10832,42 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     }
     style_fields = {k: v for k, v in style_fields.items() if v is not None}
 
-    if style_fields and caption_track is not None:
-        existing_style = caption_track.get("style") or {}
-        caption_track["style"] = {**existing_style, **style_fields}
-    elif style_fields and caption_track is None:
-        raise HTTPException(
-            status_code=404, detail=f"No caption track found for scene {scene_id} to apply text style to"
-        )
+    if style_fields:
+        existing_style = scene.get("caption_style") or {}
+        scene["caption_style"] = {**existing_style, **style_fields}
 
     if update.background_color is not None:
-        if broll_track is None:
-            raise HTTPException(
-                status_code=404, detail=f"No broll track found for scene {scene_id} to apply background_color to"
-            )
-        broll_track["background_color"] = update.background_color
+        scene["background_color"] = update.background_color
 
+    raw_scenes[scene_index] = scene
+
+    # Rebuild the full timeline from raw_scenes, same pattern as
+    # voice/trim/infographic, so caption_style/background_color are
+    # guaranteed to be re-applied by build_timeline_from_scenes() no
+    # matter what triggers a future rebuild.
+    timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
 
     try:
         supabase.table("videos").update({
-            "timeline_json": timeline,
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
             "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-style] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save style edit")
 
     return {
-        "timeline_version": new_version,
+        "video_id": video_id,
         "scene_id": scene_id,
-        "caption_style": (caption_track or {}).get("style"),
-        "background_color": (broll_track or {}).get("background_color"),
+        "timeline_version": new_version,
+        "caption_style": scene.get("caption_style"),
+        "background_color": scene.get("background_color"),
+        "timeline": timeline_json,
+        "needs_render": True,
     }
 
 
@@ -10763,12 +10933,20 @@ async def update_scene_voice(video_id: str, scene_id: str, update: SceneVoiceUpd
     scene["start"] = timed_words[0]["start"] if timed_words else None
     scene["end"] = timed_words[-1]["end"] if timed_words else None
     scene["word_segments"] = word_segments
+    # New audio means any previous trim window no longer applies to this
+    # take — clear it and the "full" backup so a future trim starts fresh
+    # against the new alignment instead of clipping against stale bounds.
+    scene.pop("trim", None)
+    scene.pop("word_segments_full", None)
     scene["error"] = None
 
     raw_scenes[scene_index] = scene
 
     # Cascading rebuild: every scene's frame offsets after this one shift
-    # to match the new audio duration.
+    # to match the new audio duration. build_timeline_from_scenes() also
+    # re-applies caption_style/background_color/broll_override for every
+    # scene (including this one and all others), so those persisted edits
+    # survive this rebuild.
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
 
@@ -10794,9 +10972,6 @@ async def update_scene_voice(video_id: str, scene_id: str, update: SceneVoiceUpd
         "timeline": timeline_json,
         "needs_render": True,
     }
-
-
-
 
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/trim")
@@ -10831,6 +11006,10 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
 
     scene = dict(raw_scenes[scene_index])
 
+    # Keep an untouched backup of the FULL word_segments the first time this
+    # scene is trimmed, so re-trimming later (e.g. user drags the handles
+    # again) always starts from the original alignment instead of
+    # compounding trims on top of an already-clipped list.
     full_word_segments = scene.get("word_segments_full")
     if full_word_segments is None:
         full_word_segments = scene.get("word_segments") or []
@@ -10893,24 +11072,6 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
     }
 
 
-
-# ---------------------------------------------------------------------------
-# NEW: PATCH /timeline/{video_id}/scene/{scene_id}/infographic
-#
-# Changes a scene's infographic treatment (which Remotion composition it
-# uses), its props, and/or its on-screen duration.
-#
-# animation_type must be a key in REMOTION_INFOGRAPHIC_LIBRARY, and props
-# is only accepted alongside an animation_type — each composition expects
-# a different props shape, so accepting props without knowing the target
-# composition risks a mismatch.
-#
-# Like the voice/trim endpoints, this rebuilds the WHOLE timeline instead
-# of patching one track in place, because changing animation_type can move
-# a scene between the "infographic_*" and "overlay_*" track families —
-# build_timeline_from_scenes() already knows how to pick the right one.
-# ---------------------------------------------------------------------------
-
 @app.patch("/timeline/{video_id}/scene/{scene_id}/infographic")
 async def update_scene_infographic(video_id: str, scene_id: str, update: SceneInfographicUpdate):
     if update.animation_type is None and update.props is None and update.duration_frames is None:
@@ -10970,6 +11131,8 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
     if update.duration_frames is not None:
         animation["duration_frames"] = update.duration_frames
 
+    # Re-validate so placement/z_index/trigger/render_engine_hint stay
+    # consistent with whatever animation_type ended up set.
     animation = _validate_animation(animation, scene)
 
     infographic = _get_scene_infographic(scene, animation)
@@ -10980,6 +11143,8 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
         )
 
     if update.props is not None:
+        # Explicit props from the caller override whatever the template's
+        # props_builder auto-generated from vo_text / on_screen_text.
         infographic["props"] = {**infographic.get("props", {}), **update.props}
 
     scene["animation"] = animation
@@ -11012,20 +11177,103 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
     }
 
 
+# ---------------------------------------------------------------------------
+# NEW: PATCH /timeline/{video_id}/scene/{scene_id}/broll
+#
+# Dedicated, typed endpoint for picking a specific candidate out of a
+# scene's already-fetched broll pool (frontend shows candidates.videos /
+# candidates.images from the timeline; this is what "select this one"
+# calls). Looks the candidate up server-side by id+source in raw_scenes'
+# media pool (rather than trusting a client-supplied file_url) so the
+# resolved link is always guaranteed to come from
+# _resolve_broll_file_url() and be genuinely playable.
+#
+# Persists onto raw_scenes (scene['broll_override']) and rebuilds the full
+# timeline, same pattern as style/voice/trim/infographic, so the pick
+# survives future rebuilds.
+# ---------------------------------------------------------------------------
 
+@app.patch("/timeline/{video_id}/scene/{scene_id}/broll")
+async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSelectUpdate):
+    if update.source not in ("video", "image"):
+        raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
 
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[update-scene-broll] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
 
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
 
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
 
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
 
+    scene = dict(raw_scenes[scene_index])
 
+    candidate = _find_broll_candidate(scene, update.asset_id, update.source)
+    if candidate is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {update.source} candidate with id {update.asset_id} in scene {scene_id}'s media pool",
+        )
 
+    file_url = _resolve_broll_file_url(candidate, update.source)
+    if not file_url:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Candidate {update.asset_id} has no resolvable playable file_url",
+        )
 
+    scene["broll_override"] = {
+        "asset_id": candidate.get("id"),
+        "source": update.source,
+        "file_url": file_url,
+    }
+    # A manually picked asset overrides any solid-color background too —
+    # otherwise the color would keep winning in the renderer.
+    scene.pop("background_color", None)
 
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-scene-broll] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save broll selection")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "selected_asset": scene["broll_override"],
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
 
 
 # =============================================================================
-# RENDER SERVICE (fixed)
+# RENDER SERVICE
 # (all imports needed here are already at the top of this file)
 # =============================================================================
 
@@ -11128,9 +11376,10 @@ async def _prepare_broll_clip(
     scaled/cropped to (width, height), ready to be used as the scene's
     background layer.
 
-    NEW: if `background_color_override` is set (from a scene-style edit),
-    it wins outright — skip broll entirely and render that solid color,
-    same as the automatic fallback path but with the user's chosen color.
+    If `background_color_override` is set (from a scene-style edit or a
+    scene that has no broll_override but does have a background_color), it
+    wins outright — skip broll entirely and render that solid color, same
+    as the automatic fallback path but with the user's chosen color.
     """
     if background_color_override:
         return await _make_color_fallback(
@@ -11139,8 +11388,8 @@ async def _prepare_broll_clip(
         )
 
     selected = broll_track.get("selected_asset")
-    # FIX: use the shared resolver instead of selected.get("file_url"),
-    # which was always missing on raw candidate objects.
+    # Use the shared resolver instead of selected.get("file_url"), which
+    # was always missing on raw candidate objects.
     source_url = _resolve_broll_file_url(selected, (selected or {}).get("source")) if selected else None
 
     if not selected or not source_url:
@@ -11232,11 +11481,11 @@ async def _make_color_fallback(
 
 
 # ---------------------------------------------------------------------------
-# FIX: silent audio fallback. Any scene whose voiceover generation or
-# whisperx alignment failed previously ended up with NO audio stream at all
-# in its rendered segment (shutil.copy path, no muxing). When that
-# video-only segment was concatenated (-c copy) after segments that DO have
-# audio, ffmpeg's stream-copy concat can't reconcile the mismatched stream
+# Silent audio fallback. Any scene whose voiceover generation or whisperx
+# alignment failed previously ended up with NO audio stream at all in its
+# rendered segment (shutil.copy path, no muxing). When that video-only
+# segment was concatenated (-c copy) after segments that DO have audio,
+# ffmpeg's stream-copy concat can't reconcile the mismatched stream
 # layouts — the audio track just stops early while video keeps rolling.
 # Muxing in silence keeps every segment's stream layout identical
 # (1 video + 1 audio), so concat stays in sync for the full duration.
@@ -11307,7 +11556,7 @@ async def render_infographic_via_remotion(
         ]
         return cmd
 
-    # FIX: the animation planner (ANIMATION_PLANNER_PROMPT / _validate_animation)
+    # The animation planner (ANIMATION_PLANNER_PROMPT / _validate_animation)
     # is free to choose any duration_frames in the 90-240 range for
     # full_screen_* overlays, but the actual Remotion <Composition> for a
     # given composition_id may have a fixed/hardcoded durationInFrames (e.g.
@@ -11363,7 +11612,7 @@ def _build_ass_from_words(
     words: list[dict], scene_start_frame: int, fps: int, width: int, height: int,
     style: Optional[dict] = None,
 ) -> str:
-    # NEW: style overrides from a scene-style edit (font_size, text_color,
+    # Style overrides from a scene-style edit (font_size, text_color,
     # outline_color, animation_type). Falls back to the original defaults
     # when no style override is present, so existing timelines render
     # exactly as before.
@@ -11483,11 +11732,13 @@ async def _render_scene(
 
         # 1. Background broll, trimmed/looped to exact scene length.
         #
-        # FIX: prefer the asset the user may have picked via
-        # PATCH /timeline/{video_id} (stored in timeline_json's
-        # broll_<scene_id> track) over always re-deriving candidate[0] from
-        # raw_scenes. Falls back to the first video/image candidate from the
-        # scene's own media pool if no timeline override exists.
+        # Prefer the asset the user may have picked via PATCH
+        # /timeline/{video_id}/scene/{scene_id}/broll or the generic PATCH
+        # /timeline/{video_id} (stored in timeline_json's broll_<scene_id>
+        # track, which by now is ALSO mirrored into raw_scenes'
+        # broll_override — see the FIX comments on those endpoints). Falls
+        # back to the first video/image candidate from the scene's own
+        # media pool if no override exists anywhere.
         selected = None
         source = None
 
@@ -11512,9 +11763,13 @@ async def _render_scene(
                 "selected_asset": {**selected, "source": source, "file_url": file_url}
             }
 
-        # NEW: solid background_color set via PATCH /timeline/{video_id}/scene/{scene_id}/style
-        # takes priority over any broll asset for this scene.
-        background_color_override = (timeline_broll or {}).get("background_color")
+        # Solid background_color set via PATCH .../style or the broll
+        # override clearing takes priority over any broll asset for this
+        # scene. Prefer the live timeline_json value (kept in sync with
+        # raw_scenes by every editing endpoint), falling back to raw_scenes
+        # directly in case this scene was never rebuilt into timeline_json
+        # for some reason.
+        background_color_override = (timeline_broll or {}).get("background_color") or scene.get("background_color")
 
         base_clip = await _prepare_broll_clip(
             broll_track, duration_frames, fps, width, height, tmp_dir, client,
@@ -11523,14 +11778,17 @@ async def _render_scene(
 
         # 2. Infographic overlay, if present, composited on top.
         #
-        # FIX: previously this always read scene.get("infographics") from
-        # raw_scenes, so any edit made via
-        # PATCH /timeline/{video_id}/scene/{scene_id}/infographic (which
-        # only touches timeline_json's infographic_<scene_id> track) was
-        # silently ignored at render time — the same class of bug the
-        # broll fix above addressed. Now the timeline override wins when
-        # present, falling back to raw_scenes' original infographic if the
-        # scene was never edited.
+        # FIX: previously this only ever read scene.get("infographics")
+        # from raw_scenes; render_video() built infographic_tracks_by_scene
+        # in some drafts but never actually populated or passed it, so any
+        # infographic edit made purely through the generic
+        # PATCH /timeline/{video_id} (rather than the dedicated
+        # .../infographic endpoint) was silently ignored at render time —
+        # the exact same bug class as the original broll page-link bug.
+        # render_video() below now correctly indexes "infographic" type
+        # tracks and passes them in, so the timeline override wins when
+        # present, falling back to raw_scenes' original infographic
+        # otherwise.
         timeline_infographic = (infographic_tracks_by_scene or {}).get(scene_id)
         if timeline_infographic and timeline_infographic.get("composition_id"):
             infographic = {
@@ -11564,11 +11822,12 @@ async def _render_scene(
 
         # 3. Burn captions.
         #
-        # NEW: pull any caption "style" override (font_size, text_color,
+        # Pull any caption "style" override (font_size, text_color,
         # outline_color, animation_type) set via
-        # PATCH /timeline/{video_id}/scene/{scene_id}/style.
+        # PATCH /timeline/{video_id}/scene/{scene_id}/style. Prefer the
+        # live timeline_json value, fall back to raw_scenes directly.
         timeline_caption = (caption_tracks_by_scene or {}).get(scene_id)
-        caption_style = (timeline_caption or {}).get("style")
+        caption_style = (timeline_caption or {}).get("style") or scene.get("caption_style")
 
         words = scene.get("word_segments") or []
         words = [
@@ -11682,19 +11941,26 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     resolution = timeline.get("resolution", {"width": 1080, "height": 1920})
     width, height = resolution["width"], resolution["height"]
 
-    # FIX: index the persisted timeline's broll tracks by scene_id so
-    # _render_scene can honor any asset the user picked via PATCH
-    # /timeline/{video_id} instead of always re-deriving candidate[0].
-    # NEW: also index caption tracks by scene_id so any style override
-    # (font size, color, animation_type) set via
-    # PATCH /timeline/{video_id}/scene/{scene_id}/style gets applied.
+    # Index the persisted timeline's tracks by scene_id so _render_scene
+    # can honor any asset the user picked via PATCH /timeline/{video_id}
+    # (or the dedicated broll/style endpoints) instead of always
+    # re-deriving candidate[0].
+    #
+    # FIX: this now ALSO indexes "infographic" type tracks (previously
+    # missing entirely — infographic_tracks_by_scene was never built or
+    # passed to _render_scene, so any infographic edit made through the
+    # generic PATCH /timeline/{video_id} endpoint was silently ignored at
+    # render time).
     timeline_tracks_by_scene = {}
     caption_tracks_by_scene = {}
+    infographic_tracks_by_scene = {}
     for track in timeline.get("tracks", []):
         if track.get("type") == "broll" and track.get("scene_id"):
             timeline_tracks_by_scene[track["scene_id"]] = track
         elif track.get("type") == "caption_word" and track.get("scene_id"):
             caption_tracks_by_scene[track["scene_id"]] = track
+        elif track.get("type") == "infographic" and track.get("scene_id"):
+            infographic_tracks_by_scene[track["scene_id"]] = track
 
     try:
         supabase.table("videos").update({"render_status": "rendering"}).eq("id", video_id).execute()
@@ -11715,6 +11981,10 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
                         scene, fps, width, height, work_root, client, semaphore,
                         timeline_tracks_by_scene=timeline_tracks_by_scene,
                         caption_tracks_by_scene=caption_tracks_by_scene,
+                        # FIX: this was previously never passed, so
+                        # infographic overrides made via the generic patch
+                        # endpoint never reached the renderer.
+                        infographic_tracks_by_scene=infographic_tracks_by_scene,
                     )
                     scene_paths.append(path)
                 except Exception as e:
@@ -11759,3 +12029,4 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
         raise HTTPException(status_code=500, detail=f"Render failed: {e}")
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
+
