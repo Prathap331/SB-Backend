@@ -9261,20 +9261,92 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
 import re
+import os
+import json
+import uuid
+import shutil
 import tempfile
 import asyncio
+import subprocess
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
 import whisperx
+from fastapi import HTTPException
+from pydantic import BaseModel
+
+
+# ---------------------------------------------------------------------------
+# SHARED HELPER — used by both the scene-planning/timeline-builder code
+# (build_timeline_from_scenes) and the renderer (_render_scene /
+# _prepare_broll_clip). Defined once, up top, so both halves of this file
+# agree on where a broll candidate's real, playable file lives.
+#
+# BUG THIS FIXES (root cause of "video still blank after first fix"):
+# The raw Pexels candidate's "url" field is the pexels.com PAGE link
+# (e.g. https://www.pexels.com/video/drone-footage-..._10207167/), not a
+# downloadable file — actual files live at videos.pexels.com/... (for
+# video_files[].link) or images.pexels.com/... (for src.large2x etc).
+# The original build_timeline_from_scenes did
+#   "file_url": candidate.get("url") or candidate.get("video_url")
+# which happily stored that unplayable page link as if it were resolved.
+# Any code that later saw a truthy file_url and trusted it blindly (as the
+# first render fix did) would try to download an HTML page as an mp4/jpg,
+# fail, and silently fall back to the solid-color card — even though the
+# fix "worked" in the sense that it always tried something.
+# The guard below only trusts a pre-existing file_url if it's actually on
+# a CDN domain that serves real media; otherwise it re-derives the correct
+# link from video_files / src.
+# ---------------------------------------------------------------------------
+
+def _looks_like_playable_media_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    if "videos.pexels.com" in url or "images.pexels.com" in url:
+        return True
+    if re.search(r"\.(mp4|mov|webm|jpg|jpeg|png|webp)(\?|$)", url, re.IGNORECASE):
+        return True
+    return False
+
+
+def _resolve_broll_file_url(candidate: dict, source: str) -> Optional[str]:
+    if not candidate:
+        return None
+
+    # Only trust an already-set file_url if it actually points at a CDN
+    # media file — never a pexels.com/video/... or pexels.com/photo/...
+    # page link, which is unplayable but was historically stored as if
+    # it were the real thing.
+    existing = candidate.get("file_url")
+    if _looks_like_playable_media_url(existing):
+        return existing
+
+    if source == "video":
+        if candidate.get("video_url") and _looks_like_playable_media_url(candidate["video_url"]):
+            return candidate["video_url"]
+        # Pexels raw video objects expose the actual mp4 links under
+        # "video_files" — "url" on a video object is the pexels.com page,
+        # not a playable file, so it must be tried last (and is filtered
+        # out by _looks_like_playable_media_url below anyway).
+        video_files = candidate.get("video_files") or []
+        if video_files:
+            for vf in video_files:
+                if vf.get("quality") == "hd" and vf.get("file_type") == "video/mp4":
+                    return vf.get("link")
+            return video_files[0].get("link")
+        return candidate.get("url") if _looks_like_playable_media_url(candidate.get("url")) else None
+
+    # source == "image"
+    src = candidate.get("src") or {}
+    for key in ("large2x", "large", "original", "medium"):
+        if src.get(key):
+            return src[key]
+    if candidate.get("image_url") and _looks_like_playable_media_url(candidate["image_url"]):
+        return candidate["image_url"]
+    return candidate.get("url") if _looks_like_playable_media_url(candidate.get("url")) else None
+
 
 SCRIPT_SCENE_PROMPT = f""" 
 System Prompt
@@ -9413,9 +9485,6 @@ Ensure the output is valid, parseable JSON.
       """
 
 
-# ---------------------------------------------------------------------------
-# Animation planning taxonomy + prompt.
-# ---------------------------------------------------------------------------
 
 ANIMATION_TAXONOMY = {
     "full_screen": [
@@ -9458,7 +9527,6 @@ ANIMATION_TAXONOMY = {
     ],
 }
 
-# Flat set of every valid animation_type, and a lookup back to its category.
 _ANIMATION_TYPE_TO_CATEGORY = {
     anim_type: category
     for category, anim_types in ANIMATION_TAXONOMY.items()
@@ -9625,25 +9693,96 @@ class EditVideo(BaseModel):
     durationMinutes: int = 0
 
 
+class TrackPatch(BaseModel):
+    track_id: str
+    updates: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# NEW: per-scene edit models — voice swap, and text/background styling.
+# ---------------------------------------------------------------------------
+
+_VALID_CAPTION_ANIMATION_TYPES = {
+    "kinetic_caption",   # word-chunk burn-in, current default behaviour
+    "static_line",       # whole line shown for the full scene, no chunking
+    "typewriter",        # metadata hint for the frontend preview player
+    "word_pop",          # metadata hint for the frontend preview player
+}
+
+
+class SceneVoiceUpdate(BaseModel):
+    voice: str
+
+
+class SceneStyleUpdate(BaseModel):
+    # Caption/text styling
+    font_size: Optional[int] = None          # px-equivalent, e.g. 48-120
+    text_color: Optional[str] = None         # hex, e.g. "#FFFFFF"
+    outline_color: Optional[str] = None      # hex, e.g. "#000000"
+    animation_type: Optional[str] = None     # one of _VALID_CAPTION_ANIMATION_TYPES
+
+    # Scene background
+    background_color: Optional[str] = None   # hex, e.g. "#111827" — solid color instead of broll
+
+
+class SceneTrimUpdate(BaseModel):
+    # Both in seconds, in the SAME coordinate space as this scene's own
+    # word_segments (i.e. relative to that scene's own generated audio
+    # clip, not the global video timeline). The frontend should snap these
+    # to an existing word's start/end from word_segments rather than
+    # letting the user pick an arbitrary sub-word instant.
+    start: float
+    end: float
+
+
+class SceneInfographicUpdate(BaseModel):
+    # One of REMOTION_INFOGRAPHIC_LIBRARY's keys, e.g. "full_screen_data_viz",
+    # "full_screen_quote_card", "stat_counter_overlay", "bullet_list_reveal",
+    # "full_screen_title_card", "icon_sequence", "icon_pop_in". Required
+    # whenever `props` is provided so the two never end up mismatched
+    # (each composition expects a different props shape).
+    animation_type: Optional[str] = None
+    props: Optional[dict[str, Any]] = None
+    duration_frames: Optional[int] = None
+
+
+def _hex_to_ass_color(hex_color: str, alpha_hex: str = "00") -> str:
+    """
+    Convert '#RRGGBB' (or 'RRGGBB') into libass's '&HAABBGGRR' format.
+    alpha_hex '00' = fully opaque, 'FF' = fully transparent (ASS convention).
+    """
+    h = (hex_color or "").strip().lstrip("#")
+    if len(h) != 6:
+        h = "FFFFFF"
+    r, g, b = h[0:2], h[2:4], h[4:6]
+    return f"&H{alpha_hex}{b}{g}{r}"
+
+
+def _normalize_ffmpeg_color(hex_color: str) -> str:
+    """Convert '#RRGGBB' (or 'RRGGBB') into ffmpeg's '0xRRGGBB' color syntax."""
+    h = (hex_color or "").strip().lstrip("#")
+    if len(h) != 6:
+        h = "111827"
+    return f"0x{h}"
+
+
 WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "small")
 WHISPERX_DEVICE = os.getenv("WHISPERX_DEVICE", "cpu")
 WHISPERX_COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "int8")
 
-# Final number of videos/images we want returned per scene, per media type.
 PEXELS_SCENE_RESULT_LIMIT = int(os.getenv("PEXELS_SCENE_RESULT_LIMIT", "6"))
-# How many results to request per individual keyword query (kept small since
-# we run several keywords per scene and then merge + trim to the limit above).
 PEXELS_SCENE_PER_KEYWORD_PER_PAGE = int(os.getenv("PEXELS_SCENE_PER_KEYWORD_PER_PAGE", "4"))
 PEXELS_SCENE_PAGE = 1
 PEXELS_SCENE_ORIENTATION = os.getenv("PEXELS_SCENE_ORIENTATION", None)  # e.g. "landscape"
 PEXELS_SCENE_SIZE = os.getenv("PEXELS_SCENE_SIZE", None)                # e.g. "large"
 PEXELS_SCENE_COLOR = os.getenv("PEXELS_SCENE_COLOR", None)              # images only
 
-# Max number of distinct keyword phrases we'll use to query Pexels, per
-# scene. Keywords now come directly from the scene-planning LLM call
-# (see `broll_keywords` in SCRIPT_SCENE_PROMPT) — no separate LLM call.
 BROLL_KEYWORDS_MAX = int(os.getenv("BROLL_KEYWORDS_MAX", "6"))
 BROLL_KEYWORDS_MIN = int(os.getenv("BROLL_KEYWORDS_MIN", "5"))
+
+TIMELINE_FPS = int(os.getenv("TIMELINE_FPS", "30"))
+TIMELINE_WIDTH = int(os.getenv("TIMELINE_WIDTH", "1080"))
+TIMELINE_HEIGHT = int(os.getenv("TIMELINE_HEIGHT", "1920"))
 
 _whisperx_model = None
 _whisperx_align_cache = {}
@@ -9715,33 +9854,13 @@ async def _generate_word_timestamps(audio_url: str) -> dict:
         return await asyncio.to_thread(_run_whisperx_sync, audio_bytes)
 
 
-# ---------------------------------------------------------------------------
-# Pexels B-roll fetching.
-#
-# Flow per scene:
-#   1. Ask the LLM for 2-3 distinct keyword phrases covering different
-#      visual angles on the scene (location/era, detail shot, wide shot).
-#   2. Query Pexels (videos + images) for EACH keyword concurrently.
-#   3. Merge all results, dedupe by asset id, and trim to
-#      PEXELS_SCENE_RESULT_LIMIT (default 6) per media type.
-# Reuses the same sync helpers / formatters as the existing
-# /search-pexels-videos, /search-pexels-images, /search-pexels endpoints so
-# results stay consistent across the app.
-# ---------------------------------------------------------------------------
 
 def _get_scene_broll_keywords(scene: dict) -> list:
-    """
-    Reads `broll_keywords` produced by the scene-planning LLM call
-    (SCRIPT_SCENE_PROMPT). No separate LLM call here — this just validates
-    and tops up/falls back if the field is missing, empty, malformed, or
-    shorter than BROLL_KEYWORDS_MIN for this scene.
-    """
     raw_keywords = scene.get("broll_keywords")
 
     keywords = []
     if isinstance(raw_keywords, list):
         keywords = [k.strip() for k in raw_keywords if isinstance(k, str) and k.strip()]
-        # de-dupe while preserving order, in case the model repeated a phrase
         seen = set()
         deduped = []
         for k in keywords:
@@ -9755,9 +9874,6 @@ def _get_scene_broll_keywords(scene: dict) -> list:
     if len(keywords) >= BROLL_KEYWORDS_MIN:
         return keywords[:BROLL_KEYWORDS_MAX]
 
-    # Model returned too few (or zero) usable keywords for this scene.
-    # Top up with visual_intent / a truncated vo_text snippet rather than
-    # searching with a thin, under-powered keyword set.
     fallback_extras = []
     visual_intent = (scene.get("visual_intent") or "").strip()
     if visual_intent and visual_intent.lower() not in [k.lower() for k in keywords]:
@@ -9776,15 +9892,6 @@ def _get_scene_broll_keywords(scene: dict) -> list:
 
 
 def _dedupe_and_trim(items: list, limit: int) -> list:
-    """
-    Dedupes a list of formatted Pexels result dicts, preserving first-seen
-    order (keyword search order), then trims to `limit`.
-
-    Tries common id field names first ("id", "video_id", "photo_id",
-    "asset_id"). Falls back to the item's url/src (whichever is present) if
-    none of those exist, so this keeps working regardless of the exact
-    shape _format_video_result / _format_image_result produce.
-    """
     def _identity(item: dict):
         for key in ("id", "video_id", "photo_id", "asset_id"):
             if key in item:
@@ -9809,15 +9916,6 @@ def _dedupe_and_trim(items: list, limit: int) -> list:
 
 
 async def _fetch_scene_media(scene: dict) -> dict:
-    """
-    Reads keyword phrases already produced by scene planning
-    (`broll_keywords`), queries Pexels (videos + images) for each keyword
-    concurrently, then merges/dedupes/trims to PEXELS_SCENE_RESULT_LIMIT
-    per media type.
-
-    Never raises — Pexels failures are captured per-type so an outage
-    degrades gracefully instead of failing the whole scene.
-    """
     keywords = _get_scene_broll_keywords(scene)
 
     empty_result = {
@@ -9863,9 +9961,6 @@ async def _fetch_scene_media(scene: dict) -> dict:
         except Exception as e:
             return {"keyword": keyword, "data": None, "error": str(e)}
 
-    # Fire every keyword's video search and every keyword's image search
-    # concurrently — for 3 keywords that's up to 6 simultaneous Pexels calls
-    # for this one scene.
     video_tasks = [_get_videos_for(k) for k in keywords]
     image_tasks = [_get_images_for(k) for k in keywords]
     video_results, image_results = await asyncio.gather(
@@ -9890,8 +9985,6 @@ async def _fetch_scene_media(scene: dict) -> dict:
     videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
     photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
 
-    # Only surface an error if EVERY keyword failed for that media type —
-    # partial keyword failures just mean a smaller (but non-empty) pool.
     videos_error = "; ".join(video_errors) if video_errors and not videos else None
     images_error = "; ".join(image_errors) if image_errors and not photos else None
 
@@ -9910,18 +10003,8 @@ async def _fetch_scene_media(scene: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Animation planning — one structured animation object per scene, chosen
-# from ANIMATION_TAXONOMY via LLM, with strict validation + a deterministic
-# fallback if the model output is missing/invalid/unparseable.
-# ---------------------------------------------------------------------------
 
 def _default_animation(scene: dict) -> dict:
-    """
-    Deterministic fallback used when the animation-planner LLM call fails,
-    returns invalid JSON, or picks a value outside the allowed taxonomy.
-    Keeps /edit-video resilient — a bad animation pick never fails the scene.
-    """
     on_screen_text = (scene.get("on_screen_text") or "").strip()
 
     if on_screen_text:
@@ -9949,11 +10032,6 @@ def _default_animation(scene: dict) -> dict:
 
 
 def _validate_animation(raw: dict, scene: dict) -> dict:
-    """
-    Validates an LLM-produced animation object against the taxonomy and
-    field enums. Returns a corrected/sane object — falls back field-by-field
-    where possible instead of discarding the whole object on one bad field.
-    """
     fallback = _default_animation(scene)
 
     if not isinstance(raw, dict):
@@ -9963,8 +10041,6 @@ def _validate_animation(raw: dict, scene: dict) -> dict:
     if animation_type not in _VALID_ANIMATION_TYPES:
         return fallback
 
-    # category must match the animation_type's real group — trust our own
-    # lookup over whatever the model claims, since this is deterministic.
     category = _ANIMATION_TYPE_TO_CATEGORY[animation_type]
 
     placement = raw.get("placement")
@@ -10008,11 +10084,6 @@ def _validate_animation(raw: dict, scene: dict) -> dict:
 
 
 async def _plan_scene_animation(scene: dict) -> dict:
-    """
-    Calls the animation-planner LLM for a single scene and returns a
-    validated animation object. Never raises — any failure (API error,
-    bad JSON, invalid enum values) falls back to _default_animation.
-    """
     scene_context = {
         "scene_id": scene.get("scene_id"),
         "vo_text": scene.get("vo_text", ""),
@@ -10049,21 +10120,6 @@ async def _plan_scene_animation(scene: dict) -> dict:
     return _validate_animation(raw, scene)
 
 
-# ---------------------------------------------------------------------------
-# Remotion infographic matching.
-#
-# Not every scene needs an infographic — only the ones whose chosen
-# `animation` treatment is actually a data/graphic-driven type (data viz,
-# stat counter, bullet list, icon sequence, quote card, title card). For
-# those, we resolve the animation_type to a specific Remotion composition
-# from a fixed library and fill its props from data already on the scene
-# (on_screen_text, vo_text) — no extra LLM call, purely deterministic.
-# ---------------------------------------------------------------------------
-
-# Registry of available Remotion compositions. `composition_id` must match
-# a real <Composition id="..."> registered in your Remotion project (e.g.
-# src/Root.tsx). `props_builder` is a function(scene, animation) -> dict
-# producing that composition's input props.
 
 def _props_title_card(scene: dict, animation: dict) -> dict:
     return {
@@ -10074,8 +10130,6 @@ def _props_title_card(scene: dict, animation: dict) -> dict:
 
 def _props_quote_card(scene: dict, animation: dict) -> dict:
     vo_text = (scene.get("vo_text") or "").strip()
-    # Trim to the first sentence-ish chunk so the quote card isn't overloaded
-    # with a full paragraph of narration.
     quote = vo_text.split(". ")[0].strip()
     if quote and not quote.endswith((".", "!", "?")):
         quote += "."
@@ -10087,8 +10141,6 @@ def _props_quote_card(scene: dict, animation: dict) -> dict:
 
 def _props_stat_counter(scene: dict, animation: dict) -> dict:
     on_screen_text = (scene.get("on_screen_text") or "").strip()
-    # Pull the first number-like token (year, stat, count) out of
-    # on_screen_text, e.g. "324 BCE" -> "324", "12,000 soldiers" -> "12,000".
     match = re.search(r"[\d,]+(?:\.\d+)?", on_screen_text)
     value = match.group(0) if match else on_screen_text
     label = on_screen_text.replace(value, "").strip(" •-") if match else ""
@@ -10100,8 +10152,6 @@ def _props_stat_counter(scene: dict, animation: dict) -> dict:
 
 def _props_bullet_list(scene: dict, animation: dict) -> dict:
     on_screen_text = (scene.get("on_screen_text") or "").strip()
-    # on_screen_text may already be bullet-separated ("A • B • C"); fall back
-    # to splitting the narration into short clauses if not.
     if "•" in on_screen_text:
         items = [item.strip() for item in on_screen_text.split("•") if item.strip()]
     elif on_screen_text:
@@ -10164,18 +10214,6 @@ REMOTION_INFOGRAPHIC_LIBRARY = {
 
 
 def _get_scene_infographic(scene: dict, animation: dict) -> dict:
-    """
-    Resolves the scene's chosen animation_type to a Remotion composition +
-    filled props, if that animation_type is infographic-driven. Returns
-    None if the animation type has no matching Remotion template (e.g.
-    plain full_screen_broll, lower_third, transitions) — those scenes just
-    don't need an infographics entry.
-
-    Purely deterministic — no LLM call, no network, cannot fail. Uses
-    animation["duration_frames"] / ["trigger"] / ["placement"] already
-    decided by animation planning so the infographic timing stays in sync
-    with the rest of the scene's animation plan.
-    """
     animation_type = animation.get("animation_type")
     template = REMOTION_INFOGRAPHIC_LIBRARY.get(animation_type)
 
@@ -10200,17 +10238,9 @@ def _get_scene_infographic(scene: dict, animation: dict) -> dict:
 
 
 async def _process_scene(scene: dict, request: EditVideo) -> dict:
-    """Tags, generates speech, timestamps, fetches B-roll, and plans the
-    animation treatment for a single scene."""
     scene_out = dict(scene)
     vo_text = scene.get("vo_text", "")
 
-    # Both of these only depend on data already present on the scene object
-    # (broll_keywords / visual_intent / vo_text / on_screen_text /
-    # requires_animation, all produced by the scene-planning call), so they
-    # run concurrently with tagging/TTS/WhisperX instead of after it.
-    # _fetch_scene_media reads broll_keywords straight off the scene dict —
-    # no extra LLM call, see _get_scene_broll_keywords.
     media_task = asyncio.create_task(_fetch_scene_media(scene))
     animation_task = asyncio.create_task(_plan_scene_animation(scene))
 
@@ -10307,6 +10337,145 @@ def _enforce_scene_limit(scenes: list, max_scenes: int = 5) -> list:
     return kept + [last_scene]
 
 
+# ---------------------------------------------------------------------------
+# Timeline builder — converts the flat, per-scene-isolated scene list into a
+# single frame-based EDL (Edit Decision List) with global offsets. This is
+# the object persisted as `videos.timeline_json`, and the single source of
+# truth both the frontend preview player and the eventual FFmpeg/Remotion
+# render step consume.
+# ---------------------------------------------------------------------------
+
+def _seconds_to_frames(seconds: float, fps: int = TIMELINE_FPS) -> int:
+    return max(round((seconds or 0.0) * fps), 0)
+
+
+def build_timeline_from_scenes(scenes: list[dict], fps: int = TIMELINE_FPS) -> dict:
+    tracks = []
+    cumulative_frames = 0
+
+    for scene in scenes:
+        scene_id = scene.get("scene_id")
+        start_sec = scene.get("start") or 0.0
+        end_sec = scene.get("end") or 0.0
+        scene_duration_frames = max(_seconds_to_frames(end_sec - start_sec, fps), fps)  # min 1s fallback
+
+        scene_start_frame = cumulative_frames
+        scene_end_frame = cumulative_frames + scene_duration_frames
+
+        # --- audio track ---
+        voiceover = scene.get("voiceover")
+        if voiceover and voiceover.get("url"):
+            tracks.append({
+                "track_id": f"audio_{scene_id}",
+                "scene_id": scene_id,
+                "type": "audio",
+                "file_url": voiceover["url"],
+                "startFrame": scene_start_frame,
+                "endFrame": scene_end_frame,
+            })
+
+        # --- caption words, offset into the global timeline ---
+        word_segments = scene.get("word_segments") or []
+        words = []
+        for w in word_segments:
+            if "start" not in w or "end" not in w:
+                continue
+            words.append({
+                "word": w.get("word", ""),
+                "startFrame": scene_start_frame + _seconds_to_frames(w["start"] - start_sec, fps),
+                "endFrame": scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps),
+            })
+        if words:
+            tracks.append({
+                "track_id": f"caption_{scene_id}",
+                "scene_id": scene_id,
+                "type": "caption_word",
+                "words": words,
+            })
+
+        # --- broll track: candidate pool + a default selection ---
+        media = scene.get("media") or {}
+        video_candidates = (media.get("videos") or {}).get("results") or []
+        image_candidates = (media.get("images") or {}).get("results") or []
+
+        default_asset = None
+        default_source = None
+        if video_candidates:
+            default_asset = video_candidates[0]
+            default_source = "video"
+        elif image_candidates:
+            default_asset = image_candidates[0]
+            default_source = "image"
+
+        tracks.append({
+            "track_id": f"broll_{scene_id}",
+            "scene_id": scene_id,
+            "type": "broll",
+            "layer": "background",
+            "startFrame": scene_start_frame,
+            "endFrame": scene_end_frame,
+            "selected_asset": {
+                "asset_id": (default_asset or {}).get("id"),
+                # FIX: was `.get("url") or .get("video_url")`, which stored
+                # the unplayable pexels.com PAGE link since raw candidates
+                # never have "video_url". Use the shared resolver so this
+                # is a real, downloadable CDN link from the start.
+                "file_url": _resolve_broll_file_url(default_asset, default_source) if default_asset else None,
+                "source": default_source,
+            } if default_asset else None,
+            "candidates": {
+                "videos": video_candidates,
+                "images": image_candidates,
+            },
+        })
+
+        # --- animation / infographic overlay track ---
+        animation = scene.get("animation") or {}
+        infographic = scene.get("infographics")
+
+        overlay_duration = animation.get("duration_frames") or (scene_end_frame - scene_start_frame)
+        overlay_start = scene_start_frame
+        overlay_end = min(scene_start_frame + overlay_duration, scene_end_frame)
+
+        if infographic:
+            tracks.append({
+                "track_id": f"infographic_{scene_id}",
+                "scene_id": scene_id,
+                "type": "infographic",
+                "layer": "foreground",
+                "composition_id": infographic.get("composition_id"),
+                "animation_type": infographic.get("animation_type"),
+                "props": infographic.get("props", {}),
+                "startFrame": overlay_start,
+                "endFrame": overlay_end,
+                "status": "pending_render",
+                "asset_url": None,
+                "render_engine_hint": "remotion",
+            })
+        elif animation:
+            tracks.append({
+                "track_id": f"overlay_{scene_id}",
+                "scene_id": scene_id,
+                "type": "animation",
+                "layer": animation.get("z_index_layer", "foreground"),
+                "animation_type": animation.get("animation_type"),
+                "placement": animation.get("placement"),
+                "content_binding": animation.get("content_binding"),
+                "startFrame": overlay_start,
+                "endFrame": overlay_end,
+                "render_engine_hint": animation.get("render_engine_hint"),
+            })
+
+        cumulative_frames = scene_end_frame
+
+    return {
+        "fps": fps,
+        "total_frames": cumulative_frames,
+        "resolution": {"width": TIMELINE_WIDTH, "height": TIMELINE_HEIGHT},
+        "tracks": tracks,
+    }
+
+
 @app.post("/edit-video")
 async def edit_video(request: EditVideo):
     try:
@@ -10360,7 +10529,1233 @@ async def edit_video(request: EditVideo):
     if failed_scenes:
         print(f"[edit-video] completed with {len(failed_scenes)} failed scene(s): {failed_scenes}")
 
+    timeline_json = build_timeline_from_scenes(scenes_with_voice_and_timestamps)
+
+    video_id = str(uuid.uuid4())
+    try:
+        supabase.table("videos").insert({
+            "id": video_id,
+            "user_id": request.userId,
+            "script": request.script,
+            "voice": request.voice,
+            "lang_code": request.langCode,
+            "timeline_json": timeline_json,
+            "timeline_version": 1,
+            "raw_scenes": scenes_with_voice_and_timestamps,
+        }).execute()
+    except Exception as e:
+        print(f"[edit-video] failed to persist video row: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save video")
+
     return {
+        "video_id": video_id,
+        "timeline": timeline_json,
         "scenes": scenes_with_voice_and_timestamps,
         "failed_scene_ids": failed_scenes,
     }
+
+
+
+@app.get("/timeline/{video_id}")
+async def get_timeline(video_id: str):
+    try:
+        row = supabase.table("videos").select("timeline_json, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[get-timeline] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    return row.data
+
+
+@app.patch("/timeline/{video_id}")
+async def patch_timeline(video_id: str, patch: TrackPatch):
+    try:
+        row = supabase.table("videos").select("timeline_json, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[patch-timeline] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    timeline = row.data["timeline_json"]
+    current_version = row.data.get("timeline_version", 1)
+
+    track_found = False
+    for track in timeline.get("tracks", []):
+        if track.get("track_id") == patch.track_id:
+            track.update(patch.updates)
+            track_found = True
+            break
+
+    if not track_found:
+        raise HTTPException(status_code=404, detail=f"Track {patch.track_id} not found in timeline")
+
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "timeline_json": timeline,
+            "timeline_version": new_version,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[patch-timeline] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save edit")
+
+    return {"timeline_version": new_version, "track_id": patch.track_id}
+
+
+# ---------------------------------------------------------------------------
+# NEW: PATCH /timeline/{video_id}/scene/{scene_id}/style
+#
+# Bundles caption text styling (font size, colors, animation_type) and
+# scene background color into one call — the friendly counterpart to the
+# generic track-level PATCH above, which requires the caller to already
+# know track_ids and the exact shape of "style"/"background_color".
+#
+# This writes:
+#   - caption_<scene_id>.style      = {font_size, text_color, outline_color, animation_type}
+#   - broll_<scene_id>.background_color = <hex>
+#
+# Any field left as None in the request body is left untouched on the
+# existing track (so callers can update just one thing, e.g. only
+# background_color, without clobbering previously-set style fields).
+# ---------------------------------------------------------------------------
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/style")
+async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpdate):
+    if update.animation_type is not None and update.animation_type not in _VALID_CAPTION_ANIMATION_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"animation_type must be one of {sorted(_VALID_CAPTION_ANIMATION_TYPES)}",
+        )
+
+    try:
+        row = supabase.table("videos").select("timeline_json, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[update-scene-style] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    timeline = row.data["timeline_json"]
+    current_version = row.data.get("timeline_version", 1)
+
+    caption_track_id = f"caption_{scene_id}"
+    broll_track_id = f"broll_{scene_id}"
+
+    caption_track = None
+    broll_track = None
+    for track in timeline.get("tracks", []):
+        if track.get("track_id") == caption_track_id:
+            caption_track = track
+        elif track.get("track_id") == broll_track_id:
+            broll_track = track
+
+    if caption_track is None and broll_track is None:
+        raise HTTPException(status_code=404, detail=f"No tracks found for scene {scene_id}")
+
+    style_fields = {
+        "font_size": update.font_size,
+        "text_color": update.text_color,
+        "outline_color": update.outline_color,
+        "animation_type": update.animation_type,
+    }
+    style_fields = {k: v for k, v in style_fields.items() if v is not None}
+
+    if style_fields and caption_track is not None:
+        existing_style = caption_track.get("style") or {}
+        caption_track["style"] = {**existing_style, **style_fields}
+    elif style_fields and caption_track is None:
+        raise HTTPException(
+            status_code=404, detail=f"No caption track found for scene {scene_id} to apply text style to"
+        )
+
+    if update.background_color is not None:
+        if broll_track is None:
+            raise HTTPException(
+                status_code=404, detail=f"No broll track found for scene {scene_id} to apply background_color to"
+            )
+        broll_track["background_color"] = update.background_color
+
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "timeline_json": timeline,
+            "timeline_version": new_version,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-scene-style] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save style edit")
+
+    return {
+        "timeline_version": new_version,
+        "scene_id": scene_id,
+        "caption_style": (caption_track or {}).get("style"),
+        "background_color": (broll_track or {}).get("background_color"),
+    }
+
+
+@app.post("/timeline/{video_id}/scene/{scene_id}/voice")
+async def update_scene_voice(video_id: str, scene_id: str, update: SceneVoiceUpdate):
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, user_id, lang_code, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[update-scene-voice] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    user_id = row.data.get("user_id")
+    lang_code = row.data.get("lang_code", "en")
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    # Reuse the tagged narration if it exists (keeps any pause/emphasis tags
+    # from the original generation), otherwise fall back to raw vo_text.
+    text_to_speak = scene.get("tagged_vo_text") or scene.get("vo_text", "")
+
+    if not text_to_speak.strip():
+        raise HTTPException(status_code=400, detail=f"Scene {scene_id} has no narration text to regenerate")
+
+    speech_request = GenerateSpeechRequest(
+        userId=user_id,
+        script=text_to_speak,
+        voice=update.voice,
+        langCode=lang_code,
+        durationMinutes=0,
+    )
+
+    try:
+        speech_result = await generate_speech(speech_request)
+    except Exception as e:
+        print(f"[update-scene-voice] voice generation failed for scene {scene_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Voice generation failed: {e}")
+
+    try:
+        scene_timestamps = await _generate_word_timestamps(speech_result["url"])
+    except Exception as e:
+        print(f"[update-scene-voice] whisperx alignment failed for scene {scene_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Timestamp alignment failed: {e}")
+
+    word_segments = scene_timestamps.get("word_segments", [])
+    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+
+    scene["voice"] = update.voice
+    scene["voiceover"] = speech_result
+    scene["start"] = timed_words[0]["start"] if timed_words else None
+    scene["end"] = timed_words[-1]["end"] if timed_words else None
+    scene["word_segments"] = word_segments
+    scene["error"] = None
+
+    raw_scenes[scene_index] = scene
+
+    # Cascading rebuild: every scene's frame offsets after this one shift
+    # to match the new audio duration.
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            # The picture no longer matches this audio/timing — force a
+            # re-render rather than silently serving the stale final video.
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-scene-voice] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save voice edit")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "voice": update.voice,
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
+
+
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/trim")
+async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdate):
+    if update.start < 0 or update.end <= update.start:
+        raise HTTPException(
+            status_code=422,
+            detail="`end` must be greater than `start`, and `start` must be >= 0",
+        )
+
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[update-scene-trim] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+
+    full_word_segments = scene.get("word_segments_full")
+    if full_word_segments is None:
+        full_word_segments = scene.get("word_segments") or []
+        scene["word_segments_full"] = full_word_segments
+
+    if not full_word_segments:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Scene {scene_id} has no word-level timestamps to trim against",
+        )
+
+    clip_start = full_word_segments[0].get("start", 0.0)
+    clip_end = full_word_segments[-1].get("end", 0.0)
+
+    if update.start < clip_start - 1e-3 or update.end > clip_end + 1e-3:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Trim range [{update.start}, {update.end}] is outside this scene's "
+                f"original audio bounds [{clip_start}, {clip_end}]"
+            ),
+        )
+
+    # Keep only words that fall fully inside the requested trim window.
+    trimmed_words = [
+        w for w in full_word_segments
+        if "start" in w and "end" in w and w["start"] >= update.start and w["end"] <= update.end
+    ]
+
+    scene["trim"] = {"start": update.start, "end": update.end}
+    scene["word_segments"] = trimmed_words
+    scene["start"] = trimmed_words[0]["start"] if trimmed_words else update.start
+    scene["end"] = trimmed_words[-1]["end"] if trimmed_words else update.end
+    scene["error"] = None
+
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-scene-trim] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save trim edit")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "trim": scene["trim"],
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# NEW: PATCH /timeline/{video_id}/scene/{scene_id}/infographic
+#
+# Changes a scene's infographic treatment (which Remotion composition it
+# uses), its props, and/or its on-screen duration.
+#
+# animation_type must be a key in REMOTION_INFOGRAPHIC_LIBRARY, and props
+# is only accepted alongside an animation_type — each composition expects
+# a different props shape, so accepting props without knowing the target
+# composition risks a mismatch.
+#
+# Like the voice/trim endpoints, this rebuilds the WHOLE timeline instead
+# of patching one track in place, because changing animation_type can move
+# a scene between the "infographic_*" and "overlay_*" track families —
+# build_timeline_from_scenes() already knows how to pick the right one.
+# ---------------------------------------------------------------------------
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/infographic")
+async def update_scene_infographic(video_id: str, scene_id: str, update: SceneInfographicUpdate):
+    if update.animation_type is None and update.props is None and update.duration_frames is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least one of animation_type, props, duration_frames",
+        )
+
+    if update.props is not None and update.animation_type is None:
+        raise HTTPException(
+            status_code=422,
+            detail="animation_type is required whenever props is provided, so they don't end up mismatched",
+        )
+
+    if update.animation_type is not None and update.animation_type not in REMOTION_INFOGRAPHIC_LIBRARY:
+        raise HTTPException(
+            status_code=422,
+            detail=f"animation_type must be one of {sorted(REMOTION_INFOGRAPHIC_LIBRARY.keys())}",
+        )
+
+    if update.duration_frames is not None:
+        if update.duration_frames <= 0 or update.duration_frames > 900:
+            raise HTTPException(
+                status_code=422,
+                detail="duration_frames must be between 1 and 900 (30s @30fps)",
+            )
+
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[update-scene-infographic] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    animation = dict(scene.get("animation") or _default_animation(scene))
+
+    if update.animation_type is not None:
+        animation["animation_type"] = update.animation_type
+        animation["category"] = _ANIMATION_TYPE_TO_CATEGORY[update.animation_type]
+
+    if update.duration_frames is not None:
+        animation["duration_frames"] = update.duration_frames
+
+    animation = _validate_animation(animation, scene)
+
+    infographic = _get_scene_infographic(scene, animation)
+    if infographic is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{animation['animation_type']}' is not an infographic composition",
+        )
+
+    if update.props is not None:
+        infographic["props"] = {**infographic.get("props", {}), **update.props}
+
+    scene["animation"] = animation
+    scene["infographics"] = infographic
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-scene-infographic] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save infographic edit")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "animation": animation,
+        "infographic": infographic,
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =============================================================================
+# RENDER SERVICE (fixed)
+# (all imports needed here are already at the top of this file)
+# =============================================================================
+
+
+RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
+RENDER_OUTPUT_BUCKET = os.getenv("RENDER_OUTPUT_BUCKET", "rendered-videos")
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
+
+# Remotion project root — see render_infographic_via_remotion() stub below.
+REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR", "")
+
+# Cap how many scenes render concurrently. ffmpeg/Remotion are CPU-heavy;
+# unbounded concurrency will thrash the host. Tune to core count.
+RENDER_CONCURRENCY = int(os.getenv("RENDER_CONCURRENCY", "2"))
+
+# Audio settings used for the silent-track fallback (must match whatever
+# your real voiceover tracks use so concat streams line up cleanly).
+SILENT_AUDIO_SAMPLE_RATE = int(os.getenv("SILENT_AUDIO_SAMPLE_RATE", "48000"))
+SILENT_AUDIO_CHANNEL_LAYOUT = os.getenv("SILENT_AUDIO_CHANNEL_LAYOUT", "stereo")
+
+
+class RenderVideoRequest(BaseModel):
+    # Optional override — if the caller wants to force a re-render even
+    # though a final_video_url already exists.
+    force: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Low-level process helpers
+# ---------------------------------------------------------------------------
+
+async def _run(cmd: list[str], cwd: Optional[str] = None) -> None:
+    """Run a subprocess, raise with captured stderr on failure."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
+            f"--- stderr ---\n{stderr.decode(errors='replace')[-4000:]}"
+        )
+
+
+async def _probe_duration_seconds(path: str) -> float:
+    cmd = [
+        FFPROBE_BIN, "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path}: {stderr.decode(errors='replace')}")
+    try:
+        return float(stdout.decode().strip())
+    except ValueError:
+        raise RuntimeError(f"ffprobe returned unparsable duration for {path}: {stdout!r}")
+
+
+async def _download(url: str, dest: str, client: httpx.AsyncClient) -> str:
+    resp = await client.get(url, follow_redirects=True, timeout=60.0)
+    resp.raise_for_status()
+    with open(dest, "wb") as f:
+        f.write(resp.content)
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# NOTE: _resolve_broll_file_url and _looks_like_playable_media_url are
+# defined once, near the top of this file (right after the imports), so
+# both build_timeline_from_scenes() and the renderer below agree on where
+# a broll candidate's real, playable file lives.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Broll: trim or loop the selected asset to exactly match the scene's frame
+# range. Handles both video and image assets.
+# ---------------------------------------------------------------------------
+
+async def _prepare_broll_clip(
+    broll_track: dict,
+    scene_duration_frames: int,
+    fps: int,
+    width: int,
+    height: int,
+    tmp_dir: str,
+    client: httpx.AsyncClient,
+    background_color_override: Optional[str] = None,
+) -> str:
+    """
+    Returns path to an MP4, exactly `scene_duration_frames` long, silent,
+    scaled/cropped to (width, height), ready to be used as the scene's
+    background layer.
+
+    NEW: if `background_color_override` is set (from a scene-style edit),
+    it wins outright — skip broll entirely and render that solid color,
+    same as the automatic fallback path but with the user's chosen color.
+    """
+    if background_color_override:
+        return await _make_color_fallback(
+            scene_duration_frames, fps, width, height, tmp_dir,
+            color=_normalize_ffmpeg_color(background_color_override),
+        )
+
+    selected = broll_track.get("selected_asset")
+    # FIX: use the shared resolver instead of selected.get("file_url"),
+    # which was always missing on raw candidate objects.
+    source_url = _resolve_broll_file_url(selected, (selected or {}).get("source")) if selected else None
+
+    if not selected or not source_url:
+        # No broll available at all — fall back to a solid color card so
+        # the timeline never has a hard gap.
+        print(
+            f"[render] no usable broll file_url for asset "
+            f"{(selected or {}).get('asset_id') or (selected or {}).get('id')} — using color fallback"
+        )
+        return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
+
+    target_seconds = scene_duration_frames / fps
+    source = selected.get("source", "video")
+    ext = ".mp4" if source == "video" else ".jpg"
+    local_src = os.path.join(tmp_dir, f"broll_src{ext}")
+
+    try:
+        await _download(source_url, local_src, client)
+    except Exception as e:
+        print(f"[render] broll download failed ({source_url}): {e} — using fallback")
+        return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
+
+    out_path = os.path.join(tmp_dir, "broll_fit.mp4")
+    scale_crop = (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},setsar=1,fps={fps}"
+    )
+
+    if source == "image":
+        # Ken Burns-lite: static image held for the full duration.
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-loop", "1", "-i", local_src,
+            "-t", f"{target_seconds:.3f}",
+            "-vf", scale_crop,
+            "-an",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            out_path,
+        ]
+        await _run(cmd)
+        return out_path
+
+    # Video: find its actual duration, then either trim or loop to fit.
+    source_seconds = await _probe_duration_seconds(local_src)
+
+    if source_seconds >= target_seconds:
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-i", local_src,
+            "-t", f"{target_seconds:.3f}",
+            "-vf", scale_crop,
+            "-an",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            out_path,
+        ]
+    else:
+        # Source is shorter than the scene — loop it (stream_loop -1 with
+        # explicit -t cutoff) rather than freeze-framing, so motion continues.
+        loops_needed = int(target_seconds // source_seconds) + 1
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-stream_loop", str(loops_needed),
+            "-i", local_src,
+            "-t", f"{target_seconds:.3f}",
+            "-vf", scale_crop,
+            "-an",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            out_path,
+        ]
+    await _run(cmd)
+    return out_path
+
+
+async def _make_color_fallback(
+    duration_frames: int, fps: int, width: int, height: int, tmp_dir: str,
+    color: str = "0x111827",
+) -> str:
+    out_path = os.path.join(tmp_dir, "broll_fallback.mp4")
+    seconds = duration_frames / fps
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-f", "lavfi",
+        "-i", f"color=c={color}:s={width}x{height}:d={seconds:.3f}:r={fps}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        out_path,
+    ]
+    await _run(cmd)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# FIX: silent audio fallback. Any scene whose voiceover generation or
+# whisperx alignment failed previously ended up with NO audio stream at all
+# in its rendered segment (shutil.copy path, no muxing). When that
+# video-only segment was concatenated (-c copy) after segments that DO have
+# audio, ffmpeg's stream-copy concat can't reconcile the mismatched stream
+# layouts — the audio track just stops early while video keeps rolling.
+# Muxing in silence keeps every segment's stream layout identical
+# (1 video + 1 audio), so concat stays in sync for the full duration.
+# ---------------------------------------------------------------------------
+
+async def _make_silent_audio(duration_frames: int, fps: int, tmp_dir: str) -> str:
+    out_path = os.path.join(tmp_dir, "silence.aac")
+    seconds = max(duration_frames / fps, 1 / fps)
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-f", "lavfi",
+        "-i", f"anullsrc=channel_layout={SILENT_AUDIO_CHANNEL_LAYOUT}:sample_rate={SILENT_AUDIO_SAMPLE_RATE}",
+        "-t", f"{seconds:.3f}",
+        "-c:a", "aac",
+        out_path,
+    ]
+    await _run(cmd)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Infographic overlays — Remotion stub.
+#
+# CONTRACT: given a composition_id (matches REMOTION_INFOGRAPHIC_LIBRARY
+# keys from the scene-planning code, e.g. "TitleCard", "DataVizFullScreen")
+# and its props dict, produce a transparent-background clip of exactly
+# `duration_frames` frames at `fps`, sized (width, height), and return its
+# path. Composited on top of broll with ffmpeg's overlay filter afterward.
+# ---------------------------------------------------------------------------
+
+async def render_infographic_via_remotion(
+    composition_id: str,
+    props: dict,
+    duration_frames: int,
+    fps: int,
+    width: int,
+    height: int,
+    tmp_dir: str,
+) -> Optional[str]:
+    if not REMOTION_PROJECT_DIR:
+        print(
+            f"[render] REMOTION_PROJECT_DIR not configured — skipping "
+            f"infographic '{composition_id}'. Set up a Remotion project and "
+            f"point REMOTION_PROJECT_DIR at it to enable overlays."
+        )
+        return None
+
+    out_path = os.path.join(tmp_dir, f"infographic_{uuid.uuid4().hex}.mov")
+    props_path = os.path.join(tmp_dir, "props.json")
+    with open(props_path, "w") as f:
+        json.dump(props, f)
+
+    def _build_cmd(frame_range: Optional[str]) -> list[str]:
+        cmd = [
+            "npx", "remotion", "render",
+            composition_id,
+            out_path,
+            f"--props={props_path}",
+        ]
+        if frame_range:
+            cmd.append(f"--frames={frame_range}")
+        cmd += [
+            f"--fps={fps}",
+            f"--width={width}",
+            f"--height={height}",
+            "--codec=prores",
+            "--pixel-format=yuva444p10le",
+        ]
+        return cmd
+
+    # FIX: the animation planner (ANIMATION_PLANNER_PROMPT / _validate_animation)
+    # is free to choose any duration_frames in the 90-240 range for
+    # full_screen_* overlays, but the actual Remotion <Composition> for a
+    # given composition_id may have a fixed/hardcoded durationInFrames (e.g.
+    # DataVizFullScreen was observed to be locked at 150 frames). Requesting
+    # a --frames range outside that fixed length makes Remotion hard-fail
+    # with "durationInFrames was evaluated to be N, but frame range X-Y is
+    # not inbetween 0-(N-1)". Rather than losing the whole overlay, retry
+    # once using the composition's own reported bound so it still renders —
+    # it will simply play for its native length instead of the requested
+    # one (acceptable for a title/stat/data-viz card overlaid on broll).
+    try:
+        await _run(_build_cmd(f"0-{duration_frames - 1}"), cwd=REMOTION_PROJECT_DIR)
+    except RuntimeError as e:
+        msg = str(e)
+        m = re.search(
+            r"durationInFrames.*?evaluated to be (\d+).*?not inbetween 0-(\d+)",
+            msg, re.IGNORECASE | re.DOTALL,
+        )
+        if not m:
+            print(f"[render] Remotion render failed for '{composition_id}': {e}")
+            return None
+
+        actual_duration = int(m.group(1))
+        max_frame = int(m.group(2))
+        print(
+            f"[render] '{composition_id}' has a fixed durationInFrames of "
+            f"{actual_duration} (requested {duration_frames}) — retrying "
+            f"within its native bounds (0-{max_frame})"
+        )
+        try:
+            await _run(_build_cmd(f"0-{max_frame}"), cwd=REMOTION_PROJECT_DIR)
+        except Exception as e2:
+            print(f"[render] retry also failed for '{composition_id}': {e2}")
+            return None
+
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Captions — build a word-accurate ASS subtitle file from word_segments and
+# burn it in with ffmpeg's `ass` filter.
+# ---------------------------------------------------------------------------
+
+def _frames_to_ass_time(frame: int, fps: int) -> str:
+    total_seconds = frame / fps
+    h = int(total_seconds // 3600)
+    m = int((total_seconds % 3600) // 60)
+    s = total_seconds % 60
+    return f"{h:d}:{m:02d}:{s:05.2f}"
+
+
+def _build_ass_from_words(
+    words: list[dict], scene_start_frame: int, fps: int, width: int, height: int,
+    style: Optional[dict] = None,
+) -> str:
+    # NEW: style overrides from a scene-style edit (font_size, text_color,
+    # outline_color, animation_type). Falls back to the original defaults
+    # when no style override is present, so existing timelines render
+    # exactly as before.
+    style = style or {}
+    font_size = style.get("font_size") or 72
+    primary_color = _hex_to_ass_color(style.get("text_color") or "#FFFFFF", alpha_hex="00")
+    outline_color = _hex_to_ass_color(style.get("outline_color") or "#000000", alpha_hex="00")
+    animation_type = style.get("animation_type") or "kinetic_caption"
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV
+Style: Caption,Arial Black,{font_size},{primary_color},{outline_color},&H80000000,1,4,0,2,60,60,200
+
+[Events]
+Format: Layer, Start, End, Style, Text
+"""
+    # "static_line" shows the whole scene's text as one continuous line for
+    # the full scene duration instead of chunked word groups. "kinetic_caption"
+    # (default) keeps the original chunked burn-in behaviour.
+    # Note: true per-word pop/fade animation (typewriter, word_pop) needs a
+    # frame-composited renderer like Remotion — plain libass/ASS burn-in
+    # can't animate individual glyphs, so those animation_type values are
+    # accepted and stored for the frontend preview player but render here
+    # using the same static/kinetic chunking as their closest ASS equivalent.
+    if animation_type == "static_line" and words:
+        start_frame = words[0]["startFrame"] - scene_start_frame
+        end_frame = words[-1]["endFrame"] - scene_start_frame
+        text = " ".join(w["word"] for w in words)
+        if start_frame < 0:
+            start_frame = 0
+        if end_frame > start_frame:
+            start_ts = _frames_to_ass_time(start_frame, fps)
+            end_ts = _frames_to_ass_time(end_frame, fps)
+            return header + f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}\n"
+        return header
+
+    # Group words into ~3-4 word chunks per line so captions read naturally
+    # instead of flashing one word at a time.
+    lines = []
+    chunk: list[dict] = []
+    CHUNK_SIZE = 4
+    for w in words:
+        chunk.append(w)
+        if len(chunk) >= CHUNK_SIZE:
+            lines.append(chunk)
+            chunk = []
+    if chunk:
+        lines.append(chunk)
+
+    events = []
+    for line_words in lines:
+        start_frame = line_words[0]["startFrame"] - scene_start_frame
+        end_frame = line_words[-1]["endFrame"] - scene_start_frame
+        if start_frame < 0 or end_frame <= start_frame:
+            continue
+        text = " ".join(w["word"] for w in line_words)
+        start_ts = _frames_to_ass_time(start_frame, fps)
+        end_ts = _frames_to_ass_time(end_frame, fps)
+        events.append(f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}")
+
+    return header + "\n".join(events) + "\n"
+
+
+async def _burn_captions(
+    input_path: str, words: list[dict], scene_start_frame: int, fps: int,
+    width: int, height: int, tmp_dir: str,
+    style: Optional[dict] = None,
+) -> str:
+    if not words:
+        return input_path
+
+    ass_content = _build_ass_from_words(words, scene_start_frame, fps, width, height, style=style)
+    ass_path = os.path.join(tmp_dir, "captions.ass")
+    with open(ass_path, "w") as f:
+        f.write(ass_content)
+
+    out_path = os.path.join(tmp_dir, "with_captions.mp4")
+    # ffmpeg's ass filter needs an escaped path on some platforms; simplest
+    # reliable form is to cwd into tmp_dir and reference the filename only.
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-i", input_path,
+        "-vf", "ass=captions.ass",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        out_path,
+    ]
+    await _run(cmd, cwd=tmp_dir)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Per-scene render: broll -> overlay infographic -> burn captions -> mux audio
+# ---------------------------------------------------------------------------
+
+async def _render_scene(
+    scene: dict, fps: int, width: int, height: int, work_root: str,
+    client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
+    timeline_tracks_by_scene: Optional[dict] = None,
+    caption_tracks_by_scene: Optional[dict] = None,
+    infographic_tracks_by_scene: Optional[dict] = None,
+) -> str:
+    async with semaphore:
+        scene_id = scene.get("scene_id", uuid.uuid4().hex)
+        tmp_dir = os.path.join(work_root, f"scene_{scene_id}")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        start_sec = scene.get("start") or 0.0
+        end_sec = scene.get("end") or 0.0
+        duration_frames = max(round((end_sec - start_sec) * fps), fps)  # min 1s
+
+        # 1. Background broll, trimmed/looped to exact scene length.
+        #
+        # FIX: prefer the asset the user may have picked via
+        # PATCH /timeline/{video_id} (stored in timeline_json's
+        # broll_<scene_id> track) over always re-deriving candidate[0] from
+        # raw_scenes. Falls back to the first video/image candidate from the
+        # scene's own media pool if no timeline override exists.
+        selected = None
+        source = None
+
+        timeline_broll = (timeline_tracks_by_scene or {}).get(scene_id)
+        if timeline_broll and timeline_broll.get("selected_asset"):
+            selected = dict(timeline_broll["selected_asset"])
+            source = selected.get("source")
+
+        if not selected:
+            media = scene.get("media") or {}
+            video_candidates = (media.get("videos") or {}).get("results") or []
+            image_candidates = (media.get("images") or {}).get("results") or []
+            if video_candidates:
+                selected, source = dict(video_candidates[0]), "video"
+            elif image_candidates:
+                selected, source = dict(image_candidates[0]), "image"
+
+        broll_track = {"selected_asset": None}
+        if selected:
+            file_url = _resolve_broll_file_url(selected, source)
+            broll_track = {
+                "selected_asset": {**selected, "source": source, "file_url": file_url}
+            }
+
+        # NEW: solid background_color set via PATCH /timeline/{video_id}/scene/{scene_id}/style
+        # takes priority over any broll asset for this scene.
+        background_color_override = (timeline_broll or {}).get("background_color")
+
+        base_clip = await _prepare_broll_clip(
+            broll_track, duration_frames, fps, width, height, tmp_dir, client,
+            background_color_override=background_color_override,
+        )
+
+        # 2. Infographic overlay, if present, composited on top.
+        #
+        # FIX: previously this always read scene.get("infographics") from
+        # raw_scenes, so any edit made via
+        # PATCH /timeline/{video_id}/scene/{scene_id}/infographic (which
+        # only touches timeline_json's infographic_<scene_id> track) was
+        # silently ignored at render time — the same class of bug the
+        # broll fix above addressed. Now the timeline override wins when
+        # present, falling back to raw_scenes' original infographic if the
+        # scene was never edited.
+        timeline_infographic = (infographic_tracks_by_scene or {}).get(scene_id)
+        if timeline_infographic and timeline_infographic.get("composition_id"):
+            infographic = {
+                "composition_id": timeline_infographic.get("composition_id"),
+                "props": timeline_infographic.get("props", {}),
+                "duration_frames": timeline_infographic.get("duration_frames") or duration_frames,
+            }
+        else:
+            infographic = scene.get("infographics")
+
+        current = base_clip
+        if infographic and infographic.get("composition_id"):
+            overlay_clip = await render_infographic_via_remotion(
+                composition_id=infographic["composition_id"],
+                props=infographic.get("props", {}),
+                duration_frames=infographic.get("duration_frames") or duration_frames,
+                fps=fps, width=width, height=height, tmp_dir=tmp_dir,
+            )
+            if overlay_clip:
+                composited = os.path.join(tmp_dir, "composited.mp4")
+                cmd = [
+                    FFMPEG_BIN, "-y",
+                    "-i", current,
+                    "-i", overlay_clip,
+                    "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    composited,
+                ]
+                await _run(cmd)
+                current = composited
+
+        # 3. Burn captions.
+        #
+        # NEW: pull any caption "style" override (font_size, text_color,
+        # outline_color, animation_type) set via
+        # PATCH /timeline/{video_id}/scene/{scene_id}/style.
+        timeline_caption = (caption_tracks_by_scene or {}).get(scene_id)
+        caption_style = (timeline_caption or {}).get("style")
+
+        words = scene.get("word_segments") or []
+        words = [
+            w for w in words
+            if "start" in w and "end" in w
+            and w["start"] >= start_sec and w["end"] <= end_sec
+        ]
+        frame_words = [
+            {
+                "word": w.get("word", ""),
+                "startFrame": max(round((w["start"] - start_sec) * fps), 0),
+                "endFrame": max(round((w["end"] - start_sec) * fps), 0),
+            }
+            for w in words
+        ]
+        current = await _burn_captions(
+            current, frame_words, 0, fps, width, height, tmp_dir, style=caption_style
+        )
+
+        voiceover = scene.get("voiceover")
+        final_scene_path = os.path.join(work_root, f"scene_{scene_id}_final.mp4")
+
+        if voiceover and voiceover.get("url"):
+            audio_path_raw = os.path.join(tmp_dir, "audio_raw.mp3")
+            await _download(voiceover["url"], audio_path_raw, client)
+
+            audio_path = os.path.join(tmp_dir, "audio_trimmed.m4a")
+            trim_cmd = [
+                FFMPEG_BIN, "-y",
+                "-i", audio_path_raw,
+                "-ss", f"{start_sec:.3f}",
+                "-to", f"{end_sec:.3f}",
+                "-c:a", "aac",
+                audio_path,
+            ]
+            await _run(trim_cmd)
+        else:
+            print(f"[render] scene {scene_id} has no voiceover — muxing silent audio instead")
+            audio_path = await _make_silent_audio(duration_frames, fps, tmp_dir)
+
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-i", current,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            final_scene_path,
+        ]
+        await _run(cmd)
+
+        return final_scene_path
+
+
+# ---------------------------------------------------------------------------
+# Concat all scene renders in order.
+# ---------------------------------------------------------------------------
+
+async def _concat_scenes(scene_paths: list[str], work_root: str) -> str:
+    list_path = os.path.join(work_root, "concat_list.txt")
+    with open(list_path, "w") as f:
+        for p in scene_paths:
+            f.write(f"file '{p}'\n")
+
+    out_path = os.path.join(work_root, "final_output.mp4")
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", list_path,
+        "-c", "copy",
+        out_path,
+    ]
+    await _run(cmd)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/render/{video_id}")
+async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoRequest()):
+    try:
+        row = (
+            supabase.table("videos")
+            .select("timeline_json, raw_scenes, final_video_url")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[render] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if row.data.get("final_video_url") and not request.force:
+        return {
+            "video_id": video_id,
+            "status": "already_rendered",
+            "final_video_url": row.data["final_video_url"],
+        }
+
+    timeline = row.data.get("timeline_json") or {}
+    scenes = row.data.get("raw_scenes") or []
+    if not scenes:
+        raise HTTPException(status_code=400, detail="No scenes to render for this video")
+
+    fps = timeline.get("fps", 30)
+    resolution = timeline.get("resolution", {"width": 1080, "height": 1920})
+    width, height = resolution["width"], resolution["height"]
+
+    # FIX: index the persisted timeline's broll tracks by scene_id so
+    # _render_scene can honor any asset the user picked via PATCH
+    # /timeline/{video_id} instead of always re-deriving candidate[0].
+    # NEW: also index caption tracks by scene_id so any style override
+    # (font size, color, animation_type) set via
+    # PATCH /timeline/{video_id}/scene/{scene_id}/style gets applied.
+    timeline_tracks_by_scene = {}
+    caption_tracks_by_scene = {}
+    for track in timeline.get("tracks", []):
+        if track.get("type") == "broll" and track.get("scene_id"):
+            timeline_tracks_by_scene[track["scene_id"]] = track
+        elif track.get("type") == "caption_word" and track.get("scene_id"):
+            caption_tracks_by_scene[track["scene_id"]] = track
+
+    try:
+        supabase.table("videos").update({"render_status": "rendering"}).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[render] failed to set render_status=rendering for {video_id}: {e}")
+
+    work_root = os.path.join(RENDER_TMP_ROOT, video_id)
+    os.makedirs(work_root, exist_ok=True)
+    semaphore = asyncio.Semaphore(RENDER_CONCURRENCY)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            scene_paths = []
+            failed_scenes = []
+            for scene in scenes:
+                try:
+                    path = await _render_scene(
+                        scene, fps, width, height, work_root, client, semaphore,
+                        timeline_tracks_by_scene=timeline_tracks_by_scene,
+                        caption_tracks_by_scene=caption_tracks_by_scene,
+                    )
+                    scene_paths.append(path)
+                except Exception as e:
+                    print(f"[render] scene {scene.get('scene_id')} failed: {e}")
+                    failed_scenes.append(scene.get("scene_id"))
+
+            if not scene_paths:
+                raise HTTPException(status_code=500, detail="All scenes failed to render")
+
+            final_path = await _concat_scenes(scene_paths, work_root)
+
+        # Upload to Supabase storage.
+        storage_path = f"{video_id}/final.mp4"
+        with open(final_path, "rb") as f:
+            supabase.storage.from_(RENDER_OUTPUT_BUCKET).upload(
+                storage_path, f, {"content-type": "video/mp4", "upsert": "true"}
+            )
+        public_url = supabase.storage.from_(RENDER_OUTPUT_BUCKET).get_public_url(storage_path)
+
+        supabase.table("videos").update({
+            "final_video_url": public_url,
+            "render_status": "completed" if not failed_scenes else "completed_with_errors",
+            "failed_render_scene_ids": failed_scenes,
+        }).eq("id", video_id).execute()
+
+        return {
+            "video_id": video_id,
+            "status": "completed" if not failed_scenes else "completed_with_errors",
+            "final_video_url": public_url,
+            "failed_scene_ids": failed_scenes,
+        }
+
+    except HTTPException:
+        supabase.table("videos").update({"render_status": "failed"}).eq("id", video_id).execute()
+        raise
+    except Exception as e:
+        print(f"[render] render failed for {video_id}: {e}")
+        try:
+            supabase.table("videos").update({"render_status": "failed"}).eq("id", video_id).execute()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Render failed: {e}")
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
