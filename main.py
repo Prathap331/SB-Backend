@@ -11213,33 +11213,60 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
 # RENDER SERVICE
 # =============================================================================
 
+
+from fastapi import HTTPException, BackgroundTasks, Response, status
+
+
 RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
-
+ 
 REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR", "")
-
-RENDER_CONCURRENCY = int(os.getenv("RENDER_CONCURRENCY", "2"))
-
+ 
+# SPEED: default concurrency now scales with available CPUs instead of a
+# hardcoded "2" — each scene render is CPU-bound (multiple ffmpeg encodes),
+# so on an 8-core box this alone roughly quadruples scene-level parallelism.
+# Override with RENDER_CONCURRENCY env var if you need to cap it (e.g. to
+# limit memory use on a shared box).
+RENDER_CONCURRENCY = int(os.getenv("RENDER_CONCURRENCY", str(max(os.cpu_count() or 2, 2))))
+ 
+# SPEED: x264 defaults to "-preset medium" with no explicit thread count when
+# neither is passed, which is needlessly slow for what is essentially
+# throwaway intermediate encoding (broll fit, caption burn, etc.) followed by
+# a final encode. "veryfast" trades a small amount of compression efficiency
+# (slightly larger files at the same CRF) for a large speed win — typically
+# 3-6x faster than "medium" on the same hardware. CRF 23 keeps visual quality
+# effectively unchanged from the previous unset default (23 is libx264's own
+# default CRF). "-threads 0" lets x264 use all available cores per encode.
+FFMPEG_X264_PRESET = os.getenv("FFMPEG_X264_PRESET", "veryfast")
+FFMPEG_X264_CRF = os.getenv("FFMPEG_X264_CRF", "23")
+FFMPEG_X264_FLAGS = [
+    "-c:v", "libx264",
+    "-preset", FFMPEG_X264_PRESET,
+    "-crf", FFMPEG_X264_CRF,
+    "-pix_fmt", "yuv420p",
+    "-threads", "0",
+]
+ 
 SILENT_AUDIO_SAMPLE_RATE = int(os.getenv("SILENT_AUDIO_SAMPLE_RATE", "48000"))
 SILENT_AUDIO_CHANNEL_LAYOUT = os.getenv("SILENT_AUDIO_CHANNEL_LAYOUT", "stereo")
-
+ 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RENDER_OUTPUT_DIR = os.environ.get("RENDER_OUTPUT_DIR", os.path.join(BASE_DIR, "rendered_videos"))
 os.makedirs(RENDER_OUTPUT_DIR, exist_ok=True)
-
+ 
 LANDSCAPE_RESOLUTION = {"width": 1920, "height": 1080}
 PORTRAIT_RESOLUTION = {"width": 1080, "height": 1920}
-
+ 
 SUPABASE_RENDERED_VIDEOS_BUCKET = os.getenv("SUPABASE_RENDERED_VIDEOS_BUCKET", "rendered-videos")
-
-
+ 
+ 
 def _upload_rendered_video_to_supabase(local_path: str, video_id: str, filename: str = "final.mp4") -> str:
     dest_path = f"{video_id}/{filename}"
-
+ 
     with open(local_path, "rb") as f:
         file_bytes = f.read()
-
+ 
     supabase.storage.from_(SUPABASE_RENDERED_VIDEOS_BUCKET).upload(
         path=dest_path,
         file=file_bytes,
@@ -11248,17 +11275,17 @@ def _upload_rendered_video_to_supabase(local_path: str, video_id: str, filename:
             "upsert": "true",  # overwrite if this video_id was rendered before
         },
     )
-
+ 
     public_url = supabase.storage.from_(SUPABASE_RENDERED_VIDEOS_BUCKET).get_public_url(dest_path)
     return public_url
-
-
+ 
+ 
 class RenderVideoRequest(BaseModel):
     force: bool = False
     # FIX: explicit orientation, defaults to landscape (YouTube long-form).
     orientation: Literal["landscape", "portrait"] = "landscape"
-
-
+ 
+ 
 async def _run(cmd: list[str], cwd: Optional[str] = None) -> None:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -11272,8 +11299,8 @@ async def _run(cmd: list[str], cwd: Optional[str] = None) -> None:
             f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
             f"--- stderr ---\n{stderr.decode(errors='replace')[-4000:]}"
         )
-
-
+ 
+ 
 async def _probe_duration_seconds(path: str) -> float:
     cmd = [
         FFPROBE_BIN, "-v", "error",
@@ -11291,8 +11318,8 @@ async def _probe_duration_seconds(path: str) -> float:
         return float(stdout.decode().strip())
     except ValueError:
         raise RuntimeError(f"ffprobe returned unparsable duration for {path}: {stdout!r}")
-
-
+ 
+ 
 async def _probe_video_dimensions(path: str) -> Optional[tuple[int, int]]:
     cmd = [
         FFPROBE_BIN, "-v", "error",
@@ -11308,19 +11335,19 @@ async def _probe_video_dimensions(path: str) -> Optional[tuple[int, int]]:
     if proc.returncode != 0:
         print(f"[render] ffprobe dimension check failed on {path}: {stderr.decode(errors='replace')[-500:]}")
         return None
-
+ 
     try:
         data = json.loads(stdout.decode())
         streams = data.get("streams") or []
         if not streams:
             return None
         stream = streams[0]
-
+ 
         width = int(stream.get("width", 0) or 0)
         height = int(stream.get("height", 0) or 0)
         if width <= 0 or height <= 0:
             return None
-
+ 
         rotation = 0
         tags_rotate = (stream.get("tags") or {}).get("rotate")
         if tags_rotate is not None:
@@ -11328,31 +11355,31 @@ async def _probe_video_dimensions(path: str) -> Optional[tuple[int, int]]:
                 rotation = int(float(tags_rotate))
             except (TypeError, ValueError):
                 rotation = 0
-
+ 
         for sd in (stream.get("side_data_list") or []):
             if "rotation" in sd:
                 try:
                     rotation = int(float(sd["rotation"]))
                 except (TypeError, ValueError):
                     pass
-
+ 
         rotation = abs(rotation) % 360
         if rotation in (90, 270):
             width, height = height, width
-
+ 
         return width, height
     except (ValueError, KeyError, IndexError, json.JSONDecodeError):
         return None
-
-
+ 
+ 
 async def _download(url: str, dest: str, client: httpx.AsyncClient) -> str:
     resp = await client.get(url, follow_redirects=True, timeout=60.0)
     resp.raise_for_status()
     with open(dest, "wb") as f:
         f.write(resp.content)
     return dest
-
-
+ 
+ 
 async def _make_color_fallback(
     duration_frames: int, fps: int, width: int, height: int, tmp_dir: str,
     color: str = "0x111827",
@@ -11363,13 +11390,13 @@ async def _make_color_fallback(
         FFMPEG_BIN, "-y",
         "-f", "lavfi",
         "-i", f"color=c={color}:s={width}x{height}:d={seconds:.3f}:r={fps}",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        *FFMPEG_X264_FLAGS,
         out_path,
     ]
     await _run(cmd)
     return out_path
-
-
+ 
+ 
 async def _make_blurpad_fallback(
     local_src: str,
     source_kind: str,
@@ -11381,14 +11408,14 @@ async def _make_blurpad_fallback(
 ) -> Optional[str]:
     target_seconds = duration_frames / fps
     out_path = os.path.join(tmp_dir, "broll_blurpad.mp4")
-
+ 
     filter_complex = (
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},gblur=sigma=30,eq=brightness=-0.05[bg];"
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
         f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={fps}[outv]"
     )
-
+ 
     if source_kind == "image":
         cmd = [
             FFMPEG_BIN, "-y",
@@ -11397,7 +11424,7 @@ async def _make_blurpad_fallback(
             "-filter_complex", filter_complex,
             "-map", "[outv]",
             "-an",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            *FFMPEG_X264_FLAGS,
             out_path,
         ]
         try:
@@ -11406,12 +11433,12 @@ async def _make_blurpad_fallback(
         except Exception as e:
             print(f"[render] blur-pad image composite failed: {e}")
             return None
-
+ 
     try:
         source_seconds = await _probe_duration_seconds(local_src)
     except Exception:
         source_seconds = target_seconds
-
+ 
     if source_seconds >= target_seconds:
         cmd = [
             FFMPEG_BIN, "-y",
@@ -11420,7 +11447,7 @@ async def _make_blurpad_fallback(
             "-filter_complex", filter_complex,
             "-map", "[outv]",
             "-an",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            *FFMPEG_X264_FLAGS,
             out_path,
         ]
     else:
@@ -11433,18 +11460,18 @@ async def _make_blurpad_fallback(
             "-filter_complex", filter_complex,
             "-map", "[outv]",
             "-an",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            *FFMPEG_X264_FLAGS,
             out_path,
         ]
-
+ 
     try:
         await _run(cmd)
         return out_path
     except Exception as e:
         print(f"[render] blur-pad video composite failed: {e}")
         return None
-
-
+ 
+ 
 async def _prepare_broll_clip(
     broll_track: dict,
     scene_duration_frames: int,
@@ -11460,29 +11487,29 @@ async def _prepare_broll_clip(
             scene_duration_frames, fps, width, height, tmp_dir,
             color=_normalize_ffmpeg_color(background_color_override),
         )
-
+ 
     selected = broll_track.get("selected_asset")
-
+ 
     if not selected:
         print("[render] no b-roll asset selected for this scene at all — using color fallback")
         return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
+ 
     source = selected.get("source", "video")
-
+ 
     # First choice: strict landscape-only URL.
     landscape_url = _resolve_broll_file_url(selected, source)
-
+ 
     if landscape_url:
         target_seconds = scene_duration_frames / fps
         ext = ".mp4" if source == "video" else ".jpg"
         local_src = os.path.join(tmp_dir, f"broll_src{ext}")
-
+ 
         try:
             await _download(landscape_url, local_src, client)
         except Exception as e:
             print(f"[render] broll download failed ({landscape_url}): {e} — trying blur-pad fallback")
             landscape_url = None  # fall through to the any-orientation path below
-
+ 
         if landscape_url:
             if source == "video":
                 dims = await _probe_video_dimensions(local_src)
@@ -11498,13 +11525,13 @@ async def _prepare_broll_clip(
                     if blurpad:
                         return blurpad
                     return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
+ 
             out_path = os.path.join(tmp_dir, "broll_fit.mp4")
             scale_crop = (
                 f"scale={width}:{height}:force_original_aspect_ratio=increase,"
                 f"crop={width}:{height},setsar=1,fps={fps}"
             )
-
+ 
             if source == "image":
                 cmd = [
                     FFMPEG_BIN, "-y",
@@ -11512,12 +11539,12 @@ async def _prepare_broll_clip(
                     "-t", f"{target_seconds:.3f}",
                     "-vf", scale_crop,
                     "-an",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    *FFMPEG_X264_FLAGS,
                     out_path,
                 ]
                 await _run(cmd)
                 return out_path
-
+ 
             source_seconds = await _probe_duration_seconds(local_src)
             if source_seconds >= target_seconds:
                 cmd = [
@@ -11526,7 +11553,7 @@ async def _prepare_broll_clip(
                     "-t", f"{target_seconds:.3f}",
                     "-vf", scale_crop,
                     "-an",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    *FFMPEG_X264_FLAGS,
                     out_path,
                 ]
             else:
@@ -11538,12 +11565,12 @@ async def _prepare_broll_clip(
                     "-t", f"{target_seconds:.3f}",
                     "-vf", scale_crop,
                     "-an",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    *FFMPEG_X264_FLAGS,
                     out_path,
                 ]
             await _run(cmd)
             return out_path
-
+ 
     # FIX A: no landscape file for this candidate — try blur-pad with the
     # ORIGINAL asset (any orientation) rather than showing a blank card.
     any_url = _resolve_broll_file_url_any_orientation(selected, source)
@@ -11553,7 +11580,7 @@ async def _prepare_broll_clip(
             f"{selected.get('asset_id') or selected.get('id')} — using color fallback"
         )
         return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
+ 
     ext = ".mp4" if source == "video" else ".jpg"
     local_src = os.path.join(tmp_dir, f"broll_anyorient{ext}")
     try:
@@ -11561,17 +11588,17 @@ async def _prepare_broll_clip(
     except Exception as e:
         print(f"[render] any-orientation broll download failed ({any_url}): {e} — using color fallback")
         return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
+ 
     blurpad = await _make_blurpad_fallback(
         local_src, source, scene_duration_frames, fps, width, height, tmp_dir
     )
     if blurpad:
         return blurpad
-
+ 
     print("[render] blur-pad composite failed — using color fallback as last resort")
     return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
-
+ 
+ 
 async def _make_silent_audio(duration_frames: int, fps: int, tmp_dir: str) -> str:
     out_path = os.path.join(tmp_dir, "silence.aac")
     seconds = max(duration_frames / fps, 1 / fps)
@@ -11585,8 +11612,8 @@ async def _make_silent_audio(duration_frames: int, fps: int, tmp_dir: str) -> st
     ]
     await _run(cmd)
     return out_path
-
-
+ 
+ 
 async def render_infographic_via_remotion(
     composition_id: str,
     props: dict,
@@ -11603,12 +11630,12 @@ async def render_infographic_via_remotion(
             f"point REMOTION_PROJECT_DIR at it to enable overlays."
         )
         return None
-
+ 
     out_path = os.path.join(tmp_dir, f"infographic_{uuid.uuid4().hex}.mov")
     props_path = os.path.join(tmp_dir, "props.json")
     with open(props_path, "w") as f:
         json.dump(props, f)
-
+ 
     def _build_cmd(frame_range: Optional[str]) -> list[str]:
         cmd = [
             "npx", "remotion", "render",
@@ -11626,7 +11653,7 @@ async def render_infographic_via_remotion(
             "--pixel-format=yuva444p10le",
         ]
         return cmd
-
+ 
     try:
         await _run(_build_cmd(f"0-{duration_frames - 1}"), cwd=REMOTION_PROJECT_DIR)
     except RuntimeError as e:
@@ -11638,7 +11665,7 @@ async def render_infographic_via_remotion(
         if not m:
             print(f"[render] Remotion render failed for '{composition_id}': {e}")
             return None
-
+ 
         actual_duration = int(m.group(1))
         max_frame = int(m.group(2))
         print(
@@ -11651,18 +11678,18 @@ async def render_infographic_via_remotion(
         except Exception as e2:
             print(f"[render] retry also failed for '{composition_id}': {e2}")
             return None
-
+ 
     return out_path
-
-
+ 
+ 
 def _frames_to_ass_time(frame: int, fps: int) -> str:
     total_seconds = frame / fps
     h = int(total_seconds // 3600)
     m = int((total_seconds % 3600) // 60)
     s = total_seconds % 60
     return f"{h:d}:{m:02d}:{s:05.2f}"
-
-
+ 
+ 
 def _build_ass_from_words(
     words: list[dict], scene_start_frame: int, fps: int, width: int, height: int,
     style: Optional[dict] = None,
@@ -11672,17 +11699,17 @@ def _build_ass_from_words(
     primary_color = _hex_to_ass_color(style.get("text_color") or "#FFFFFF", alpha_hex="00")
     outline_color = _hex_to_ass_color(style.get("outline_color") or "#000000", alpha_hex="00")
     animation_type = style.get("animation_type") or "kinetic_caption"
-
+ 
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
 PlayResY: {height}
 WrapStyle: 0
-
+ 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV
 Style: Caption,Arial Black,{font_size},{primary_color},{outline_color},&H80000000,1,4,0,2,60,60,200
-
+ 
 [Events]
 Format: Layer, Start, End, Style, Text
 """
@@ -11697,7 +11724,7 @@ Format: Layer, Start, End, Style, Text
             end_ts = _frames_to_ass_time(end_frame, fps)
             return header + f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}\n"
         return header
-
+ 
     lines = []
     chunk: list[dict] = []
     CHUNK_SIZE = 4
@@ -11708,7 +11735,7 @@ Format: Layer, Start, End, Style, Text
             chunk = []
     if chunk:
         lines.append(chunk)
-
+ 
     events = []
     for line_words in lines:
         start_frame = line_words[0]["startFrame"] - scene_start_frame
@@ -11719,10 +11746,10 @@ Format: Layer, Start, End, Style, Text
         start_ts = _frames_to_ass_time(start_frame, fps)
         end_ts = _frames_to_ass_time(end_frame, fps)
         events.append(f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}")
-
+ 
     return header + "\n".join(events) + "\n"
-
-
+ 
+ 
 async def _burn_captions(
     input_path: str, words: list[dict], scene_start_frame: int, fps: int,
     width: int, height: int, tmp_dir: str,
@@ -11730,25 +11757,25 @@ async def _burn_captions(
 ) -> str:
     if not words:
         return input_path
-
+ 
     ass_content = _build_ass_from_words(words, scene_start_frame, fps, width, height, style=style)
     ass_path = os.path.join(tmp_dir, "captions.ass")
     with open(ass_path, "w") as f:
         f.write(ass_content)
-
+ 
     out_path = os.path.join(tmp_dir, "with_captions.mp4")
     cmd = [
         FFMPEG_BIN, "-y",
         "-i", input_path,
         "-vf", "ass=captions.ass",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        *FFMPEG_X264_FLAGS,
         "-c:a", "copy",
         out_path,
     ]
     await _run(cmd, cwd=tmp_dir)
     return out_path
-
-
+ 
+ 
 async def _render_scene(
     scene: dict, fps: int, width: int, height: int, work_root: str,
     client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
@@ -11760,16 +11787,16 @@ async def _render_scene(
         scene_id = scene.get("scene_id", uuid.uuid4().hex)
         tmp_dir = os.path.join(work_root, f"scene_{scene_id}")
         os.makedirs(tmp_dir, exist_ok=True)
-
+ 
         trim = scene.get("trim") or {}
         start_sec = scene.get("start")
         if start_sec is None:
             start_sec = trim.get("start", 0.0)
-
+ 
         end_sec = scene.get("end")
         if end_sec is None:
             end_sec = trim.get("end", 0.0)
-
+ 
         if (start_sec in (None, 0.0)) or (end_sec in (None, 0.0)):
             word_segments = scene.get("word_segments") or []
             timed = [w for w in word_segments if "start" in w and "end" in w]
@@ -11778,18 +11805,18 @@ async def _render_scene(
                     start_sec = timed[0]["start"]
                 if end_sec in (None, 0.0):
                     end_sec = timed[-1]["end"]
-
+ 
         duration_frames = max(round((end_sec - start_sec) * fps), fps)
         target_seconds = duration_frames / fps
-
+ 
         selected = None
         source = None
-
+ 
         timeline_broll = (timeline_tracks_by_scene or {}).get(scene_id)
         if timeline_broll and timeline_broll.get("selected_asset"):
             selected = dict(timeline_broll["selected_asset"])
             source = selected.get("source")
-
+ 
         if not selected:
             media = scene.get("media") or {}
             video_candidates = (media.get("videos") or {}).get("results") or []
@@ -11798,20 +11825,20 @@ async def _render_scene(
                 selected, source = dict(video_candidates[0]), "video"
             elif image_candidates:
                 selected, source = dict(image_candidates[0]), "image"
-
+ 
         broll_track = {"selected_asset": None}
         if selected:
             broll_track = {
                 "selected_asset": {**selected, "source": source}
             }
-
+ 
         background_color_override = (timeline_broll or {}).get("background_color") or scene.get("background_color")
-
+ 
         base_clip = await _prepare_broll_clip(
             broll_track, duration_frames, fps, width, height, tmp_dir, client,
             background_color_override=background_color_override,
         )
-
+ 
         timeline_infographic = (infographic_tracks_by_scene or {}).get(scene_id)
         if timeline_infographic and timeline_infographic.get("composition_id"):
             infographic = {
@@ -11821,7 +11848,7 @@ async def _render_scene(
             }
         else:
             infographic = scene.get("infographics")
-
+ 
         current = base_clip
         if infographic and infographic.get("composition_id"):
             overlay_clip = await render_infographic_via_remotion(
@@ -11838,15 +11865,15 @@ async def _render_scene(
                     "-i", overlay_clip,
                     "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto",
                     "-r", str(fps),
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    *FFMPEG_X264_FLAGS,
                     composited,
                 ]
                 await _run(cmd)
                 current = composited
-
+ 
         timeline_caption = (caption_tracks_by_scene or {}).get(scene_id)
         caption_style = (timeline_caption or {}).get("style") or scene.get("caption_style")
-
+ 
         words = scene.get("word_segments") or []
         words = [
             w for w in words
@@ -11864,14 +11891,14 @@ async def _render_scene(
         current = await _burn_captions(
             current, frame_words, 0, fps, width, height, tmp_dir, style=caption_style
         )
-
+ 
         voiceover = scene.get("voiceover")
         final_scene_path = os.path.join(work_root, f"scene_{scene_id}_final.mp4")
-
+ 
         if voiceover and voiceover.get("url"):
             audio_path_raw = os.path.join(tmp_dir, "audio_raw.mp3")
             await _download(voiceover["url"], audio_path_raw, client)
-
+ 
             audio_path = os.path.join(tmp_dir, "audio_trimmed.m4a")
             trim_cmd = [
                 FFMPEG_BIN, "-y",
@@ -11885,7 +11912,7 @@ async def _render_scene(
         else:
             print(f"[render] scene {scene_id} has no voiceover ({scene.get('error')}) — muxing silent audio instead")
             audio_path = await _make_silent_audio(duration_frames, fps, tmp_dir)
-
+ 
         locked_audio_path = os.path.join(tmp_dir, "audio_locked.m4a")
         lock_cmd = [
             FFMPEG_BIN, "-y",
@@ -11896,76 +11923,100 @@ async def _render_scene(
             locked_audio_path,
         ]
         await _run(lock_cmd)
-
+ 
+        # SPEED: `current` is already h264/yuv420p at the correct fps and
+        # duration (it came out of _prepare_broll_clip / the infographic
+        # composite / _burn_captions, each of which already encoded it
+        # correctly). Re-encoding it again here just to attach audio was a
+        # wasted full x264 pass per scene. Stream-copying the video track
+        # keeps this step to audio-muxing speed instead of encode speed.
         cmd = [
             FFMPEG_BIN, "-y",
             "-i", current,
             "-i", locked_audio_path,
             "-map", "0:v:0", "-map", "1:a:0",
-            "-r", str(fps),
-            "-vsync", "cfr",
             "-frames:v", str(duration_frames),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:v", "copy",
             "-c:a", "aac",
             "-shortest",
             final_scene_path,
         ]
-        await _run(cmd)
-
+        try:
+            await _run(cmd)
+        except Exception as e:
+            # Fallback: if stream copy fails for any reason (e.g. an odd
+            # container edge case), re-encode as before rather than failing
+            # the whole scene.
+            print(f"[render] stream-copy mux failed for scene {scene_id}, falling back to re-encode: {e}")
+            cmd = [
+                FFMPEG_BIN, "-y",
+                "-i", current,
+                "-i", locked_audio_path,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-r", str(fps),
+                "-vsync", "cfr",
+                "-frames:v", str(duration_frames),
+                *FFMPEG_X264_FLAGS,
+                "-c:a", "aac",
+                "-shortest",
+                final_scene_path,
+            ]
+            await _run(cmd)
+ 
         return final_scene_path
-
-
+ 
+ 
 async def _concat_scenes(scene_paths: list[str], work_root: str, fps: int = TIMELINE_FPS) -> str:
     list_path = os.path.join(work_root, "concat_list.txt")
     with open(list_path, "w") as f:
         for p in scene_paths:
             f.write(f"file '{p}'\n")
-
+ 
     out_path = os.path.join(work_root, "final_output.mp4")
+ 
+    # SPEED: every scene_path here was produced by our own pipeline with
+    # identical codec/fps/pix_fmt settings, so the concat demuxer can safely
+    # stream-copy them into one file instead of decoding+re-encoding the
+    # entire video a second time. This turns what used to be a full-length
+    # x264 pass over the whole video into a near-instant remux.
     cmd = [
         FFMPEG_BIN, "-y",
         "-f", "concat", "-safe", "0",
         "-i", list_path,
-        "-r", str(fps),
-        "-vsync", "cfr",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
+        "-c", "copy",
         out_path,
     ]
-    await _run(cmd)
-    return out_path
-
-
-@app.post("/render/{video_id}")
-async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoRequest()):
-    print("hit")
     try:
-        row = (
-            supabase.table("videos")
-            .select("timeline_json, raw_scenes, final_video_url")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        await _run(cmd)
     except Exception as e:
-        print(f"[render] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if row.data.get("final_video_url") and not request.force:
-        return {
-            "video_id": video_id,
-            "status": "already_rendered",
-            "final_video_url": row.data["final_video_url"],
-        }
-
-    timeline = row.data.get("timeline_json") or {}
-    scenes = row.data.get("raw_scenes") or []
-    if not scenes:
-        raise HTTPException(status_code=400, detail="No scenes to render for this video")
-
+        # Fallback: if any scene file actually diverges in params (e.g. a
+        # manual edit slipped through), re-encode as before rather than
+        # failing the whole render.
+        print(f"[render] concat stream-copy failed, falling back to re-encode: {e}")
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", list_path,
+            "-r", str(fps),
+            "-vsync", "cfr",
+            *FFMPEG_X264_FLAGS,
+            "-c:a", "aac",
+            out_path,
+        ]
+        await _run(cmd)
+ 
+    return out_path
+ 
+ 
+async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientation: str) -> Optional[str]:
+    """
+    The actual heavy-lifting render pipeline. Runs synchronously inside the
+    request — the caller (the /render/{video_id} endpoint) awaits this and
+    only responds once it's fully done, returning the final video URL (or
+    raising on failure). This function still keeps the videos table updated
+    throughout (rendering -> completed/failed/etc.) so other consumers can
+    poll render_status independently if needed.
+    """
     no_voice_scene_ids = [
         s.get("scene_id") for s in scenes
         if not (s.get("voiceover") and s.get("voiceover", {}).get("url"))
@@ -11975,9 +12026,9 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
             f"[render] video {video_id}: scenes with NO voiceover "
             f"(will render silent): {no_voice_scene_ids}"
         )
-
+ 
     fps = timeline.get("fps", 30)
-
+ 
     # FIX: force resolution based on the requested orientation instead of
     # trusting timeline.get("resolution") directly. Previously this video's
     # timeline_json had a portrait (1080x1920) resolution stored on it
@@ -11986,11 +12037,11 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     # pipeline was actually broken. Defaulting the request orientation to
     # "landscape" guarantees YouTube long-form 1920x1080 output unless the
     # caller explicitly asks for "portrait".
-    if request.orientation == "portrait":
+    if orientation == "portrait":
         resolution = PORTRAIT_RESOLUTION
     else:
         resolution = LANDSCAPE_RESOLUTION
-
+ 
     stored_resolution = timeline.get("resolution")
     if stored_resolution and (
         stored_resolution.get("width") != resolution["width"]
@@ -11999,11 +12050,11 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
         print(
             f"[render] video {video_id}: overriding stored timeline resolution "
             f"{stored_resolution} -> {resolution} to match requested "
-            f"orientation='{request.orientation}'"
+            f"orientation='{orientation}'"
         )
-
+ 
     width, height = resolution["width"], resolution["height"]
-
+ 
     timeline_tracks_by_scene = {}
     caption_tracks_by_scene = {}
     infographic_tracks_by_scene = {}
@@ -12014,16 +12065,16 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
             caption_tracks_by_scene[track["scene_id"]] = track
         elif track.get("type") == "infographic" and track.get("scene_id"):
             infographic_tracks_by_scene[track["scene_id"]] = track
-
+ 
     try:
         supabase.table("videos").update({"render_status": "rendering"}).eq("id", video_id).execute()
     except Exception as e:
         print(f"[render] failed to set render_status=rendering for {video_id}: {e}")
-
+ 
     work_root = os.path.join(RENDER_TMP_ROOT, video_id)
     os.makedirs(work_root, exist_ok=True)
     semaphore = asyncio.Semaphore(RENDER_CONCURRENCY)
-
+ 
     try:
         async with httpx.AsyncClient() as client:
             scene_paths = []
@@ -12040,18 +12091,26 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
                 except Exception as e:
                     print(f"[render] scene {scene.get('scene_id')} failed: {e}")
                     failed_scenes.append(scene.get("scene_id"))
-
+ 
             if not scene_paths:
+                print(f"[render] video {video_id}: all scenes failed to render")
+                try:
+                    supabase.table("videos").update({
+                        "render_status": "failed",
+                        "failed_render_scene_ids": failed_scenes,
+                    }).eq("id", video_id).execute()
+                except Exception as e:
+                    print(f"[render] failed to persist all-scenes-failed status for {video_id}: {e}")
                 raise HTTPException(status_code=500, detail="All scenes failed to render")
-
+ 
             final_path = await _concat_scenes(scene_paths, work_root, fps=fps)
-
+ 
         try:
             final_duration = await _probe_duration_seconds(final_path)
             print(f"[render] video {video_id}: final output duration = {final_duration:.3f}s")
         except Exception as e:
             print(f"[render] could not probe final output duration: {e}")
-
+ 
         # FIX: upload the rendered video to Supabase Storage ("rendered-videos"
         # bucket) instead of only keeping it in the local RENDER_OUTPUT_DIR
         # folder, and return that public URL as final_video_url.
@@ -12069,23 +12128,33 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
             shutil.copy2(final_path, dest_path)
             public_url = None
             render_status = "completed_upload_failed"
-
-        supabase.table("videos").update({
-            "final_video_url": public_url,
-            "render_status": render_status,
-            "failed_render_scene_ids": failed_scenes,
-        }).eq("id", video_id).execute()
-
-        return {
-            "video_id": video_id,
-            "status": render_status,
-            "final_video_url": public_url,
-            "failed_scene_ids": failed_scenes,
-            "no_voiceover_scene_ids": no_voice_scene_ids,
-        }
-
+ 
+        try:
+            supabase.table("videos").update({
+                "final_video_url": public_url,
+                "render_status": render_status,
+                "failed_render_scene_ids": failed_scenes,
+            }).eq("id", video_id).execute()
+        except Exception as e:
+            print(f"[render] failed to persist final status for {video_id}: {e}")
+ 
+        print(
+            f"[render] video {video_id}: done, status={render_status}, "
+            f"failed_scenes={failed_scenes}, no_voiceover_scenes={no_voice_scene_ids}"
+        )
+ 
+        if public_url is None:
+            # Upload failed — local copy was kept as a fallback, but there's
+            # no URL to hand back to the caller.
+            raise HTTPException(status_code=500, detail="Render completed but upload to storage failed")
+ 
+        return public_url
+ 
     except HTTPException:
-        supabase.table("videos").update({"render_status": "failed"}).eq("id", video_id).execute()
+        try:
+            supabase.table("videos").update({"render_status": "failed"}).eq("id", video_id).execute()
+        except Exception:
+            pass
         raise
     except Exception as e:
         print(f"[render] render failed for {video_id}: {e}")
@@ -12096,3 +12165,37 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
         raise HTTPException(status_code=500, detail=f"Render failed: {e}")
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
+ 
+ 
+@app.post("/render/{video_id}")
+async def render_video(
+    video_id: str,
+    request: RenderVideoRequest = RenderVideoRequest(),
+):
+    print("hit")
+    try:
+        row = (
+            supabase.table("videos")
+            .select("timeline_json, raw_scenes, final_video_url")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[render] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+ 
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+ 
+    if row.data.get("final_video_url") and not request.force:
+        return {"final_video_url": row.data["final_video_url"]}
+ 
+    timeline = row.data.get("timeline_json") or {}
+    scenes = row.data.get("raw_scenes") or []
+    if not scenes:
+        raise HTTPException(status_code=400, detail="No scenes to render for this video")
+ 
+    final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
+ 
+    return {"final_video_url": final_video_url}
