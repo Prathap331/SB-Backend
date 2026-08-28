@@ -9841,6 +9841,11 @@ class SceneBrollSelectUpdate(BaseModel):
     # The Pexels asset to use as this scene's B-roll.
     asset_id: Any
     source: str
+    # A scene can have several rotating B-roll "beats" (one every ~10s).
+    # beat_id selects which beat this override applies to. If omitted,
+    # defaults to the scene's first beat for backward compatibility with
+    # single-beat (<=12s) scenes.
+    beat_id: Optional[str] = None
     # NEW: optional manual override of the image motion effect (Ken Burns
     # pan/zoom/tilt). Only meaningful when the selected candidate's source
     # is "image" — ignored otherwise. When omitted, the beat keeps
@@ -9858,7 +9863,6 @@ class SceneBrollSelectUpdate(BaseModel):
     # beat's new `end`, so beats stay contiguous with no gap or overlap.
     # Only relevant for scenes with more than one rotating B-roll beat.
     adjust_next_beat: bool = True
-
 
 def _hex_to_ass_color(hex_color: str, alpha_hex: str = "00") -> str:
     h = (hex_color or "").strip().lstrip("#")
