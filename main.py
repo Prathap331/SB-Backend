@@ -9171,6 +9171,36 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import re
 import os
 import json
@@ -9774,9 +9804,18 @@ class SceneStyleUpdate(BaseModel):
 
 
 class BeatSplitUpdate(BaseModel):
-    # NEW: absolute seconds (same timebase as beat/scene start/end) at
-    # which to split one beat into two independent beats.
+    # Absolute seconds (same timebase as beat/scene start/end) at which to
+    # split one beat into two independent beats. Always splits within the
+    # beat's existing [start, end] — nothing else to configure.
     split_at: float
+
+
+class BeatInsertUpdate(BaseModel):
+    # Absolute seconds (same timebase as beat/scene start/end) for a brand
+    # new B-roll clip, carved out of an existing beat's window. Must fall
+    # inside the target beat's [start, end].
+    start: float
+    end: float
 
 
 class SceneTrimUpdate(BaseModel):
@@ -12136,6 +12175,155 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
                 "media_type": second_media_type, "motion_type": second_motion_type,
             },
         ],
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
+@app.post("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/insert")
+async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatInsertUpdate):
+    """
+    Inserts a brand new, independently AI-directed B-roll beat inside an
+    existing beat's [start, end] window, at [update.start, update.end].
+    Unlike /split, the surrounding footage is NOT regenerated — only the
+    new middle piece gets a fresh LLM keyword/media_type/motion_type pass
+    and its own Pexels search. Whatever's left before/after the new clip
+    keeps the original beat's existing asset, just trimmed in time.
+    """
+    MIN_SECONDS = 1.0
+    if update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+    if update.end - update.start < MIN_SECONDS:
+        raise HTTPException(status_code=422, detail=f"the new clip must be at least {MIN_SECONDS}s long")
+
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[insert-beat] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    beats = scene.get("beats") or []
+
+    beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+    if beat_idx is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Beat {beat_id} not found in scene {scene_id} (available: "
+                   f"{[b.get('beat_id') for b in beats]})",
+        )
+
+    beat = beats[beat_idx]
+    b_start = beat.get("start")
+    b_end = beat.get("end")
+
+    if b_start is None or b_end is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Beat {beat_id} has no start/end timing to insert into (silent/implicit beat)",
+        )
+    if update.start < b_start - 1e-3 or update.end > b_end + 1e-3:
+        raise HTTPException(
+            status_code=422,
+            detail=f"[{update.start}, {update.end}] must fall inside beat {beat_id}'s own [{b_start}, {b_end}]",
+        )
+
+    word_segments = scene.get("word_segments") or []
+    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+    new_vo_text = _words_in_range(timed_words, update.start, update.end)
+    fallback_keywords = _get_scene_broll_keywords(scene)
+
+    previous_media_type = beat.get("preferred_media_type")
+    previous_motion_type = beat.get("motion_type") if previous_media_type == "image" else None
+
+    new_kws, new_media_type, new_motion_type = await _generate_beat_keywords(
+        scene, new_vo_text, beat_idx, len(beats) + 1, fallback_keywords,
+        previous_media_type=previous_media_type,
+        previous_motion_type=previous_motion_type,
+    )
+    new_media = await _fetch_media_for_keywords(new_kws, f"{scene_id}:{beat_id}:insert")
+
+    new_beat = {
+        "beat_id": f"{scene_id}_insert_{uuid.uuid4().hex[:6]}",
+        "start": update.start,
+        "end": update.end,
+        "vo_text": new_vo_text,
+        "keywords": new_kws,
+        "preferred_media_type": new_media_type,
+        "motion_type": new_motion_type,
+        "media": new_media,
+    }
+
+    # Whatever's left before/after the new clip keeps the original beat's
+    # existing content (same keywords/media/motion), just trimmed to the
+    # remaining time — no regeneration for these, unlike the new middle piece.
+    pieces = []
+    if update.start > b_start + 1e-3:
+        before = dict(beat)
+        before["beat_id"] = f"{beat_id}_pre"
+        before["start"] = b_start
+        before["end"] = update.start
+        pieces.append(before)
+
+    pieces.append(new_beat)
+
+    if update.end < b_end - 1e-3:
+        after = dict(beat)
+        after["beat_id"] = f"{beat_id}_post"
+        after["start"] = update.end
+        after["end"] = b_end
+        pieces.append(after)
+
+    new_beats = beats[:beat_idx] + pieces + beats[beat_idx + 1:]
+    for i, b in enumerate(new_beats):
+        b["beat_index"] = i
+
+    await _fill_empty_beats(scene, new_beats, fallback_keywords)
+    _dedupe_beats_media_across_scene(new_beats)
+
+    scene["beats"] = new_beats
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[insert-beat] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save beat insert")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "original_beat_id": beat_id,
+        "new_beat": {
+            "beat_id": new_beat["beat_id"], "start": new_beat["start"], "end": new_beat["end"],
+            "media_type": new_media_type, "motion_type": new_motion_type,
+        },
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
