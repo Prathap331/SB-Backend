@@ -9201,6 +9201,8 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
 import re
 import os
 import json
@@ -9841,11 +9843,6 @@ class SceneBrollSelectUpdate(BaseModel):
     # The Pexels asset to use as this scene's B-roll.
     asset_id: Any
     source: str
-    # A scene can have several rotating B-roll "beats" (one every ~10s).
-    # beat_id selects which beat this override applies to. If omitted,
-    # defaults to the scene's first beat for backward compatibility with
-    # single-beat (<=12s) scenes.
-    beat_id: Optional[str] = None
     # NEW: optional manual override of the image motion effect (Ken Burns
     # pan/zoom/tilt). Only meaningful when the selected candidate's source
     # is "image" — ignored otherwise. When omitted, the beat keeps
@@ -9863,6 +9860,7 @@ class SceneBrollSelectUpdate(BaseModel):
     # beat's new `end`, so beats stay contiguous with no gap or overlap.
     # Only relevant for scenes with more than one rotating B-roll beat.
     adjust_next_beat: bool = True
+
 
 def _hex_to_ass_color(hex_color: str, alpha_hex: str = "00") -> str:
     h = (hex_color or "").strip().lstrip("#")
@@ -12366,6 +12364,127 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
     }
 
 
+@app.post("/timeline/{video_id}/scene/{scene_id}/beats/rebuild")
+async def rebuild_scene_beats(video_id: str, scene_id: str):
+    """
+    Repairs a scene whose `beats` array is empty or missing — the state
+    that makes /broll, /split, and /insert all fail with "Scene has no
+    B-roll beats to select from yet".
+
+    FIX: this used to only re-run _build_scene_beats against whatever
+    word_segments/start/end were already stored on the scene — but if
+    THOSE were also empty (the actual root cause in at least one observed
+    case: a merged multi-section scene whose word_segments never got
+    persisted, despite its caption track clearly having full per-word
+    timing), _build_scene_beats silently takes its "no timed narration"
+    fallback path and produces a single beat spanning the ENTIRE scene
+    duration instead of properly rotating every ~10s. That's a strictly
+    worse outcome than the original bug — one clip now holds for the
+    whole scene (potentially 60s+) instead of just failing loudly.
+
+    Now: if word_segments/start/end are missing but the scene already has
+    a generated voiceover, re-run WhisperX alignment against that existing
+    audio (_generate_word_timestamps) to repopulate them BEFORE building
+    beats — same alignment step _process_scene runs once at creation, just
+    reapplied here without regenerating the voice itself. Only scenes with
+    no voiceover at all (or no vo_text) fall back to the single-implicit-
+    beat path, which is the correct behavior for those.
+    """
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[rebuild-beats] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    realigned = False
+
+    has_timed_words = any(
+        "start" in w and "end" in w for w in (scene.get("word_segments") or [])
+    )
+    voiceover = scene.get("voiceover") or {}
+
+    if not has_timed_words and voiceover.get("url"):
+        print(
+            f"[rebuild-beats] scene {scene_id} has a voiceover but no timed "
+            f"word_segments — re-running WhisperX alignment on the existing "
+            f"audio before rebuilding beats"
+        )
+        try:
+            scene_timestamps = await _generate_word_timestamps(voiceover["url"])
+            word_segments = scene_timestamps.get("word_segments", [])
+            timed_words = [w for w in word_segments if "start" in w and "end" in w]
+            if timed_words:
+                scene["word_segments"] = word_segments
+                scene["start"] = timed_words[0]["start"]
+                scene["end"] = timed_words[-1]["end"]
+                realigned = True
+            else:
+                print(
+                    f"[rebuild-beats][WARN] scene {scene_id}: re-alignment produced "
+                    f"no timed words — falling back to single-beat behavior"
+                )
+        except Exception as e:
+            print(
+                f"[rebuild-beats][WARN] scene {scene_id}: WhisperX re-alignment "
+                f"failed ({e}) — falling back to single-beat behavior"
+            )
+    elif not has_timed_words:
+        print(
+            f"[rebuild-beats] scene {scene_id} has no voiceover to re-align against "
+            f"— will produce a single implicit beat (expected for silent scenes)"
+        )
+
+    scene["beats"] = await _build_scene_beats(scene)
+    scene["media"] = _aggregate_beats_media(scene["beats"])
+
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[rebuild-beats] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save rebuilt beats")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "realigned_word_timing": realigned,
+        "beats": [
+            {"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end")}
+            for b in scene["beats"]
+        ],
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
 @app.patch("/timeline/{video_id}/scene/{scene_id}/infographic")
 async def update_scene_infographic(video_id: str, scene_id: str, update: SceneInfographicUpdate):
     if (
@@ -12529,9 +12648,40 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
     beats = scene.get("beats") or []
 
     if not beats:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Scene {scene_id} has no B-roll beats to select from yet",
+        # FIX: build_timeline_from_scenes synthesizes a single implicit
+        # beat ("{scene_id}_b1") on the fly whenever a scene's real beats
+        # array is empty, purely so the rendered timeline shows *something*
+        # selectable instead of a blank scene. That synthesized beat was
+        # visible to callers via GET /timeline but invisible to this
+        # endpoint, which only ever checked the real, persisted array and
+        # rejected the exact beat_id the user could see and click on.
+        #
+        # Mirror that same synthesis here — using the scene's own
+        # start/end and whole-scene media pool, identical to
+        # build_timeline_from_scenes's fallback — and PERSIST it as a real
+        # beat immediately. This makes the beat the user sees always
+        # selectable, and it stops being synthetic after this call: once
+        # persisted, subsequent /broll, /split, /insert, and
+        # /beats/rebuild calls all see a normal, real beat going forward.
+        media = scene.get("media") or {}
+        beats = [{
+            "beat_id": f"{scene_id}_b1",
+            "beat_index": 0,
+            "start": scene.get("start"),
+            "end": scene.get("end"),
+            "vo_text": scene.get("vo_text", ""),
+            "keywords": None,
+            "motion_type": _DEFAULT_MOTION_TYPE,
+            "preferred_media_type": None,
+            "media": {
+                "videos": media.get("videos") or {"total_results": 0, "results": [], "error": None},
+                "images": media.get("images") or {"total_results": 0, "results": [], "error": None},
+            },
+        }]
+        print(
+            f"[update-scene-broll] scene {scene_id} had no persisted beats — "
+            f"materializing the implicit '{scene_id}_b1' beat the timeline "
+            f"already displayed, so it's usable and persists going forward"
         )
 
     if update.beat_id:
