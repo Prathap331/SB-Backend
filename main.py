@@ -9790,7 +9790,7 @@ class SceneStyleUpdate(BaseModel):
     # both fields (vertical_position -> ASS Alignment, margin_bottom_percent
     # -> ASS MarginV as a % of frame height), so no render-side change was
     # needed, just exposing them on this request model.
-    vertical_position: Optional[Literal["top", "bottom"]] = None
+    vertical_position: Optional[Literal["top", "middle", "bottom"]] = None
     margin_bottom_percent: Optional[float] = None
     # NEW: on-screen window (seconds, relative to this scene's own start —
     # 0 = the moment the scene begins) for the scene's overlay/infographic
@@ -9838,28 +9838,25 @@ class SceneInfographicUpdate(BaseModel):
 
 
 class SceneBrollSelectUpdate(BaseModel):
+    # The Pexels asset to use as this scene's B-roll.
     asset_id: Any
     source: str
-    # NEW: a scene can now have several rotating B-roll "beats" (one every
-    # ~10s). beat_id selects which beat's B-roll this override applies
-    # to. If omitted, defaults to the scene's first beat for backward
-    # compatibility with single-beat (<=12s) scenes.
-    beat_id: Optional[str] = None
     # NEW: optional manual override of the image motion effect (Ken Burns
-    # pan/zoom/tilt) for this beat. Only meaningful when the selected
-    # candidate's source is "image" — ignored otherwise. When omitted, the
-    # beat keeps whichever motion_type the LLM already chose for it in
+    # pan/zoom/tilt). Only meaningful when the selected candidate's source
+    # is "image" — ignored otherwise. When omitted, the beat keeps
+    # whichever motion_type the LLM already chose for it in
     # BEAT_KEYWORDS_PROMPT (see _resolve_beat_motion_type).
     motion_type: Optional[str] = None
-    # NEW: optional B-roll duration override for this same beat, in
-    # seconds (same timebase as beat/scene start/end). Provide both
-    # together to resize the beat's on-screen window in the same call
-    # that picks its asset — no separate endpoint needed.
+    # NEW: optional B-roll duration override, in seconds (same timebase as
+    # scene start/end). Provide both together to resize the on-screen
+    # window in the same call that picks the asset — no separate endpoint
+    # needed.
     start: Optional[float] = None
     end: Optional[float] = None
     # If true (default) and start/end are provided, the very next beat in
     # this scene has its own `start` pulled forward/back to match this
     # beat's new `end`, so beats stay contiguous with no gap or overlap.
+    # Only relevant for scenes with more than one rotating B-roll beat.
     adjust_next_beat: bool = True
 
 
@@ -11214,6 +11211,41 @@ def _find_beat_broll_candidate(beat: dict, asset_id: Any, source: str) -> Option
     return None
 
 
+async def _fetch_pexels_asset_by_id(asset_id: Any, source: str) -> Optional[dict]:
+    """
+    Fallback for /broll: an asset picked from an external search/matching
+    tool (relevance-scored results across the whole video, not this one
+    beat's own auto-fetched candidate pool) won't be found by
+    _find_beat_broll_candidate, since that only checks the 4-6 results this
+    specific beat's keywords happened to return. Rather than rejecting any
+    asset outside that narrow pool, fetch it directly from Pexels by ID —
+    this also guarantees we get the full video_files/src variants (so
+    _resolve_broll_file_url can pick the actual best-quality file) instead
+    of trusting a client-supplied assetUrl, which may point at a small
+    preview/SD rendition rather than the asset's real best quality.
+    """
+    if not PEXELS_API_KEY:
+        return None
+
+    url = (
+        f"https://api.pexels.com/videos/videos/{asset_id}"
+        if source == "video"
+        else f"https://api.pexels.com/v1/photos/{asset_id}"
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                url, headers={"Authorization": PEXELS_API_KEY}, timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        print(f"[broll] direct Pexels lookup failed for {source} asset {asset_id}: {e}")
+        return None
+
+    return _format_video_result(data) if source == "video" else _format_image_result(data)
+
+
 def _seconds_to_frames(seconds: float, fps: int = TIMELINE_FPS) -> int:
     return max(round((seconds or 0.0) * fps), 0)
 
@@ -12507,18 +12539,31 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
                        f"{[b.get('beat_id') for b in beats]})",
             )
     else:
-        # No beat specified: default to the first beat, which is correct
-        # for the common case of a single-beat (<=12s) scene.
-        beat_idx = 0
+        # No beat specified: search every beat in the scene for one whose
+        # own candidate pool already contains this asset_id, so callers
+        # that only know the asset (not which time-slot it belongs to)
+        # don't have to guess. Falls back to the first beat — same as
+        # before — only if the asset isn't in ANY beat's pool (in which
+        # case the direct Pexels-by-ID fallback below still has a shot).
+        beat_idx = next(
+            (i for i, b in enumerate(beats) if _find_beat_broll_candidate(b, update.asset_id, update.source)),
+            0,
+        )
 
     beat = dict(beats[beat_idx])
 
     candidate = _find_beat_broll_candidate(beat, update.asset_id, update.source)
     if candidate is None:
+        # Not in this beat's own auto-fetched pool — could be an asset
+        # picked from a broader search/matching tool. Try fetching it
+        # directly from Pexels by ID before giving up.
+        candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
+
+    if candidate is None:
         raise HTTPException(
             status_code=404,
             detail=f"No {update.source} candidate with id {update.asset_id} in beat "
-                   f"{beat.get('beat_id')}'s media pool",
+                   f"{beat.get('beat_id')}'s media pool, and it couldn't be fetched directly from Pexels either",
         )
 
     file_url = _resolve_broll_file_url(candidate, update.source)
@@ -13260,18 +13305,29 @@ def _build_ass_from_words(
     # very low. Those fields were being computed and stored in the
     # timeline JSON correctly, then silently dropped here at burn-in time.
     #
-    # ASS numpad alignment: 2 = bottom-center, 8 = top-center. MarginV is
-    # the margin from whichever edge Alignment anchors to (bottom for 1-3,
-    # top for 7-9) — computed as a percentage of frame height so "very low"
-    # holds regardless of canvas resolution, matching how the JSON side
-    # expresses it.
+    # ASS numpad alignment: 2 = bottom-center, 5 = middle-center,
+    # 8 = top-center. MarginV is the margin from whichever edge Alignment
+    # anchors to (bottom for 1-3, top for 7-9) — computed as a percentage
+    # of frame height so "very low"/"very high" holds regardless of canvas
+    # resolution, matching how the JSON side expresses it. MarginV has no
+    # effect for the middle anchor (5), since that alignment is already
+    # centered vertically — kept at 0 there rather than reusing
+    # margin_bottom_percent, which would otherwise nudge it off-center.
     vertical_position = (style.get("vertical_position") or "bottom").lower()
     try:
         margin_percent = float(style.get("margin_bottom_percent", 3))
     except (TypeError, ValueError):
         margin_percent = 3.0
-    alignment = 8 if vertical_position == "top" else 2
-    margin_v = max(round(height * margin_percent / 100), 0)
+
+    if vertical_position == "top":
+        alignment = 8
+        margin_v = max(round(height * margin_percent / 100), 0)
+    elif vertical_position == "middle":
+        alignment = 5
+        margin_v = 0
+    else:
+        alignment = 2
+        margin_v = max(round(height * margin_percent / 100), 0)
 
     header = f"""[Script Info]
 ScriptType: v4.00+
