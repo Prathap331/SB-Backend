@@ -9168,30 +9168,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -9770,8 +9746,25 @@ class SceneStyleUpdate(BaseModel):
     outline_color: Optional[str] = None
     animation_type: Optional[str] = None
     background_color: Optional[str] = None
-    vertical_position: Optional[Literal["top", "bottom"]] = None   # NEW
-    margin_bottom_percent: Optional[float] = None                  # NEW
+    # NEW: caption text positioning. Merged into scene["caption_style"] on
+    # top of DEFAULT_CAPTION_STYLE — _build_ass_from_words already reads
+    # both fields (vertical_position -> ASS Alignment, margin_bottom_percent
+    # -> ASS MarginV as a % of frame height), so no render-side change was
+    # needed, just exposing them on this request model.
+    vertical_position: Optional[Literal["top", "bottom"]] = None
+    margin_bottom_percent: Optional[float] = None
+
+
+class BeatDurationUpdate(BaseModel):
+    # NEW: manual override of a single beat's [start, end] window, in
+    # seconds, within its parent scene's overall narration timing.
+    start: float
+    end: float
+    # If true (default), the very next beat in the same scene (by
+    # beat_index) has its own `start` pulled forward/back to match this
+    # beat's new `end`, so beats stay contiguous with no gap or overlap.
+    # Set false if you're patching adjacent beats yourself in sequence.
+    adjust_next_beat: bool = True
 
 
 class SceneTrimUpdate(BaseModel):
@@ -11535,6 +11528,27 @@ async def patch_timeline(video_id: str, patch: TrackPatch):
                 scene["caption_style"] = {**existing_style, **patch.updates["style"]}
                 visual_change = True
 
+        elif track_found.get("type") == "animation":
+            # NEW: lets a non-infographic overlay's on-screen duration be
+            # patched the same way infographic duration already is via
+            # /scene/{scene_id}/infographic. Persisted onto scene["animation"]
+            # so it survives the next build_timeline_from_scenes call,
+            # not just this one track's endFrame in the current snapshot.
+            if "duration_frames" in patch.updates:
+                try:
+                    new_duration = int(patch.updates["duration_frames"])
+                    if new_duration <= 0 or new_duration > 900:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="duration_frames must be an integer between 1 and 900 (30s @30fps)",
+                    )
+                animation = dict(scene.get("animation") or {})
+                animation["duration_frames"] = new_duration
+                scene["animation"] = animation
+                visual_change = True
+
         raw_scenes[scene_index] = scene
 
     new_version = current_version + 1
@@ -11576,7 +11590,8 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     if (
         update.font_size is None and update.text_color is None
         and update.outline_color is None and update.animation_type is None
-        and update.background_color is None
+        and update.background_color is None and update.vertical_position is None
+        and update.margin_bottom_percent is None
     ):
         raise HTTPException(status_code=422, detail="Provide at least one field to update")
 
@@ -11609,6 +11624,8 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         "text_color": update.text_color,
         "outline_color": update.outline_color,
         "animation_type": update.animation_type,
+        "vertical_position": update.vertical_position,
+        "margin_bottom_percent": update.margin_bottom_percent,
     }
     style_fields = {k: v for k, v in style_fields.items() if v is not None}
 
@@ -11858,6 +11875,107 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
         "video_id": video_id,
         "scene_id": scene_id,
         "trim": scene["trim"],
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/duration")
+async def update_beat_duration(video_id: str, scene_id: str, beat_id: str, update: BeatDurationUpdate):
+    """
+    NEW: manual override of a single B-roll beat's [start, end] window, in
+    seconds. Same fetch/mutate/rebuild-timeline/save pattern as every other
+    PATCH endpoint here (e.g. update_scene_trim). Does NOT touch which
+    asset/motion_type the beat uses — only how long it's on screen.
+    """
+    if update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[update-beat-duration] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    beats = scene.get("beats") or []
+
+    beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+    if beat_idx is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Beat {beat_id} not found in scene {scene_id} (available: "
+                   f"{[b.get('beat_id') for b in beats]})",
+        )
+
+    scene_start = scene.get("start")
+    scene_end = scene.get("end")
+    if scene_start is not None and update.start < scene_start - 1e-3:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Beat start {update.start} is before this scene's own start ({scene_start})",
+        )
+    if scene_end is not None and update.end > scene_end + 1e-3:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Beat end {update.end} is after this scene's own end ({scene_end})",
+        )
+
+    beat = dict(beats[beat_idx])
+    beat["start"] = update.start
+    beat["end"] = update.end
+    beats[beat_idx] = beat
+
+    # Keep beats contiguous by default: pull the following beat's start up
+    # to match this beat's new end. Without this, shortening a beat leaves
+    # a gap (no B-roll track covers that span) and lengthening it overlaps
+    # the next beat's window.
+    if update.adjust_next_beat and beat_idx + 1 < len(beats):
+        next_beat = dict(beats[beat_idx + 1])
+        next_beat["start"] = update.end
+        beats[beat_idx + 1] = next_beat
+
+    scene["beats"] = beats
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-beat-duration] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save beat duration edit")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "beat_id": beat_id,
+        "start": beat["start"],
+        "end": beat["end"],
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
@@ -13468,3 +13586,34 @@ async def render_video(
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
  
     return {"final_video_url": final_video_url}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
