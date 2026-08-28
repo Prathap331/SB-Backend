@@ -9203,6 +9203,10 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
 import re
 import os
 import json
@@ -9843,6 +9847,12 @@ class SceneBrollSelectUpdate(BaseModel):
     # The Pexels asset to use as this scene's B-roll.
     asset_id: Any
     source: str
+    # A scene can have several rotating B-roll "beats" (one every ~10s).
+    # beat_id selects which beat this override applies to. If omitted,
+    # the endpoint searches every beat's own candidate pool for this
+    # asset_id first, falling back to the scene's first beat if it isn't
+    # found in any pool.
+    beat_id: Optional[str] = None
     # NEW: optional manual override of the image motion effect (Ken Burns
     # pan/zoom/tilt). Only meaningful when the selected candidate's source
     # is "image" — ignored otherwise. When omitted, the beat keeps
