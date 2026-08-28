@@ -9738,6 +9738,12 @@ _VALID_CAPTION_ANIMATION_TYPES = {
 
 class SceneVoiceUpdate(BaseModel):
     voice: str
+    # NEW: optional trim window (seconds, absolute — same timebase as the
+    # scene's own start/end) applied to the freshly generated voiceover's
+    # word-level timestamps, same trimming logic as /scene/{scene_id}/trim.
+    # Omit both to keep the full newly-generated voiceover untrimmed.
+    start: Optional[float] = None
+    end: Optional[float] = None
 
 
 class SceneStyleUpdate(BaseModel):
@@ -9753,6 +9759,15 @@ class SceneStyleUpdate(BaseModel):
     # needed, just exposing them on this request model.
     vertical_position: Optional[Literal["top", "bottom"]] = None
     margin_bottom_percent: Optional[float] = None
+    # NEW: on-screen window (seconds, relative to this scene's own start —
+    # 0 = the moment the scene begins) for the scene's overlay/infographic
+    # TEXT animation (lower-third, title card, quote card, etc.) — NOT the
+    # burned-in word captions, which always span the whole scene. Stored as
+    # animation["start_offset_seconds"]/["end_offset_seconds"] and read by
+    # build_timeline_from_scenes when computing that track's startFrame/
+    # endFrame. Provide both together.
+    text_start: Optional[float] = None
+    text_end: Optional[float] = None
 
 
 class BeatDurationUpdate(BaseModel):
@@ -9767,6 +9782,12 @@ class BeatDurationUpdate(BaseModel):
     adjust_next_beat: bool = True
 
 
+class BeatSplitUpdate(BaseModel):
+    # NEW: absolute seconds (same timebase as beat/scene start/end) at
+    # which to split one beat into two independent beats.
+    split_at: float
+
+
 class SceneTrimUpdate(BaseModel):
     start: float
     end: float
@@ -9776,6 +9797,14 @@ class SceneInfographicUpdate(BaseModel):
     animation_type: Optional[str] = None
     props: Optional[dict[str, Any]] = None
     duration_frames: Optional[int] = None
+    # NEW: same idea as SceneStyleUpdate.text_start/text_end but for an
+    # infographic composition specifically — on-screen window in seconds,
+    # relative to this scene's own start. Stored the same way, on the
+    # scene's animation dict, since build_timeline_from_scenes computes
+    # startFrame/endFrame for BOTH infographic and plain-animation tracks
+    # from that one shared dict. Provide both together.
+    start_seconds: Optional[float] = None
+    end_seconds: Optional[float] = None
 
 
 class SceneBrollSelectUpdate(BaseModel):
@@ -11286,9 +11315,24 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
         animation = scene.get("animation") or {}
         infographic = scene.get("infographics")
 
-        overlay_duration = animation.get("duration_frames") or (scene_end_frame - scene_start_frame)
-        overlay_start = scene_start_frame
-        overlay_end = min(scene_start_frame + overlay_duration, scene_end_frame)
+        # NEW: prefer an explicit start/end window (seconds, relative to
+        # this scene's own start) set via SceneStyleUpdate.text_start/
+        # text_end or SceneInfographicUpdate.start_seconds/end_seconds —
+        # see those endpoints. Falls back to the original "starts at scene
+        # start, runs for duration_frames" behavior when neither offset is
+        # set, so scenes that never used the new fields render unchanged.
+        start_offset_seconds = animation.get("start_offset_seconds")
+        end_offset_seconds = animation.get("end_offset_seconds")
+
+        if start_offset_seconds is not None and end_offset_seconds is not None:
+            overlay_start = scene_start_frame + _seconds_to_frames(start_offset_seconds, fps)
+            overlay_end = scene_start_frame + _seconds_to_frames(end_offset_seconds, fps)
+            overlay_start = max(scene_start_frame, min(overlay_start, scene_end_frame))
+            overlay_end = max(overlay_start, min(overlay_end, scene_end_frame))
+        else:
+            overlay_duration = animation.get("duration_frames") or (scene_end_frame - scene_start_frame)
+            overlay_start = scene_start_frame
+            overlay_end = min(scene_start_frame + overlay_duration, scene_end_frame)
 
         if infographic:
             tracks.append({
@@ -11587,11 +11631,17 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     _validate_hex_color(update.outline_color, "outline_color")
     _validate_hex_color(update.background_color, "background_color")
 
+    if (update.text_start is None) != (update.text_end is None):
+        raise HTTPException(status_code=422, detail="text_start and text_end must be provided together")
+    if update.text_start is not None and update.text_end is not None and update.text_end <= update.text_start:
+        raise HTTPException(status_code=422, detail="text_end must be greater than text_start")
+
     if (
         update.font_size is None and update.text_color is None
         and update.outline_color is None and update.animation_type is None
         and update.background_color is None and update.vertical_position is None
-        and update.margin_bottom_percent is None
+        and update.margin_bottom_percent is None and update.text_start is None
+        and update.text_end is None
     ):
         raise HTTPException(status_code=422, detail="Provide at least one field to update")
 
@@ -11636,6 +11686,12 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     if update.background_color is not None:
         scene["background_color"] = update.background_color
 
+    if update.text_start is not None and update.text_end is not None:
+        animation = dict(scene.get("animation") or _default_animation(scene))
+        animation["start_offset_seconds"] = update.text_start
+        animation["end_offset_seconds"] = update.text_end
+        scene["animation"] = animation
+
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
@@ -11659,6 +11715,8 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         "timeline_version": new_version,
         "caption_style": scene.get("caption_style"),
         "background_color": scene.get("background_color"),
+        "text_start": (scene.get("animation") or {}).get("start_offset_seconds"),
+        "text_end": (scene.get("animation") or {}).get("end_offset_seconds"),
         "timeline": timeline_json,
         "needs_render": True,
     }
@@ -11730,14 +11788,45 @@ async def update_scene_voice(video_id: str, scene_id: str, update: SceneVoiceUpd
     word_segments = scene_timestamps.get("word_segments", [])
     timed_words = [w for w in word_segments if "start" in w and "end" in w]
 
-    scene["voice"] = update.voice
-    scene["voiceover"] = speech_result
-    scene["start"] = timed_words[0]["start"] if timed_words else None
-    scene["end"] = timed_words[-1]["end"] if timed_words else None
-    scene["word_segments"] = word_segments
-    scene.pop("trim", None)
-    scene.pop("word_segments_full", None)
-    scene["error"] = None
+    # NEW: optional trim window (seconds) on the freshly generated
+    # voiceover, same semantics/validation as /scene/{scene_id}/trim. Full
+    # untrimmed word_segments are always kept as word_segments_full so a
+    # later /trim call still has the complete range to trim against.
+    if update.start is not None and update.end is not None:
+        if update.end <= update.start:
+            raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+        if timed_words:
+            clip_start = timed_words[0]["start"]
+            clip_end = timed_words[-1]["end"]
+            if update.start < clip_start - 1e-3 or update.end > clip_end + 1e-3:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Trim range [{update.start}, {update.end}] is outside the newly "
+                        f"generated audio's bounds [{clip_start}, {clip_end}]"
+                    ),
+                )
+        trimmed_words = [
+            w for w in timed_words
+            if w["start"] >= update.start and w["end"] <= update.end
+        ]
+        scene["voice"] = update.voice
+        scene["voiceover"] = speech_result
+        scene["trim"] = {"start": update.start, "end": update.end}
+        scene["word_segments_full"] = word_segments
+        scene["word_segments"] = trimmed_words
+        scene["start"] = trimmed_words[0]["start"] if trimmed_words else update.start
+        scene["end"] = trimmed_words[-1]["end"] if trimmed_words else update.end
+        scene["error"] = None
+    else:
+        scene["voice"] = update.voice
+        scene["voiceover"] = speech_result
+        scene["start"] = timed_words[0]["start"] if timed_words else None
+        scene["end"] = timed_words[-1]["end"] if timed_words else None
+        scene["word_segments"] = word_segments
+        scene.pop("trim", None)
+        scene.pop("word_segments_full", None)
+        scene["error"] = None
 
     # Timing just changed completely — rebuild the rotating ~10s B-roll
     # beats (new keywords + new media_type + new motion_type + new Pexels
@@ -11982,12 +12071,186 @@ async def update_beat_duration(video_id: str, scene_id: str, beat_id: str, updat
     }
 
 
-@app.patch("/timeline/{video_id}/scene/{scene_id}/infographic")
-async def update_scene_infographic(video_id: str, scene_id: str, update: SceneInfographicUpdate):
-    if update.animation_type is None and update.props is None and update.duration_frames is None:
+@app.post("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/split")
+async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSplitUpdate):
+    """
+    NEW: splits one rotating B-roll beat into two independent beats at
+    `split_at`. This is a real content split, not just a time-window
+    split — each half gets its own fresh LLM keyword/media_type/
+    motion_type pass (_generate_beat_keywords, same call used when beats
+    are first built in _build_scene_beats) and its own Pexels search,
+    since the two halves likely correspond to different narration and
+    should be free to pick different footage/motion independently from
+    here on. Continuity context (previous_media_type/previous_motion_type)
+    is threaded through exactly like the normal sequential beat-build
+    loop, so the first half considers whatever beat preceded the original,
+    and the second half considers the first half's own result.
+    """
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[split-beat] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    beats = scene.get("beats") or []
+
+    beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+    if beat_idx is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Beat {beat_id} not found in scene {scene_id} (available: "
+                   f"{[b.get('beat_id') for b in beats]})",
+        )
+
+    beat = beats[beat_idx]
+    b_start = beat.get("start")
+    b_end = beat.get("end")
+
+    if b_start is None or b_end is None:
         raise HTTPException(
             status_code=422,
-            detail="Provide at least one of animation_type, props, duration_frames",
+            detail=f"Beat {beat_id} has no start/end timing to split (silent/implicit beat)",
+        )
+
+    # Keeps either resulting half from being too short to actually register
+    # on screen as its own distinct beat.
+    MIN_HALF_SECONDS = 1.5
+    if update.split_at <= b_start + MIN_HALF_SECONDS or update.split_at >= b_end - MIN_HALF_SECONDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"split_at must leave at least {MIN_HALF_SECONDS}s on each side — "
+                f"beat spans [{b_start}, {b_end}], got split_at={update.split_at}"
+            ),
+        )
+
+    word_segments = scene.get("word_segments") or []
+    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+
+    first_vo_text = _words_in_range(timed_words, b_start, update.split_at)
+    second_vo_text = _words_in_range(timed_words, update.split_at, b_end)
+
+    fallback_keywords = _get_scene_broll_keywords(scene)
+
+    prior_beat = beats[beat_idx - 1] if beat_idx > 0 else None
+    previous_media_type = (prior_beat or {}).get("preferred_media_type")
+    previous_motion_type = (
+        (prior_beat or {}).get("motion_type")
+        if (prior_beat or {}).get("preferred_media_type") == "image" else None
+    )
+
+    first_kws, first_media_type, first_motion_type = await _generate_beat_keywords(
+        scene, first_vo_text, beat_idx, len(beats) + 1, fallback_keywords,
+        previous_media_type=previous_media_type,
+        previous_motion_type=previous_motion_type,
+    )
+    second_kws, second_media_type, second_motion_type = await _generate_beat_keywords(
+        scene, second_vo_text, beat_idx + 1, len(beats) + 1, fallback_keywords,
+        previous_media_type=first_media_type,
+        previous_motion_type=first_motion_type if first_media_type == "image" else previous_motion_type,
+    )
+
+    first_media, second_media = await asyncio.gather(
+        _fetch_media_for_keywords(first_kws, f"{scene_id}:{beat_id}:split-a"),
+        _fetch_media_for_keywords(second_kws, f"{scene_id}:{beat_id}:split-b"),
+    )
+
+    first_beat = {
+        "beat_id": f"{scene_id}_split_{uuid.uuid4().hex[:6]}_a",
+        "start": b_start,
+        "end": update.split_at,
+        "vo_text": first_vo_text,
+        "keywords": first_kws,
+        "preferred_media_type": first_media_type,
+        "motion_type": first_motion_type,
+        "media": first_media,
+    }
+    second_beat = {
+        "beat_id": f"{scene_id}_split_{uuid.uuid4().hex[:6]}_b",
+        "start": update.split_at,
+        "end": b_end,
+        "vo_text": second_vo_text,
+        "keywords": second_kws,
+        "preferred_media_type": second_media_type,
+        "motion_type": second_motion_type,
+        "media": second_media,
+    }
+
+    new_beats = beats[:beat_idx] + [first_beat, second_beat] + beats[beat_idx + 1:]
+    for i, b in enumerate(new_beats):
+        b["beat_index"] = i
+
+    # Same repair/dedupe passes the normal beat-build path runs, so a split
+    # that happens to land on a keyword with no Pexels hits still gets
+    # filled, and neither new half defaults to the exact same asset as a
+    # sibling beat elsewhere in the scene.
+    await _fill_empty_beats(scene, new_beats, fallback_keywords)
+    _dedupe_beats_media_across_scene(new_beats)
+
+    scene["beats"] = new_beats
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[split-beat] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save beat split")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "original_beat_id": beat_id,
+        "new_beats": [
+            {
+                "beat_id": first_beat["beat_id"], "start": first_beat["start"], "end": first_beat["end"],
+                "media_type": first_media_type, "motion_type": first_motion_type,
+            },
+            {
+                "beat_id": second_beat["beat_id"], "start": second_beat["start"], "end": second_beat["end"],
+                "media_type": second_media_type, "motion_type": second_motion_type,
+            },
+        ],
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/infographic")
+async def update_scene_infographic(video_id: str, scene_id: str, update: SceneInfographicUpdate):
+    if (
+        update.animation_type is None and update.props is None and update.duration_frames is None
+        and update.start_seconds is None and update.end_seconds is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least one of animation_type, props, duration_frames, start_seconds/end_seconds",
         )
 
     if update.props is not None and update.animation_type is None:
@@ -12008,6 +12271,11 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
                 status_code=422,
                 detail="duration_frames must be between 1 and 900 (30s @30fps)",
             )
+
+    if (update.start_seconds is None) != (update.end_seconds is None):
+        raise HTTPException(status_code=422, detail="start_seconds and end_seconds must be provided together")
+    if update.start_seconds is not None and update.end_seconds is not None and update.end_seconds <= update.start_seconds:
+        raise HTTPException(status_code=422, detail="end_seconds must be greater than start_seconds")
 
     try:
         row = (
@@ -12042,6 +12310,13 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
         animation["duration_frames"] = update.duration_frames
 
     animation = _validate_animation(animation, scene)
+
+    # NEW: _validate_animation only preserves its own known fields, so the
+    # start/end window has to be re-applied after validation rather than
+    # before — otherwise it would be silently dropped here.
+    if update.start_seconds is not None and update.end_seconds is not None:
+        animation["start_offset_seconds"] = update.start_seconds
+        animation["end_offset_seconds"] = update.end_seconds
 
     infographic = _get_scene_infographic(scene, animation)
     if infographic is None:
