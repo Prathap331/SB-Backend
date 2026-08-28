@@ -9168,6 +9168,9 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
 import re
 import os
 import json
@@ -9770,18 +9773,6 @@ class SceneStyleUpdate(BaseModel):
     text_end: Optional[float] = None
 
 
-class BeatDurationUpdate(BaseModel):
-    # NEW: manual override of a single beat's [start, end] window, in
-    # seconds, within its parent scene's overall narration timing.
-    start: float
-    end: float
-    # If true (default), the very next beat in the same scene (by
-    # beat_index) has its own `start` pulled forward/back to match this
-    # beat's new `end`, so beats stay contiguous with no gap or overlap.
-    # Set false if you're patching adjacent beats yourself in sequence.
-    adjust_next_beat: bool = True
-
-
 class BeatSplitUpdate(BaseModel):
     # NEW: absolute seconds (same timebase as beat/scene start/end) at
     # which to split one beat into two independent beats.
@@ -9821,6 +9812,16 @@ class SceneBrollSelectUpdate(BaseModel):
     # beat keeps whichever motion_type the LLM already chose for it in
     # BEAT_KEYWORDS_PROMPT (see _resolve_beat_motion_type).
     motion_type: Optional[str] = None
+    # NEW: optional B-roll duration override for this same beat, in
+    # seconds (same timebase as beat/scene start/end). Provide both
+    # together to resize the beat's on-screen window in the same call
+    # that picks its asset — no separate endpoint needed.
+    start: Optional[float] = None
+    end: Optional[float] = None
+    # If true (default) and start/end are provided, the very next beat in
+    # this scene has its own `start` pulled forward/back to match this
+    # beat's new `end`, so beats stay contiguous with no gap or overlap.
+    adjust_next_beat: bool = True
 
 
 def _hex_to_ass_color(hex_color: str, alpha_hex: str = "00") -> str:
@@ -11970,107 +11971,6 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
     }
 
 
-@app.patch("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/duration")
-async def update_beat_duration(video_id: str, scene_id: str, beat_id: str, update: BeatDurationUpdate):
-    """
-    NEW: manual override of a single B-roll beat's [start, end] window, in
-    seconds. Same fetch/mutate/rebuild-timeline/save pattern as every other
-    PATCH endpoint here (e.g. update_scene_trim). Does NOT touch which
-    asset/motion_type the beat uses — only how long it's on screen.
-    """
-    if update.end <= update.start:
-        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
-
-    try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
-    except Exception as e:
-        print(f"[update-beat-duration] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    raw_scenes = row.data.get("raw_scenes") or []
-    current_version = row.data.get("timeline_version", 1)
-
-    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
-    if scene_index is None:
-        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
-
-    scene = dict(raw_scenes[scene_index])
-    beats = scene.get("beats") or []
-
-    beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
-    if beat_idx is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Beat {beat_id} not found in scene {scene_id} (available: "
-                   f"{[b.get('beat_id') for b in beats]})",
-        )
-
-    scene_start = scene.get("start")
-    scene_end = scene.get("end")
-    if scene_start is not None and update.start < scene_start - 1e-3:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Beat start {update.start} is before this scene's own start ({scene_start})",
-        )
-    if scene_end is not None and update.end > scene_end + 1e-3:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Beat end {update.end} is after this scene's own end ({scene_end})",
-        )
-
-    beat = dict(beats[beat_idx])
-    beat["start"] = update.start
-    beat["end"] = update.end
-    beats[beat_idx] = beat
-
-    # Keep beats contiguous by default: pull the following beat's start up
-    # to match this beat's new end. Without this, shortening a beat leaves
-    # a gap (no B-roll track covers that span) and lengthening it overlaps
-    # the next beat's window.
-    if update.adjust_next_beat and beat_idx + 1 < len(beats):
-        next_beat = dict(beats[beat_idx + 1])
-        next_beat["start"] = update.end
-        beats[beat_idx + 1] = next_beat
-
-    scene["beats"] = beats
-    raw_scenes[scene_index] = scene
-
-    timeline_json = build_timeline_from_scenes(raw_scenes)
-    new_version = current_version + 1
-
-    try:
-        supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-        }).eq("id", video_id).execute()
-    except Exception as e:
-        print(f"[update-beat-duration] failed to save video {video_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save beat duration edit")
-
-    return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "beat_id": beat_id,
-        "start": beat["start"],
-        "end": beat["end"],
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
-    }
-
-
 @app.post("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/split")
 async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSplitUpdate):
     """
@@ -12372,6 +12272,13 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
             detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}",
         )
 
+    # NEW: B-roll duration override, folded into this same endpoint instead
+    # of a separate one — must be provided together, end after start.
+    if (update.start is None) != (update.end is None):
+        raise HTTPException(status_code=422, detail="start and end must be provided together")
+    if update.start is not None and update.end is not None and update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+
     try:
         row = (
             supabase.table("videos")
@@ -12460,7 +12367,37 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
         # it to the default on every manual asset pick.
         "motion_type": update.motion_type,
     }
+
+    # NEW: apply the duration override to this same beat, in the same call
+    # that picked its asset. Bounds-checked against the parent scene's own
+    # [start, end] so a beat can't be resized outside the scene's timing.
+    if update.start is not None and update.end is not None:
+        scene_start = scene.get("start")
+        scene_end = scene.get("end")
+        if scene_start is not None and update.start < scene_start - 1e-3:
+            raise HTTPException(
+                status_code=422,
+                detail=f"start {update.start} is before this scene's own start ({scene_start})",
+            )
+        if scene_end is not None and update.end > scene_end + 1e-3:
+            raise HTTPException(
+                status_code=422,
+                detail=f"end {update.end} is after this scene's own end ({scene_end})",
+            )
+        beat["start"] = update.start
+        beat["end"] = update.end
+
     beats[beat_idx] = beat
+
+    # Keep beats contiguous by default: pull the following beat's start up
+    # to match this beat's new end. Without this, shortening a beat leaves
+    # a gap (no B-roll track covers that span) and lengthening it overlaps
+    # the next beat's window.
+    if update.start is not None and update.end is not None and update.adjust_next_beat and beat_idx + 1 < len(beats):
+        next_beat = dict(beats[beat_idx + 1])
+        next_beat["start"] = update.end
+        beats[beat_idx + 1] = next_beat
+
     scene["beats"] = beats
 
     raw_scenes[scene_index] = scene
@@ -12486,6 +12423,8 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
         "beat_id": beat.get("beat_id"),
         "selected_asset": beat["broll_override"],
         "resolved_motion_type": _resolve_beat_motion_type(beat),
+        "start": beat.get("start"),
+        "end": beat.get("end"),
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
