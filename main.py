@@ -9210,6 +9210,9 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
 import re
 import os
 import json
@@ -9824,22 +9827,6 @@ _VALID_CAPTION_ANIMATION_TYPES = {
     "typewriter",
     "word_pop",
 }
-
-
-class SceneVoiceUpdate(BaseModel):
-    voice: str
-    # NEW: optional trim window (seconds, absolute — same timebase as the
-    # scene's own start/end) applied to the freshly generated voiceover's
-    # word-level timestamps, same trimming logic as /scene/{scene_id}/trim.
-    # Omit both to keep the full newly-generated voiceover untrimmed.
-    start: Optional[float] = None
-    end: Optional[float] = None
-    # NEW: same Fish Audio prosody/normalization settings as EditVideo —
-    # see that model's comment for field meanings and the caveat about
-    # needing GenerateSpeechRequest/generate_speech to forward them.
-    volume: Optional[float] = None
-    loudness_normalization: Optional[bool] = None
-    text_normalization: Optional[bool] = None
 
 
 class SceneStyleUpdate(BaseModel):
@@ -11360,11 +11347,10 @@ def _get_scene_infographic(scene: dict, animation: dict) -> dict:
 async def _get_or_create_tagged_text(scene: dict, scene_id, user_id: str, vo_text: str) -> str:
     """
     Voice tags are mandatory before any TTS call — narration must always be
-    run through add_script_tags first, whether that happens at initial scene
-    creation or later when a scene's voice is regenerated. This raises on
-    failure rather than ever silently falling back to the raw, untagged
-    script, so callers must handle the exception (see _process_scene and
-    update_scene_voice for how each path surfaces that failure).
+    run through add_script_tags first, at initial scene creation. This
+    raises on failure rather than ever silently falling back to the raw,
+    untagged script, so callers must handle the exception (see
+    _process_scene for how that's surfaced).
     """
     tags_request = AddScriptTagsRequest(
         userId=user_id,
@@ -12300,155 +12286,6 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     }
 
 
-@app.post("/timeline/{video_id}/scene/{scene_id}/voice")
-async def update_scene_voice(video_id: str, scene_id: str, update: SceneVoiceUpdate):
-    try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, user_id, lang_code, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
-    except Exception as e:
-        print(f"[update-scene-voice] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    raw_scenes = row.data.get("raw_scenes") or []
-    user_id = row.data.get("user_id")
-    lang_code = row.data.get("lang_code", "en")
-    current_version = row.data.get("timeline_version", 1)
-
-    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
-    if scene_index is None:
-        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
-
-    scene = dict(raw_scenes[scene_index])
-
-    # Voice tags are mandatory before any TTS call — never speak raw vo_text.
-    # Reuse an existing tagged version if we have one, otherwise (re-)tag
-    # from the raw script and persist the tagged text back onto the scene.
-    # If tagging fails, the whole request fails instead of speaking
-    # untagged text.
-    raw_text = scene.get("vo_text", "")
-    if not raw_text.strip():
-        raise HTTPException(status_code=400, detail=f"Scene {scene_id} has no narration text to regenerate")
-
-    tagged_text = scene.get("tagged_vo_text")
-    if not tagged_text or not tagged_text.strip():
-        try:
-            tagged_text = await _get_or_create_tagged_text(scene, scene_id, user_id, raw_text)
-        except Exception as e:
-            print(f"[update-scene-voice] voice tagging failed for scene {scene_id}: {e}")
-            raise HTTPException(status_code=502, detail=f"Voice tagging failed: {e}")
-        scene["tagged_vo_text"] = tagged_text
-
-    try:
-        speech_result = await _generate_speech_possibly_chunked(
-            user_id=user_id,
-            tagged_text=tagged_text,
-            voice=update.voice,
-            lang_code=lang_code,
-            volume=update.volume,
-            loudness_normalization=update.loudness_normalization,
-            text_normalization=update.text_normalization,
-        )
-    except Exception as e:
-        print(f"[update-scene-voice] voice generation failed for scene {scene_id}: {e}")
-        raise HTTPException(status_code=502, detail=f"Voice generation failed: {e}")
-
-    try:
-        scene_timestamps = await _generate_word_timestamps(speech_result["url"])
-    except Exception as e:
-        print(f"[update-scene-voice] whisperx alignment failed for scene {scene_id}: {e}")
-        raise HTTPException(status_code=502, detail=f"Timestamp alignment failed: {e}")
-
-    word_segments = scene_timestamps.get("word_segments", [])
-    timed_words = [w for w in word_segments if "start" in w and "end" in w]
-
-    # NEW: optional trim window (seconds) on the freshly generated
-    # voiceover, same semantics/validation as /scene/{scene_id}/trim. Full
-    # untrimmed word_segments are always kept as word_segments_full so a
-    # later /trim call still has the complete range to trim against.
-    if update.start is not None and update.end is not None:
-        if update.end <= update.start:
-            raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
-        if timed_words:
-            clip_start = timed_words[0]["start"]
-            clip_end = timed_words[-1]["end"]
-            if update.start < clip_start - 1e-3 or update.end > clip_end + 1e-3:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"Trim range [{update.start}, {update.end}] is outside the newly "
-                        f"generated audio's bounds [{clip_start}, {clip_end}]"
-                    ),
-                )
-        trimmed_words = [
-            w for w in timed_words
-            if w["start"] >= update.start and w["end"] <= update.end
-        ]
-        scene["voice"] = update.voice
-        scene["voiceover"] = speech_result
-        scene["trim"] = {"start": update.start, "end": update.end}
-        scene["word_segments_full"] = word_segments
-        scene["word_segments"] = trimmed_words
-        scene["start"] = trimmed_words[0]["start"] if trimmed_words else update.start
-        scene["end"] = trimmed_words[-1]["end"] if trimmed_words else update.end
-        scene["error"] = None
-    else:
-        scene["voice"] = update.voice
-        scene["voiceover"] = speech_result
-        scene["start"] = timed_words[0]["start"] if timed_words else None
-        scene["end"] = timed_words[-1]["end"] if timed_words else None
-        scene["word_segments"] = word_segments
-        scene.pop("trim", None)
-        scene.pop("word_segments_full", None)
-        scene["error"] = None
-
-    # Timing just changed completely — rebuild the rotating ~10s B-roll
-    # beats (new keywords + new media_type + new motion_type + new Pexels
-    # search per beat) so B-roll windows line up with the new voiceover
-    # instead of stale ones.
-    scene["beats"] = await _build_scene_beats(scene)
-    scene["media"] = _aggregate_beats_media(scene["beats"])
-    scene["duration_seconds"] = (
-        round(scene["end"] - scene["start"], 3)
-        if scene.get("start") is not None and scene.get("end") is not None
-        else None
-    )
-
-    raw_scenes[scene_index] = scene
-
-    timeline_json = build_timeline_from_scenes(raw_scenes)
-    new_version = current_version + 1
-
-    try:
-        supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-        }).eq("id", video_id).execute()
-    except Exception as e:
-        print(f"[update-scene-voice] failed to save video {video_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save voice edit")
-
-    return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "voice": update.voice,
-        "start": scene["start"],
-        "end": scene["end"],
-        "beats": [{"beat_id": b["beat_id"], "start": b["start"], "end": b["end"]} for b in scene["beats"]],
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
-    }
 
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/trim")
@@ -13683,6 +13520,142 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
     }
 
 
+_VALID_DELETE_CONTENT_TYPES = {"video", "image", "text", "infographics"}
+
+
+@app.delete("/timeline/{video_id}/scene/{scene_id}/content")
+async def delete_scene_content(
+    video_id: str,
+    scene_id: str,
+    content_type: Literal["video", "image", "text", "infographics"],
+    beat_id: Optional[str] = None,
+):
+    """
+    Removes content from a scene, by type:
+
+    - content_type="video" or "image": clears the B-roll for ONE beat
+      (beat_id required) — the beat's asset and candidate pool are wiped,
+      so it falls back to a plain color card at render time instead of
+      any footage. The beat's own time slot (its [start, end] window,
+      captions, audio) is untouched — this deletes what's SHOWN during
+      that window, not the window itself. "video" and "image" behave
+      identically (there's nothing type-specific to clear beyond "the
+      asset"); both are accepted since callers may not always know which
+      one is currently selected.
+    - content_type="text": clears a scene's plain overlay_text animation
+      (lower_third, callout_textbox, kinetic_caption) — the scene reverts
+      to having no overlay at all. Does nothing if the scene's overlay is
+      actually an infographic (use content_type="infographics" instead).
+    - content_type="infographics": clears a scene's infographic
+      composition (title card, quote card, stat counter, bullet list,
+      data viz, icon sequence/pop-in) the same way. Does nothing if the
+      scene's overlay is actually plain text.
+
+    beat_id is required (and only meaningful) for "video"/"image";
+    omit it for "text"/"infographics".
+    """
+    if content_type in ("video", "image") and not beat_id:
+        raise HTTPException(
+            status_code=422,
+            detail="beat_id is required when content_type is 'video' or 'image'",
+        )
+
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[delete-scene-content] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    deleted_something = False
+
+    if content_type in ("video", "image"):
+        beats = scene.get("beats") or []
+        beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+        if beat_idx is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Beat {beat_id} not found in scene {scene_id} (available: "
+                       f"{[b.get('beat_id') for b in beats]})",
+            )
+        beat = dict(beats[beat_idx])
+        beat["broll_override"] = None
+        beat["preferred_media_type"] = None
+        beat["media"] = {
+            "videos": {"total_results": 0, "results": [], "error": None},
+            "images": {"total_results": 0, "results": [], "error": None},
+        }
+        beats[beat_idx] = beat
+        scene["beats"] = beats
+        deleted_something = True
+
+    elif content_type == "infographics":
+        if scene.get("infographics"):
+            scene["infographics"] = None
+            scene["animation"] = {}
+            deleted_something = True
+
+    elif content_type == "text":
+        animation = scene.get("animation") or {}
+        if animation.get("category") == "overlay_text" and not scene.get("infographics"):
+            scene["animation"] = {}
+            deleted_something = True
+
+    if not deleted_something:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Scene {scene_id} has no {content_type} content to delete "
+                   f"(check the scene's current animation_type/infographics via GET /timeline first)",
+        )
+
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+            "infographics_list": infographics_list,
+            "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[delete-scene-content] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete content")
+
+    return {
+        "video_id": video_id,
+        "scene_id": scene_id,
+        "content_type": content_type,
+        "beat_id": beat_id,
+        "infographics_list": infographics_list,
+        "text_list": text_list,
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
 
 
 # =============================================================================
