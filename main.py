@@ -8457,6 +8457,17 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
     return {"message": "Uploaded and processed"}
 
 
+
+
+
+
+
+
+
+
+
+
+
 import math
 
 FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
@@ -8476,7 +8487,7 @@ GENERATED_AUDIO_BUCKET = "generated-audio"
 # the global default speed applied whenever a request doesn't specify its
 # own `speed`. Range 0.5-2.0, lower = slower. Kept as an env var so it can be
 # tuned without a redeploy.
-TTS_SPEECH_SPEED = float(os.getenv("TTS_SPEECH_SPEED", "0.85"))
+TTS_SPEECH_SPEED = float(os.getenv("TTS_SPEECH_SPEED", "0.95"))
 
 # ---- Credit pricing for voice generation ----
 # 1 minute of generated audio = 5 credits.
@@ -8507,6 +8518,9 @@ class GenerateSpeechRequest(BaseModel):
     langCode: str = "en"
     durationMinutes: int = 0
     speed: float | None = None  # FIX (voice too fast): 0.5-2.0, lower = slower; None = use TTS_SPEECH_SPEED
+    volume: float | None = None  # Fish Audio prosody.volume — dB adjustment, roughly -20..20; None = Fish Audio's own default (0)
+    loudnessNormalization: bool | None = None  # Fish Audio prosody.normalize_loudness; None = Fish Audio's own default
+    textNormalization: bool | None = None  # Fish Audio top-level "normalize"; None = Fish Audio's own default (true)
 
 
 async def _download_bytes(url: str) -> bytes:
@@ -8526,26 +8540,38 @@ def _create_fish_model_sync(ref_audio_bytes: bytes, title: str) -> str:
     return model.id
 
 
-def _run_fish_tts_sync(script: str, reference_id: str, speed: float = TTS_SPEECH_SPEED) -> bytes:
+def _run_fish_tts_sync(
+    script: str,
+    reference_id: str,
+    speed: float = TTS_SPEECH_SPEED,
+    volume: float | None = None,
+    loudness_normalization: bool | None = None,
+    text_normalization: bool | None = None,
+) -> bytes:
+    prosody_kwargs = {"speed": speed}
+    if volume is not None:
+        prosody_kwargs["volume"] = volume
+    if loudness_normalization is not None:
+        prosody_kwargs["normalize_loudness"] = loudness_normalization
+
     tts_request = TTSRequest(
         text=script,
         reference_id=reference_id,
-        temperature=0.5,              
-        top_p=0.7,                    
-        repetition_penalty=1.2,     
-        chunk_length=300,           
-        latency="normal",             
-        normalize=True,              
-        format="mp3",             
-        mp3_bitrate=192,               
+        temperature=0.5,
+        top_p=0.7,
+        repetition_penalty=1.2,
+        chunk_length=300,
+        latency="normal",
+        normalize=text_normalization if text_normalization is not None else True,
+        format="mp3",
+        mp3_bitrate=192,
         condition_on_previous_chunks=True,
-        prosody=Prosody(speed=speed),  # FIX (voice too fast): the actual speed control
+        prosody=Prosody(**prosody_kwargs),
     )
     audio_chunks = []
     for chunk in fish_session.tts(tts_request):
         audio_chunks.append(chunk)
     return b"".join(audio_chunks)
-
 
 def _credits_for_voice_minutes(duration_minutes: float) -> int:
     if duration_minutes <= 0:
@@ -8581,8 +8607,6 @@ async def generate_speech(body: GenerateSpeechRequest):
     script = body.script
     voice = body.voice.strip() if body.voice else ""
     lang_code = (body.langCode or "en").strip()
-    # FIX (voice too fast): resolve the speed to use — request-specified if
-    # given, otherwise the new global default.
     speed = body.speed if body.speed is not None else TTS_SPEECH_SPEED
 
     await require_valid_user(userId)
@@ -8645,7 +8669,10 @@ async def generate_speech(body: GenerateSpeechRequest):
         reference_id = voice
 
     try:
-        audio_bytes = await asyncio.to_thread(_run_fish_tts_sync, script, reference_id, speed)
+        audio_bytes = await asyncio.to_thread(_run_fish_tts_sync, script, reference_id,speed,body.volume,
+            body.loudnessNormalization,
+            body.textNormalization,
+)
     except Exception as e:
         print(f"[TTS] Fish Audio TTS failed: {e}")
         import traceback
@@ -9194,19 +9221,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -9221,6 +9235,10 @@ from typing import Any, Optional, Literal
 
 import httpx
 import whisperx
+import torch
+from PIL import Image
+import io as _io
+from transformers import CLIPModel, CLIPProcessor
 from fastapi import HTTPException
 from pydantic import BaseModel
 
@@ -9679,6 +9697,17 @@ _VALID_Z_LAYERS = {"background", "midground", "foreground"}
 _VALID_TRIGGERS = {"time_offset", "on_keyword", "on_beat", "scene_start"}
 _VALID_RENDER_HINTS = {"remotion", "ffmpeg"}
 
+# NEW: Canva-style entrance animation for plain text overlays (category
+# "overlay_text" — lower-thirds, callout boxes, bullet lists, stat
+# counters). Distinct from _VALID_CAPTION_ANIMATION_TYPES, which governs
+# the word-by-word burned-in captions, not these overlay text elements.
+_TEXT_ANIMATION_STYLES = [
+    "fade_in", "slide_in_left", "slide_in_right", "slide_up", "slide_down",
+    "zoom_in", "bounce", "pop", "typewriter", "wipe",
+]
+_VALID_TEXT_ANIMATION_STYLES = set(_TEXT_ANIMATION_STYLES)
+_DEFAULT_TEXT_ANIMATION_STYLE = "fade_in"
+
 ANIMATION_PLANNER_PROMPT = f"""
 System Prompt
 
@@ -9730,6 +9759,23 @@ instead for those categories. Bottom placements remain fine only for
 full_screen or transition category animation_types, which own the whole
 frame anyway.
 
+TEXT ENTRANCE ANIMATION (only meaningful for category "overlay_text" —
+lower_third, kinetic_caption, bullet_list_reveal, callout_textbox,
+stat_counter_overlay; ignored for every other category, but you must
+still return a valid value):
+
+Choose one text_animation_style from: fade_in, slide_in_left,
+slide_in_right, slide_up, slide_down, zoom_in, bounce, pop, typewriter,
+wipe — the same kind of entrance animation a tool like Canva offers for
+text elements. Match it to the tone/pace of the scene: a punchy stat or
+short callout suits pop/bounce/zoom_in; a calmer lower-third or quote
+suits fade_in/slide_in_left/slide_in_right; a longer bullet list can use
+wipe or slide_up so items feel like they build in sequence; typewriter
+suits a single short line meant to be read character-by-character. Vary
+your choice across scenes rather than defaulting to the same one every
+time, unless the scenes call for consistency (e.g. a repeating lower-third
+format).
+
 Output Schema
 
 Return exactly one JSON object with these fields:
@@ -9742,7 +9788,8 @@ Return exactly one JSON object with these fields:
   "trigger": "on_keyword",
   "duration_frames": 45,
   "content_binding": "icon:lightbulb",
-  "render_engine_hint": "remotion"
+  "render_engine_hint": "remotion",
+  "text_animation_style": "fade_in"
 }}
 
 Constraints
@@ -9760,6 +9807,21 @@ class EditVideo(BaseModel):
     voice: str
     langCode: str = "en"
     durationMinutes: int = 0
+    # NEW: Fish Audio prosody/normalization settings — verified against
+    # Fish Audio's actual /v1/tts request schema:
+    #   {"prosody": {"volume": 0, "normalize_loudness": true}, "normalize": true, ...}
+    # volume: dB adjustment, roughly -20..20, default 0 (Fish Audio's own default).
+    # loudness_normalization -> prosody.normalize_loudness.
+    # text_normalization -> top-level "normalize" (Fish Audio's own docs: reduces
+    #   latency but may reduce accuracy on numbers/dates when disabled).
+    # All optional — omit to use Fish Audio's own defaults. IMPORTANT: these are
+    # only forwarded correctly if GenerateSpeechRequest/generate_speech (defined
+    # outside this file) also passes them through into the actual Fish Audio
+    # request body — that wiring isn't visible from this file and may need its
+    # own update.
+    volume: Optional[float] = None
+    loudness_normalization: Optional[bool] = None
+    text_normalization: Optional[bool] = None
 
 
 class TrackPatch(BaseModel):
@@ -9783,6 +9845,12 @@ class SceneVoiceUpdate(BaseModel):
     # Omit both to keep the full newly-generated voiceover untrimmed.
     start: Optional[float] = None
     end: Optional[float] = None
+    # NEW: same Fish Audio prosody/normalization settings as EditVideo —
+    # see that model's comment for field meanings and the caveat about
+    # needing GenerateSpeechRequest/generate_speech to forward them.
+    volume: Optional[float] = None
+    loudness_normalization: Optional[bool] = None
+    text_normalization: Optional[bool] = None
 
 
 class SceneStyleUpdate(BaseModel):
@@ -9807,6 +9875,12 @@ class SceneStyleUpdate(BaseModel):
     # endFrame. Provide both together.
     text_start: Optional[float] = None
     text_end: Optional[float] = None
+    # NEW: Canva-style entrance animation for the scene's plain-text
+    # overlay (category "overlay_text" — lower-third, callout box, bullet
+    # list, stat counter). One of _TEXT_ANIMATION_STYLES. Ignored if the
+    # scene's overlay is an infographic composition or has no overlay at
+    # all — merged into scene["animation"]["text_animation_style"].
+    text_animation_style: Optional[str] = None
 
 
 class BeatSplitUpdate(BaseModel):
@@ -9983,13 +10057,6 @@ def _get_whisperx_model():
     return _whisperx_model
 
 
-def _preload_whisperx_align_model(language_code: str = "en"):
-    if language_code not in _whisperx_align_cache:
-        print(f"[WHISPERX] preloading alignment model for language '{language_code}'")
-        align_model, metadata = whisperx.load_align_model(
-            language_code=language_code, device=WHISPERX_DEVICE
-        )
-        _whisperx_align_cache[language_code] = (align_model, metadata)
 
 
 def _run_whisperx_sync(audio_bytes: bytes) -> dict:
@@ -10080,13 +10147,35 @@ async def _upload_audio_to_storage(local_path: str, user_id: str) -> str:
 
 async def _generate_speech_possibly_chunked(
     user_id: str, tagged_text: str, voice: str, lang_code: str,
+    volume: Optional[float] = None,
+    loudness_normalization: Optional[bool] = None,
+    text_normalization: Optional[bool] = None,
 ) -> dict:
+    """
+    volume/loudness_normalization/text_normalization map to Fish Audio's
+    real /v1/tts fields (prosody.volume, prosody.normalize_loudness, and
+    top-level normalize respectively). They're passed through to
+    GenerateSpeechRequest as keyword args here — but GenerateSpeechRequest
+    and generate_speech() are defined outside this file, so whether Fish
+    Audio actually receives them depends on that model/function also
+    accepting and forwarding these fields. If they're not yet defined
+    there, this will need a matching update in that file too.
+    """
+    tts_kwargs = {}
+    if volume is not None:
+        tts_kwargs["volume"] = volume
+    if loudness_normalization is not None:
+        tts_kwargs["loudnessNormalization"] = loudness_normalization
+    if text_normalization is not None:
+        tts_kwargs["textNormalization"] = text_normalization
+
     chunks = _split_text_for_tts(tagged_text)
 
     if len(chunks) <= 1:
         speech_request = GenerateSpeechRequest(
             userId=user_id, script=tagged_text, voice=voice,
             langCode=lang_code, durationMinutes=0,
+            **tts_kwargs,
         )
         return await generate_speech(speech_request)
 
@@ -10102,6 +10191,7 @@ async def _generate_speech_possibly_chunked(
             speech_request = GenerateSpeechRequest(
                 userId=user_id, script=chunk_text, voice=voice,
                 langCode=lang_code, durationMinutes=0,
+                **tts_kwargs,
             )
             chunk_result = await generate_speech(speech_request)
             chunk_bytes = await _download_bytes(chunk_result["url"])
@@ -10195,6 +10285,157 @@ def _dedupe_and_trim(items: list, limit: int) -> list:
     return deduped
 
 
+# =============================================================================
+# CLIP / X-CLIP SEMANTIC RERANKING  (NEW)
+#
+# Pexels' own search returns candidates in whatever order its own relevance
+# scoring picks — that order has no guarantee of matching what the keyword
+# actually depicts, and _resolve_beat_broll_selection simply takes
+# candidates[0]. This reranks the already-fetched, already-deduped candidate
+# pool by actual text-image / text-video similarity, so the DEFAULT pick for
+# a beat is the best semantic match, not just whichever Pexels listed first.
+#
+# Runs only on the trimmed, per-beat pool (PEXELS_SCENE_RESULT_LIMIT items,
+# not the full raw pool across every keyword) to keep the cost bounded —
+# see _fetch_media_for_keywords, where this is called once per beat/scene
+# lookup, right before the pool is returned.
+# =============================================================================
+
+CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "openai/clip-vit-base-patch32")
+CLIP_DEVICE = os.getenv("CLIP_DEVICE", "cpu")
+
+# Feature flag — reranking downloads a thumbnail image per candidate and
+# scores it against the beat's own keywords, for both images and video
+# candidates (video candidates use their Pexels-provided thumbnail, not
+# extracted frames). Default on, but can be turned off without touching
+# code if the extra download/inference cost isn't worth it at your render
+# volume.
+CLIP_RERANK_ENABLED = os.getenv("CLIP_RERANK_ENABLED", "true").lower() == "true"
+
+_clip_model = None
+_clip_processor = None
+
+
+def _get_clip():
+    global _clip_model, _clip_processor
+    if _clip_model is None:
+        print(f"[CLIP] loading '{CLIP_MODEL_NAME}' on {CLIP_DEVICE}")
+        _clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(CLIP_DEVICE).eval()
+        _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+    return _clip_model, _clip_processor
+
+
+def _clip_score_images_sync(query_text: str, images: list) -> dict:
+    """images: list of (candidate_id, PIL.Image). Returns {candidate_id: score}."""
+    model, processor = _get_clip()
+    pil_images = [img for _cid, img in images]
+    inputs = processor(text=[query_text], images=pil_images, return_tensors="pt", padding=True)
+    inputs = {k: v.to(CLIP_DEVICE) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits_per_image = outputs.logits_per_image.squeeze(-1)
+        scores = logits_per_image.softmax(dim=0).tolist()
+        if not isinstance(scores, list):
+            scores = [scores]
+    return {images[i][0]: scores[i] for i in range(len(images))}
+
+
+async def _rerank_images_with_clip(query_text: str, image_candidates: list) -> list:
+    """
+    Re-orders Pexels image candidates by CLIP text-image similarity against
+    `query_text` (the beat's own keywords). Any candidate that fails to
+    download or score is kept, just pushed to the end rather than dropped —
+    a reranking failure should never reduce the pool a beat can pick from.
+    """
+    if not CLIP_RERANK_ENABLED or not image_candidates or not query_text.strip():
+        return image_candidates
+
+    downloaded = []
+    try:
+        async with httpx.AsyncClient() as client:
+            for cand in image_candidates:
+                url = _resolve_broll_file_url(cand, "image")
+                if not url:
+                    continue
+                try:
+                    resp = await client.get(url, timeout=20.0)
+                    resp.raise_for_status()
+                    img = Image.open(_io.BytesIO(resp.content)).convert("RGB")
+                    downloaded.append((str(cand.get("id")), img, cand))
+                except Exception as e:
+                    print(f"[CLIP] failed to download image {cand.get('id')}: {e}")
+    except Exception as e:
+        print(f"[CLIP] image download pass failed entirely, keeping original order: {e}")
+        return image_candidates
+
+    if not downloaded:
+        return image_candidates
+
+    try:
+        scores = await asyncio.to_thread(
+            _clip_score_images_sync, query_text, [(cid, img) for cid, img, _c in downloaded]
+        )
+    except Exception as e:
+        print(f"[CLIP] scoring failed, keeping original order: {e}")
+        return image_candidates
+
+    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], 0.0), reverse=True)
+    ranked_ids = {cid for cid, _img, _c in ranked}
+    result = [c for _cid, _img, c in ranked]
+    result += [c for c in image_candidates if str(c.get("id")) not in ranked_ids]
+    return result
+
+
+async def _rerank_videos_with_clip(query_text: str, video_candidates: list) -> list:
+    """
+    Re-orders Pexels video candidates by CLIP text-image similarity,
+    scored against each candidate's Pexels-provided THUMBNAIL image —
+    same CLIP model/scoring as _rerank_images_with_clip, just applied to
+    the video's thumbnail rather than an image asset. This is deliberately
+    NOT X-CLIP / frame sampling: no video download, no ffmpeg frame
+    extraction, just one thumbnail image per candidate, so it's as cheap
+    as the image reranking path. Any candidate whose thumbnail fails to
+    download/score is kept, pushed to the end rather than dropped.
+    """
+    if not CLIP_RERANK_ENABLED or not video_candidates or not query_text.strip():
+        return video_candidates
+
+    downloaded = []
+    try:
+        async with httpx.AsyncClient() as client:
+            for cand in video_candidates:
+                url = cand.get("thumbnail")
+                if not url:
+                    continue
+                try:
+                    resp = await client.get(url, timeout=20.0)
+                    resp.raise_for_status()
+                    img = Image.open(_io.BytesIO(resp.content)).convert("RGB")
+                    downloaded.append((str(cand.get("id")), img, cand))
+                except Exception as e:
+                    print(f"[CLIP] failed to download video thumbnail {cand.get('id')}: {e}")
+    except Exception as e:
+        print(f"[CLIP] video thumbnail download pass failed entirely, keeping original order: {e}")
+        return video_candidates
+
+    if not downloaded:
+        return video_candidates
+
+    try:
+        scores = await asyncio.to_thread(
+            _clip_score_images_sync, query_text, [(cid, img) for cid, img, _c in downloaded]
+        )
+    except Exception as e:
+        print(f"[CLIP] video thumbnail scoring failed, keeping original order: {e}")
+        return video_candidates
+
+    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], 0.0), reverse=True)
+    ranked_ids = {cid for cid, _img, _c in ranked}
+    result = [c for _cid, _img, c in ranked]
+    result += [c for c in video_candidates if str(c.get("id")) not in ranked_ids]
+    return result
+
+
 async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     """
     NEW: shared Pexels-search core, factored out of what used to be
@@ -10284,6 +10525,18 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
 
     videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
     photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
+
+    # NEW: rerank by actual semantic match (CLIP for images, X-CLIP for
+    # video) against the same keywords that were searched, so the DEFAULT
+    # pick (candidates[0], see _resolve_beat_broll_selection) is the best
+    # visual match Pexels returned — not just whichever result Pexels'
+    # own search ranking happened to list first. Runs only on this
+    # already-trimmed pool, not the full raw search results.
+    query_text = ", ".join(keywords)
+    if photos:
+        photos = await _rerank_images_with_clip(query_text, photos)
+    if videos:
+        videos = await _rerank_videos_with_clip(query_text, videos)
 
     videos_error = "; ".join(video_errors) if video_errors and not videos else None
     images_error = "; ".join(image_errors) if image_errors and not photos else None
@@ -10773,6 +11026,7 @@ def _default_animation(scene: dict) -> dict:
             "duration_frames": 60,
             "content_binding": "text:on_screen_text",
             "render_engine_hint": "remotion",
+            "text_animation_style": _DEFAULT_TEXT_ANIMATION_STYLE,
         }
 
     return {
@@ -10784,6 +11038,7 @@ def _default_animation(scene: dict) -> dict:
         "duration_frames": 150,
         "content_binding": "broll:visual_intent",
         "render_engine_hint": "ffmpeg",
+        "text_animation_style": _DEFAULT_TEXT_ANIMATION_STYLE,
     }
 
 
@@ -10838,6 +11093,12 @@ def _validate_animation(raw: dict, scene: dict) -> dict:
     if render_engine_hint not in _VALID_RENDER_HINTS:
         render_engine_hint = "remotion" if category in ("overlay_text", "overlay_graphic", "pip", "branding") else "ffmpeg"
 
+    # NEW: only meaningful for overlay_text, but validated/defaulted
+    # regardless so the field is always present and safe to read.
+    text_animation_style = raw.get("text_animation_style")
+    if text_animation_style not in _VALID_TEXT_ANIMATION_STYLES:
+        text_animation_style = _DEFAULT_TEXT_ANIMATION_STYLE
+
     return {
         "animation_type": animation_type,
         "category": category,
@@ -10847,6 +11108,7 @@ def _validate_animation(raw: dict, scene: dict) -> dict:
         "duration_frames": duration_frames,
         "content_binding": content_binding,
         "render_engine_hint": render_engine_hint,
+        "text_animation_style": text_animation_style,
     }
 
 
@@ -11074,6 +11336,9 @@ async def _process_scene(scene: dict, request: EditVideo) -> dict:
             tagged_text=tagged_text,
             voice=request.voice,
             lang_code=request.langCode,
+            volume=request.volume,
+            loudness_normalization=request.loudness_normalization,
+            text_normalization=request.text_normalization,
         )
     except Exception as e:
         print(f"[edit-video] scene {scene.get('scene_id')} voice generation failed: {e}")
@@ -11260,6 +11525,100 @@ async def _fetch_pexels_asset_by_id(asset_id: Any, source: str) -> Optional[dict
 
 def _seconds_to_frames(seconds: float, fps: int = TIMELINE_FPS) -> int:
     return max(round((seconds or 0.0) * fps), 0)
+
+
+# =============================================================================
+# RESPONSE SLIMMING  (NEW)
+#
+# Full beat/track data (every Pexels candidate, every resolution variant
+# in video_files, the whole "candidates" pool) has to stay in raw_scenes /
+# timeline_json — reselection (/broll), dedupe, and blur-pad render
+# fallbacks all read that full data later. But none of that belongs in
+# what a caller actually sees after /edit-video or GET /timeline: they
+# want to know what beat exists, what keywords found its footage, and
+# which single asset/resolution actually got picked — not the other 5
+# candidates and every resolution Pexels offers for each of them.
+#
+# These helpers build a slimmed VIEW for API responses only; they never
+# mutate or replace what gets stored.
+# =============================================================================
+
+def _slim_selected_asset(selected: Optional[dict]) -> Optional[dict]:
+    if not selected:
+        return None
+    return {
+        "asset_id": selected.get("asset_id") if "asset_id" in selected else selected.get("id"),
+        "file_url": selected.get("file_url"),
+        "source": selected.get("source"),
+        "width": selected.get("width"),
+        "height": selected.get("height"),
+    }
+
+
+def _slim_beat_for_response(beat: dict) -> dict:
+    default_asset, default_source = _resolve_beat_broll_selection(beat)
+    selected = None
+    if default_asset:
+        selected = {
+            "asset_id": default_asset.get("id"),
+            "file_url": _resolve_broll_file_url(default_asset, default_source),
+            "source": default_source,
+            "width": default_asset.get("width"),
+            "height": default_asset.get("height"),
+        }
+    return {
+        "beat_id": beat.get("beat_id"),
+        "start": beat.get("start"),
+        "end": beat.get("end"),
+        "keywords": beat.get("keywords"),
+        "preferred_media_type": beat.get("preferred_media_type"),
+        "motion_type": _resolve_beat_motion_type(beat),
+        "selected_asset": selected,
+    }
+
+
+def _slim_scene_for_response(scene: dict) -> dict:
+    return {
+        "scene_id": scene.get("scene_id"),
+        "vo_text": scene.get("vo_text"),
+        "visual_intent": scene.get("visual_intent"),
+        "on_screen_text": scene.get("on_screen_text"),
+        "start": scene.get("start"),
+        "end": scene.get("end"),
+        "duration_seconds": scene.get("duration_seconds"),
+        "voice_url": (scene.get("voiceover") or {}).get("url"),
+        "error": scene.get("error"),
+        "beats": [_slim_beat_for_response(b) for b in (scene.get("beats") or [])],
+        "animation": scene.get("animation"),
+        "infographics": scene.get("infographics"),
+        "caption_style": scene.get("caption_style"),
+        "background_color": scene.get("background_color"),
+    }
+
+
+def _slim_timeline_for_response(timeline: dict) -> dict:
+    slim_tracks = []
+    for track in timeline.get("tracks", []):
+        if track.get("type") != "broll":
+            slim_tracks.append(track)
+            continue
+        slim_tracks.append({
+            "track_id": track.get("track_id"),
+            "type": "broll",
+            "scene_id": track.get("scene_id"),
+            "beat_id": track.get("beat_id"),
+            "layer": track.get("layer"),
+            "startFrame": track.get("startFrame"),
+            "endFrame": track.get("endFrame"),
+            "beat_start_sec": track.get("beat_start_sec"),
+            "beat_end_sec": track.get("beat_end_sec"),
+            "keywords": track.get("keywords"),
+            "preferred_media_type": track.get("preferred_media_type"),
+            "motion_type": track.get("motion_type"),
+            "selected_asset": _slim_selected_asset(track.get("selected_asset")),
+            "background_color": track.get("background_color"),
+        })
+    return {**timeline, "tracks": slim_tracks}
 
 
 def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
@@ -11549,12 +11908,47 @@ async def edit_video(request: EditVideo):
         print(f"[edit-video] failed to persist video row: {e}")
         raise HTTPException(status_code=500, detail="Failed to save video")
 
+    # NEW: split every scene's overlay into two flat, top-level lists —
+    # "infographics" (anything rendered with an icon/graphic/composition,
+    # i.e. everything in REMOTION_INFOGRAPHIC_LIBRARY: title cards, quote
+    # cards, data viz, stat counters, bullet lists, icon sequences/pop-ins)
+    # vs "text" (a plain overlay_text animation with no icon/graphic —
+    # lower-thirds, kinetic captions, callout boxes). Classification reuses
+    # exactly what _get_scene_infographic already decided per scene
+    # (scene["infographics"] is only ever set for library animation_types),
+    # so this is just reshaping already-computed data, not a new decision.
+    infographics = []
+    text_overlays = []
+    for s in scenes_with_voice_and_timestamps:
+        animation = s.get("animation") or {}
+        infographic = s.get("infographics")
+        if infographic:
+            infographics.append({
+                "scene_id": s.get("scene_id"),
+                "animation_type": infographic.get("animation_type"),
+                "composition_id": infographic.get("composition_id"),
+                "placement": infographic.get("placement"),
+                "props": infographic.get("props", {}),
+                "duration_frames": infographic.get("duration_frames"),
+            })
+        elif animation.get("category") == "overlay_text":
+            text_overlays.append({
+                "scene_id": s.get("scene_id"),
+                "animation_type": animation.get("animation_type"),
+                "placement": animation.get("placement"),
+                "text": (s.get("on_screen_text") or "").strip(),
+                "duration_frames": animation.get("duration_frames"),
+                "text_animation_style": animation.get("text_animation_style"),
+            })
+
     return {
         "video_id": video_id,
-        "timeline": timeline_json,
-        "scenes": scenes_with_voice_and_timestamps,
+        "timeline": _slim_timeline_for_response(timeline_json),
+        "scenes": [_slim_scene_for_response(s) for s in scenes_with_voice_and_timestamps],
         "scene_timings": scene_timings,
         "failed_scene_ids": failed_scenes,
+        "infographics": infographics,
+        "text": text_overlays,
     }
 
 
@@ -11575,7 +11969,10 @@ async def get_timeline(video_id: str):
     if not row.data:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    return row.data
+    data = dict(row.data)
+    if data.get("timeline_json"):
+        data["timeline_json"] = _slim_timeline_for_response(data["timeline_json"])
+    return data
 
 
 @app.patch("/timeline/{video_id}")
@@ -11720,12 +12117,18 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     if update.text_start is not None and update.text_end is not None and update.text_end <= update.text_start:
         raise HTTPException(status_code=422, detail="text_end must be greater than text_start")
 
+    if update.text_animation_style is not None and update.text_animation_style not in _VALID_TEXT_ANIMATION_STYLES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"text_animation_style must be one of {sorted(_VALID_TEXT_ANIMATION_STYLES)}",
+        )
+
     if (
         update.font_size is None and update.text_color is None
         and update.outline_color is None and update.animation_type is None
         and update.background_color is None and update.vertical_position is None
         and update.margin_bottom_percent is None and update.text_start is None
-        and update.text_end is None
+        and update.text_end is None and update.text_animation_style is None
     ):
         raise HTTPException(status_code=422, detail="Provide at least one field to update")
 
@@ -11776,6 +12179,11 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         animation["end_offset_seconds"] = update.text_end
         scene["animation"] = animation
 
+    if update.text_animation_style is not None:
+        animation = dict(scene.get("animation") or _default_animation(scene))
+        animation["text_animation_style"] = update.text_animation_style
+        scene["animation"] = animation
+
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
@@ -11801,6 +12209,7 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         "background_color": scene.get("background_color"),
         "text_start": (scene.get("animation") or {}).get("start_offset_seconds"),
         "text_end": (scene.get("animation") or {}).get("end_offset_seconds"),
+        "text_animation_style": (scene.get("animation") or {}).get("text_animation_style"),
         "timeline": timeline_json,
         "needs_render": True,
     }
@@ -11858,6 +12267,9 @@ async def update_scene_voice(video_id: str, scene_id: str, update: SceneVoiceUpd
             tagged_text=tagged_text,
             voice=update.voice,
             lang_code=lang_code,
+            volume=update.volume,
+            loudness_normalization=update.loudness_normalization,
+            text_normalization=update.text_normalization,
         )
     except Exception as e:
         print(f"[update-scene-voice] voice generation failed for scene {scene_id}: {e}")
@@ -13613,6 +14025,142 @@ def _animation_overlay_text(animation: dict, scene: dict, infographic: Optional[
     return on_screen_text or None
 
 
+# =============================================================================
+# TEXT ENTRANCE ANIMATION RENDERING  (NEW)
+#
+# text_animation_style was previously stored, validated, and returned in
+# API responses, but never actually reached a renderer — the FFmpeg path
+# below (_burn_animation_overlay) drew static text with no entrance
+# animation, and the Remotion path never included the field in props. This
+# section makes the FFmpeg path — which is what actually runs whenever
+# REMOTION_PROJECT_DIR isn't configured, i.e. most local/test setups —
+# genuinely render each of the 10 styles using FFmpeg drawtext's per-frame
+# x/y/alpha expressions (all evaluated once per frame using drawtext's
+# built-in `t` = seconds since this clip started).
+#
+# Honesty about two approximations, since drawtext has real limits:
+# - "zoom_in": drawtext's fontsize is NOT reliably animatable per-frame
+#   across ffmpeg versions, so true scale-up isn't available. Approximated
+#   as a fast fade + a small settle-in vertical move — reads as "arriving"
+#   but does not actually change text size.
+# - "wipe": a true left-to-right reveal needs a moving crop/mask over the
+#   text, which drawtext can't do on its own. Approximated as a fast
+#   slide_in_left.
+# Every other style (fade_in, slide_in_left/right, slide_up/down, bounce,
+# pop, typewriter) is a genuine implementation, not an approximation.
+# =============================================================================
+
+def _clip01_expr(inner: str) -> str:
+    return f"min(max({inner},0),1)"
+
+
+def _build_animated_drawtext(
+    text: str,
+    style: str,
+    x_final: str,
+    y_final: str,
+    font_size: int,
+    start_sec: float,
+    end_sec: Optional[float],
+) -> str:
+    """
+    Returns one or more comma-joined `drawtext=...` filter clauses that
+    animate `text` into place at (x_final, y_final) using `style`, gated
+    to be visible starting at start_sec (and, if end_sec is given, hidden
+    again after it — matching the on-screen window set via
+    SceneStyleUpdate.text_start/text_end or
+    SceneInfographicUpdate.start_seconds/end_seconds). If end_sec is None,
+    the text stays visible for the rest of the clip once it appears,
+    matching the original (pre-animation) behavior.
+    """
+    enable_expr = (
+        f"between(t,{start_sec},{end_sec})" if end_sec is not None else f"gte(t,{start_sec})"
+    )
+    box_clause = "box=1:boxcolor=black@0.55:boxborderw=20"
+    base = f"fontcolor=white:fontsize={font_size}:{box_clause}:line_spacing=8:enable='{enable_expr}'"
+
+    entrance = 0.6  # seconds the entrance animation itself takes
+    reveal = _clip01_expr(f"(t-{start_sec})/{entrance}")
+
+    if style == "typewriter":
+        # Genuine per-step reveal: cut the text into N coarse chunks (not
+        # per-character, to avoid chaining dozens of drawtext filters) and
+        # enable each chunk only during its own slice of a longer entrance
+        # window, so the text visibly builds up left-to-right over time.
+        steps = 8
+        typewriter_entrance = 1.2
+        step_len = typewriter_entrance / steps
+        clauses = []
+        for i in range(steps):
+            cut = max(1, round(len(text) * (i + 1) / steps))
+            prefix = _escape_drawtext(text[:cut])
+            step_start = start_sec + i * step_len
+            step_end = start_sec + (i + 1) * step_len
+            if i < steps - 1:
+                step_enable = f"between(t,{step_start},{step_end})"
+            else:
+                # Final chunk (full text) stays up through end_sec (or
+                # indefinitely) once fully typed, not just its own slice.
+                step_enable = (
+                    f"between(t,{step_start},{end_sec})" if end_sec is not None
+                    else f"gte(t,{step_start})"
+                )
+            clauses.append(
+                f"drawtext=text='{prefix}':fontcolor=white:fontsize={font_size}:"
+                f"{box_clause}:line_spacing=8:enable='{step_enable}':x={x_final}:y={y_final}"
+            )
+        return ",".join(clauses)
+
+    if style == "fade_in":
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y={y_final}"
+
+    if style == "slide_in_left":
+        x_start = "-text_w-20"
+        x_anim = f"(({x_start}))+((({x_final}))-(({x_start})))*({reveal})"
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x='{x_anim}':y={y_final}"
+
+    if style == "slide_in_right":
+        x_start = "w+20"
+        x_anim = f"(({x_start}))+((({x_final}))-(({x_start})))*({reveal})"
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x='{x_anim}':y={y_final}"
+
+    if style == "slide_up":
+        y_start = "h+20"
+        y_anim = f"(({y_start}))+((({y_final}))-(({y_start})))*({reveal})"
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y='{y_anim}'"
+
+    if style == "slide_down":
+        y_start = "-text_h-20"
+        y_anim = f"(({y_start}))+((({y_final}))-(({y_start})))*({reveal})"
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y='{y_anim}'"
+
+    if style == "bounce":
+        # Decaying oscillation settling on y_final — amplitude shrinks as
+        # reveal approaches 1, so it ends exactly on the resting position.
+        y_anim = f"(({y_final}))-(18*sin(({reveal})*3*PI))*(1-({reveal}))"
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y='{y_anim}'"
+
+    if style == "pop":
+        # Fast, punchy alpha ramp with no position travel.
+        pop_reveal = _clip01_expr(f"(t-{start_sec})/0.2")
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{pop_reveal}':x={x_final}:y={y_final}"
+
+    if style == "zoom_in":
+        # Approximation — see module docstring above.
+        y_anim = f"(({y_final}))-(10*(1-({reveal})))"
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y='{y_anim}'"
+
+    if style == "wipe":
+        # Approximation — see module docstring above.
+        wipe_reveal = _clip01_expr(f"(t-{start_sec})/0.35")
+        x_start = "-text_w-20"
+        x_anim = f"(({x_start}))+((({x_final}))-(({x_start})))*({wipe_reveal})"
+        return f"drawtext=text='{{TEXT}}':{base}:alpha='{wipe_reveal}':x='{x_anim}':y={y_final}"
+
+    # Unknown/default style — plain fade_in.
+    return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y={y_final}"
+
+
 async def _burn_animation_overlay(
     input_path: str,
     animation: dict,
@@ -13628,21 +14176,35 @@ async def _burn_animation_overlay(
     if not text:
         return input_path
 
-    placement = (animation or {}).get("placement") or "bottom_center"
+    animation = animation or {}
+    placement = animation.get("placement") or "bottom_center"
     x_expr, y_expr = _PLACEMENT_TO_XY.get(placement, _PLACEMENT_TO_XY["bottom_center"])
     font_size = max(round(height / 22), 28)
     safe_text = _escape_drawtext(text)
 
-    out_path = os.path.join(tmp_dir, "with_animation.mp4")
-    drawtext = (
-        f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
-        f"box=1:boxcolor=black@0.55:boxborderw=20:"
-        f"x={x_expr}:y={y_expr}:line_spacing=8"
+    style = animation.get("text_animation_style")
+    if style not in _VALID_TEXT_ANIMATION_STYLES:
+        style = _DEFAULT_TEXT_ANIMATION_STYLE
+    start_sec = animation.get("start_offset_seconds") or 0.0
+    end_sec = animation.get("end_offset_seconds")
+
+    filter_str = _build_animated_drawtext(
+        text=text, style=style, x_final=x_expr, y_final=y_expr,
+        font_size=font_size, start_sec=start_sec, end_sec=end_sec,
     )
+    # typewriter builds its own per-chunk drawtext clauses with the text
+    # already embedded; every other style has a single {TEXT} placeholder
+    # to fill in (kept as a placeholder above so the escaped text is
+    # substituted in exactly one place, rather than repeated through each
+    # style's branch).
+    if style != "typewriter":
+        filter_str = filter_str.replace("{TEXT}", safe_text)
+
+    out_path = os.path.join(tmp_dir, "with_animation.mp4")
     cmd = [
         FFMPEG_BIN, "-y",
         "-i", input_path,
-        "-vf", drawtext,
+        "-vf", filter_str,
         *FFMPEG_X264_FLAGS,
         "-c:a", "copy",
         out_path,
@@ -13652,10 +14214,26 @@ async def _burn_animation_overlay(
         return out_path
     except Exception as e:
         print(
-            f"[render] scene {scene.get('scene_id')}: ffmpeg text-overlay "
-            f"fallback failed, leaving scene without an overlay: {e}"
+            f"[render] scene {scene.get('scene_id')}: animated ffmpeg text-overlay "
+            f"failed ({e}) — retrying with a plain static overlay instead of failing the scene"
         )
-        return input_path
+        # Fall back to the original, non-animated overlay so a broken
+        # animation expression degrades to "static text" rather than
+        # dropping the overlay entirely.
+        plain = (
+            f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
+            f"box=1:boxcolor=black@0.55:boxborderw=20:x={x_expr}:y={y_expr}:line_spacing=8"
+        )
+        try:
+            fallback_out = os.path.join(tmp_dir, "with_animation_fallback.mp4")
+            await _run([
+                FFMPEG_BIN, "-y", "-i", input_path, "-vf", plain,
+                *FFMPEG_X264_FLAGS, "-c:a", "copy", fallback_out,
+            ])
+            return fallback_out
+        except Exception as e2:
+            print(f"[render] scene {scene.get('scene_id')}: plain overlay fallback also failed: {e2}")
+            return input_path
 
 
 async def _lock_clip_to_frame_count(
@@ -13822,9 +14400,18 @@ async def _render_scene(
         animation_applied = False
 
         if infographic and infographic.get("composition_id"):
+            remotion_props = dict(infographic.get("props", {}))
+            # Pass the chosen entrance animation through to Remotion too —
+            # previously computed/validated but never included in props,
+            # so composition components had no way to read it even if they
+            # implemented per-style animation logic.
+            remotion_props.setdefault(
+                "text_animation_style",
+                animation.get("text_animation_style") or _DEFAULT_TEXT_ANIMATION_STYLE,
+            )
             overlay_clip = await render_infographic_via_remotion(
                 composition_id=infographic["composition_id"],
-                props=infographic.get("props", {}),
+                props=remotion_props,
                 duration_frames=infographic.get("duration_frames") or duration_frames,
                 fps=fps, width=width, height=height, tmp_dir=tmp_dir,
             )
@@ -14208,34 +14795,3 @@ async def render_video(
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
  
     return {"final_video_url": final_video_url}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
