@@ -9193,6 +9193,9 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
 import re
 import os
 import json
@@ -12040,8 +12043,8 @@ async def edit_video(request: EditVideo):
         "scenes": [_slim_scene_for_response(s) for s in scenes_with_voice_and_timestamps],
         "scene_timings": scene_timings,
         "failed_scene_ids": failed_scenes,
-        "infographics": infographics,
-        "text": text_overlays,
+        "infographics_list": infographics,
+        "text_list": text_overlays,
     }
 
 
