@@ -11969,6 +11969,16 @@ async def edit_video(request: EditVideo):
         for s in scenes_with_voice_and_timestamps
     ]
 
+    # FIX: "infographics" was previously anything whose animation_type
+    # NEW: computed BEFORE the insert below (previously computed after),
+    # specifically so both lists can be persisted as their own columns —
+    # not just returned in this one response — and stay available on
+    # every later GET/PATCH of this video, not only right after creation.
+    # See _compute_infographics_and_text_lists for the classification
+    # rules (also reused by /style and /infographic to keep these columns
+    # in sync after edits).
+    infographics, text_overlays = _compute_infographics_and_text_lists(scenes_with_voice_and_timestamps)
+
     video_id = str(uuid.uuid4())
     try:
         supabase.table("videos").insert({
@@ -11981,61 +11991,12 @@ async def edit_video(request: EditVideo):
             "timeline_version": 1,
             "raw_scenes": scenes_with_voice_and_timestamps,
             "scene_timings": scene_timings,
+            "infographics_list": infographics,
+            "text_list": text_overlays,
         }).execute()
     except Exception as e:
         print(f"[edit-video] failed to persist video row: {e}")
         raise HTTPException(status_code=500, detail="Failed to save video")
-
-    # FIX: "infographics" was previously anything whose animation_type
-    # happened to be a key in REMOTION_INFOGRAPHIC_LIBRARY — but most of
-    # those (full_screen_title_card, full_screen_quote_card,
-    # full_screen_data_viz, stat_counter_overlay, bullet_list_reveal) are
-    # PURE TEXT presentations with no icon or graphic asset involved at
-    # all; they just happen to render via a styled Remotion composition
-    # instead of a plain FFmpeg drawtext overlay. Only icon_sequence and
-    # icon_pop_in actually carry a graphic (props["icons"]). Classification
-    # now checks for that specifically — a composition without any icons
-    # is text content, full stop, regardless of which renderer draws it.
-    infographics = []
-    text_overlays = []
-    for s in scenes_with_voice_and_timestamps:
-        animation = s.get("animation") or {}
-        infographic = s.get("infographics")
-        has_icon_graphic = bool(infographic and (infographic.get("props") or {}).get("icons"))
-
-        if infographic and has_icon_graphic:
-            infographics.append({
-                "scene_id": s.get("scene_id"),
-                "animation_type": infographic.get("animation_type"),
-                "composition_id": infographic.get("composition_id"),
-                "placement": infographic.get("placement"),
-                "props": infographic.get("props", {}),
-                "duration_frames": infographic.get("duration_frames"),
-            })
-        elif infographic:
-            # A Remotion composition with no icon/graphic — pure text.
-            # Reuse the same text-extraction logic the FFmpeg fallback
-            # path already uses (_animation_overlay_text), so the
-            # resulting string matches title/quote/value+label/bullet
-            # items exactly, rather than falling back to the looser
-            # on_screen_text.
-            text_overlays.append({
-                "scene_id": s.get("scene_id"),
-                "animation_type": infographic.get("animation_type"),
-                "placement": infographic.get("placement"),
-                "text": (_animation_overlay_text(animation, s, infographic) or "").strip(),
-                "duration_frames": infographic.get("duration_frames"),
-                "text_animation_style": animation.get("text_animation_style"),
-            })
-        elif animation.get("category") == "overlay_text":
-            text_overlays.append({
-                "scene_id": s.get("scene_id"),
-                "animation_type": animation.get("animation_type"),
-                "placement": animation.get("placement"),
-                "text": (s.get("on_screen_text") or "").strip(),
-                "duration_frames": animation.get("duration_frames"),
-                "text_animation_style": animation.get("text_animation_style"),
-            })
 
     return {
         "video_id": video_id,
@@ -12288,6 +12249,13 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
 
+    # NEW: keep the persisted infographics_list/text_list columns in sync
+    # with this edit — text_animation_style (and, less commonly here,
+    # animation_type via a future endpoint) changes which list a scene's
+    # overlay belongs in or what text it displays, so these need
+    # recomputing on every style change, not just at video creation.
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes)
+
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes,
@@ -12295,6 +12263,8 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
             "timeline_version": new_version,
             "final_video_url": None,
             "render_status": "stale_needs_render",
+            "infographics_list": infographics_list,
+            "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-style] failed to save video {video_id}: {e}")
@@ -12309,6 +12279,8 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         "text_start": (scene.get("animation") or {}).get("start_offset_seconds"),
         "text_end": (scene.get("animation") or {}).get("end_offset_seconds"),
         "text_animation_style": (scene.get("animation") or {}).get("text_animation_style"),
+        "infographics_list": infographics_list,
+        "text_list": text_list,
         "timeline": timeline_json,
         "needs_render": True,
     }
@@ -13114,6 +13086,12 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
 
+    # NEW: keep the persisted infographics_list/text_list columns in sync —
+    # changing animation_type here can move a scene between the two lists
+    # entirely (e.g. icon_sequence <-> full_screen_title_card), and prop
+    # changes can change the displayed text, so recompute on every edit.
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes)
+
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes,
@@ -13121,6 +13099,8 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
             "timeline_version": new_version,
             "final_video_url": None,
             "render_status": "stale_needs_render",
+            "infographics_list": infographics_list,
+            "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-infographic] failed to save video {video_id}: {e}")
@@ -13132,6 +13112,8 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
         "animation": animation,
         "infographic": infographic,
         "timeline_version": new_version,
+        "infographics_list": infographics_list,
+        "text_list": text_list,
         "timeline": timeline_json,
         "needs_render": True,
     }
@@ -14195,6 +14177,60 @@ def _animation_overlay_text(animation: dict, scene: dict, infographic: Optional[
 
     on_screen_text = (scene.get("on_screen_text") or "").strip()
     return on_screen_text or None
+
+
+def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
+    """
+    Shared classification logic behind the "infographics_list"/"text_list"
+    fields — factored out of /edit-video so /style and /infographic can
+    call it too and keep the PERSISTED infographics_list/text_list columns
+    in sync whenever an edit changes a scene's animation_type,
+    text_animation_style, or infographic props/placement, not just at
+    initial video creation.
+
+    Only icon_sequence and icon_pop_in actually carry a graphic asset
+    (props["icons"]) — every other REMOTION_INFOGRAPHIC_LIBRARY type
+    (full_screen_title_card, full_screen_quote_card, full_screen_data_viz,
+    stat_counter_overlay, bullet_list_reveal) is pure text presented via a
+    styled Remotion composition, so it's classified into text_list, not
+    infographics_list, regardless of which renderer draws it.
+    """
+    infographics = []
+    text_overlays = []
+    for s in scenes:
+        animation = s.get("animation") or {}
+        infographic = s.get("infographics")
+        has_icon_graphic = bool(infographic and (infographic.get("props") or {}).get("icons"))
+
+        if infographic and has_icon_graphic:
+            infographics.append({
+                "scene_id": s.get("scene_id"),
+                "animation_type": infographic.get("animation_type"),
+                "composition_id": infographic.get("composition_id"),
+                "placement": infographic.get("placement"),
+                "props": infographic.get("props", {}),
+                "duration_frames": infographic.get("duration_frames"),
+            })
+        elif infographic:
+            text_overlays.append({
+                "scene_id": s.get("scene_id"),
+                "animation_type": infographic.get("animation_type"),
+                "placement": infographic.get("placement"),
+                "text": (_animation_overlay_text(animation, s, infographic) or "").strip(),
+                "duration_frames": infographic.get("duration_frames"),
+                "text_animation_style": animation.get("text_animation_style"),
+            })
+        elif animation.get("category") == "overlay_text":
+            text_overlays.append({
+                "scene_id": s.get("scene_id"),
+                "animation_type": animation.get("animation_type"),
+                "placement": animation.get("placement"),
+                "text": (s.get("on_screen_text") or "").strip(),
+                "duration_frames": animation.get("duration_frames"),
+                "text_animation_style": animation.get("text_animation_style"),
+            })
+
+    return infographics, text_overlays
 
 
 # =============================================================================
