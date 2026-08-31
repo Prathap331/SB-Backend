@@ -9189,6 +9189,10 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
 import re
 import os
 import json
@@ -11979,21 +11983,24 @@ async def edit_video(request: EditVideo):
         print(f"[edit-video] failed to persist video row: {e}")
         raise HTTPException(status_code=500, detail="Failed to save video")
 
-    # NEW: split every scene's overlay into two flat, top-level lists —
-    # "infographics" (anything rendered with an icon/graphic/composition,
-    # i.e. everything in REMOTION_INFOGRAPHIC_LIBRARY: title cards, quote
-    # cards, data viz, stat counters, bullet lists, icon sequences/pop-ins)
-    # vs "text" (a plain overlay_text animation with no icon/graphic —
-    # lower-thirds, kinetic captions, callout boxes). Classification reuses
-    # exactly what _get_scene_infographic already decided per scene
-    # (scene["infographics"] is only ever set for library animation_types),
-    # so this is just reshaping already-computed data, not a new decision.
+    # FIX: "infographics" was previously anything whose animation_type
+    # happened to be a key in REMOTION_INFOGRAPHIC_LIBRARY — but most of
+    # those (full_screen_title_card, full_screen_quote_card,
+    # full_screen_data_viz, stat_counter_overlay, bullet_list_reveal) are
+    # PURE TEXT presentations with no icon or graphic asset involved at
+    # all; they just happen to render via a styled Remotion composition
+    # instead of a plain FFmpeg drawtext overlay. Only icon_sequence and
+    # icon_pop_in actually carry a graphic (props["icons"]). Classification
+    # now checks for that specifically — a composition without any icons
+    # is text content, full stop, regardless of which renderer draws it.
     infographics = []
     text_overlays = []
     for s in scenes_with_voice_and_timestamps:
         animation = s.get("animation") or {}
         infographic = s.get("infographics")
-        if infographic:
+        has_icon_graphic = bool(infographic and (infographic.get("props") or {}).get("icons"))
+
+        if infographic and has_icon_graphic:
             infographics.append({
                 "scene_id": s.get("scene_id"),
                 "animation_type": infographic.get("animation_type"),
@@ -12001,6 +12008,21 @@ async def edit_video(request: EditVideo):
                 "placement": infographic.get("placement"),
                 "props": infographic.get("props", {}),
                 "duration_frames": infographic.get("duration_frames"),
+            })
+        elif infographic:
+            # A Remotion composition with no icon/graphic — pure text.
+            # Reuse the same text-extraction logic the FFmpeg fallback
+            # path already uses (_animation_overlay_text), so the
+            # resulting string matches title/quote/value+label/bullet
+            # items exactly, rather than falling back to the looser
+            # on_screen_text.
+            text_overlays.append({
+                "scene_id": s.get("scene_id"),
+                "animation_type": infographic.get("animation_type"),
+                "placement": infographic.get("placement"),
+                "text": (_animation_overlay_text(animation, s, infographic) or "").strip(),
+                "duration_frames": infographic.get("duration_frames"),
+                "text_animation_style": animation.get("text_animation_style"),
             })
         elif animation.get("category") == "overlay_text":
             text_overlays.append({
