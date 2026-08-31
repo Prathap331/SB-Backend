@@ -9196,6 +9196,20 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import re
 import os
 import json
@@ -13367,6 +13381,302 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
         "resolved_motion_type": _resolve_beat_motion_type(beat),
         "start": beat.get("start"),
         "end": beat.get("end"),
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
+# =============================================================================
+# GLOBAL / ABSOLUTE-TIMELINE B-ROLL PLACEMENT  (NEW)
+#
+# The endpoint above (`PATCH /timeline/{video_id}/scene/{scene_id}/broll`)
+# requires knowing which scene AND which beat a change belongs to, and a
+# beat's own [start, end] is bounded by its parent scene — B-roll simply
+# cannot move outside the scene it was created in, and can only reach
+# earlier than its scene's own start if it happens to be that scene's
+# first beat. That's a real structural limit, not a validation nitpick:
+# beats are stored per-scene, and a scene's own frame budget is what
+# positions everything after it in the whole video.
+#
+# This endpoint removes that constraint entirely. The caller thinks in
+# ABSOLUTE seconds — position in the final assembled video, exactly the
+# same numbers startFrame/endFrame/fps already describe — and picks ANY
+# Pexels asset (any video or image, regardless of which scene's search
+# originally found it, or whether it was ever "found" by this video at
+# all — same direct-by-ID Pexels lookup /broll already uses). No scene_id
+# or beat_id is required in the request at all.
+#
+# What it does under the hood:
+#   1. Resolves the requested asset once (direct Pexels lookup by ID).
+#   2. Computes each scene's current ABSOLUTE [start, end] window in
+#      seconds from cumulative scene durations (same math
+#      build_timeline_from_scenes uses for frames, done here in seconds).
+#   3. If the requested start is earlier than the very first scene's
+#      absolute start (the "even though the video starts at 0.24, I want
+#      0.00" case), the FIRST scene's own `start` is pulled earlier to
+#      genuinely make room — same mechanism the per-beat version already
+#      used, just generalized to not require a specific beat_id.
+#   4. For every scene the requested [start, end] range actually overlaps
+#      (it can span more than one scene), that scene's beat list is
+#      "carved": any beat fully inside the range is removed, any beat
+#      only partially overlapped is trimmed to keep its untouched edge
+#      (with its ORIGINAL asset — this endpoint never invents new footage
+#      for the parts you didn't ask to change), and exactly one new beat
+#      carrying the requested asset is inserted to cover that scene's
+#      share of the range.
+#   5. All touched scenes are saved together in one edit.
+# =============================================================================
+
+class AbsoluteBrollUpdate(BaseModel):
+    asset_id: Any
+    source: str
+    # Absolute seconds — position in the FINAL ASSEMBLED VIDEO, the same
+    # timebase as startFrame/endFrame/fps in the timeline, NOT scene-local
+    # time. This is the whole point of this endpoint: no scene/beat
+    # bookkeeping required from the caller.
+    start: float
+    end: float
+    motion_type: Optional[str] = None
+
+
+def _carve_scene_beats_for_absolute_range(
+    scene: dict, local_start: float, local_end: float, override: dict, id_prefix: str,
+) -> list:
+    """
+    Rewrites one scene's beat list so that [local_start, local_end]
+    (already converted to THIS scene's own local timebase by the caller)
+    is covered by exactly one new beat carrying `override`'s asset, while
+    every untouched portion of the scene keeps whatever beat/asset it had
+    before. Any beat fully inside the range is dropped; a beat only
+    partially overlapped is trimmed down to its untouched edge (its
+    original asset/keywords/media are preserved unchanged for that
+    remaining sliver — this function only ever touches the requested
+    window, never anything outside it).
+    """
+    beats = scene.get("beats") or []
+
+    if not beats:
+        # Scene has no beats yet at all — synthesize the same implicit
+        # single beat build_timeline_from_scenes/`/broll` already do, so
+        # there's something to carve into.
+        media = scene.get("media") or {}
+        beats = [{
+            "beat_id": f"{id_prefix}_b1",
+            "beat_index": 0,
+            "start": scene.get("start"),
+            "end": scene.get("end"),
+            "vo_text": scene.get("vo_text", ""),
+            "keywords": None,
+            "motion_type": _DEFAULT_MOTION_TYPE,
+            "preferred_media_type": None,
+            "media": {
+                "videos": media.get("videos") or {"total_results": 0, "results": [], "error": None},
+                "images": media.get("images") or {"total_results": 0, "results": [], "error": None},
+            },
+        }]
+
+    kept_fragments = []
+    for b in beats:
+        b_start = b.get("start")
+        b_end = b.get("end")
+        if b_start is None or b_end is None:
+            # No timing at all on this beat (legacy/implicit) — nothing
+            # meaningful to trim; just drop it, the new beat covers the
+            # whole scene anyway in that case.
+            continue
+        if b_end <= local_start + 1e-6 or b_start >= local_end - 1e-6:
+            # No overlap at all with the requested range — keep as-is.
+            kept_fragments.append(b)
+            continue
+        if b_start < local_start - 1e-6:
+            before = dict(b)
+            before["beat_id"] = f"{b.get('beat_id')}_pre"
+            before["end"] = local_start
+            kept_fragments.append(before)
+        if b_end > local_end + 1e-6:
+            after = dict(b)
+            after["beat_id"] = f"{b.get('beat_id')}_post"
+            after["start"] = local_end
+            kept_fragments.append(after)
+        # A beat fully inside [local_start, local_end] contributes no
+        # fragment at all — it's entirely replaced by the new beat below.
+
+    new_beat = {
+        "beat_id": f"{id_prefix}_abs_{uuid.uuid4().hex[:6]}",
+        "start": local_start,
+        "end": local_end,
+        "vo_text": "",
+        "keywords": None,
+        "preferred_media_type": override.get("source"),
+        "motion_type": override.get("motion_type") or _DEFAULT_MOTION_TYPE,
+        "media": {
+            "videos": {"total_results": 0, "results": [], "error": None},
+            "images": {"total_results": 0, "results": [], "error": None},
+        },
+        # Directly assigning the resolved asset here (rather than running
+        # keyword search/CLIP reranking) is intentional — the user picked
+        # this exact asset for this exact position, there's nothing to
+        # search for.
+        "broll_override": override,
+    }
+
+    result = kept_fragments + [new_beat]
+    result.sort(key=lambda b: b.get("start") if b.get("start") is not None else 0.0)
+    for i, b in enumerate(result):
+        b["beat_index"] = i
+
+    return result
+
+
+@app.patch("/timeline/{video_id}/broll")
+async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
+    """
+    Place any Pexels asset at any absolute position in the assembled
+    video. See the module docstring above for the full mechanics.
+    """
+    if update.source not in ("video", "image"):
+        raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
+    if update.start < 0:
+        raise HTTPException(status_code=422, detail="start cannot be negative")
+    if update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+    if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}",
+        )
+
+    candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
+    if candidate is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not fetch {update.source} asset {update.asset_id} from Pexels",
+        )
+    file_url = _resolve_broll_file_url(candidate, update.source)
+    if not file_url:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Asset {update.asset_id} has no landscape/horizontal file available",
+        )
+
+    override = {
+        "asset_id": candidate.get("id"),
+        "source": update.source,
+        "file_url": file_url,
+        "width": candidate.get("width"),
+        "height": candidate.get("height"),
+        "video_files": candidate.get("video_files"),
+        "src": candidate.get("src"),
+        "motion_type": update.motion_type,
+    }
+
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_json, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[update-broll-absolute] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    if not raw_scenes:
+        raise HTTPException(status_code=400, detail="This video has no scenes yet")
+
+    current_version = row.data.get("timeline_version", 1)
+    fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
+
+    def _compute_boundaries(scenes: list) -> list:
+        boundaries = []
+        cumulative = 0.0
+        for i, s in enumerate(scenes):
+            s_start = s.get("start") or 0.0
+            s_end = s.get("end") or 0.0
+            dur = max(s_end - s_start, 1.0 / fps)
+            boundaries.append({
+                "index": i, "abs_start": cumulative, "abs_end": cumulative + dur,
+                "scene_start": s_start, "scene_end": s_end,
+            })
+            cumulative += dur
+        return boundaries, cumulative
+
+    boundaries, total_duration = _compute_boundaries(raw_scenes)
+
+    # Extend the very front of the video if requested — this is what
+    # makes "the video currently starts at 0.24 but I want 0.00" work,
+    # generalized from the old per-beat-only version: it no longer matters
+    # which beat you were thinking about, just the absolute time you want.
+    if update.start < boundaries[0]["abs_start"] - 1e-3:
+        extend_by = boundaries[0]["abs_start"] - update.start
+        first_scene = dict(raw_scenes[0])
+        first_scene["start"] = max(0.0, (first_scene.get("start") or 0.0) - extend_by)
+        print(
+            f"[update-broll-absolute] extending video start from "
+            f"{boundaries[0]['abs_start']:.3f}s to {update.start:.3f}s by pulling "
+            f"scene {first_scene.get('scene_id')}'s own start earlier "
+            f"(adds ~{extend_by:.2f}s of lead-in to the video's total duration)"
+        )
+        raw_scenes[0] = first_scene
+        boundaries, total_duration = _compute_boundaries(raw_scenes)
+
+    if update.end > total_duration + 1e-3:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"end {update.end} is beyond the video's current total duration "
+                f"({total_duration:.2f}s) — extending the END of the video isn't "
+                f"supported yet, only the start"
+            ),
+        )
+
+    touched = []
+    for b in boundaries:
+        if b["abs_end"] <= update.start + 1e-6 or b["abs_start"] >= update.end - 1e-6:
+            continue  # this scene doesn't overlap the requested range at all
+        local_start = max(update.start, b["abs_start"]) - b["abs_start"] + b["scene_start"]
+        local_end = min(update.end, b["abs_end"]) - b["abs_start"] + b["scene_start"]
+        scene = dict(raw_scenes[b["index"]])
+        scene_id = scene.get("scene_id")
+        scene["beats"] = _carve_scene_beats_for_absolute_range(
+            scene, local_start, local_end, override, id_prefix=scene_id,
+        )
+        raw_scenes[b["index"]] = scene
+        touched.append(scene_id)
+
+    if not touched:
+        raise HTTPException(
+            status_code=422,
+            detail=f"[{update.start}, {update.end}] didn't overlap any scene in this video",
+        )
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-broll-absolute] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save B-roll placement")
+
+    return {
+        "video_id": video_id,
+        "start": update.start,
+        "end": update.end,
+        "selected_asset": override,
+        "touched_scenes": touched,
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
