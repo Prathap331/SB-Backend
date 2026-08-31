@@ -13551,6 +13551,199 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
     }
 
 
+class BrollInsertGapUpdate(BaseModel):
+    asset_id: Any
+    source: str
+    # Absolute seconds — where in the CURRENT timeline to insert new time.
+    # Unlike PATCH /broll (which only ever replaces time that already
+    # exists), this adds `duration` seconds of new B-roll that didn't
+    # exist before, pushing everything at or after `at` later to make
+    # room. Total video duration grows by `duration`.
+    at: float
+    duration: float
+    motion_type: Optional[str] = None
+
+
+@app.post("/timeline/{video_id}/broll/insert")
+async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
+    """
+    Inserts a brand-new, standalone B-roll segment at absolute position
+    `at`, extending the video's total duration by `duration` seconds.
+    Implemented as a new silent "scene" (no narration) holding one beat
+    with the requested asset, spliced into raw_scenes at the right
+    position so build_timeline_from_scenes' normal cumulative-duration
+    math naturally pushes every later scene's frames back to make room.
+
+    SCOPE LIMIT: if `at` lands exactly on the boundary between two
+    existing scenes (or before the first / after the last), it inserts
+    cleanly there. If `at` lands INSIDE an existing scene's own
+    narration, this does NOT split that scene's audio/captions mid-
+    sentence — it snaps forward to the end of whichever scene contains
+    `at` instead. The response always reports the actual insertion point
+    used, which may differ from the requested `at` because of this.
+    """
+    if update.source not in ("video", "image"):
+        raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
+    if update.at < 0:
+        raise HTTPException(status_code=422, detail="at cannot be negative")
+    if update.duration <= 0:
+        raise HTTPException(status_code=422, detail="duration must be greater than 0")
+    if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}",
+        )
+
+    candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
+    if candidate is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not fetch {update.source} asset {update.asset_id} from Pexels",
+        )
+    file_url = _resolve_broll_file_url(candidate, update.source)
+    if not file_url:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Asset {update.asset_id} has no landscape/horizontal file available",
+        )
+
+    override = {
+        "asset_id": candidate.get("id"),
+        "source": update.source,
+        "file_url": file_url,
+        "width": candidate.get("width"),
+        "height": candidate.get("height"),
+        "video_files": candidate.get("video_files"),
+        "src": candidate.get("src"),
+        "motion_type": update.motion_type,
+    }
+
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_json, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[insert-broll-gap] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    if not raw_scenes:
+        raise HTTPException(status_code=400, detail="This video has no scenes yet")
+
+    current_version = row.data.get("timeline_version", 1)
+    fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
+
+    boundaries = []
+    cumulative = 0.0
+    for i, s in enumerate(raw_scenes):
+        s_start = s.get("start") or 0.0
+        s_end = s.get("end") or 0.0
+        dur = max(s_end - s_start, 1.0 / fps)
+        boundaries.append({"index": i, "abs_start": cumulative, "abs_end": cumulative + dur})
+        cumulative += dur
+    total_duration = cumulative
+
+    if update.at <= 0:
+        insert_index = 0
+        actual_at = 0.0
+    elif update.at >= total_duration:
+        insert_index = len(raw_scenes)
+        actual_at = total_duration
+    else:
+        insert_index = None
+        actual_at = None
+        for b in boundaries:
+            if abs(update.at - b["abs_start"]) < 1e-3:
+                insert_index = b["index"]
+                actual_at = b["abs_start"]
+                break
+            if abs(update.at - b["abs_end"]) < 1e-3:
+                insert_index = b["index"] + 1
+                actual_at = b["abs_end"]
+                break
+            if b["abs_start"] < update.at < b["abs_end"]:
+                # Lands inside this scene's own narration — snap forward
+                # to its end rather than splitting the scene.
+                insert_index = b["index"] + 1
+                actual_at = b["abs_end"]
+                break
+        if insert_index is None:
+            raise HTTPException(status_code=500, detail="Could not resolve an insertion point")
+
+    snapped = abs(actual_at - update.at) > 1e-3
+
+    new_scene_id = f"s_ins_{uuid.uuid4().hex[:6]}"
+    new_beat = {
+        "beat_id": f"{new_scene_id}_b1",
+        "beat_index": 0,
+        "start": 0.0,
+        "end": update.duration,
+        "vo_text": "",
+        "keywords": None,
+        "preferred_media_type": update.source,
+        "motion_type": update.motion_type or _DEFAULT_MOTION_TYPE,
+        "media": {
+            "videos": {"total_results": 0, "results": [], "error": None},
+            "images": {"total_results": 0, "results": [], "error": None},
+        },
+        "broll_override": override,
+    }
+    new_scene = {
+        "scene_id": new_scene_id,
+        "vo_text": "",
+        "visual_intent": "",
+        "on_screen_text": "",
+        "start": 0.0,
+        "end": update.duration,
+        "duration_seconds": update.duration,
+        "voiceover": None,
+        "word_segments": [],
+        "error": None,
+        "beats": [new_beat],
+        "media": new_beat["media"],
+        "animation": {},
+        "infographics": None,
+    }
+
+    raw_scenes = raw_scenes[:insert_index] + [new_scene] + raw_scenes[insert_index:]
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[insert-broll-gap] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to insert B-roll segment")
+
+    return {
+        "video_id": video_id,
+        "new_scene_id": new_scene_id,
+        "requested_at": update.at,
+        "actual_at": actual_at,
+        "snapped_to_scene_boundary": snapped,
+        "duration": update.duration,
+        "new_total_duration": total_duration + update.duration,
+        "selected_asset": override,
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
 _VALID_DELETE_CONTENT_TYPES = {"video", "image", "text", "infographics"}
 
 
