@@ -9220,7 +9220,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
 import re
 import os
 import json
@@ -10057,6 +10056,13 @@ def _get_whisperx_model():
     return _whisperx_model
 
 
+def _preload_whisperx_align_model(language_code: str = "en"):
+    if language_code not in _whisperx_align_cache:
+        print(f"[WHISPERX] preloading alignment model for language '{language_code}'")
+        align_model, metadata = whisperx.load_align_model(
+            language_code=language_code, device=WHISPERX_DEVICE
+        )
+        _whisperx_align_cache[language_code] = (align_model, metadata)
 
 
 def _run_whisperx_sync(audio_bytes: bytes) -> dict:
@@ -10312,6 +10318,23 @@ CLIP_DEVICE = os.getenv("CLIP_DEVICE", "cpu")
 # volume.
 CLIP_RERANK_ENABLED = os.getenv("CLIP_RERANK_ENABLED", "true").lower() == "true"
 
+# NEW: real accuracy thresholds, now meaningful because _clip_score_images_sync
+# returns raw cosine similarity rather than a pool-relative softmax score.
+# If the BEST video candidate's score falls below CLIP_MIN_VIDEO_SCORE — i.e.
+# even the top pick isn't a confident match for the beat's keywords — and the
+# BEST image candidate clears CLIP_MIN_IMAGE_SCORE, the beat falls back to
+# using the image instead of the video, regardless of which media type the
+# LLM originally preferred. This is what actually enforces "don't use an
+# inaccurate video just because it's the best of a bad video pool."
+#
+# These defaults are tuned for openai/clip-vit-base-patch32: ~0.30+ is a
+# strong match, ~0.20-0.30 is a plausible-but-loose match, below ~0.20
+# usually means the image doesn't really depict the query. Override via env
+# if you switch to a different CLIP checkpoint (larger models tend to
+# produce higher absolute cosine similarities for the same match quality).
+CLIP_MIN_VIDEO_SCORE = float(os.getenv("CLIP_MIN_VIDEO_SCORE", "0.24"))
+CLIP_MIN_IMAGE_SCORE = float(os.getenv("CLIP_MIN_IMAGE_SCORE", "0.22"))
+
 _clip_model = None
 _clip_processor = None
 
@@ -10326,18 +10349,43 @@ def _get_clip():
 
 
 def _clip_score_images_sync(query_text: str, images: list) -> dict:
-    """images: list of (candidate_id, PIL.Image). Returns {candidate_id: score}."""
+    """
+    images: list of (candidate_id, PIL.Image). Returns {candidate_id: score}.
+
+    FIX (no real quality signal): this used to return softmax(logits) —
+    a probability distribution that always sums to 1.0 ACROSS THE POOL,
+    regardless of whether any candidate is actually a good match. A pool
+    of 6 mediocre videos would still produce a "confident-looking" top
+    score, because softmax only measures "best of what's here," not
+    "good enough in absolute terms." That made a real accuracy threshold
+    impossible.
+
+    Now returns raw cosine similarity between the (L2-normalized) image
+    and text embeddings — bounded roughly -1..1, comparable across
+    different beats/pools, and interpretable on its own: for
+    openai/clip-vit-base-patch32, ~0.30+ is a strong match, ~0.20-0.30 is
+    plausible-but-loose, and below ~0.20 usually means the image doesn't
+    actually depict the query. Relative ranking within one pool is
+    unchanged (cosine similarity and softmax(logits) are both monotonic
+    transforms of the same underlying similarity), so sort order from
+    this function's callers doesn't change — only whether the SCORE ITSELF
+    can be used for a threshold decision changes.
+    """
     model, processor = _get_clip()
     pil_images = [img for _cid, img in images]
     inputs = processor(text=[query_text], images=pil_images, return_tensors="pt", padding=True)
     inputs = {k: v.to(CLIP_DEVICE) for k, v in inputs.items()}
     with torch.no_grad():
-        outputs = model(**inputs)
-        logits_per_image = outputs.logits_per_image.squeeze(-1)
-        scores = logits_per_image.softmax(dim=0).tolist()
-        if not isinstance(scores, list):
-            scores = [scores]
-    return {images[i][0]: scores[i] for i in range(len(images))}
+        image_embeds = model.get_image_features(pixel_values=inputs["pixel_values"])
+        text_embeds = model.get_text_features(
+            input_ids=inputs["input_ids"], attention_mask=inputs.get("attention_mask")
+        )
+        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        sims = (image_embeds @ text_embeds.T).squeeze(-1).tolist()
+        if not isinstance(sims, list):
+            sims = [sims]
+    return {images[i][0]: sims[i] for i in range(len(images))}
 
 
 async def _rerank_images_with_clip(query_text: str, image_candidates: list) -> list:
@@ -10379,9 +10427,12 @@ async def _rerank_images_with_clip(query_text: str, image_candidates: list) -> l
         print(f"[CLIP] scoring failed, keeping original order: {e}")
         return image_candidates
 
-    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], 0.0), reverse=True)
+    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], -1.0), reverse=True)
     ranked_ids = {cid for cid, _img, _c in ranked}
-    result = [c for _cid, _img, c in ranked]
+    result = []
+    for cid, _img, c in ranked:
+        c["_clip_score"] = scores.get(cid)
+        result.append(c)
     result += [c for c in image_candidates if str(c.get("id")) not in ranked_ids]
     return result
 
@@ -10429,9 +10480,12 @@ async def _rerank_videos_with_clip(query_text: str, video_candidates: list) -> l
         print(f"[CLIP] video thumbnail scoring failed, keeping original order: {e}")
         return video_candidates
 
-    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], 0.0), reverse=True)
+    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], -1.0), reverse=True)
     ranked_ids = {cid for cid, _img, _c in ranked}
-    result = [c for _cid, _img, c in ranked]
+    result = []
+    for cid, _img, c in ranked:
+        c["_clip_score"] = scores.get(cid)
+        result.append(c)
     result += [c for c in video_candidates if str(c.get("id")) not in ranked_ids]
     return result
 
@@ -10526,12 +10580,13 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
     photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
 
-    # NEW: rerank by actual semantic match (CLIP for images, X-CLIP for
-    # video) against the same keywords that were searched, so the DEFAULT
-    # pick (candidates[0], see _resolve_beat_broll_selection) is the best
-    # visual match Pexels returned — not just whichever result Pexels'
-    # own search ranking happened to list first. Runs only on this
-    # already-trimmed pool, not the full raw search results.
+    # NEW: rerank by actual semantic match (CLIP for images, and CLIP
+    # applied to video thumbnails) against the same keywords that were
+    # searched, so the DEFAULT pick (candidates[0], see
+    # _resolve_beat_broll_selection) is the best visual match Pexels
+    # returned — not just whichever result Pexels' own search ranking
+    # happened to list first. Runs only on this already-trimmed pool, not
+    # the full raw search results.
     query_text = ", ".join(keywords)
     if photos:
         photos = await _rerank_images_with_clip(query_text, photos)
@@ -10541,9 +10596,34 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     videos_error = "; ".join(video_errors) if video_errors and not videos else None
     images_error = "; ".join(image_errors) if image_errors and not photos else None
 
+    # NEW: accuracy gate — if even the BEST video candidate scores below
+    # CLIP_MIN_VIDEO_SCORE (i.e. it's a weak match for the keywords, not
+    # just "the best of a mediocre pool"), and a genuinely good image
+    # exists instead, flag this beat to fall back to the image rather than
+    # use inaccurate video footage. This is what actually enforces
+    # "don't show a video just because it's the top-ranked one, if the
+    # top-ranked one still isn't a real match."
+    best_video_score = videos[0].get("_clip_score") if videos else None
+    best_image_score = photos[0].get("_clip_score") if photos else None
+    force_image_fallback = (
+        best_video_score is not None
+        and best_video_score < CLIP_MIN_VIDEO_SCORE
+        and best_image_score is not None
+        and best_image_score >= CLIP_MIN_IMAGE_SCORE
+    )
+    if force_image_fallback:
+        print(
+            f"[CLIP] {label}: best video scored {best_video_score:.3f} "
+            f"(below {CLIP_MIN_VIDEO_SCORE}) — falling back to image "
+            f"(scored {best_image_score:.3f}) instead of an inaccurate video"
+        )
+
     return {
         "videos": {"total_results": len(videos), "results": videos, "error": videos_error},
         "images": {"total_results": len(photos), "results": photos, "error": images_error},
+        "force_image_fallback": force_image_fallback,
+        "best_video_score": best_video_score,
+        "best_image_score": best_image_score,
     }
 
 
@@ -10967,6 +11047,19 @@ async def _build_scene_beats(scene: dict) -> list:
     ])
     for b, media in zip(beats, media_results):
         b["media"] = media
+        # NEW: honor the CLIP accuracy gate computed in
+        # _fetch_media_for_keywords — if even the best video candidate for
+        # this beat wasn't a confident match and a good image exists
+        # instead, use the image regardless of what the LLM originally
+        # preferred for this beat (see BEAT_KEYWORDS_PROMPT). Accuracy
+        # takes priority over the LLM's creative video/image preference.
+        if media.get("force_image_fallback") and b.get("preferred_media_type") != "image":
+            print(
+                f"[edit-video] beat {b['beat_id']}: overriding LLM's "
+                f"preferred_media_type={b.get('preferred_media_type')!r} -> 'image' "
+                f"(CLIP accuracy gate: video too weak a match)"
+            )
+            b["preferred_media_type"] = "image"
 
     await _fill_empty_beats(scene, beats, fallback_keywords)
 
@@ -12567,6 +12660,16 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
         _fetch_media_for_keywords(second_kws, f"{scene_id}:{beat_id}:split-b"),
     )
 
+    # NEW: same CLIP accuracy gate as the normal beat-build path — if a
+    # half's best video isn't a confident match and a good image exists,
+    # use the image regardless of the LLM's preference for that half.
+    if first_media.get("force_image_fallback") and first_media_type != "image":
+        print(f"[split-beat] {beat_id}:split-a: overriding to 'image' (CLIP accuracy gate)")
+        first_media_type = "image"
+    if second_media.get("force_image_fallback") and second_media_type != "image":
+        print(f"[split-beat] {beat_id}:split-b: overriding to 'image' (CLIP accuracy gate)")
+        second_media_type = "image"
+
     first_beat = {
         "beat_id": f"{scene_id}_split_{uuid.uuid4().hex[:6]}_a",
         "start": b_start,
@@ -12715,6 +12818,11 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
         previous_motion_type=previous_motion_type,
     )
     new_media = await _fetch_media_for_keywords(new_kws, f"{scene_id}:{beat_id}:insert")
+
+    # NEW: same CLIP accuracy gate as the normal beat-build path.
+    if new_media.get("force_image_fallback") and new_media_type != "image":
+        print(f"[insert-beat] {beat_id}: overriding to 'image' (CLIP accuracy gate)")
+        new_media_type = "image"
 
     new_beat = {
         "beat_id": f"{scene_id}_insert_{uuid.uuid4().hex[:6]}",
