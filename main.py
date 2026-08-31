@@ -9213,6 +9213,9 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
 import re
 import os
 import json
@@ -9866,6 +9869,17 @@ class SceneStyleUpdate(BaseModel):
     # scene's overlay is an infographic composition or has no overlay at
     # all — merged into scene["animation"]["text_animation_style"].
     text_animation_style: Optional[str] = None
+    # NEW: the actual TEXT CONTENT shown — not styling, the words
+    # themselves. Updates scene["on_screen_text"]. If the scene's overlay
+    # is a plain overlay_text type (lower_third, callout_textbox,
+    # kinetic_caption), this is what gets drawn directly. If the scene's
+    # overlay is an infographic composition (title card, quote card, stat
+    # counter, bullet list, data viz), this also re-derives that
+    # composition's props (title/quote/value+label/items) from the new
+    # text via the same deterministic parsing _get_scene_infographic
+    # already uses at creation time — so editing the text keeps the
+    # infographic's structured fields in sync instead of going stale.
+    text: Optional[str] = None
 
 
 class BeatSplitUpdate(BaseModel):
@@ -12187,6 +12201,7 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         and update.margin_bottom_percent is None and update.text_start is None
         and update.text_end is None and update.text_animation_style is None
         and update.horizontal_position is None and update.margin_horizontal_percent is None
+        and update.text is None
     ):
         raise HTTPException(status_code=422, detail="Provide at least one field to update")
 
@@ -12244,6 +12259,21 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         animation["text_animation_style"] = update.text_animation_style
         scene["animation"] = animation
 
+    if update.text is not None:
+        scene["on_screen_text"] = update.text
+        # If this scene currently has an infographic composition, its
+        # props (title/quote/value+label/items) were derived from the OLD
+        # text at creation time via _get_scene_infographic's deterministic
+        # parsing (regex for stat_counter, sentence-splitting for
+        # bullet_list, etc.) — re-run that same parsing against the new
+        # text so the composition doesn't go stale/mismatched. If the
+        # scene has no infographic (plain overlay_text, or no overlay at
+        # all), there's no derived structure to refresh — on_screen_text
+        # is read directly at render time in that case.
+        if scene.get("infographics"):
+            animation_for_infographic = scene.get("animation") or _default_animation(scene)
+            scene["infographics"] = _get_scene_infographic(scene, animation_for_infographic)
+
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
@@ -12276,6 +12306,7 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         "timeline_version": new_version,
         "caption_style": scene.get("caption_style"),
         "background_color": scene.get("background_color"),
+        "text": scene.get("on_screen_text"),
         "text_start": (scene.get("animation") or {}).get("start_offset_seconds"),
         "text_end": (scene.get("animation") or {}).get("end_offset_seconds"),
         "text_animation_style": (scene.get("animation") or {}).get("text_animation_style"),
@@ -13658,6 +13689,105 @@ async def delete_scene_content(
     }
 
 
+@app.delete("/timeline/{video_id}/overlay/{id}")
+async def delete_overlay_by_id(video_id: str, id: int):
+    """
+    Simpler counterpart to DELETE /scene/{scene_id}/content for text and
+    infographics specifically — takes just the numeric "id" field already
+    present on every entry in infographics_list/text_list (see
+    _compute_infographics_and_text_lists), no content_type or separate
+    scene_id lookup needed. `id` is the scene's 1-indexed position in the
+    video (a scene can only ever have one active overlay at a time, so
+    position is already a stable, unique, NUMERIC identifier for it) —
+    this endpoint just auto-detects whether that scene currently holds an
+    infographic or a plain text overlay and clears whichever one is there.
+
+    Does NOT touch video/image B-roll — a video can have several B-roll
+    beats per scene, so those still need DELETE .../content with an
+    explicit beat_id (see delete_scene_content above); there's no single
+    unambiguous numeric id for a beat the way there is for a scene's one
+    overlay.
+    """
+    if id < 1:
+        raise HTTPException(status_code=422, detail="id must be a positive integer")
+
+    try:
+        row = (
+            supabase.table("videos")
+            .select("raw_scenes, timeline_version")
+            .eq("id", video_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[delete-overlay-by-id] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = id - 1
+    if scene_index < 0 or scene_index >= len(raw_scenes):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No overlay found with id {id} (video has {len(raw_scenes)} scene(s), valid ids: 1-{len(raw_scenes)})",
+        )
+
+    scene = dict(raw_scenes[scene_index])
+    scene_id = scene.get("scene_id")
+    animation = scene.get("animation") or {}
+    infographic = scene.get("infographics")
+
+    if infographic:
+        deleted_type = "infographics"
+        scene["infographics"] = None
+        scene["animation"] = {}
+    elif animation.get("category") == "overlay_text":
+        deleted_type = "text"
+        scene["animation"] = {}
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Overlay {id} (scene {scene_id}) has no text or infographic content to delete",
+        )
+
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes,
+            "timeline_json": timeline_json,
+            "timeline_version": new_version,
+            "final_video_url": None,
+            "render_status": "stale_needs_render",
+            "infographics_list": infographics_list,
+            "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[delete-overlay-by-id] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete overlay")
+
+    return {
+        "video_id": video_id,
+        "id": id,
+        "scene_id": scene_id,
+        "deleted_type": deleted_type,
+        "infographics_list": infographics_list,
+        "text_list": text_list,
+        "timeline_version": new_version,
+        "timeline": timeline_json,
+        "needs_render": True,
+    }
+
+
 # =============================================================================
 # RENDER SERVICE
 # =============================================================================
@@ -14480,14 +14610,22 @@ def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
     """
     infographics = []
     text_overlays = []
-    for s in scenes:
+    for idx, s in enumerate(scenes):
         animation = s.get("animation") or {}
         infographic = s.get("infographics")
         has_icon_graphic = bool(infographic and (infographic.get("props") or {}).get("icons"))
+        scene_id = s.get("scene_id")
+        # NEW: numeric id (1-indexed position of this scene in the video),
+        # NOT the scene_id string — a scene can only ever have one active
+        # overlay at a time, so its position is already a stable, unique,
+        # NUMERIC identifier for that overlay. Used directly by
+        # DELETE /timeline/{video_id}/overlay/{id}.
+        content_id = idx + 1
 
         if infographic and has_icon_graphic:
             infographics.append({
-                "scene_id": s.get("scene_id"),
+                "id": content_id,
+                "scene_id": scene_id,
                 "animation_type": infographic.get("animation_type"),
                 "composition_id": infographic.get("composition_id"),
                 "placement": infographic.get("placement"),
@@ -14496,7 +14634,8 @@ def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
             })
         elif infographic:
             text_overlays.append({
-                "scene_id": s.get("scene_id"),
+                "id": content_id,
+                "scene_id": scene_id,
                 "animation_type": infographic.get("animation_type"),
                 "placement": infographic.get("placement"),
                 "text": (_animation_overlay_text(animation, s, infographic) or "").strip(),
@@ -14505,7 +14644,8 @@ def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
             })
         elif animation.get("category") == "overlay_text":
             text_overlays.append({
-                "scene_id": s.get("scene_id"),
+                "id": content_id,
+                "scene_id": scene_id,
                 "animation_type": animation.get("animation_type"),
                 "placement": animation.get("placement"),
                 "text": (s.get("on_screen_text") or "").strip(),
