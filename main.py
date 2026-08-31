@@ -12301,6 +12301,7 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         raise HTTPException(status_code=500, detail="Failed to save style edit")
 
     return {
+        "id": scene_index + 1,  
         "video_id": video_id,
         "scene_id": scene_id,
         "timeline_version": new_version,
