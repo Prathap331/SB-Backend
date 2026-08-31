@@ -9189,37 +9189,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -9865,6 +9834,15 @@ class SceneStyleUpdate(BaseModel):
     # needed, just exposing them on this request model.
     vertical_position: Optional[Literal["top", "middle", "bottom"]] = None
     margin_bottom_percent: Optional[float] = None
+    # NEW: horizontal caption positioning — was previously always centered
+    # (ASS alignment 2/5/8), with no way to left- or right-align captions.
+    # Combined with vertical_position by _build_ass_from_words into one of
+    # the 9 ASS numpad alignment values. margin_horizontal_percent is the
+    # distance from whichever side edge horizontal_position anchors to
+    # (left or right), as a percentage of frame WIDTH — ignored for
+    # "center", same as margin_bottom_percent is ignored for "middle".
+    horizontal_position: Optional[Literal["left", "center", "right"]] = None
+    margin_horizontal_percent: Optional[float] = None
     # NEW: on-screen window (seconds, relative to this scene's own start —
     # 0 = the moment the scene begins) for the scene's overlay/infographic
     # TEXT animation (lower-third, title card, quote card, etc.) — NOT the
@@ -12222,6 +12200,7 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         and update.background_color is None and update.vertical_position is None
         and update.margin_bottom_percent is None and update.text_start is None
         and update.text_end is None and update.text_animation_style is None
+        and update.horizontal_position is None and update.margin_horizontal_percent is None
     ):
         raise HTTPException(status_code=422, detail="Provide at least one field to update")
 
@@ -12256,6 +12235,8 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         "animation_type": update.animation_type,
         "vertical_position": update.vertical_position,
         "margin_bottom_percent": update.margin_bottom_percent,
+        "horizontal_position": update.horizontal_position,
+        "margin_horizontal_percent": update.margin_horizontal_percent,
     }
     style_fields = {k: v for k, v in style_fields.items() if v is not None}
 
@@ -13286,16 +13267,53 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
     }
 
     # NEW: apply the duration override to this same beat, in the same call
-    # that picked its asset. Bounds-checked against the parent scene's own
-    # [start, end] so a beat can't be resized outside the scene's timing.
+    # that picked its asset.
     if update.start is not None and update.end is not None:
         scene_start = scene.get("start")
         scene_end = scene.get("end")
-        if scene_start is not None and update.start < scene_start - 1e-3:
+
+        # FIX (B-roll couldn't start before the voice): this used to
+        # reject any start earlier than the scene's own start outright.
+        # But a scene's "start" is literally the first spoken word's
+        # timestamp — the raw generated audio always has real (silent)
+        # content before that, so trimming the AUDIO earlier is completely
+        # safe, it just adds a bit of lead-in silence before speech
+        # begins. The old rejection made "B-roll starts a moment before
+        # the voice" impossible even though there was nothing actually
+        # stopping it.
+        #
+        # This only applies to the scene's FIRST beat (beat_idx == 0) —
+        # any other beat sits after earlier beats/scenes and genuinely
+        # can't reach further back without overlapping them. Requesting
+        # this on a later beat still gets clamped to the previous beat's
+        # end, same as before.
+        if beat_idx == 0 and scene_start is not None and update.start < scene_start - 1e-3:
+            if update.start < 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"start {update.start} cannot be negative",
+                )
+            print(
+                f"[update-scene-broll] scene {scene_id}: extending scene start "
+                f"{scene_start} -> {update.start} so beat {beat.get('beat_id')} "
+                f"can visually begin before the voice's first word (this adds "
+                f"~{scene_start - update.start:.2f}s of lead-in silence to the "
+                f"scene's audio and total video duration, it does not shift "
+                f"anything else in the timeline earlier)"
+            )
+            scene["start"] = update.start
+            scene_start = update.start
+        elif scene_start is not None and update.start < scene_start - 1e-3:
             raise HTTPException(
                 status_code=422,
-                detail=f"start {update.start} is before this scene's own start ({scene_start})",
+                detail=(
+                    f"start {update.start} is before this scene's own start "
+                    f"({scene_start}) — only the scene's FIRST beat can start "
+                    f"earlier than the scene, since any other beat would have "
+                    f"to overlap the beat before it"
+                ),
             )
+
         if scene_end is not None and update.end > scene_end + 1e-3:
             raise HTTPException(
                 status_code=422,
@@ -13989,29 +14007,50 @@ def _build_ass_from_words(
     # very low. Those fields were being computed and stored in the
     # timeline JSON correctly, then silently dropped here at burn-in time.
     #
-    # ASS numpad alignment: 2 = bottom-center, 5 = middle-center,
-    # 8 = top-center. MarginV is the margin from whichever edge Alignment
-    # anchors to (bottom for 1-3, top for 7-9) — computed as a percentage
-    # of frame height so "very low"/"very high" holds regardless of canvas
-    # resolution, matching how the JSON side expresses it. MarginV has no
-    # effect for the middle anchor (5), since that alignment is already
-    # centered vertically — kept at 0 there rather than reusing
-    # margin_bottom_percent, which would otherwise nudge it off-center.
+    # NEW: horizontal_position/margin_horizontal_percent add the other
+    # axis — captions were previously always horizontally centered
+    # (alignment always 2/5/8, the center column of the numpad grid below)
+    # with no way to left- or right-align them.
+    #
+    # ASS numpad alignment is a 3x3 grid:
+    #   7 top-left     8 top-center     9 top-right
+    #   4 middle-left   5 middle-center  6 middle-right
+    #   1 bottom-left  2 bottom-center  3 bottom-right
+    # MarginV is the margin from whichever edge the VERTICAL component
+    # anchors to (bottom for 1-3, top for 7-9; ignored for the middle row).
+    # MarginL/MarginR are the margins from the left/right edges — only the
+    # one matching the HORIZONTAL component actually offsets the text (the
+    # other is irrelevant for a given alignment), computed as a percentage
+    # of frame WIDTH so it holds regardless of canvas resolution, same
+    # principle as the vertical margin. Both default to a small fixed
+    # inset (60px) when horizontal_position is "center" or unset, since
+    # centered text ignores side margins entirely.
     vertical_position = (style.get("vertical_position") or "bottom").lower()
+    horizontal_position = (style.get("horizontal_position") or "center").lower()
     try:
-        margin_percent = float(style.get("margin_bottom_percent", 3))
+        margin_v_percent = float(style.get("margin_bottom_percent", 3))
     except (TypeError, ValueError):
-        margin_percent = 3.0
+        margin_v_percent = 3.0
+    try:
+        margin_h_percent = float(style.get("margin_horizontal_percent", 0))
+    except (TypeError, ValueError):
+        margin_h_percent = 0.0
 
-    if vertical_position == "top":
-        alignment = 8
-        margin_v = max(round(height * margin_percent / 100), 0)
-    elif vertical_position == "middle":
-        alignment = 5
-        margin_v = 0
-    else:
-        alignment = 2
-        margin_v = max(round(height * margin_percent / 100), 0)
+    _ALIGNMENT_GRID = {
+        ("top", "left"): 7, ("top", "center"): 8, ("top", "right"): 9,
+        ("middle", "left"): 4, ("middle", "center"): 5, ("middle", "right"): 6,
+        ("bottom", "left"): 1, ("bottom", "center"): 2, ("bottom", "right"): 3,
+    }
+    alignment = _ALIGNMENT_GRID.get((vertical_position, horizontal_position), 2)
+
+    margin_v = 0 if vertical_position == "middle" else max(round(height * margin_v_percent / 100), 0)
+    default_side_margin = 60
+    margin_h = (
+        default_side_margin if margin_h_percent <= 0
+        else max(round(width * margin_h_percent / 100), 0)
+    )
+    margin_l = margin_h
+    margin_r = margin_h
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -14021,7 +14060,7 @@ WrapStyle: 0
  
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV
-Style: Caption,Arial Black,{font_size},{primary_color},{outline_color},&H80000000,1,4,0,{alignment},60,60,{margin_v}
+Style: Caption,Arial Black,{font_size},{primary_color},{outline_color},&H80000000,1,4,0,{alignment},{margin_l},{margin_r},{margin_v}
  
 [Events]
 Format: Layer, Start, End, Style, Text
@@ -14517,6 +14556,13 @@ async def _render_scene(
                 "text_animation_style",
                 animation.get("text_animation_style") or _DEFAULT_TEXT_ANIMATION_STYLE,
             )
+            # NEW: same gap as text_animation_style had — `placement`
+            # (chosen by the LLM in ANIMATION_PLANNER_PROMPT, validated by
+            # _validate_animation) was computed and stored on
+            # infographic["placement"] but never actually included in the
+            # props sent to Remotion, so composition components had no way
+            # to honor it even if they implemented placement-aware layout.
+            remotion_props.setdefault("placement", infographic.get("placement") or "bottom_left")
             overlay_clip = await render_infographic_via_remotion(
                 composition_id=infographic["composition_id"],
                 props=remotion_props,
@@ -14903,3 +14949,41 @@ async def render_video(
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
  
     return {"final_video_url": final_video_url}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
