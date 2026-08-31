@@ -13555,45 +13555,26 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
 class BrollInsertGapUpdate(BaseModel):
     asset_id: Any
     source: str
-    # Absolute seconds — where in the CURRENT timeline to insert new time.
-    # Unlike PATCH /broll (which only ever replaces time that already
-    # exists), this adds `duration` seconds of new B-roll that didn't
-    # exist before, pushing everything at or after `at` later to make
-    # room. Total video duration grows by `duration`.
-    at: float
-    duration: float
+    start: float
+    end: float
     motion_type: Optional[str] = None
 
 
 @app.post("/timeline/{video_id}/broll/insert")
 async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
-    """
-    Inserts a brand-new, standalone B-roll segment at absolute position
-    `at`, extending the video's total duration by `duration` seconds.
-    Implemented as a new silent "scene" (no narration) holding one beat
-    with the requested asset, spliced into raw_scenes at the right
-    position so build_timeline_from_scenes' normal cumulative-duration
-    math naturally pushes every later scene's frames back to make room.
-
-    SCOPE LIMIT: if `at` lands exactly on the boundary between two
-    existing scenes (or before the first / after the last), it inserts
-    cleanly there. If `at` lands INSIDE an existing scene's own
-    narration, this does NOT split that scene's audio/captions mid-
-    sentence — it snaps forward to the end of whichever scene contains
-    `at` instead. The response always reports the actual insertion point
-    used, which may differ from the requested `at` because of this.
-    """
     if update.source not in ("video", "image"):
         raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
-    if update.at < 0:
-        raise HTTPException(status_code=422, detail="at cannot be negative")
-    if update.duration <= 0:
-        raise HTTPException(status_code=422, detail="duration must be greater than 0")
+    if update.start < 0:
+        raise HTTPException(status_code=422, detail="start cannot be negative")
+    if update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
     if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
         raise HTTPException(
             status_code=422,
             detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}",
         )
+
+    duration = update.end - update.start
 
     candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
     if candidate is None:
@@ -13651,41 +13632,39 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
         cumulative += dur
     total_duration = cumulative
 
-    if update.at <= 0:
+    if update.start <= 0:
         insert_index = 0
         actual_at = 0.0
-    elif update.at >= total_duration:
+    elif update.start >= total_duration:
         insert_index = len(raw_scenes)
         actual_at = total_duration
     else:
         insert_index = None
         actual_at = None
         for b in boundaries:
-            if abs(update.at - b["abs_start"]) < 1e-3:
+            if abs(update.start - b["abs_start"]) < 1e-3:
                 insert_index = b["index"]
                 actual_at = b["abs_start"]
                 break
-            if abs(update.at - b["abs_end"]) < 1e-3:
+            if abs(update.start - b["abs_end"]) < 1e-3:
                 insert_index = b["index"] + 1
                 actual_at = b["abs_end"]
                 break
-            if b["abs_start"] < update.at < b["abs_end"]:
-                # Lands inside this scene's own narration — snap forward
-                # to its end rather than splitting the scene.
+            if b["abs_start"] < update.start < b["abs_end"]:
                 insert_index = b["index"] + 1
                 actual_at = b["abs_end"]
                 break
         if insert_index is None:
             raise HTTPException(status_code=500, detail="Could not resolve an insertion point")
 
-    snapped = abs(actual_at - update.at) > 1e-3
+    snapped = abs(actual_at - update.start) > 1e-3
 
     new_scene_id = f"s_ins_{uuid.uuid4().hex[:6]}"
     new_beat = {
         "beat_id": f"{new_scene_id}_b1",
         "beat_index": 0,
         "start": 0.0,
-        "end": update.duration,
+        "end": duration,
         "vo_text": "",
         "keywords": None,
         "preferred_media_type": update.source,
@@ -13702,8 +13681,8 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
         "visual_intent": "",
         "on_screen_text": "",
         "start": 0.0,
-        "end": update.duration,
-        "duration_seconds": update.duration,
+        "end": duration,
+        "duration_seconds": duration,
         "voiceover": None,
         "word_segments": [],
         "error": None,
@@ -13733,16 +13712,19 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
     return {
         "video_id": video_id,
         "new_scene_id": new_scene_id,
-        "requested_at": update.at,
-        "actual_at": actual_at,
+        "requested_start": update.start,
+        "actual_start": actual_at,
         "snapped_to_scene_boundary": snapped,
-        "duration": update.duration,
-        "new_total_duration": total_duration + update.duration,
+        "duration": duration,
+        "end": actual_at + duration,
+        "new_total_duration": total_duration + duration,
         "selected_asset": override,
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
     }
+
+
 
 
 _VALID_DELETE_CONTENT_TYPES = {"video", "image", "text", "infographics"}
