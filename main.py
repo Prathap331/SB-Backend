@@ -235,16 +235,17 @@ async def eci(request: PromptRequest):
 
 
 
+
+
+
 import io
 import os
-import re
 import json
 import time
 import math
 import base64
 import uuid
 import hashlib
-import asyncio
 import contextvars
 import concurrent.futures
 from urllib.parse import urlparse
@@ -1270,7 +1271,7 @@ WORDS_PER_MINUTE = 140
 
 BOOKS_TABLE_NAME = "english_books"
 THUMBNAILS_BUCKET = "generated-thumbnails"
-FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "6"))   # was 15
+FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "6"))  
 
 def to_pgvector(embedding) -> str:
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
@@ -2458,7 +2459,7 @@ async def build_shared_web_pool(
     keywords: list[str],
     scraped_urls: set,
     per_keyword_results: int = PER_KEYWORD_SCRAPE_COUNT,
-    overall_timeout: float = 20.0,   # NEW — hard cap for the whole pool-build stage
+    overall_timeout: float = 120.0,   # NEW — hard cap for the whole pool-build stage
 ) -> list[dict]:
     model = _get_st_model()
 
@@ -2747,7 +2748,7 @@ async def _generate_search_keywords_for_script(
         )
         return cached_keywords
 
-    segments_block = _segments_brief(template.get("segments") or [])
+    segments_block = _segments_brief(template.get("segments") or [], brief_field="hyde_brief")
 
     prompt = SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE.format(
         title=title,
@@ -3599,12 +3600,11 @@ def _strip_json_fences(raw: str) -> str:
 
 
 RRF_K = 60  
-
 SCRIPT_RAG_POOL_PER_DOC = 40
 SCRIPT_TOP_K_PER_DOC = 2       
 
-DENSE_SCORE_THRESHOLD = 0.30
-SPARSE_SCORE_THRESHOLD = 0.20
+DENSE_SCORE_THRESHOLD = 0.3
+SPARSE_SCORE_THRESHOLD = 0.2
 
 async def get_context_from_db_segment(
     hyde_document: str,
@@ -3760,7 +3760,7 @@ async def get_context_from_db_segment_with_timeout(
     hyde_document: str,
     keywords: list[str],
     table_name: str,
-    timeout: float = 20.0,
+    timeout: float = 60.0,
     dense_k: int = SCRIPT_RAG_POOL_PER_DOC,   # was 10
     sparse_k: int = SCRIPT_RAG_POOL_PER_DOC,  # was 10
 ) -> list[dict]:
@@ -3789,19 +3789,51 @@ async def generate_hyde_docs_for_script(
     segments: list[dict],
 ) -> list[dict]:
     """
-    Returns a list of {"hyde_document": str, "keywords": list[str]} — one
-    entry per template segment, in order.
+    Returns a list of {"hyde_document": str, "keywords": list[str],
+    "segment_index": int, "segment_name": str, "hyde_brief": str,
+    "llm_brief": str} — one entry per template segment, in order.
+
+    Only `segment_name` and `hyde_brief` are pulled from each segment to
+    build the HyDE generation prompt (llm_brief / engagement_craft are never
+    shown to the HyDE generator — they are for the final script-writing LLM
+    only). segment_name / hyde_brief / llm_brief are carried through onto
+    the returned entry (not invented by the model) so downstream retrieval
+    can tag each chunk with the segment it was retrieved for.
     """
     segment_briefs = "\n".join(
-        f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}%): {seg.get('brief', '')}"
+        f"- {seg.get('segment_name', 'segment')} ({seg.get('percentage', 0)}%): {seg.get('hyde_brief', '')}"
         for seg in segments
     )
 
     fallback_text = f"{title}\n\n{description}".strip()
-    fallback_docs = lambda: [{"hyde_document": fallback_text, "keywords": []} for _ in segments]
+    fallback_docs = lambda: [
+        {
+            "hyde_document": fallback_text,
+            "keywords": [],
+            "segment_index": idx,
+            "segment_name": seg.get("segment_name", f"segment_{idx}"),
+            "hyde_brief": seg.get("hyde_brief", ""),
+            "llm_brief": seg.get("llm_brief", ""),
+        }
+        for idx, seg in enumerate(segments, start=1)
+    ] or [{
+        "hyde_document": fallback_text,
+        "keywords": [],
+        "segment_index": 1,
+        "segment_name": "segment_1",
+        "hyde_brief": "",
+        "llm_brief": "",
+    }]
 
     if not segments:
-        return [{"hyde_document": fallback_text, "keywords": []}]
+        return [{
+            "hyde_document": fallback_text,
+            "keywords": [],
+            "segment_index": 1,
+            "segment_name": "segment_1",
+            "hyde_brief": "",
+            "llm_brief": "",
+        }]
 
     template_title = template.get('title')
     template_about = template.get('about')
@@ -3911,7 +3943,7 @@ OUTPUT — valid JSON only, no markdown fences, no preamble, no trailing text:
             return fallback_docs()
 
         docs = []
-        for entry in raw_docs:
+        for i, entry in enumerate(raw_docs):
             if not isinstance(entry, dict):
                 continue
             text_value = (entry.get("hyde_document") or "").strip()
@@ -3919,8 +3951,22 @@ OUTPUT — valid JSON only, no markdown fences, no preamble, no trailing text:
             if not isinstance(raw_keywords, list):
                 raw_keywords = []
             kw_clean = [str(k).strip() for k in raw_keywords if str(k).strip()]
-            if text_value:
-                docs.append({"hyde_document": text_value, "keywords": kw_clean})
+            if not text_value:
+                continue
+
+            # Positional match to the original template segment — segment
+            # metadata (segment_name / hyde_brief / llm_brief) always comes
+            # from the input `segments` list, never from what the model
+            # returned, so it can be trusted for chunk provenance tagging.
+            seg_meta = segments[i] if i < len(segments) else {}
+            docs.append({
+                "hyde_document": text_value,
+                "keywords": kw_clean,
+                "segment_index": i + 1,
+                "segment_name": seg_meta.get("segment_name") or entry.get("segment") or f"segment_{i + 1}",
+                "hyde_brief": seg_meta.get("hyde_brief", ""),
+                "llm_brief": seg_meta.get("llm_brief", ""),
+            })
 
         if len(docs) != len(segments):
             print(
@@ -3962,6 +4008,8 @@ async def get_context_with_timeout(
         print("[DB] task still running after timeout, proceeding without it for now.")
         return []
 
+
+
 SCRIPT_SYSTEM_PROMPT = """
 ## ROLE
 
@@ -3978,9 +4026,15 @@ You will receive:
 * Idea Title
 * Idea Description
 * Target Duration (minutes)
-* Script Template (title, cluster, purpose, ordered segments)
-* Retrieved Knowledge Chunks with sources (Book name, author, published year)
-* Recent Web/News Chunks with source details (with link of web article)
+* Script Template (title, cluster, purpose, ordered segments — each segment's
+  writing guidance is given as its `llm_brief`)
+* Retrieved Knowledge Chunks with sources (Book name, author, published year).
+  Each chunk also carries `segment_name` and `segment_brief` (that
+  segment's `llm_brief`) showing which part of the template it was
+  retrieved to support — use this to place the chunk's information in the
+  right part of the narration and to match that segment's intended craft.
+* Recent Web/News Chunks with source details (with link of web article),
+  tagged the same way with `segment_name` / `segment_brief`.
 
 
 All retrieved chunks have already passed semantic relevance filtering and should be treated as the trusted knowledge base.
@@ -4163,32 +4217,13 @@ Requirements:
 """
 
 
-def _build_script_context(db_results: list[dict], new_articles: list[dict]) -> str:
-    parts = []
-
-    if db_results:
-        parts.append(f"=== KNOWLEDGE BASE EXCERPTS (dense similarity >= {DB_SIMILARITY_THRESHOLD}) ===")
-        for i, row in enumerate(db_results, start=1):
-            content = row.get("content", "")
-            dense_score = row.get("dense_score")
-            parts.append(f"[KB-{i}] (similarity={dense_score}) {content}")
-
-    if new_articles:
-        parts.append(f"\n=== RECENT NEWS / WEB (similarity >= {WEB_CONTENT_SIMILARITY_THRESHOLD}) ===")
-        for i, article in enumerate(new_articles, start=1):
-            snippet = article.get("snippet", "")
-            url = article.get("url", "")
-            similarity = article.get("similarity")
-            parts.append(f"[NEWS-{i}] (similarity={similarity}) {snippet} (source: {url})")
-
-    return "\n\n".join(parts) if parts else "No high-confidence source material available."
 
 
-def _segments_brief(segments: list[dict]) -> str:
+def _segments_brief(segments: list[dict], brief_field: str = "hyde_brief") -> str:
     if not segments:
         return "No template segments available — write a natural documentary-style structure."
     return "\n".join(
-        f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}% of runtime): {seg.get('brief', '')}"
+        f"- {seg.get('segment_name', 'segment')} ({seg.get('percentage', 0)}% of runtime): {seg.get(brief_field, '')}"
         for seg in segments
     )
 
@@ -4242,7 +4277,14 @@ async def _build_script_context_json(
             "content": row.get("content", ""),
             "similarity": row.get("dense_score"),
             "md5": md5,
-            "book": book_map.get(md5),  
+            "book": book_map.get(md5),
+            # Chunk provenance: which template segment this chunk was
+            # retrieved for. Deliberately carries llm_brief (writing
+            # guidance for the script LLM), never hyde_brief (retrieval-only,
+            # not meant for the script-writing pass).
+            "segment_id": row.get("segment_id"),
+            "segment_name": row.get("segment_name"),
+            "segment_brief": row.get("llm_brief"),
         })
 
     web_chunks = []
@@ -4251,6 +4293,9 @@ async def _build_script_context_json(
             "snippet": article.get("snippet", ""),
             "similarity": article.get("similarity"),
             "url": article.get("url", ""),
+            "segment_id": article.get("segment_id"),
+            "segment_name": article.get("segment_name"),
+            "segment_brief": article.get("llm_brief"),
         })
 
     payload = {
@@ -4272,7 +4317,9 @@ async def generate_script_from_context(
     target_word_count: int,
 ) -> dict:
     context_block, _context_payload = await _build_script_context_json(db_results, new_articles)
-    segments_block = _segments_brief(selected_template.get("segments") or [])
+    segments_block = _segments_brief(selected_template.get("segments") or [], brief_field="llm_brief")
+
+    print( "script_segments" + segments_block)
 
     user_prompt = f"""
 Video Title: "{request.title}"
@@ -4283,14 +4330,18 @@ Target Word Count: approximately {target_word_count} words
 Template: "{selected_template.get('title')}" (cluster: {selected_template.get('cluster')})
 Template Purpose: {selected_template.get('about')}
 
-Segments (write the script in this exact order):
+Segments (write the script in this exact order — each entry's guidance is
+that segment's llm_brief):
 {segments_block}
 
 Source Material (JSON — each knowledge_base_chunks entry may include a "book"
 object with title/author/year; each web_chunks entry includes its source
-"url". Attribute facts to these sources naturally in the narration, e.g.
-"According to [author]'s [title]..." or "As reported by [domain]..."; never
-attribute to a chunk whose "book" is null or whose "url" is empty):
+"url". Every chunk also carries "segment_name" and "segment_brief" showing
+which template segment it was retrieved for — use that chunk's facts in the
+matching part of the narration, guided by that segment's brief. Attribute
+facts to their sources naturally in the narration, e.g. "According to
+[author]'s [title]..." or "As reported by [domain]..."; never attribute to a
+chunk whose "book" is null or whose "url" is empty):
 {context_block}
 """
 
@@ -5429,6 +5480,27 @@ def pick_topk_with_backfill(
     return picked
 
 
+def _tag_chunks_with_segment(chunks: list[dict], seg_info: dict) -> None:
+    """
+    Stamps chunk provenance in place: which HyDE document / template segment
+    this chunk was retrieved for. Both hyde_brief and llm_brief are carried
+    on the chunk at this stage (retrieval-time), so downstream code can
+    choose which one to expose to which consumer:
+      - hyde_brief -> retrieval-only, never sent to the script-writing LLM
+      - llm_brief  -> the one actually sent to the script-writing LLM
+    Works identically for RAG DB chunks and web-scraped chunks.
+    """
+    segment_id = seg_info.get("segment_index")
+    segment_name = seg_info.get("segment_name")
+    hyde_brief = seg_info.get("hyde_brief")
+    llm_brief = seg_info.get("llm_brief")
+    for chunk in chunks:
+        chunk["segment_id"] = segment_id
+        chunk["segment_name"] = segment_name
+        chunk["hyde_brief"] = hyde_brief
+        chunk["llm_brief"] = llm_brief
+
+
 
 
 
@@ -5534,12 +5606,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         kw = seg.get("keywords") or []
         print(f"  [HYDE-{i}] ({_count_tokens(doc_preview)} tok, {len(kw)} kw) \"{doc_preview}\"")
 
-    # =========================================================================
-    # STAGE 2 (RAG retrieval) and STAGE 3 (web search) both only depend on
-    # Stage 1's hyde_documents — not on each other — so they now run
-    # concurrently instead of sequentially. All retrieval math/thresholds/
-    # RRF fusion logic inside each is byte-for-byte unchanged.
-    # =========================================================================
     script_rag_target = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC
     script_web_source_target = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC
 
@@ -5592,9 +5658,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
             script_search_keywords = await _generate_search_keywords_for_script(
                 request.title, request.description, selected_template, request.time
             )
-            print(f"[STAGE 3] {len(script_search_keywords)} search keyword(s) generated:")
-            for i, kw in enumerate(script_search_keywords, start=1):
-                print(f"    [KW-{i}] {kw}")
         except Exception as exc:
             print(f"[STAGE 3] keyword generation failed: {exc}")
             script_search_keywords = [f"{request.title} latest news today", f"{request.title} 2026 update"]
@@ -5602,21 +5665,14 @@ async def _generate_script_impl(request: "ScriptRequest"):
         shared_pool: list[dict] = []
         try:
             shared_pool = await build_shared_web_pool(script_search_keywords, scraped_urls)
-            print(f"[STAGE 3] shared web pool built: {len(shared_pool)} article(s) fetched/chunked/embedded")
         except Exception as exc:
             print(f"[STAGE 3] shared web pool build failed: {exc}")
-            import traceback
-            traceback.print_exc()
             shared_pool = []
 
         articles: list[dict] = []
+        seen_urls_final: set = set()
         try:
             model = _get_st_model()
-            seen_urls_final: set = set()
-
-            # Batch all segment HyDE embeddings in a single encode() call
-            # instead of one call per segment — same vectors, far fewer
-            # sequential model invocations on CPU.
             hyde_texts = [seg.get("hyde_document", "") for seg in hyde_documents]
             try:
                 hyde_embeddings_batch = await _run_encode(
@@ -5627,47 +5683,68 @@ async def _generate_script_impl(request: "ScriptRequest"):
                 hyde_embeddings_batch = None
 
             for doc_idx, seg in enumerate(hyde_documents, start=1):
-                if hyde_embeddings_batch is not None:
-                    hyde_embedding = hyde_embeddings_batch[doc_idx - 1]
-                else:
-                    doc = seg.get("hyde_document", "")
-                    hyde_embedding = await _run_encode(
-                        lambda d=doc: model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
+                hyde_embedding = (
+                    hyde_embeddings_batch[doc_idx - 1] if hyde_embeddings_batch is not None
+                    else await _run_encode(
+                        lambda d=seg.get("hyde_document", ""): model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
                     )
-
-                top_for_doc = rank_pool_for_hyde_doc(
-                    shared_pool, hyde_embedding, WEB_CONTENT_SIMILARITY_THRESHOLD, SCRIPT_TOP_K_PER_DOC
                 )
-                newly_added = 0
+                top_for_doc = rank_pool_for_hyde_doc(
+                    shared_pool, hyde_embedding, WEB_CONTENT_SIMILARITY_THRESHOLD, SCRIPT_TOP_K_PER_DOC,
+                    exclude_urls=seen_urls_final,
+                )
+                _tag_chunks_with_segment(top_for_doc, seg)
                 for article in top_for_doc:
                     url = article.get("url")
                     if url and url not in seen_urls_final:
                         seen_urls_final.add(url)
                         articles.append(article)
-                        newly_added += 1
-                print(
-                    f"[STAGE 3 | SEGMENT #{doc_idx}] matched {newly_added} new source(s) from the "
-                    f"pool of {len(shared_pool)} (running unique total: {len(seen_urls_final)})"
-                )
 
-            unique_source_count = _unique_url_count(articles)
-            print(f"[STAGE 3] direct matching done: {unique_source_count}/{script_web_source_target} unique source(s)")
+            print(f"[STAGE 3] direct matching done: {_unique_url_count(articles)}/{script_web_source_target} unique source(s)")
+
+            # --- NEW: backfill, mirrors /generate-ideas ---
+            if _unique_url_count(articles) < script_web_source_target:
+                print(f"[STAGE 3] backfilling — only {_unique_url_count(articles)}/{script_web_source_target}, widening search")
+                generic_queries = [
+                    request.title, f"{request.title} history", f"{request.title} overview",
+                    f"{request.title} explained", f"{request.title} background",
+                    f"{request.title} facts", f"{request.title} details", f"{request.title} analysis",
+                ]
+                try:
+                    extra_pool = await build_shared_web_pool(generic_queries, scraped_urls)
+                    combined_pool = shared_pool + extra_pool
+                    for seg in hyde_documents:
+                        if _unique_url_count(articles) >= script_web_source_target:
+                            break
+                        doc = seg.get("hyde_document", "")
+                        hyde_embedding = await _run_encode(
+                            lambda d=doc: model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
+                        )
+                        backfilled = rank_pool_for_hyde_doc(
+                            combined_pool, hyde_embedding, _MIN_ACCEPTABLE_SIMILARITY,
+                            SCRIPT_TOP_K_PER_DOC, exclude_urls=seen_urls_final,
+                        )
+                        _tag_chunks_with_segment(backfilled, seg)
+                        for article in backfilled:
+                            if _unique_url_count(articles) >= script_web_source_target:
+                                break
+                            url = article.get("url")
+                            if url and url not in seen_urls_final:
+                                seen_urls_final.add(url)
+                                articles.append(article)
+                    print(f"[STAGE 3] backfill done — now {_unique_url_count(articles)}/{script_web_source_target}")
+                except Exception as exc:
+                    print(f"[STAGE 3] backfill failed: {exc}")
 
             articles.sort(key=lambda a: a.get("similarity", 0.0), reverse=True)
             articles = articles[:script_web_source_target]
-            print(
-                f"[STAGE 3] {_unique_url_count(articles)}/{script_web_source_target} "
-                f"unique semantically relevant web source(s) available (no backfill)."
-            )
         except Exception as exc:
             print(f"[STAGE 3] FAILED — web content matching raised: {exc}")
             import traceback
             traceback.print_exc()
 
         print(f"[STAGE 3] done in {time.time() - stage3_start:.2f}s — final unique source count: {_unique_url_count(articles)}/{script_web_source_target}")
-        for i, a in enumerate(articles, start=1):
-            print(f"    [SRC-{i}] sim={a.get('similarity'):.4f} {a.get('url')}")
-        return articles
+        return articles  
 
     (table_name, db_results_per_doc), new_articles = await asyncio.gather(
         _run_stage2(), _run_stage3()
@@ -5703,6 +5780,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
         top_for_doc = pick_topk_with_backfill(
             doc_results, SCRIPT_TOP_K_PER_DOC, globally_claimed_md5s
         )
+        _tag_chunks_with_segment(top_for_doc, hyde_documents[doc_idx - 1])
         db_results.extend(top_for_doc)
 
         picked_ids = {item.get("chunk_id") for item in top_for_doc}
@@ -5902,6 +5980,52 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
