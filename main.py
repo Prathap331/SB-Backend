@@ -9184,43 +9184,15 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
 import math
 import uuid
+import zlib
 import shutil
 import tempfile
 import asyncio
-import subprocess
 from pathlib import Path
 from typing import Any, Optional, Literal
 
@@ -9234,9 +9206,6 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 
-# =============================================================================
-# B-ROLL ORIENTATION HELPERS  (FIX A)
-# =============================================================================
 
 def _looks_like_playable_media_url(url: Optional[str]) -> bool:
     if not url:
@@ -9249,14 +9218,6 @@ def _looks_like_playable_media_url(url: Optional[str]) -> bool:
 
 
 def _is_landscape_dimensions(width, height) -> bool:
-    """
-    True only if width clearly exceeds height (landscape/horizontal).
-
-    FIX A: requires a minimum 1.2:1 ratio, not just width > height. A clip
-    that's only marginally wider than it is tall (e.g. 1100x1000) still
-    crops very badly onto a 1080x1920 canvas and reads as "basically
-    vertical" once cropped — the old `w > h` check let those through.
-    """
     try:
         w = float(width)
         h = float(height)
@@ -9266,27 +9227,6 @@ def _is_landscape_dimensions(width, height) -> bool:
 
 
 def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) -> Optional[str]:
-    """
-    Pick the best-quality file_url for a b-roll candidate.
-
-    Pexels frequently returns video_files where every entry's "quality"
-    field is null (seen on many assets in this dataset, e.g. 34730966,
-    36767561, 26833619). A naive "match quality=='hd', else take
-    video_files[0]" falls through to whatever Pexels happened to list
-    first — which is often the smallest/lowest-resolution file, not the
-    best one. That silently produced blurry/near-unusable broll (asset
-    34730966 resolved to a 640x360 clip instead of its available
-    3840x2160 version).
-
-    Selection order now is:
-      1. Images: just use the highest-resolution src variant available.
-      2. Videos: prefer an entry with an explicit "hd"/"uhd" quality
-         label if one exists (skips low-res "sd" entries when better
-         is labeled and available). Otherwise — including when every
-         entry has quality=None — pick the single largest file by
-         pixel area (width * height). This guarantees we never favor
-         a smaller file over a larger one just because of list order.
-    """
     if not candidate:
         return None
 
@@ -9324,13 +9264,6 @@ def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) ->
 
 
 def _resolve_broll_file_url_any_orientation(candidate: dict, source: str) -> Optional[str]:
-    """
-    FIX A (blur-pad fallback support): unlike `_resolve_broll_file_url`,
-    this ignores orientation entirely and just returns the best playable
-    URL for the candidate, whatever shape it is. Used ONLY as input to the
-    blur-pad composite in `_prepare_broll_clip` — never used to select what
-    gets shown full-bleed.
-    """
     if not candidate:
         return None
 
@@ -9364,312 +9297,596 @@ def _image_is_landscape(p: dict) -> bool:
     return _resolve_broll_file_url(p, "image") is not None
 
 
-# =============================================================================
-# SCENE PLANNING PROMPTS  (unchanged from your original)
-# =============================================================================
 
-SCRIPT_SCENE_PROMPT = f""" 
-System Prompt
+SCRIPT_SCENE_PROMPT = """ 
+You are Storybit's Scene Planner, an AI that converts documentary-style
+narration into (a) a single category classification for the whole video and
+(b) a structured scene manifest for an automated video editing pipeline.
 
-You are Storybit's Scene Planner, an AI that converts documentary-style narration into a structured scene manifest for an automated video editing pipeline.
+Your output is consumed directly by backend services, so it must be valid
+JSON only with no markdown, explanations, comments, or code fences.
 
-Your output is consumed directly by backend services, so it must be valid JSON only with no markdown, explanations, comments, or code fences.
+Step A — Classify the whole script ONCE
 
-Objective
+Choose exactly one category from this fixed list, based on the overall
+subject and tone of the ENTIRE script (not any single sentence):
 
-Transform a narration script into a sequence of visually coherent scenes while preserving the original narration exactly.
+['anthropology', 'biography', 'business', 'economics', 'entrepreneurship', 'finance', 'health', 'knowledge', 'law', 'personal_development', 'philosophy', 'politics', 'psychology', 'self_help', 'sociology', 'history', 'religion', 'travel', 'geography', 'astronomy', 'technology', 'sports', 'communication', 'science', 'neuroscience', 'film_theatre', 'social_science', 'criminology', 'cultural_studies', 'general_documentary']
 
-The output must contain no timestampsw. Timing will be generated later from voiceover alignment.
+Category reference (use this to judge fit, do not invent new categories):
+{'anthropology': 'Human societies, cultures, evolution, ethnography.', 'biography': "A specific person's life story.", 'business': 'Companies, corporate strategy, case studies, industry.', 'economics': 'Markets, macro/micro economics, trade, policy.', 'entrepreneurship': 'Startups, founders, building and scaling businesses.', 'finance': 'Personal finance, investing, markets, money management.', 'health': 'Medicine, wellness, fitness, nutrition.', 'knowledge': "General facts, trivia, 'did you know' style content spanning any subject.", 'law': 'Legal systems, court cases, legislation.', 'personal_development': 'Habits, growth frameworks, productivity, self-improvement systems.', 'philosophy': 'Abstract ideas, ethics, philosophers, thought experiments.', 'politics': 'Political systems, elections, government, policy.', 'psychology': 'Mind, behavior, cognitive concepts, mental processes (behavioral framing).', 'self_help': 'Direct, prescriptive advice and how-to guidance for personal problems.', 'sociology': 'Social structures, group behavior, societal trends.', 'history': 'Historical events and periods, any era.', 'religion': 'Religious traditions, theology, practices.', 'travel': 'Destinations, travel guides, culture of places.', 'geography': 'Physical geography, countries, natural formations, maps.', 'astronomy': 'Space, planets, cosmology.', 'technology': 'Tech products, engineering, innovation, computing.', 'sports': 'Sports history, athletes, competitions, stats.', 'communication': 'Language, media, rhetoric, interpersonal/mass communication.', 'science': 'General science: physics, chemistry, biology, experimentation.', 'neuroscience': 'Brain, nervous system, cognitive science (research/clinical framing).', 'film_theatre': 'Film and theatre history, analysis, industry.', 'social_science': 'Social science research and theory (methodology/research framing).', 'criminology': 'Study of crime, criminal behavior, and the justice system.', 'cultural_studies': 'Culture, identity, media/cultural analysis.', 'general_documentary': "Fallback for scripts that don't clearly fit another category."}
+
+If nothing fits clearly, choose "general_documentary". This category applies
+to the whole video and will be reused unchanged by later pipeline steps —
+choose it once, carefully, from the full script.
+
+Also detect script_language: the ISO 639-1 code of the language the
+narration is actually written in (e.g. "en", "hi", "ta", "te", "ur").
+Detect this from the actual text — do not assume it's English.
+
+Step B — Segment into scenes
+
+Objective: transform the narration into a sequence of visually coherent
+scenes while preserving the original narration exactly. The output must
+contain no timestamps — timing is generated later from voiceover alignment.
 
 Scene Segmentation Rules
 
-Return AT MOST 5 scenes total, regardless of script length. This is a hard limit — never exceed 5.
+- Each scene's vo_text must represent NO more than approximately 2 minutes
+  of spoken narration, estimated at ~140 words per minute (~280 words).
+  This is a HARD limit that applies regardless of total script/video
+  length — there is NO cap on the number of scenes. A 3-minute script might
+  produce 2 scenes; a 20-minute script might produce 10+. Never merge
+  scenes together purely to reduce scene count — the 2-minute-per-scene
+  limit always wins over having fewer scenes.
+- Split whenever the spoken idea or visual changes, in addition to
+  splitting wherever needed to respect the 2-minute limit.
+- Preserve the narration verbatim inside vo_text. Every word of the
+  original script must appear in exactly one scene's vo_text, in order —
+  do not drop or paraphrase any narration.
 
-If the narration would naturally split into more than 5 scenes, merge related sentences/ideas together until you have 5 or fewer scenes, rather than dropping any narration text.
+Animation density per scene
 
-Split whenever the spoken idea or visual changes, but stay within the 5-scene limit.
-
-Keep scene lengths balanced; avoid overly long scenes.
-
-Preserve the narration verbatim inside vo_text. Every word of the original script must appear in exactly one scene's vo_text — do not drop or paraphrase any narration when merging scenes to fit the limit.
+Using the category's baseline "animation_density" from the reference table
+above, assign each scene a "scene_animation_density" of "low", "medium", or
+"high". Default to the category's baseline. Only deviate for a specific
+scene when its content clearly calls for it (e.g. a quiet emotional human
+story inside an otherwise "high" density business video can be "low").
 
 Output Schema
 
-Return a JSON array (5 objects or fewer) where every object contains exactly these fields:
+Return exactly one JSON object:
 
 {{
-  "scene_id": "s1",
-  "vo_text": "Exact narration for this scene.",
-  "visual_intent": "Concise documentary-style description of what should be shown.",
-  "on_screen_text": "Short text overlay or empty string.",
-  "requires_animation": true/false,
-  "broll_keywords": ["query one", "query two", "query three", "query four", "query five"]
+  "category": "business",
+  "script_language": "en",
+  "scenes": [
+    {{
+      "scene_id": "s1",
+      "vo_text": "Exact narration for this scene.",
+      "visual_intent": "Concise documentary-style description of what should be shown.",
+      "on_screen_text": "Short text overlay or empty string.",
+      "requires_animation": true,
+      "scene_animation_density": "medium",
+      "estimated_duration_seconds": 95,
+      "broll_keywords": ["query one", "query two", "query three", "query four", "query five"]
+    }}
+  ]
 }}
+
 Field Guidelines
 
-scene_id
+script_language: ISO 639-1 code detected from the narration text itself.
+This is passed unchanged to every later pipeline step — get it right once
+here.
 
-Sequential: s1, s2, s3, s4, s5 (never more than 5).
+scene_id: Sequential: s1, s2, s3, ... — as many as the 2-minute-per-scene
+rule requires. There is no upper bound.
 
-vo_text
+vo_text: Copy the narration exactly. Do not paraphrase or rewrite.
 
-Copy the narration exactly.
+visual_intent: Concise documentary-style search query suitable for B-roll
+retrieval. Prefer real-world imagery matching the category's footage_style.
+Mention important subjects, locations, time periods, or events. Avoid
+cinematic adjectives like "epic" or "dramatic" unless explicitly stated.
+Keep under roughly 15 words.
 
-Do not paraphrase or rewrite.
+on_screen_text: Use only when helpful — years, dates, locations, people's
+names, statistics, short titles. Otherwise "".
 
-visual_intent
+requires_animation: true only if the scene benefits from kinetic
+typography, lower-thirds, maps, charts, timelines, or infographics.
 
-Write a concise documentary-style search query suitable for B-roll retrieval.
+scene_animation_density: see "Animation density per scene" above.
 
-Prefer real-world imagery.
+estimated_duration_seconds: word count of this scene's vo_text divided by
+~2.33 words/sec (~140 wpm). Integer.
 
-Mention important subjects, locations, time periods, or events.
-
-Avoid cinematic adjectives like "epic" or "dramatic" unless explicitly stated.
-
-on_screen_text
-
-Use only when helpful for viewers, such as:
-
-Years
-
-Dates
-
-Locations
-
-People's names
-
-Statistics
-
-Short titles
-
-Otherwise return "".
-
-requires_animation
-
-Return true only if the scene benefits from:
-
-Kinetic typography
-
-Lower-third text
-
-Maps
-
-Charts
-
-Timelines
-
-Infographics
-
-Otherwise return false.
-
-broll_keywords
-
-Return a list of 5-6 distinct stock-footage search phrases for this scene,
-suitable for searching a stock video/photo API (e.g. Pexels).
-
-- Each phrase should be 2-6 words, concrete, and searchable (real-world
-  nouns: places, objects, actions, eras — not abstract concepts).
-- Each phrase should target a DIFFERENT visual angle on the same scene, so
-  together they widen the pool of usable B-roll rather than repeating the
-  same query.
-- Always return at least 5 phrases, and up to 6.
-- Do not invent specific names, dates, or facts not present in the narration.
-- Do not use cinematic adjectives like "epic" or "dramatic".
-- Prefer real, photographable subjects over metaphors.
-
-Note: these scene-level keywords are only a seed/fallback. The actual B-roll
-shown to viewers rotates every ~10 seconds within a scene, driven by a
-second, beat-level keyword pass (see BEAT_KEYWORDS_PROMPT) that looks at
-exactly what's being said in each smaller window of narration.
+broll_keywords: 5-6 distinct stock-footage search phrases, 2-6 words each,
+concrete and searchable, each targeting a different visual angle. These are
+a scene-level seed/fallback only — beat-level keywords (generated next in the
+pipeline) take precedence for actual footage rotation.
 
 Constraints
 
-Do not invent facts.
-
-Do not create timestamps.
-
-Do not include camera directions unless they improve B-roll retrieval (e.g., "aerial view", "satellite map", "close-up").
-
-Keep visual_intent under roughly 15 words.
-
-Never output more than 5 scenes.
-
+Do not invent facts. Do not create timestamps. Do not include camera
+directions unless they improve B-roll retrieval (e.g. "aerial view",
+"satellite map", "close-up"). No scene may exceed ~280 words of vo_text.
 Ensure the output is valid, parseable JSON.
 """
 
 
-# =============================================================================
-# BEAT-LEVEL (~10s) B-ROLL KEYWORD PROMPT
-#
-# NEW: this prompt now also drives image MOTION selection (Ken Burns-style
-# pan/zoom/tilt). The LLM is the only place that picks a motion_type — the
-# render layer (_build_image_motion_filter, see RENDER SERVICE section) just
-# turns whatever motion_type it's handed into the matching FFmpeg zoompan
-# expression. No motion is ever chosen by render-time code except as a
-# last-resort default when the LLM call itself fails (see
-# _generate_beat_keywords' except block) or returns something invalid.
-# =============================================================================
+STYLE_PROFILES = {
+  "anthropology": {
+    "description": "Human societies, cultures, evolution, ethnography.",
+    "footage_style": "Communities, ceremonies, artifacts, archaeological sites, cultural practices across regions/eras.",
+    "animation_density": "low",
+    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third", "callout_textbox"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+  },
+  "biography": {
+    "description": "A specific person's life story.",
+    "footage_style": "Portraits, era-appropriate settings, places tied to the person's life.",
+    "animation_density": "low",
+    "favored_animation_types": ["lower_third", "full_screen_quote_card", "ken_burns_pan_zoom"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+  },
+  "business": {
+    "description": "Companies, corporate strategy, case studies, industry.",
+    "footage_style": "Offices, meetings, product shots, people working, cities.",
+    "animation_density": "high",
+    "favored_animation_types": ["stat_counter_overlay", "icon_sequence", "bullet_list_reveal", "full_screen_data_viz", "callout_textbox"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "economics": {
+    "description": "Markets, macro/micro economics, trade, policy.",
+    "footage_style": "Markets, factories, trade, currency, charts/screens.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "stat_counter_overlay", "icon_sequence", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+  },
+  "entrepreneurship": {
+    "description": "Startups, founders, building and scaling businesses.",
+    "footage_style": "Startup offices, founders working, product launches, pitching.",
+    "animation_density": "high",
+    "favored_animation_types": ["icon_pop_in", "stat_counter_overlay", "bullet_list_reveal", "callout_textbox"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "finance": {
+    "description": "Personal finance, investing, markets, money management.",
+    "footage_style": "Stock tickers, banks, currency, people managing money.",
+    "animation_density": "high",
+    "favored_animation_types": ["stat_counter_overlay", "full_screen_data_viz", "icon_sequence", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "health": {
+    "description": "Medicine, wellness, fitness, nutrition.",
+    "footage_style": "Clinical settings, exercise, food, doctors/patients, wellness scenes.",
+    "animation_density": "medium",
+    "favored_animation_types": ["stat_counter_overlay", "icon_pop_in", "bullet_list_reveal", "full_screen_data_viz"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "knowledge": {
+    "description": "General facts, trivia, 'did you know' style content spanning any subject.",
+    "footage_style": "Broad real-world imagery matched directly to whichever fact is being discussed.",
+    "animation_density": "medium",
+    "favored_animation_types": ["stat_counter_overlay", "icon_pop_in", "bullet_list_reveal", "callout_textbox"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "law": {
+    "description": "Legal systems, court cases, legislation.",
+    "footage_style": "Courtrooms, legal documents, government/court buildings.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_document_highlight", "lower_third", "callout_textbox", "bullet_list_reveal"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+  },
+  "personal_development": {
+    "description": "Habits, growth frameworks, productivity, self-improvement systems.",
+    "footage_style": "Everyday life, people building routines, journaling, incremental progress.",
+    "animation_density": "medium",
+    "favored_animation_types": ["bullet_list_reveal", "icon_pop_in", "callout_textbox", "stat_counter_overlay"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "philosophy": {
+    "description": "Abstract ideas, ethics, philosophers, thought experiments.",
+    "footage_style": "Contemplative real-world imagery, historical settings, symbolic everyday scenes.",
+    "animation_density": "low",
+    "favored_animation_types": ["full_screen_quote_card", "lower_third", "ken_burns_pan_zoom"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation", "icon_sequence"],
+  },
+  "politics": {
+    "description": "Political systems, elections, government, policy.",
+    "footage_style": "Government buildings, rallies, officials, maps.",
+    "animation_density": "medium",
+    "favored_animation_types": ["lower_third", "full_screen_data_viz", "callout_textbox", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+  },
+  "psychology": {
+    "description": "Mind, behavior, cognitive concepts, mental processes (behavioral framing).",
+    "footage_style": "People and everyday behavior/interactions, relatable real-world scenes.",
+    "animation_density": "medium",
+    "favored_animation_types": ["icon_pop_in", "callout_textbox", "bullet_list_reveal", "full_screen_data_viz"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "self_help": {
+    "description": "Direct, prescriptive advice and how-to guidance for personal problems.",
+    "footage_style": "Relatable everyday life, people applying advice/techniques.",
+    "animation_density": "medium",
+    "favored_animation_types": ["bullet_list_reveal", "callout_textbox", "icon_pop_in"],
+    "avoided_animation_types": ["full_screen_data_viz", "mascot_animation"],
+  },
+  "sociology": {
+    "description": "Social structures, group behavior, societal trends.",
+    "footage_style": "Communities, social settings, crowds, institutions.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_data_viz", "stat_counter_overlay", "lower_third", "callout_textbox"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "history": {
+    "description": "Historical events and periods, any era.",
+    "footage_style": "Archival-style or era-appropriate imagery, artifacts, maps, timelines — matched to whichever era the specific script covers.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third", "full_screen_data_viz"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+  },
+  "religion": {
+    "description": "Religious traditions, theology, practices.",
+    "footage_style": "Religious sites, symbols, ceremonies, texts.",
+    "animation_density": "low",
+    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation", "emoji_reaction"],
+  },
+  "travel": {
+    "description": "Destinations, travel guides, culture of places.",
+    "footage_style": "Landmarks, landscapes, street scenes, local life.",
+    "animation_density": "low",
+    "favored_animation_types": ["lower_third", "ken_burns_pan_zoom", "callout_textbox"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+  },
+  "geography": {
+    "description": "Physical geography, countries, natural formations, maps.",
+    "footage_style": "Landscapes, maps, satellite-style views, natural formations.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_data_viz", "lower_third", "arrow_highlight", "ken_burns_pan_zoom"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "astronomy": {
+    "description": "Space, planets, cosmology.",
+    "footage_style": "Space imagery, telescopes, night sky, planetary/scale visuals.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "technology": {
+    "description": "Tech products, engineering, innovation, computing.",
+    "footage_style": "Devices, labs, close-ups of tech, digital interfaces.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "sports": {
+    "description": "Sports history, athletes, competitions, stats.",
+    "footage_style": "Sports action, athletes, stadiums, equipment.",
+    "animation_density": "high",
+    "favored_animation_types": ["stat_counter_overlay", "lower_third", "full_screen_data_viz", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "communication": {
+    "description": "Language, media, rhetoric, interpersonal/mass communication.",
+    "footage_style": "People talking, media/broadcast settings, writing, signals.",
+    "animation_density": "medium",
+    "favored_animation_types": ["icon_pop_in", "callout_textbox", "bullet_list_reveal", "lower_third"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "science": {
+    "description": "General science: physics, chemistry, biology, experimentation.",
+    "footage_style": "Labs, experiments, natural phenomena, close-ups of mechanisms.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "neuroscience": {
+    "description": "Brain, nervous system, cognitive science (research/clinical framing).",
+    "footage_style": "Brain/medical imagery, labs, research settings.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "icon_pop_in", "stat_counter_overlay", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "film_theatre": {
+    "description": "Film and theatre history, analysis, industry.",
+    "footage_style": "Theatres, film sets, performances, era-appropriate cinema imagery.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_quote_card", "lower_third", "callout_textbox", "ken_burns_pan_zoom"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+  },
+  "social_science": {
+    "description": "Social science research and theory (methodology/research framing).",
+    "footage_style": "Research settings, communities, data-adjacent real-world imagery.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_data_viz", "callout_textbox", "lower_third", "bullet_list_reveal"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "criminology": {
+    "description": "Study of crime, criminal behavior, and the justice system.",
+    "footage_style": "Evidence-style imagery, courtrooms, investigation settings, documents.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_document_highlight", "lower_third", "callout_textbox", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction", "icon_sequence"],
+  },
+  "cultural_studies": {
+    "description": "Culture, identity, media/cultural analysis.",
+    "footage_style": "Cultural settings, communities, symbols, everyday life across cultures.",
+    "animation_density": "medium",
+    "favored_animation_types": ["lower_third", "callout_textbox", "full_screen_quote_card", "bullet_list_reveal"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "general_documentary": {
+    "description": "Fallback for scripts that don't clearly fit another category.",
+    "footage_style": "Real-world footage matched directly to narration subjects.",
+    "animation_density": "low",
+    "favored_animation_types": ["lower_third", "ken_burns_pan_zoom", "full_screen_quote_card"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+}
+
 
 BEAT_KEYWORDS_PROMPT = """
-System Prompt
 
-You are Storybit's B-roll Director for a single ~10 second beat (roughly
-8-12 seconds) inside a longer scene of a documentary-style video.
+You are Storybit's Beat Director for a single scene of a documentary-style
+video. Unlike a fixed clock grid, YOU decide how many beats this scene
+splits into and roughly how long each beat should run, based on how much
+visual/narrative complexity each stretch of narration carries.
 
 You are given, as JSON:
-- scene_visual_intent: the overall visual direction for the whole scene.
-- scene_full_narration: the full narration spoken across the whole scene.
-- beat_narration: the exact narration spoken during THIS beat only.
-- beat_number / total_beats: this beat's position among the scene's beats.
-- previous_media_type: the media type ("video" or "image") actually used
-  for the immediately preceding beat in this scene, or null if this is the
-  first beat.
-- previous_motion_type: the image motion effect used for the most recent
-  IMAGE beat in this scene (one of the six values listed below), or null
-  if no image beat has occurred yet in this scene. This is only relevant
-  when THIS beat also ends up being an image.
+- category: the video's overall category (fixed for the whole video).
+- style_profile: the STYLE_PROFILES entry for that category (footage_style,
+  animation_density baseline, favored/avoided animation types).
+- script_language: ISO 639-1 code of the narration's language (fixed for
+  the whole video).
+- scene_id, scene_visual_intent, scene_animation_density: from the Scene
+  Planner.
+- scene_on_screen_text: the Scene Planner's scene-level suggestion for
+  overlay-worthy content (a year, date, name, statistic, or short title) —
+  "" if it flagged nothing. Treat this as a checklist, not literal text to
+  copy: if scene_on_screen_text is non-empty, check whether the content it
+  names actually appears in this beat's vo_text; if so, that beat's
+  animation_signal should lean toward needs_animation=true with
+  key_subject capturing that exact content (so it isn't lost between the
+  scene-level suggestion and the beat-level decision). Don't force every
+  beat to react to it — only the beat(s) whose vo_text actually contains
+  it.
+- scene_vo_text: the full exact narration for this scene.
+- previous_scene_last_media_type: "video", "image", or null (null only for
+  the very first scene) — the media_type of the last beat in the scene
+  immediately before this one.
+- known_entities: an array of {"name": ..., "entity_type": ...} accumulated
+  from every scene processed so far in this video ([] for the very first
+  scene). Use this to stay consistent — if a name here was already
+  classified as "real_person", don't reclassify it as "fictional_character"
+  (or vice versa) if it recurs in this scene.
+- known_setting: {"location": ..., "time_period": ...} established by the
+  most recent prior scene ({"location": "", "time_period": ""} for the
+  very first scene). Use this to stay consistent — don't drift the
+  location/era without the narration itself explicitly moving the story.
 
-Your job has three parts:
+Your job
 
-1. Return fresh stock-footage search phrases for THIS beat specifically, so
-   the B-roll on screen visibly changes every beat instead of repeating the
-   same shot for the whole scene.
-2. Decide whether THIS beat should be filled with a VIDEO clip or a STILL
-   IMAGE, based on what the beat_narration actually calls for.
-3. Choose a motion_type — the camera-style pan/zoom/tilt effect that will
-   animate the still image if (and only if) this beat ends up using an
-   image. You must always return a valid motion_type even when media_type
-   is "video" (it will simply be ignored in that case) — never omit it or
-   return null.
+1. Segment scene_vo_text into a sequence of beats. Typical beat length is
+   8-20 seconds of spoken narration (~19-47 words at ~140 wpm), but let
+   content decide: a dense idea that will carry a detailed animation or an
+   infographic can run toward the long end (up to ~20s); a fast-moving or
+   simple stretch of narration can be a short beat (down to ~8s). Do not
+   force a fixed count or fixed length — vary it scene to scene.
+2. Preserve scene_vo_text verbatim across beats — every word must appear in
+   exactly one beat's vo_text, in order, with nothing dropped, paraphrased,
+   or duplicated.
+3. For each beat, generate fresh B-roll keywords specific to that beat.
+4. For each beat, decide media_type ("video" or "image").
+5. For each beat, emit an animation SIGNAL — not a final decision. A later
+   step (Animation Planner) has final authority and may accept, reject, or
+   change what you propose here.
+6. For each beat, direct the scene: identify characters/elements, setting,
+   mood, and the central action (see "Scene Direction" below) — everything
+   needed to visually construct this beat, not just who's named in it.
 
-Output Schema
+Scene Direction
 
-Return exactly one JSON object with these three fields, and nothing else —
-no markdown, no explanations, no code fences:
+You are directing this beat, not just labeling it. Provide:
 
-{
-  "keywords": ["query one", "query two", "query three", "query four", "query five"],
-  "media_type": "video",
-  "motion_type": "zoom_in"
-}
+- entities: every named character or significant recurring object in this
+  beat's vo_text, each classified:
+  - "real_person": an actual historical or contemporary person (e.g.
+    Cleopatra, a scientist, a CEO named in the script).
+  - "fictional_character": a character from a story, myth-as-narrative-
+    device, or invented scenario the script is telling (not the same as a
+    real mythological/religious figure being discussed factually — judge
+    by whether the narration asserts the figure existed/acted, or is
+    explicitly telling a fictional/illustrative story).
+  - "element": a significant recurring object, place, or symbol that isn't
+    a person but matters visually across the narration (e.g. "the Nile",
+    "a locked vault", "the company's first office").
+  Use known_entities to stay consistent: reuse an existing name's
+  entity_type rather than reclassifying it. Only list what's new or
+  freshly relevant in THIS beat — don't repeat an earlier beat's entity
+  just because it was mentioned before in the scene.
+- setting: {"location": ..., "time_period": ...} — where and when this
+  beat visually takes place, grounded in what the narration states or
+  strongly implies. Use "" for either field when the narration doesn't
+  establish it. Use known_setting to stay consistent: don't drift the
+  location/era from what's already established unless the narration
+  itself explicitly moves the story somewhere/somewhen else.
+- mood: one or two words for this beat's emotional/atmospheric tone (e.g.
+  "tense", "triumphant", "solemn", "playful", "urgent"), grounded in the
+  narration's actual content and phrasing — never invented flavor beyond
+  what the words support. Use "neutral" if nothing distinct comes through.
+- key_action: one concise sentence describing the central visual
+  event/activity happening in this beat — what should be SHOWN occurring,
+  not what's being said. This is often not a named entity at all (e.g.
+  "a ship sinking during a storm", "a verdict being read in a courtroom",
+  "two founders shaking hands over a contract") and should ground at least
+  one of this beat's keyword phrases when it names a concrete action.
 
 Keyword Rules (accuracy is critical — bad keywords produce wrong footage)
 
-- Each phrase: 2-6 words, concrete, real-world, photographable (places,
-  objects, actions, eras) — never an abstract concept, emotion, or theme
-  on its own (e.g. "hope" or "progress" is not searchable; "person walking
-  toward sunrise" is).
-- Every phrase must be grounded in a concrete noun or subject that is
-  literally present, or very directly implied, in beat_narration. If
-  beat_narration names a specific person, place, object, or event, at
-  least one phrase must center on that exact subject — do not substitute a
-  generic stand-in when the specific one is stated.
-- Do not invent facts, names, dates, or subjects not present in the text.
-- If this beat's narration doesn't introduce new visual content beyond the
-  scene's overall visual intent, still produce phrases that give a
-  DIFFERENT concrete angle on the same subject (wide shot vs. close-up,
-  a related real-world subject, a different moment in the same activity)
-  — never just repeat the scene-level search generically.
-- No cinematic adjectives ("epic", "dramatic", "breathtaking").
-- Prefer real, photographable subjects over metaphors.
-- Always return 5-6 phrases.
+- Each phrase: 2-6 words, concrete, real-world, photographable — never an
+  abstract concept on its own.
+- Every phrase must be grounded in a concrete noun or subject literally
+  present, or very directly implied, in this beat's vo_text.
+- If this beat's narration names a specific person, place, object, or
+  event, at least one phrase must center on that exact subject, and at
+  least one other phrase should combine that subject with the category's
+  era/style (footage_style) rather than being purely generic. Example: if
+  category is "history" and the beat mentions Cleopatra, include
+  something like "Cleopatra ancient Egyptian portrait" or "ancient Egyptian
+  queen depiction" — not just "Cleopatra" alone (too likely to surface
+  modern/unrelated results) and not just generic "ancient Egypt" (loses the
+  specific subject).
+- If the beat doesn't introduce new visual content beyond the scene's
+  overall visual_intent, still produce phrases giving a DIFFERENT concrete
+  angle on the same subject (wide vs. close-up, a related real subject, a
+  different moment in the same activity) — never just repeat the scene-level
+  query generically.
+- No cinematic adjectives. Prefer real, photographable subjects over
+  metaphors. Do not invent facts, names, dates, or subjects not present in
+  the text. Always return 5-6 phrases.
+- Always write keywords in ENGLISH, regardless of script_language. Stock
+  footage libraries are English-indexed and search quality drops sharply
+  on non-English queries — translate the concrete subject into English
+  even when scene_vo_text is in another language.
+- For a "real_person" entity, search using their actual name plus the
+  category's era/style (the existing Cleopatra rule above).
+- For a "fictional_character" entity, do NOT search using the character's
+  name — no stock library has a photo of someone who doesn't exist, and a
+  literal-name search returns irrelevant results. Instead, generate
+  keywords describing the SETTING, MOOD, or visual archetype the narration
+  implies for that moment (e.g. a shadowy detective scene → "person in
+  trench coat silhouette", "rain-soaked city street at night" — not the
+  character's invented name).
+- At least one keyword phrase should reflect key_action (the central
+  visual event you identified in Scene Direction) when it names a concrete
+  activity — footage of the ACTION happening is often more useful than
+  footage of just the subject standing still. Fold in setting.location
+  and mood where they sharpen the search (e.g. "verdict being read" +
+  "wood-paneled courtroom" for a tense key_action set in a courtroom).
 
-Media Type Rules (this decision drives what actually gets shown — get it right)
+Media Type Rules
 
-Choose "image" when the beat's narration is about:
-- A specific static subject best shown as a single frame: a portrait, a
-  named person, a document, a building exterior, a product, a screenshot-
-  like reference, a statistic or data point, a historical/archival moment.
-- A quote, a definition, or a reflective/explanatory beat with no motion
-  implied by the narration.
+Choose "image" for: a specific static subject best shown as a single frame
+(portrait, named person, document, building exterior, product, a
+statistic/data point, a historical/archival moment), or a quote/definition/
+reflective beat with no motion implied.
 
-Choose "video" when the beat's narration is about:
-- Motion, action, process, or change over time: someone doing something,
-  a place being walked through, a sequence of events, anything where
-  seeing movement adds meaning that a still frame would lose.
+Choose "video" for: motion, action, process, or change over time.
 
-Do not default to "video" out of habit — a documentary rotates between
-motion and stills deliberately, and stills are often the stronger choice
-for factual/explanatory beats. Avoid choosing the same media_type as
-previous_media_type when the narration content would support either
-choice equally well, so consecutive beats visually vary (motion, then a
-still, then motion again) rather than showing video back-to-back for an
-entire scene by default. Only repeat the previous media_type when THIS
-beat's content clearly calls for it regardless of variety.
+Do not default to "video" out of habit. Avoid repeating the same
+media_type as the immediately preceding beat unless this beat's content
+clearly calls for it regardless of variety — consecutive beats should
+visually vary (motion, then a still, then motion again). This applies at
+the scene boundary too: this scene's FIRST beat should avoid repeating
+previous_scene_last_media_type unless its content clearly calls for it.
 
-Motion Type Rules (only applied if media_type is "image" — pick it anyway)
+Animation Signal Rules
 
-Choose exactly one of these six values for motion_type:
+Set needs_animation based on whether this beat's content would genuinely
+benefit from an overlay/full-screen animation treatment (not just B-roll) —
+weigh this against scene_animation_density: a "low" density scene should
+have animation signals on only a small minority of beats; "high" density
+can flag most beats.
 
-- "zoom_in" — slowly pushes in toward the center of the image. Best for a
-  single clear subject you want the viewer's attention drawn into
-  (a portrait, a document, a product, a specific detail).
-- "zoom_out" — starts closer in and pulls back to reveal the full frame.
-  Best for a reveal moment, or establishing a wider scene after a close
-  detail was just implied by the narration.
-- "pan_left" — fixed zoom, drifts left-to-right across the frame. Best for
-  wide scenes with a horizontal layout (a skyline, a crowd, a landscape,
-  a row of objects) where sweeping across adds information.
-- "pan_right" — fixed zoom, drifts right-to-left across the frame. Same
-  use case as pan_left; alternate direction for variety rather than
-  always defaulting to one direction.
-- "tilt_up" — fixed zoom, drifts bottom-to-top. Best for tall subjects:
-  a building, a monument, a standing person, anything with vertical
-  scale worth revealing.
-- "tilt_down" — fixed zoom, drifts top-to-bottom. Best for a "descending
-  reveal" feel — starting on a wide/high vantage and settling on the
-  actual subject below.
+- intent: one short sentence — what the animation would communicate or
+  emphasize (e.g. "highlight the specific casualty statistic just spoken").
+- suggested_category: your best guess at one of: full_screen, overlay_text,
+  overlay_graphic, pip, branding, transition — or null if needs_animation
+  is false. This is a suggestion; the Animation Planner may override it.
+- key_subject: the exact entity, number, quote, or short phrase from this
+  beat's vo_text that the animation should center on or highlight. Ground
+  this in the literal text — do not invent.
+- source_type: "quoted_source" if this beat is narrating or referencing a
+  specific quote from an article, study, publication, or named source that
+  should be visually presented as that source (e.g. "a report from X
+  found..." or a direct quotation); otherwise "narrative".
+- quoted_excerpt: if source_type is "quoted_source", the exact quoted text
+  from vo_text (verbatim substring). Otherwise null.
+- source_name_guess: if source_type is "quoted_source", the name of the
+  publication, study, report, or person the narration attributes this
+  quote to, exactly as stated in vo_text (e.g. "Reuters", "a Harvard
+  study", "the WHO report"). This is used downstream to attempt locating a
+  real source page to screenshot — a real screenshot asset, not a mockup.
+  If vo_text doesn't name a specific source, return null (the downstream
+  system will need a fallback treatment in that case).
+- key_subject_entity_type: if key_subject corresponds to one of this
+  beat's identified entities, its entity_type ("real_person",
+  "fictional_character", or "element"); otherwise null. This lets the
+  Animation Planner choose a treatment appropriate to whether the subject
+  is real (documentary-style, photo-realistic footage/animation) or
+  fictional (illustrative/symbolic treatment, since no real depiction
+  exists).
 
-Pick based on the image subject implied by beat_narration and
-scene_visual_intent (tall subject -> tilt_up/tilt_down, wide subject ->
-pan_left/pan_right, single focal subject -> zoom_in/zoom_out). When the
-content doesn't clearly favor one, still choose deliberately for variety:
-avoid returning the same motion_type as previous_motion_type back-to-back
-across consecutive image beats in this scene unless the subject genuinely
-calls for repeating it.
+Output Schema
+
+Return exactly one JSON object, nothing else — no markdown, no code fences:
+
+{
+  "beats": [
+    {
+      "beat_id": "s1_beat1",
+      "vo_text": "Exact narration for this beat.",
+      "estimated_duration_seconds": 12,
+      "keywords": ["query one", "query two", "query three", "query four", "query five"],
+      "media_type": "video",
+      "entities": [
+        {"name": "Cleopatra", "entity_type": "real_person"}
+      ],
+      "scene_direction": {
+        "setting": {"location": "the royal palace in Alexandria", "time_period": "1st century BC"},
+        "mood": "tense",
+        "key_action": "Cleopatra negotiating with a Roman envoy"
+      },
+      "animation_signal": {
+        "needs_animation": true,
+        "intent": "Emphasize the named statistic just spoken.",
+        "suggested_category": "overlay_text",
+        "key_subject": "40 percent increase",
+        "source_type": "narrative",
+        "quoted_excerpt": null,
+        "source_name_guess": null,
+        "key_subject_entity_type": null
+      }
+    }
+  ]
+}
+
+Constraints
+
+Beats must be in narration order, contiguous, and non-overlapping.
+estimated_duration_seconds is a hint for downstream timing reconciliation
+against real voiceover alignment — not a hard timestamp. entities may be
+an empty list [] when a beat introduces no new named character/element —
+don't force an entry. scene_direction.setting fields may be "" when not
+established; mood and key_action are always required (use "neutral" for
+mood and a plain description of what's being said/shown for key_action if
+nothing more specific applies — never leave them blank). Do not invent
+facts. Ensure the output is valid, parseable JSON.
 """
 
 
 ANIMATION_TAXONOMY = {
-    "full_screen": [
-        "full_screen_broll",
-        "full_screen_title_card",
-        "full_screen_data_viz",
-        "full_screen_transition",
-        "full_screen_color_wash",
-        "full_screen_quote_card",
-    ],
-    "overlay_text": [
-        "lower_third",
-        "kinetic_caption",
-        "bullet_list_reveal",
-        "callout_textbox",
-        "stat_counter_overlay",
-    ],
-    "overlay_graphic": [
-        "icon_pop_in",
-        "icon_sequence",
-        "logo_watermark",
-        "emoji_reaction",
-        "arrow_highlight",
-        "badge_sticker",
-    ],
-    "pip": [
-        "pip_video",
-        "split_screen",
-        "multi_panel_grid",
-    ],
-    "branding": [
-        "avatar_overlay",
-        "mascot_animation",
-    ],
-    "transition": [
-        "ken_burns_pan_zoom",
-        "parallax_layering",
-        "shake_impact",
-        "speed_ramp_indicator",
-    ],
+  "full_screen": [
+    "full_screen_broll", "full_screen_title_card", "full_screen_data_viz",
+    "full_screen_transition", "full_screen_color_wash", "full_screen_quote_card",
+    "full_screen_document_highlight",
+  ],
+  "overlay_text": [
+    "lower_third", "kinetic_caption", "bullet_list_reveal", "callout_textbox",
+    "stat_counter_overlay",
+  ],
+  "overlay_graphic": [
+    "icon_pop_in", "icon_sequence", "logo_watermark", "emoji_reaction",
+    "arrow_highlight", "badge_sticker",
+  ],
+  "pip": ["pip_video", "split_screen", "multi_panel_grid"],
+  "branding": ["avatar_overlay", "mascot_animation"],
+  "transition": ["ken_burns_pan_zoom", "parallax_layering", "shake_impact", "speed_ramp_indicator"],
 }
 
 _ANIMATION_TYPE_TO_CATEGORY = {
@@ -9687,11 +9904,28 @@ _VALID_PLACEMENTS = {
 _VALID_Z_LAYERS = {"background", "midground", "foreground"}
 _VALID_TRIGGERS = {"time_offset", "on_keyword", "on_beat", "scene_start"}
 _VALID_RENDER_HINTS = {"remotion", "ffmpeg"}
+_VALID_ICON_LAYOUTS = {"sequence", "cluster", "pair"}
 
-# NEW: Canva-style entrance animation for plain text overlays (category
-# "overlay_text" — lower-thirds, callout boxes, bullet lists, stat
-# counters). Distinct from _VALID_CAPTION_ANIMATION_TYPES, which governs
-# the word-by-word burned-in captions, not these overlay text elements.
+_ICON_VOCAB = set([
+    'activity', 'alert-triangle', 'anchor', 'archive', 'arrow-right', 'atom', 'award', 'banknote',
+    'bar-chart', 'battery', 'bell', 'bird', 'book', 'brain', 'brain-circuit', 'briefcase', 'bug',
+    'building', 'building-2', 'bus', 'calendar', 'camera', 'car', 'castle', 'cat', 'chart-column',
+    'chart-line', 'check', 'church', 'clapperboard', 'clock', 'code', 'coffee', 'coins', 'compass',
+    'cpu', 'credit-card', 'cross', 'crown', 'database', 'dna', 'dog', 'dollar-sign', 'drama',
+    'dumbbell', 'factory', 'file-text', 'film', 'fingerprint-pattern', 'fish', 'flag', 'flame',
+    'flask-conical', 'folder', 'gauge', 'gavel', 'globe', 'graduation-cap', 'handshake', 'heart',
+    'heart-handshake', 'infinity', 'key', 'landmark', 'laptop', 'leaf', 'library', 'lightbulb',
+    'line-chart', 'lock', 'luggage', 'map', 'map-pin', 'map-pinned', 'medal', 'megaphone',
+    'message-circle', 'mic', 'microscope', 'moon', 'moon-star', 'mountain', 'music', 'network',
+    'newspaper', 'orbit', 'paintbrush', 'palette', 'pen', 'pencil', 'pie-chart', 'piggy-bank',
+    'pill', 'pizza', 'plane', 'podcast', 'puzzle', 'quote', 'radio', 'receipt', 'ribbon', 'rocket',
+    'rss', 'satellite', 'scale', 'scroll', 'search', 'server', 'shield', 'ship', 'shirt',
+    'smartphone', 'snowflake', 'sparkles', 'sprout', 'star', 'stethoscope', 'sun', 'sword',
+    'target', 'telescope', 'tent', 'terminal', 'theater', 'thermometer', 'timer', 'train',
+    'trending-down', 'trending-up', 'trophy', 'tv', 'umbrella', 'user', 'users', 'users-round',
+    'utensils', 'vote', 'wallet', 'waves', 'wifi', 'wind', 'x', 'zap',
+])
+
 _TEXT_ANIMATION_STYLES = [
     "fade_in", "slide_in_left", "slide_in_right", "slide_up", "slide_down",
     "zoom_in", "bounce", "pop", "typewriter", "wipe",
@@ -9699,24 +9933,167 @@ _TEXT_ANIMATION_STYLES = [
 _VALID_TEXT_ANIMATION_STYLES = set(_TEXT_ANIMATION_STYLES)
 _DEFAULT_TEXT_ANIMATION_STYLE = "fade_in"
 
+# Animation canvas per the new ANIMATION_PLANNER_PROMPT (16:9, distinct from
+# the vertical 1080x1920 TIMELINE render resolution defined further down —
+# the renderer is expected to scale/letterbox geometry_px accordingly).
+ANIMATION_CANVAS_WIDTH = 1920
+ANIMATION_CANVAS_HEIGHT = 1080
+CAPTION_SAFE_ZONE_Y = 918  # burned-in captions occupy the bottom 162px
+
+PLACEMENT_ANCHORS_PX = {
+    "top_left": (64, 64), "top_center": (960, 64), "top_right": (1856, 64),
+    "center_left": (64, 540), "center": (960, 540), "center_right": (1856, 540),
+    "bottom_left": (64, 854), "bottom_center": (960, 854), "bottom_right": (1856, 854),
+    "full_frame": (0, 0),
+}
+
 ANIMATION_PLANNER_PROMPT = f"""
-System Prompt
+You are Storybit's Animation Director — the creative director of this
+video, and the FINAL authority on animation decisions for this scene. The
+rendering pipeline (hybrid Remotion + FFmpeg) draws exactly what you return
+here — there is no other layout logic downstream.
 
-You are Storybit's Animation Director — the creative director of this video.
-You alone decide WHICH animation treatment plays for a scene and EXACTLY
-WHERE on screen it is placed. The rendering pipeline (hybrid Remotion +
-FFmpeg) draws the animation at the literal placement/z-index/trigger you
-return here — there is no other layout logic downstream, so your placement
-choice IS the final on-screen position.
+You are given, as JSON:
+- category, style_profile (footage_style, animation_density baseline,
+  favored_animation_types, avoided_animation_types).
+- script_language: ISO 639-1 code of the narration's language (fixed for
+  the whole video).
+- scene_id, scene_visual_intent, scene_on_screen_text, requires_animation,
+  scene_animation_density.
+- beats: the full array of this scene's beats from the Beat Director, each
+  with beat_id, vo_text, estimated_duration_seconds, entities,
+  scene_direction (setting, mood, key_action), and animation_signal
+  (needs_animation, intent, suggested_category, key_subject, source_type,
+  quoted_excerpt, source_name_guess, key_subject_entity_type).
+- previous_scene_last_animation: null (first scene only), or
+  {{"animation_type": ..., "placement": ..., "category": ...}} for the last
+  animated beat of the immediately preceding scene.
 
-Your output must be valid JSON only — no markdown, explanations, comments,
-or code fences.
+Language rule: display_text must be written in script_language — it is
+on-screen text tied to spoken narration, so it must match what the viewer
+is hearing. icon_name (fixed vocabulary), content_binding, and
+render_prompt stay in English regardless of script_language, since they
+are internal/documentation values, not viewer-facing text.
+
+Canvas: every video is 1920x1080px (16:9). All
+positions and sizes you return must be real pixel values on this canvas —
+not vague fractions or percentages.
+
+Placement anchor reference (top-left corner in px for each placement zone,
+before you add your own width/height offset):
+{PLACEMENT_ANCHORS_PX}
+
+Burned-in captions always occupy the bottom 162px of the
+frame (y >= 918). For overlay_text/overlay_graphic types,
+geometry_px must keep (y + height) at or above 918 minus
+a small buffer — this is the same caption safe-zone rule as before, just
+now expressed in exact pixels instead of only a placement name.
+
+Your output is consumed by a deterministic renderer, not another LLM —
+there is no interpretation step between your JSON and the rendered clip.
+That means icon_name, display_text, and color_hint (defined below) must be
+exact, final values, not prose for something else to parse.
+
+Icon vocabulary: if this animation involves an icon (overlay_graphic or
+branding category), every icon_name value must come from this fixed set —
+nothing outside it will resolve to a real component prop:
+{sorted(_ICON_VOCAB)}
+
+Mixing icons for richer visuals: you are not limited to one icon per
+animation. icon_name may be either a single string (the common case) or
+an array of 2-4 icon names when a beat's content genuinely benefits from
+combining concepts visually — e.g. "briefcase" + "trending-up" for a
+promotion, "brain" + "lightbulb" for a psychological insight, "globe" +
+"handshake" for an international deal. When icon_name is "icon_sequence",
+it must be an array (that animation_type exists specifically to reveal
+multiple icons in order). For other overlay_graphic types, use an array
+only when a single icon can't carry the idea — don't mix icons just
+because you can; an unearned combination reads as cluttered, not rich.
+When icon_name is an array, set icon_layout to one of "sequence" (icons
+appear one after another, cascading), "cluster" (icons appear together at
+once, grouped), or "pair" (exactly two icons side by side representing a
+relationship). icon_layout is null when icon_name is a single string.
+
+Mood-aware styling: each beat carries a scene_direction.mood from the Beat
+Director (e.g. "tense", "triumphant", "solemn", "playful"). Let it inform
+color_hint (e.g. warmer/brighter for triumphant or playful moods, cooler
+or higher-contrast for tense or solemn ones) and motion_style (e.g. sharp/
+quick for urgent moods, slow/gentle for reflective ones) — within what the
+category's footage_style/tone otherwise allows. This is a styling input,
+not a license to override the category's established palette.
+
+Real vs. fictional subjects: check key_subject_entity_type on the beat's
+animation_signal. If it's "fictional_character", do not choose a
+treatment that implies photographic reality (e.g. full_screen_broll
+framed as if showing that character) — no real footage of them exists.
+Prefer an illustrative/symbolic treatment instead: an icon-based animation
+representing the idea/mood, a full_screen_quote_card, or on-screen text —
+something that doesn't claim to depict a real image of someone who isn't
+real. "real_person" and "element" subjects have no such restriction.
+
+Your job
+
+Hard gate first: if requires_animation (from the Scene Planner, passed in
+as a scene-level field) is false, return an empty animations list for this
+entire scene — no exceptions, regardless of scene_animation_density or any
+beat's animation_signal. requires_animation is the scene-level "should
+this scene have animation treatment AT ALL" decision; it overrides
+everything below. Only proceed past this point if requires_animation is
+true.
+
+For each beat, decide whether it actually gets an animation. The beat's
+animation_signal is a PROPOSAL from an earlier step, not a final decision —
+you may accept it, reject it (needs_animation was true but you judge it
+unnecessary), or add one it didn't flag, if the scene's overall
+animation_density budget calls for it. As a guide: "low" density scenes
+should end up with animation on roughly one beat, "medium" on a couple,
+"high" on most beats — but use judgment over rigid counts.
+
+Prefer favored_animation_types for this category and avoid
+avoided_animation_types unless the specific beat content overrides that
+default.
+
+Vary treatment across beats within the scene — do not give consecutive
+animated beats the same animation_type/placement combination back to back
+unless the content specifically calls for repeating it, so the video keeps
+visibly changing rather than looking static. This also applies at the
+scene boundary: if this scene's first animated beat would otherwise match
+previous_scene_last_animation's animation_type AND placement exactly,
+change at least one of the two unless the content clearly calls for
+repeating it.
+
+Text sizing: keep display_text short enough to comfortably fit
+geometry_px at a readable size. As a rule of thumb, assume roughly 14-18
+characters fit per 100px of box width at a comfortable reading size — if
+your intended phrase is longer than that, shorten the ON-SCREEN wording
+(never alter the underlying narration) or widen geometry_px within the
+safe margins already described above, rather than shrinking text to the
+point of being unreadable.
+
+Quoted-source handling: if a beat's source_type is "quoted_source", use
+"full_screen_document_highlight" (or another full_screen quote treatment
+only if document_highlight clearly doesn't fit). This treatment is backed
+by a REAL screenshot of the actual source page (captured separately from
+you, using source_name_guess) — not an AI-generated mockup. Because the
+real page's layout is unknown to you in advance, do NOT invent pixel
+coordinates for the highlight itself — instead:
+- set highlight_target_text to the quoted_excerpt exactly as given, so a
+  downstream text-locating step (OCR/text search over the captured
+  screenshot) can find and highlight it precisely;
+- use render_prompt only to describe the highlight STYLE and timing (e.g.
+  "yellow marker-style highlight sweeps left to right under the sentence,
+  starting 1s after the screenshot appears, holding for the rest of the
+  beat") and to name the source if inferable from vo_text;
+- geometry_px for this animation_type is always the full frame
+  (x=0, y=0, width=1920, height=1080) since the
+  screenshot itself fills the screen.
 
 ALLOWED animation_type VALUES (grouped by category):
 
 FULL_SCREEN (category: "full_screen")
 - full_screen_broll, full_screen_title_card, full_screen_data_viz,
-  full_screen_transition, full_screen_color_wash, full_screen_quote_card
+  full_screen_transition, full_screen_color_wash, full_screen_quote_card,
+  full_screen_document_highlight
 
 OVERLAY_TEXT (category: "overlay_text")
 - lower_third, kinetic_caption, bullet_list_reveal, callout_textbox,
@@ -9735,62 +10112,116 @@ CHARACTER (category: "branding")
 MOTION_EFFECT (category: "transition")
 - ken_burns_pan_zoom, parallax_layering, shake_impact, speed_ramp_indicator
 
-Placement values you may choose from (choose the one that best composes
-against the B-roll and on-screen text for this scene):
-top_left, top_center, top_right, center_left, center, center_right,
-bottom_left, bottom_center, bottom_right, full_frame
+Placement values: top_left, top_center, top_right, center_left, center,
+center_right, bottom_left, bottom_center, bottom_right, full_frame
 
 IMPORTANT — caption safe zone: word-by-word captions are always burned in
-along the very bottom edge of the frame (the lowest ~15% of the canvas).
-For any overlay_text or overlay_graphic animation_type, do NOT choose
-bottom_left, bottom_center, or bottom_right — that band is reserved for
-captions and an overlay placed there will visually collide with them.
-Prefer top_left/top_center/top_right, center_left/center/center_right
-instead for those categories. Bottom placements remain fine only for
-full_screen or transition category animation_types, which own the whole
-frame anyway.
-
-TEXT ENTRANCE ANIMATION (only meaningful for category "overlay_text" —
-lower_third, kinetic_caption, bullet_list_reveal, callout_textbox,
-stat_counter_overlay; ignored for every other category, but you must
-still return a valid value):
-
-Choose one text_animation_style from: fade_in, slide_in_left,
-slide_in_right, slide_up, slide_down, zoom_in, bounce, pop, typewriter,
-wipe — the same kind of entrance animation a tool like Canva offers for
-text elements. Match it to the tone/pace of the scene: a punchy stat or
-short callout suits pop/bounce/zoom_in; a calmer lower-third or quote
-suits fade_in/slide_in_left/slide_in_right; a longer bullet list can use
-wipe or slide_up so items feel like they build in sequence; typewriter
-suits a single short line meant to be read character-by-character. Vary
-your choice across scenes rather than defaulting to the same one every
-time, unless the scenes call for consistency (e.g. a repeating lower-third
-format).
+along the very bottom edge of the frame (lowest ~15% of canvas). For any
+overlay_text or overlay_graphic animation_type, do NOT choose bottom_left,
+bottom_center, or bottom_right. Prefer top_left/top_center/top_right,
+center_left/center/center_right instead. Bottom placements remain fine only
+for full_screen or transition category animation_types, which own the
+whole frame anyway.
 
 Output Schema
 
-Return exactly one JSON object with these fields:
+Return exactly one JSON object, nothing else — no markdown, no code fences:
 
 {{
-  "animation_type": "icon_pop_in",
-  "category": "overlay_graphic",
-  "placement": "top_right",
-  "z_index_layer": "foreground",
-  "trigger": "on_keyword",
-  "duration_frames": 45,
-  "content_binding": "icon:lightbulb",
-  "render_engine_hint": "remotion",
-  "text_animation_style": "fade_in"
+  "animations": [
+    {{
+      "beat_id": "s1_beat1",
+      "animation_type": "icon_pop_in",
+      "category": "overlay_graphic",
+      "placement": "top_right",
+      "geometry_px": {{"x": 1696, "y": 64, "width": 160, "height": 160}},
+      "motion": {{
+        "start_xy_px": [1696, 44],
+        "end_xy_px": [1696, 64],
+        "motion_style": "pop-in with slight bounce, scale 80% to 100%"
+      }},
+      "z_index_layer": "foreground",
+      "trigger": "on_keyword",
+      "duration_frames": 45,
+      "content_binding": "icon:lightbulb",
+      "icon_name": "lightbulb",
+      "icon_layout": null,
+      "display_text": null,
+      "color_hint": "#F5A623",
+      "highlight_target_text": null,
+      "render_prompt": "A lightbulb icon pops in from 80% scale to 100% with a slight bounce, positioned top-right, appearing exactly as the word 'idea' is spoken; icon uses the video's accent color; holds for 1.5s then fades.",
+      "render_engine_hint": "remotion"
+    }}
+  ]
 }}
+
+Field Guidelines
+
+beat_id: must match a beat_id from the input beats array. Only include
+beats that actually receive an animation — omit beats with no animation.
+
+geometry_px: {{x, y, width, height}} in real pixels on the
+1920x1080 canvas — the element's full rendered
+footprint. Derive x/y from the PLACEMENT_ANCHORS_PX entry for your chosen
+placement, then choose width/height deliberately for this content: icons
+typically 120-240px square depending on emphasis; text overlay boxes sized
+to fit the actual text at a readable size (roughly 36-64px font for
+overlay text, larger for full_screen title/quote cards); pip frames
+roughly 1/3 to 1/2 of canvas width/height. For full_screen and transition
+category types, geometry_px is always the full frame: {{"x": 0, "y": 0,
+"width": 1920, "height": 1080}}.
+
+motion: {{start_xy_px, end_xy_px, motion_style}}. For a static element
+(appears in place, no travel), set start_xy_px equal to end_xy_px and
+describe the entrance/exit behavior (fade, pop, scale) in motion_style.
+For an element that visibly moves or travels across the frame, set
+different start/end coordinates. motion_style is a short phrase, not a
+full paragraph — the paragraph-level detail goes in render_prompt.
+
+icon_name: a single string, or an array of 2-4 strings (see "Mixing icons"
+above), from the icon vocabulary — required (non-null) whenever category
+is "overlay_graphic" or "branding". null for every other category.
+
+icon_layout: "sequence", "cluster", or "pair" — required (non-null) when
+icon_name is an array; null when icon_name is a single string or null.
+
+display_text: the literal on-screen text for this animation, grounded in
+this beat's vo_text/on_screen_text/key_subject — never invented wording.
+A single string for most types; an array of short strings for
+bullet_list_reveal or icon_sequence when each item needs its own label.
+null for animation types with no on-screen text (e.g. a plain
+ken_burns_pan_zoom with no overlay copy).
+
+color_hint: a hex color string (e.g. "#F5A623"), always required — the
+accent color for this animation, chosen to fit the category's
+footage_style/tone unless the specific beat content calls for something
+else (e.g. a red accent for a warning statistic).
+
+highlight_target_text: the exact quoted_excerpt from the source beat's
+animation_signal when animation_type is "full_screen_document_highlight"
+(or any other treatment highlighting specific text within a real
+screenshot asset). null for every other animation_type.
+
+content_binding: a short free-form label kept for logging/debugging (e.g.
+"icon:lightbulb", "data:quarterly_revenue") — not the authoritative value
+for icon or text content; icon_name/display_text/color_hint above are what
+the renderer actually binds to.
+
+render_prompt: a full descriptive creative-direction paragraph — human-
+readable rationale and motion/reveal detail for anyone reviewing this
+animation. It documents the "why" and the motion feel; it is not parsed by
+the renderer, which reads geometry_px/motion/icon_name/display_text/
+color_hint directly.
 
 Constraints
 
-Return ONLY the JSON object. No markdown, no code fences, no commentary.
-Every field is required. Do not omit any field.
-Choose `placement` deliberately based on where it will read best given the
-scene's on_screen_text and visual_intent — this is a real creative/staging
-decision, not a formality.
+Every field is required for each animation object. Do not omit any field
+(use null where noted above). Choose placement and geometry deliberately
+based on what will read best against this beat's B-roll and on_screen_text
+— a real creative decision, not a formality. Return ONLY the JSON object.
+
 """
+
 
 class EditVideo(BaseModel):
     userId: str
@@ -9798,18 +10229,6 @@ class EditVideo(BaseModel):
     voice: str
     langCode: str = "en"
     durationMinutes: int = 0
-    # NEW: Fish Audio prosody/normalization settings — verified against
-    # Fish Audio's actual /v1/tts request schema:
-    #   {"prosody": {"volume": 0, "normalize_loudness": true}, "normalize": true, ...}
-    # volume: dB adjustment, roughly -20..20, default 0 (Fish Audio's own default).
-    # loudness_normalization -> prosody.normalize_loudness.
-    # text_normalization -> top-level "normalize" (Fish Audio's own docs: reduces
-    #   latency but may reduce accuracy on numbers/dates when disabled).
-    # All optional — omit to use Fish Audio's own defaults. IMPORTANT: these are
-    # only forwarded correctly if GenerateSpeechRequest/generate_speech (defined
-    # outside this file) also passes them through into the actual Fish Audio
-    # request body — that wiring isn't visible from this file and may need its
-    # own update.
     volume: Optional[float] = None
     loudness_normalization: Optional[bool] = None
     text_normalization: Optional[bool] = None
@@ -9821,10 +10240,7 @@ class TrackPatch(BaseModel):
 
 
 _VALID_CAPTION_ANIMATION_TYPES = {
-    "kinetic_caption",
-    "static_line",
-    "typewriter",
-    "word_pop",
+    "kinetic_caption", "static_line", "typewriter", "word_pop",
 }
 
 
@@ -9834,61 +10250,17 @@ class SceneStyleUpdate(BaseModel):
     outline_color: Optional[str] = None
     animation_type: Optional[str] = None
     background_color: Optional[str] = None
-    # NEW: caption text positioning. Merged into scene["caption_style"] on
-    # top of DEFAULT_CAPTION_STYLE — _build_ass_from_words already reads
-    # both fields (vertical_position -> ASS Alignment, margin_bottom_percent
-    # -> ASS MarginV as a % of frame height), so no render-side change was
-    # needed, just exposing them on this request model.
     vertical_position: Optional[Literal["top", "middle", "bottom"]] = None
     margin_bottom_percent: Optional[float] = None
-    # NEW: horizontal caption positioning — was previously always centered
-    # (ASS alignment 2/5/8), with no way to left- or right-align captions.
-    # Combined with vertical_position by _build_ass_from_words into one of
-    # the 9 ASS numpad alignment values. margin_horizontal_percent is the
-    # distance from whichever side edge horizontal_position anchors to
-    # (left or right), as a percentage of frame WIDTH — ignored for
-    # "center", same as margin_bottom_percent is ignored for "middle".
     horizontal_position: Optional[Literal["left", "center", "right"]] = None
     margin_horizontal_percent: Optional[float] = None
-    # NEW: on-screen window (seconds, relative to this scene's own start —
-    # 0 = the moment the scene begins) for the scene's overlay/infographic
-    # TEXT animation (lower-third, title card, quote card, etc.) — NOT the
-    # burned-in word captions, which always span the whole scene. Stored as
-    # animation["start_offset_seconds"]/["end_offset_seconds"] and read by
-    # build_timeline_from_scenes when computing that track's startFrame/
-    # endFrame. Provide both together.
-    text_start: Optional[float] = None
-    text_end: Optional[float] = None
-    # NEW: Canva-style entrance animation for the scene's plain-text
-    # overlay (category "overlay_text" — lower-third, callout box, bullet
-    # list, stat counter). One of _TEXT_ANIMATION_STYLES. Ignored if the
-    # scene's overlay is an infographic composition or has no overlay at
-    # all — merged into scene["animation"]["text_animation_style"].
-    text_animation_style: Optional[str] = None
-    # NEW: the actual TEXT CONTENT shown — not styling, the words
-    # themselves. Updates scene["on_screen_text"]. If the scene's overlay
-    # is a plain overlay_text type (lower_third, callout_textbox,
-    # kinetic_caption), this is what gets drawn directly. If the scene's
-    # overlay is an infographic composition (title card, quote card, stat
-    # counter, bullet list, data viz), this also re-derives that
-    # composition's props (title/quote/value+label/items) from the new
-    # text via the same deterministic parsing _get_scene_infographic
-    # already uses at creation time — so editing the text keeps the
-    # infographic's structured fields in sync instead of going stale.
-    text: Optional[str] = None
 
 
 class BeatSplitUpdate(BaseModel):
-    # Absolute seconds (same timebase as beat/scene start/end) at which to
-    # split one beat into two independent beats. Always splits within the
-    # beat's existing [start, end] — nothing else to configure.
     split_at: float
 
 
 class BeatInsertUpdate(BaseModel):
-    # Absolute seconds (same timebase as beat/scene start/end) for a brand
-    # new B-roll clip, carved out of an existing beat's window. Must fall
-    # inside the target beat's [start, end].
     start: float
     end: float
 
@@ -9898,46 +10270,32 @@ class SceneTrimUpdate(BaseModel):
     end: float
 
 
-class SceneInfographicUpdate(BaseModel):
+class BeatAnimationUpdate(BaseModel):
+    """Create or edit the (at most one) animation attached to a beat."""
     animation_type: Optional[str] = None
-    props: Optional[dict[str, Any]] = None
+    placement: Optional[str] = None
+    geometry_px: Optional[dict[str, Any]] = None
+    motion: Optional[dict[str, Any]] = None
     duration_frames: Optional[int] = None
-    # NEW: same idea as SceneStyleUpdate.text_start/text_end but for an
-    # infographic composition specifically — on-screen window in seconds,
-    # relative to this scene's own start. Stored the same way, on the
-    # scene's animation dict, since build_timeline_from_scenes computes
-    # startFrame/endFrame for BOTH infographic and plain-animation tracks
-    # from that one shared dict. Provide both together.
-    start_seconds: Optional[float] = None
-    end_seconds: Optional[float] = None
+    z_index_layer: Optional[str] = None
+    trigger: Optional[str] = None
+    content_binding: Optional[str] = None
+    icon_name: Optional[Any] = None
+    icon_layout: Optional[str] = None
+    display_text: Optional[Any] = None
+    color_hint: Optional[str] = None
+    highlight_target_text: Optional[str] = None
+    render_prompt: Optional[str] = None
+    render_engine_hint: Optional[str] = None
 
 
 class SceneBrollSelectUpdate(BaseModel):
-    # The Pexels asset to use as this scene's B-roll.
     asset_id: Any
     source: str
-    # A scene can have several rotating B-roll "beats" (one every ~10s).
-    # beat_id selects which beat this override applies to. If omitted,
-    # the endpoint searches every beat's own candidate pool for this
-    # asset_id first, falling back to the scene's first beat if it isn't
-    # found in any pool.
     beat_id: Optional[str] = None
-    # NEW: optional manual override of the image motion effect (Ken Burns
-    # pan/zoom/tilt). Only meaningful when the selected candidate's source
-    # is "image" — ignored otherwise. When omitted, the beat keeps
-    # whichever motion_type the LLM already chose for it in
-    # BEAT_KEYWORDS_PROMPT (see _resolve_beat_motion_type).
     motion_type: Optional[str] = None
-    # NEW: optional B-roll duration override, in seconds (same timebase as
-    # scene start/end). Provide both together to resize the on-screen
-    # window in the same call that picks the asset — no separate endpoint
-    # needed.
     start: Optional[float] = None
     end: Optional[float] = None
-    # If true (default) and start/end are provided, the very next beat in
-    # this scene has its own `start` pulled forward/back to match this
-    # beat's new `end`, so beats stay contiguous with no gap or overlap.
-    # Only relevant for scenes with more than one rotating B-roll beat.
     adjust_next_beat: bool = True
 
 
@@ -9982,51 +10340,16 @@ PEXELS_SCENE_IMAGE_ORIENTATION = os.getenv("PEXELS_SCENE_IMAGE_ORIENTATION", "la
 PEXELS_SCENE_SIZE = os.getenv("PEXELS_SCENE_SIZE", None)
 PEXELS_SCENE_COLOR = os.getenv("PEXELS_SCENE_COLOR", None)
 
-# FIX (blank/color-fallback beats): a scene with N beats fires up to
-# N * len(keywords) * 2 (video+image) Pexels calls all at once via
-# asyncio.gather, and a full multi-scene /edit-video request can add up to
-# several hundred concurrent requests. Pexels' rate limit is easy to hit at
-# that volume; a throttled call is caught and logged per-keyword but still
-# leaves that beat with fewer (or zero) candidates — indistinguishable from
-# Pexels genuinely having no footage for the query. Capping concurrency
-# smooths the request burst out over time instead of firing it all at once,
-# which cuts down on throttling-caused empty results.
 PEXELS_MAX_CONCURRENT_REQUESTS = int(os.getenv("PEXELS_MAX_CONCURRENT_REQUESTS", "8"))
 _pexels_semaphore = asyncio.Semaphore(PEXELS_MAX_CONCURRENT_REQUESTS)
 
 BROLL_KEYWORDS_MAX = int(os.getenv("BROLL_KEYWORDS_MAX", "6"))
 BROLL_KEYWORDS_MIN = int(os.getenv("BROLL_KEYWORDS_MIN", "5"))
 
-# NEW: how long each rotating B-roll "beat" is allowed to be. Any scene
-# whose spoken duration exceeds BEAT_MAX_SECONDS gets split into multiple
-# beats, each with its own LLM-generated keywords and its own Pexels
-# search, so the visible B-roll changes roughly every 10 seconds.
-#
-# We keep a narrow [MIN, MAX] band rather than a single fixed "10" because
-# `_compute_beat_boundaries` divides a scene's total duration evenly across
-# whole beats — a hard-coded exact 10s target would leave a tiny, ugly
-# remainder beat on scenes that aren't exact multiples of 10s (e.g. a 34s
-# scene would produce a 4s last beat). An 8-12s band lets the splitter
-# round each beat's length to something close to 10s while still landing
-# exactly on the scene's start/end.
-BEAT_MIN_SECONDS = int(os.getenv("BEAT_MIN_SECONDS", "8"))
-BEAT_MAX_SECONDS = int(os.getenv("BEAT_MAX_SECONDS", "12"))
-
 TIMELINE_FPS = int(os.getenv("TIMELINE_FPS", "30"))
 TIMELINE_WIDTH = int(os.getenv("TIMELINE_WIDTH", "1080"))
 TIMELINE_HEIGHT = int(os.getenv("TIMELINE_HEIGHT", "1920"))
 
-# NEW: captions default to a very low, near-bottom-edge position on the
-# 9:16 canvas. `vertical_position`/`margin_bottom_percent` are read by the
-# downstream ASS/Remotion caption renderer (outside this file) to place the
-# karaoke caption block. Expressed as a percentage of TIMELINE_HEIGHT rather
-# than a fixed pixel margin so it stays "very low" consistently across any
-# canvas size. margin_bottom_percent is kept small (close to the edge) per
-# explicit request — if platform UI (like/comment/share buttons on
-# YouTube Shorts/TikTok/Reels) ends up overlapping captions on a specific
-# export target, raise this a few points rather than removing it outright.
-# Any per-scene `caption_style` the user/editor sets is merged on top of
-# this default — it only fills in fields the caller didn't specify.
 DEFAULT_CAPTION_STYLE = {
     "vertical_position": "bottom",
     "margin_bottom_percent": 3,
@@ -10045,20 +10368,9 @@ def _get_whisperx_model():
     if _whisperx_model is None:
         print(f"[WHISPERX] loading model '{WHISPERX_MODEL_SIZE}' on {WHISPERX_DEVICE}")
         _whisperx_model = whisperx.load_model(
-            WHISPERX_MODEL_SIZE,
-            WHISPERX_DEVICE,
-            compute_type=WHISPERX_COMPUTE_TYPE,
+            WHISPERX_MODEL_SIZE, WHISPERX_DEVICE, compute_type=WHISPERX_COMPUTE_TYPE,
         )
     return _whisperx_model
-
-
-def _preload_whisperx_align_model(language_code: str = "en"):
-    if language_code not in _whisperx_align_cache:
-        print(f"[WHISPERX] preloading alignment model for language '{language_code}'")
-        align_model, metadata = whisperx.load_align_model(
-            language_code=language_code, device=WHISPERX_DEVICE
-        )
-        _whisperx_align_cache[language_code] = (align_model, metadata)
 
 
 def _run_whisperx_sync(audio_bytes: bytes) -> dict:
@@ -10074,19 +10386,13 @@ def _run_whisperx_sync(audio_bytes: bytes) -> dict:
 
         if language not in _whisperx_align_cache:
             print(f"[WHISPERX] loading alignment model for language '{language}'")
-            align_model, metadata = whisperx.load_align_model(
-                language_code=language, device=WHISPERX_DEVICE
-            )
+            align_model, metadata = whisperx.load_align_model(language_code=language, device=WHISPERX_DEVICE)
             _whisperx_align_cache[language] = (align_model, metadata)
 
         align_model, metadata = _whisperx_align_cache[language]
 
         aligned_result = whisperx.align(
-            result["segments"],
-            align_model,
-            metadata,
-            audio,
-            WHISPERX_DEVICE,
+            result["segments"], align_model, metadata, audio, WHISPERX_DEVICE,
             return_char_alignments=False,
         )
 
@@ -10102,10 +10408,6 @@ async def _generate_word_timestamps(audio_url: str) -> dict:
     async with _whisperx_lock:
         return await asyncio.to_thread(_run_whisperx_sync, audio_bytes)
 
-
-# ---------------------------------------------------------------------------
-# TTS chunking helpers
-# ---------------------------------------------------------------------------
 
 def _split_text_for_tts(text: str, max_chars: int = TTS_MAX_CHARS_PER_CALL) -> list[str]:
     text = (text or "").strip()
@@ -10153,16 +10455,6 @@ async def _generate_speech_possibly_chunked(
     loudness_normalization: Optional[bool] = None,
     text_normalization: Optional[bool] = None,
 ) -> dict:
-    """
-    volume/loudness_normalization/text_normalization map to Fish Audio's
-    real /v1/tts fields (prosody.volume, prosody.normalize_loudness, and
-    top-level normalize respectively). They're passed through to
-    GenerateSpeechRequest as keyword args here — but GenerateSpeechRequest
-    and generate_speech() are defined outside this file, so whether Fish
-    Audio actually receives them depends on that model/function also
-    accepting and forwarding these fields. If they're not yet defined
-    there, this will need a matching update in that file too.
-    """
     tts_kwargs = {}
     if volume is not None:
         tts_kwargs["volume"] = volume
@@ -10175,25 +10467,18 @@ async def _generate_speech_possibly_chunked(
 
     if len(chunks) <= 1:
         speech_request = GenerateSpeechRequest(
-            userId=user_id, script=tagged_text, voice=voice,
-            langCode=lang_code, durationMinutes=0,
-            **tts_kwargs,
+            userId=user_id, script=tagged_text, voice=voice, langCode=lang_code, durationMinutes=0, **tts_kwargs,
         )
         return await generate_speech(speech_request)
 
-    print(
-        f"[tts] narration is {len(tagged_text)} chars — splitting into "
-        f"{len(chunks)} TTS calls to avoid provider truncation"
-    )
+    print(f"[tts] narration is {len(tagged_text)} chars — splitting into {len(chunks)} TTS calls to avoid provider truncation")
 
     work_dir = tempfile.mkdtemp(prefix="tts_chunks_")
     try:
         chunk_paths = []
         for idx, chunk_text in enumerate(chunks):
             speech_request = GenerateSpeechRequest(
-                userId=user_id, script=chunk_text, voice=voice,
-                langCode=lang_code, durationMinutes=0,
-                **tts_kwargs,
+                userId=user_id, script=chunk_text, voice=voice, langCode=lang_code, durationMinutes=0, **tts_kwargs,
             )
             chunk_result = await generate_speech(speech_request)
             chunk_bytes = await _download_bytes(chunk_result["url"])
@@ -10208,16 +10493,9 @@ async def _generate_speech_possibly_chunked(
                 f.write(f"file '{p}'\n")
 
         combined_path = os.path.join(work_dir, "combined.mp3")
-        # Re-encode rather than stream-copy — chunk calls can come back
-        # with slightly different internal formats, and concat demuxer
-        # stream-copy is fragile across those; re-encoding guarantees a
-        # single consistent output file.
         cmd = [
-            FFMPEG_BIN, "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", list_path,
-            "-c:a", "libmp3lame", "-b:a", "192k",
-            combined_path,
+            FFMPEG_BIN, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c:a", "libmp3lame", "-b:a", "192k", combined_path,
         ]
         await _run(cmd)
 
@@ -10263,7 +10541,14 @@ def _get_scene_broll_keywords(scene: dict) -> list:
     return keywords
 
 
-def _dedupe_and_trim(items: list, limit: int) -> list:
+def _dedupe_and_trim(items: list, limit: Optional[int] = None) -> list:
+    """
+    limit=None dedupes the FULL pool with no truncation — use this before
+    CLIP reranking, since trimming before scoring means the best match
+    can be discarded before it's ever evaluated (see _fetch_media_for_keywords).
+    Pass an actual limit only when you want the pool truncated in its
+    CURRENT order (e.g. AFTER reranking, to cap the final candidate list).
+    """
     def _identity(item: dict):
         for key in ("id", "video_id", "photo_id", "asset_id"):
             if key in item:
@@ -10282,52 +10567,16 @@ def _dedupe_and_trim(items: list, limit: int) -> list:
                 continue
             seen.add(item_id)
         deduped.append(item)
-        if len(deduped) >= limit:
+        if limit is not None and len(deduped) >= limit:
             break
     return deduped
 
 
-# =============================================================================
-# CLIP / X-CLIP SEMANTIC RERANKING  (NEW)
-#
-# Pexels' own search returns candidates in whatever order its own relevance
-# scoring picks — that order has no guarantee of matching what the keyword
-# actually depicts, and _resolve_beat_broll_selection simply takes
-# candidates[0]. This reranks the already-fetched, already-deduped candidate
-# pool by actual text-image / text-video similarity, so the DEFAULT pick for
-# a beat is the best semantic match, not just whichever Pexels listed first.
-#
-# Runs only on the trimmed, per-beat pool (PEXELS_SCENE_RESULT_LIMIT items,
-# not the full raw pool across every keyword) to keep the cost bounded —
-# see _fetch_media_for_keywords, where this is called once per beat/scene
-# lookup, right before the pool is returned.
-# =============================================================================
-
 CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "openai/clip-vit-base-patch32")
 CLIP_DEVICE = os.getenv("CLIP_DEVICE", "cpu")
 
-# Feature flag — reranking downloads a thumbnail image per candidate and
-# scores it against the beat's own keywords, for both images and video
-# candidates (video candidates use their Pexels-provided thumbnail, not
-# extracted frames). Default on, but can be turned off without touching
-# code if the extra download/inference cost isn't worth it at your render
-# volume.
 CLIP_RERANK_ENABLED = os.getenv("CLIP_RERANK_ENABLED", "true").lower() == "true"
 
-# NEW: real accuracy thresholds, now meaningful because _clip_score_images_sync
-# returns raw cosine similarity rather than a pool-relative softmax score.
-# If the BEST video candidate's score falls below CLIP_MIN_VIDEO_SCORE — i.e.
-# even the top pick isn't a confident match for the beat's keywords — and the
-# BEST image candidate clears CLIP_MIN_IMAGE_SCORE, the beat falls back to
-# using the image instead of the video, regardless of which media type the
-# LLM originally preferred. This is what actually enforces "don't use an
-# inaccurate video just because it's the best of a bad video pool."
-#
-# These defaults are tuned for openai/clip-vit-base-patch32: ~0.30+ is a
-# strong match, ~0.20-0.30 is a plausible-but-loose match, below ~0.20
-# usually means the image doesn't really depict the query. Override via env
-# if you switch to a different CLIP checkpoint (larger models tend to
-# produce higher absolute cosine similarities for the same match quality).
 CLIP_MIN_VIDEO_SCORE = float(os.getenv("CLIP_MIN_VIDEO_SCORE", "0.24"))
 CLIP_MIN_IMAGE_SCORE = float(os.getenv("CLIP_MIN_IMAGE_SCORE", "0.22"))
 
@@ -10344,54 +10593,40 @@ def _get_clip():
     return _clip_model, _clip_processor
 
 
-def _clip_score_images_sync(query_text: str, images: list) -> dict:
+def _clip_score_images_sync(query_texts: list[str], images: list) -> dict:
     """
-    images: list of (candidate_id, PIL.Image). Returns {candidate_id: score}.
-
-    FIX (no real quality signal): this used to return softmax(logits) —
-    a probability distribution that always sums to 1.0 ACROSS THE POOL,
-    regardless of whether any candidate is actually a good match. A pool
-    of 6 mediocre videos would still produce a "confident-looking" top
-    score, because softmax only measures "best of what's here," not
-    "good enough in absolute terms." That made a real accuracy threshold
-    impossible.
-
-    Now returns raw cosine similarity between the (L2-normalized) image
-    and text embeddings — bounded roughly -1..1, comparable across
-    different beats/pools, and interpretable on its own: for
-    openai/clip-vit-base-patch32, ~0.30+ is a strong match, ~0.20-0.30 is
-    plausible-but-loose, and below ~0.20 usually means the image doesn't
-    actually depict the query. Relative ranking within one pool is
-    unchanged (cosine similarity and softmax(logits) are both monotonic
-    transforms of the same underlying similarity), so sort order from
-    this function's callers doesn't change — only whether the SCORE ITSELF
-    can be used for a threshold decision changes.
+    Scores each image against EVERY keyword phrase individually and takes
+    the MAX score per image — "how well does this candidate match its
+    single best keyword" — instead of blending all keywords into one
+    joined CLIP text query. A beat's 5-6 keywords are deliberately
+    different visual angles (wide vs. close-up, subject vs. action,
+    etc.); CLIP's text encoder also truncates at 77 tokens and degrades
+    on long multi-concept strings. Blending them into one query threw
+    away exactly the specificity that made having several keywords
+    useful — a candidate that's a perfect match for one keyword but
+    irrelevant to the rest used to lose to a mediocre match for
+    "everything at once."
     """
     model, processor = _get_clip()
     pil_images = [img for _cid, img in images]
-    inputs = processor(text=[query_text], images=pil_images, return_tensors="pt", padding=True)
+    inputs = processor(text=query_texts, images=pil_images, return_tensors="pt", padding=True)
     inputs = {k: v.to(CLIP_DEVICE) for k, v in inputs.items()}
     with torch.no_grad():
         image_embeds = model.get_image_features(pixel_values=inputs["pixel_values"])
-        text_embeds = model.get_text_features(
-            input_ids=inputs["input_ids"], attention_mask=inputs.get("attention_mask")
-        )
+        text_embeds = model.get_text_features(input_ids=inputs["input_ids"], attention_mask=inputs.get("attention_mask"))
         image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
         text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-        sims = (image_embeds @ text_embeds.T).squeeze(-1).tolist()
-        if not isinstance(sims, list):
-            sims = [sims]
-    return {images[i][0]: sims[i] for i in range(len(images))}
+        # [num_images, num_texts] similarity matrix — take each image's
+        # BEST-matching keyword rather than an average across all of them.
+        sims = image_embeds @ text_embeds.T
+        best_per_image = sims.max(dim=-1).values.tolist()
+        if not isinstance(best_per_image, list):
+            best_per_image = [best_per_image]
+    return {images[i][0]: best_per_image[i] for i in range(len(images))}
 
 
-async def _rerank_images_with_clip(query_text: str, image_candidates: list) -> list:
-    """
-    Re-orders Pexels image candidates by CLIP text-image similarity against
-    `query_text` (the beat's own keywords). Any candidate that fails to
-    download or score is kept, just pushed to the end rather than dropped —
-    a reranking failure should never reduce the pool a beat can pick from.
-    """
-    if not CLIP_RERANK_ENABLED or not image_candidates or not query_text.strip():
+async def _rerank_images_with_clip(query_texts: list[str], image_candidates: list) -> list:
+    if not CLIP_RERANK_ENABLED or not image_candidates or not query_texts:
         return image_candidates
 
     downloaded = []
@@ -10416,9 +10651,7 @@ async def _rerank_images_with_clip(query_text: str, image_candidates: list) -> l
         return image_candidates
 
     try:
-        scores = await asyncio.to_thread(
-            _clip_score_images_sync, query_text, [(cid, img) for cid, img, _c in downloaded]
-        )
+        scores = await asyncio.to_thread(_clip_score_images_sync, query_texts, [(cid, img) for cid, img, _c in downloaded])
     except Exception as e:
         print(f"[CLIP] scoring failed, keeping original order: {e}")
         return image_candidates
@@ -10433,18 +10666,8 @@ async def _rerank_images_with_clip(query_text: str, image_candidates: list) -> l
     return result
 
 
-async def _rerank_videos_with_clip(query_text: str, video_candidates: list) -> list:
-    """
-    Re-orders Pexels video candidates by CLIP text-image similarity,
-    scored against each candidate's Pexels-provided THUMBNAIL image —
-    same CLIP model/scoring as _rerank_images_with_clip, just applied to
-    the video's thumbnail rather than an image asset. This is deliberately
-    NOT X-CLIP / frame sampling: no video download, no ffmpeg frame
-    extraction, just one thumbnail image per candidate, so it's as cheap
-    as the image reranking path. Any candidate whose thumbnail fails to
-    download/score is kept, pushed to the end rather than dropped.
-    """
-    if not CLIP_RERANK_ENABLED or not video_candidates or not query_text.strip():
+async def _rerank_videos_with_clip(query_texts: list[str], video_candidates: list) -> list:
+    if not CLIP_RERANK_ENABLED or not video_candidates or not query_texts:
         return video_candidates
 
     downloaded = []
@@ -10469,9 +10692,7 @@ async def _rerank_videos_with_clip(query_text: str, video_candidates: list) -> l
         return video_candidates
 
     try:
-        scores = await asyncio.to_thread(
-            _clip_score_images_sync, query_text, [(cid, img) for cid, img, _c in downloaded]
-        )
+        scores = await asyncio.to_thread(_clip_score_images_sync, query_texts, [(cid, img) for cid, img, _c in downloaded])
     except Exception as e:
         print(f"[CLIP] video thumbnail scoring failed, keeping original order: {e}")
         return video_candidates
@@ -10486,16 +10707,27 @@ async def _rerank_videos_with_clip(query_text: str, video_candidates: list) -> l
     return result
 
 
-async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
+def _filter_by_min_clip_score(candidates: list, min_score: float) -> list:
     """
-    NEW: shared Pexels-search core, factored out of what used to be
-    `_fetch_scene_media` so both whole-scene lookups (silent scenes with no
-    narration, used as a single "beat") and per-beat lookups (the normal,
-    rotating-every-~10s path) share identical search/filter/dedupe logic.
+    Drops any candidate that WAS CLIP-scored and falls below the minimum
+    relevance threshold — this is the actual "only pick relevant media"
+    enforcement. Candidates with no score at all (CLIP disabled, or the
+    scoring pass failed and fell back to original order) are left
+    untouched: an unscored candidate isn't known to be irrelevant, so
+    filtering it out would be guessing, not enforcing relevance. If
+    filtering empties out a pool entirely, that's intentional — it means
+    nothing fetched for these keywords actually cleared the bar, and
+    _fill_empty_beats' retry/borrow/last-resort fallback chain takes over
+    from there rather than this function silently keeping a bad match.
+    """
+    if not candidates:
+        return candidates
+    if not any(c.get("_clip_score") is not None for c in candidates):
+        return candidates
+    return [c for c in candidates if c.get("_clip_score") is None or c["_clip_score"] >= min_score]
 
-    `label` is only used for log lines (e.g. "s2" or "s2:s2_b3") so failures
-    are traceable to the exact scene/beat.
-    """
+
+async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     empty_result = {
         "videos": {"total_results": 0, "results": [], "error": None},
         "images": {"total_results": 0, "results": [], "error": None},
@@ -10513,12 +10745,8 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
         try:
             async with _pexels_semaphore:
                 data = await asyncio.to_thread(
-                    _pexels_search_videos_sync,
-                    keyword,
-                    PEXELS_SCENE_PER_KEYWORD_PER_PAGE,
-                    PEXELS_SCENE_PAGE,
-                    PEXELS_SCENE_VIDEO_ORIENTATION,
-                    PEXELS_SCENE_SIZE,
+                    _pexels_search_videos_sync, keyword, PEXELS_SCENE_PER_KEYWORD_PER_PAGE,
+                    PEXELS_SCENE_PAGE, PEXELS_SCENE_VIDEO_ORIENTATION, PEXELS_SCENE_SIZE,
                 )
             return {"keyword": keyword, "data": data, "error": None}
         except Exception as e:
@@ -10528,13 +10756,8 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
         try:
             async with _pexels_semaphore:
                 data = await asyncio.to_thread(
-                    _pexels_search_images_sync,
-                    keyword,
-                    PEXELS_SCENE_PER_KEYWORD_PER_PAGE,
-                    PEXELS_SCENE_PAGE,
-                    PEXELS_SCENE_IMAGE_ORIENTATION,
-                    PEXELS_SCENE_SIZE,
-                    PEXELS_SCENE_COLOR,
+                    _pexels_search_images_sync, keyword, PEXELS_SCENE_PER_KEYWORD_PER_PAGE,
+                    PEXELS_SCENE_PAGE, PEXELS_SCENE_IMAGE_ORIENTATION, PEXELS_SCENE_SIZE, PEXELS_SCENE_COLOR,
                 )
             return {"keyword": keyword, "data": data, "error": None}
         except Exception as e:
@@ -10543,8 +10766,7 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     video_tasks = [_get_videos_for(k) for k in keywords]
     image_tasks = [_get_images_for(k) for k in keywords]
     video_results, image_results = await asyncio.gather(
-        asyncio.gather(*video_tasks),
-        asyncio.gather(*image_tasks),
+        asyncio.gather(*video_tasks), asyncio.gather(*image_tasks),
     )
 
     video_errors = [r["error"] for r in video_results if r["error"]]
@@ -10573,39 +10795,46 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     if dropped_img:
         print(f"[edit-video] {label}: dropped {dropped_img} non-landscape image result(s) at fetch time")
 
-    videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
-    photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
+    # NEW: dedupe WITHOUT trimming first — the previous version trimmed to
+    # PEXELS_SCENE_RESULT_LIMIT (6) here, before CLIP ever scored anything.
+    # With 5-6 keywords each contributing their own Pexels results, the raw
+    # pool is routinely 20-30+ candidates; truncating before scoring meant
+    # the actual best match could be candidate #14 and never get evaluated
+    # at all. Now the full deduped pool is scored, and only trimmed to the
+    # display limit AFTER reranking + relevance filtering below.
+    videos_full = _dedupe_and_trim(videos_pool)
+    photos_full = _dedupe_and_trim(images_pool)
 
-    # NEW: rerank by actual semantic match (CLIP for images, and CLIP
-    # applied to video thumbnails) against the same keywords that were
-    # searched, so the DEFAULT pick (candidates[0], see
-    # _resolve_beat_broll_selection) is the best visual match Pexels
-    # returned — not just whichever result Pexels' own search ranking
-    # happened to list first. Runs only on this already-trimmed pool, not
-    # the full raw search results.
-    query_text = ", ".join(keywords)
-    if photos:
-        photos = await _rerank_images_with_clip(query_text, photos)
-    if videos:
-        videos = await _rerank_videos_with_clip(query_text, videos)
+    if photos_full:
+        photos_full = await _rerank_images_with_clip(keywords, photos_full)
+        pre_relevance_photo_count = len(photos_full)
+        photos_full = _filter_by_min_clip_score(photos_full, CLIP_MIN_IMAGE_SCORE)
+        dropped_irrelevant_photos = pre_relevance_photo_count - len(photos_full)
+        if dropped_irrelevant_photos:
+            print(f"[CLIP] {label}: dropped {dropped_irrelevant_photos} image candidate(s) below the relevance floor ({CLIP_MIN_IMAGE_SCORE})")
+    if videos_full:
+        videos_full = await _rerank_videos_with_clip(keywords, videos_full)
+        pre_relevance_video_count = len(videos_full)
+        videos_full = _filter_by_min_clip_score(videos_full, CLIP_MIN_VIDEO_SCORE)
+        dropped_irrelevant_videos = pre_relevance_video_count - len(videos_full)
+        if dropped_irrelevant_videos:
+            print(f"[CLIP] {label}: dropped {dropped_irrelevant_videos} video candidate(s) below the relevance floor ({CLIP_MIN_VIDEO_SCORE})")
+
+    # Trim to the display/storage limit only now, AFTER scoring — the pool
+    # is already sorted best-first by _rerank_*_with_clip, so this keeps
+    # the top N genuinely relevant candidates rather than the first N
+    # fetched.
+    videos = videos_full[:PEXELS_SCENE_RESULT_LIMIT]
+    photos = photos_full[:PEXELS_SCENE_RESULT_LIMIT]
 
     videos_error = "; ".join(video_errors) if video_errors and not videos else None
     images_error = "; ".join(image_errors) if image_errors and not photos else None
 
-    # NEW: accuracy gate — if even the BEST video candidate scores below
-    # CLIP_MIN_VIDEO_SCORE (i.e. it's a weak match for the keywords, not
-    # just "the best of a mediocre pool"), and a genuinely good image
-    # exists instead, flag this beat to fall back to the image rather than
-    # use inaccurate video footage. This is what actually enforces
-    # "don't show a video just because it's the top-ranked one, if the
-    # top-ranked one still isn't a real match."
     best_video_score = videos[0].get("_clip_score") if videos else None
     best_image_score = photos[0].get("_clip_score") if photos else None
     force_image_fallback = (
-        best_video_score is not None
-        and best_video_score < CLIP_MIN_VIDEO_SCORE
-        and best_image_score is not None
-        and best_image_score >= CLIP_MIN_IMAGE_SCORE
+        best_video_score is not None and best_video_score < CLIP_MIN_VIDEO_SCORE
+        and best_image_score is not None and best_image_score >= CLIP_MIN_IMAGE_SCORE
     )
     if force_image_fallback:
         print(
@@ -10623,250 +10852,11 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     }
 
 
-async def _fetch_scene_media(scene: dict) -> dict:
-    """
-    Whole-scene Pexels lookup. After the beats refactor this is now used
-    ONLY as the fallback path for scenes with no narration (so there's no
-    voiceover timing to split into beats) — it produces a single implicit
-    beat covering the whole scene. Normal narrated scenes go through
-    `_build_scene_beats` -> `_fetch_media_for_keywords` per beat instead.
-    """
-    keywords = _get_scene_broll_keywords(scene)
-    media = await _fetch_media_for_keywords(keywords, str(scene.get("scene_id")))
-    return {"keywords": keywords, "videos": media["videos"], "images": media["images"]}
-
-
-# =============================================================================
-# BEAT SPLITTING — rotate B-roll every ~10 seconds within a scene, and
-# choose an image motion effect (LLM-driven) for any beat that becomes a
-# still image.
-# =============================================================================
-
-def _compute_beat_boundaries(
-    scene_start: float,
-    scene_end: float,
-    min_sec: int = BEAT_MIN_SECONDS,
-    max_sec: int = BEAT_MAX_SECONDS,
-) -> list[tuple[float, float]]:
-    """
-    Splits [scene_start, scene_end] into consecutive windows, each between
-    `min_sec` and `max_sec` long (the last window absorbs any remainder so
-    boundaries land exactly on scene_end). Scenes shorter than `max_sec`
-    are returned as a single window — no need to rotate B-roll on a scene
-    that's already short.
-    """
-    total = scene_end - scene_start
-    if total <= 0:
-        return [(scene_start, scene_end)]
-    if total <= max_sec:
-        return [(scene_start, scene_end)]
-
-    num_beats = max(2, math.ceil(total / max_sec))
-    beat_len = total / num_beats
-    while beat_len < min_sec and num_beats > 1:
-        num_beats -= 1
-        beat_len = total / num_beats
-
-    boundaries = []
-    for i in range(num_beats):
-        b_start = scene_start + i * beat_len
-        b_end = scene_end if i == num_beats - 1 else scene_start + (i + 1) * beat_len
-        boundaries.append((b_start, b_end))
-    return boundaries
-
-
-def _words_in_range(timed_words: list, start: float, end: float) -> str:
-    words = [
-        (w.get("word") or "").strip()
-        for w in timed_words
-        if w.get("start", -1) >= start - 1e-6 and w.get("start", -1) < end + 1e-6
-    ]
-    return " ".join(w for w in words if w)
-
-
-_VALID_MEDIA_TYPES = {"video", "image"}
-
-# NEW: the six LLM-selectable image motion effects (Ken Burns-style
-# pan/zoom/tilt). Kept as an explicit ordered list (not just a set) so the
-# diversity fallback below can deterministically cycle through them.
-_MOTION_TYPE_LIST = ["zoom_in", "zoom_out", "pan_left", "pan_right", "tilt_up", "tilt_down"]
-_VALID_MOTION_TYPES = set(_MOTION_TYPE_LIST)
-_DEFAULT_MOTION_TYPE = "zoom_in"
-
-
-def _pick_diversified_motion_type(previous_motion_type: Optional[str], beat_index: int) -> str:
-    """
-    Used only when the LLM call for a beat fails outright, or returns a
-    motion_type outside the six valid values — never used to override a
-    valid LLM choice. Cycles through the motion types that aren't the same
-    as the previous image beat's motion, so even the failure path avoids
-    showing the exact same pan/zoom back-to-back.
-    """
-    candidates = [m for m in _MOTION_TYPE_LIST if m != previous_motion_type] or list(_MOTION_TYPE_LIST)
-    return candidates[beat_index % len(candidates)]
-
-
-async def _generate_beat_keywords(
-    scene: dict, beat_vo_text: str, beat_index: int, total_beats: int, fallback_keywords: list,
-    previous_media_type: Optional[str] = None,
-    previous_motion_type: Optional[str] = None,
-) -> tuple[list, str, str]:
-    """
-    LLM call #2 for B-roll: given the scene's overall visual intent plus the
-    exact narration spoken in THIS beat, ask the model for a fresh set of
-    search phrases, which media type (video vs. still image) best fits this
-    beat, AND — new — which image motion effect (pan/zoom/tilt) to use if
-    this beat ends up as a still image. The LLM is the only place any of
-    these three decisions get made; render-time code (see
-    _build_image_motion_filter) only ever translates whatever motion_type
-    it's handed into the matching FFmpeg filter, and only substitutes a
-    diversified default when this call fails or returns something invalid.
-
-    Returns (keywords, media_type, motion_type) where media_type is "video"
-    or "image", and motion_type is always one of the six values in
-    _VALID_MOTION_TYPES (even when media_type is "video", in which case
-    it's simply unused downstream).
-    """
-    context = {
-        "scene_visual_intent": scene.get("visual_intent", ""),
-        "scene_full_narration": scene.get("vo_text", ""),
-        "beat_narration": beat_vo_text,
-        "beat_number": beat_index + 1,
-        "total_beats": total_beats,
-        "previous_media_type": previous_media_type,
-        "previous_motion_type": previous_motion_type,
-    }
-    try:
-        res = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": BEAT_KEYWORDS_PROMPT},
-                    {"role": "user", "content": json.dumps(context)},
-                ],
-                stream=False,
-            )
-        )
-        _record_token_usage("edit video - beat keywords", res)
-
-        content = (res.choices[0].message.content or "").strip()
-        if content.startswith("```"):
-            content = content.strip("`")
-            if content.lower().startswith("json"):
-                content = content[4:].strip()
-
-        raw = json.loads(content)
-        if not isinstance(raw, dict):
-            raise ValueError(f"expected a JSON object, got {type(raw)}")
-
-        raw_keywords = raw.get("keywords")
-        if not isinstance(raw_keywords, list):
-            raise ValueError(f"expected 'keywords' to be a list, got {type(raw_keywords)}")
-
-        keywords = [k.strip() for k in raw_keywords if isinstance(k, str) and k.strip()]
-        seen = set()
-        deduped = []
-        for k in keywords:
-            key = k.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(k)
-
-        if len(deduped) < BROLL_KEYWORDS_MIN:
-            raise ValueError(f"model returned only {len(deduped)} usable keyword(s)")
-
-        media_type = str(raw.get("media_type") or "").strip().lower()
-        if media_type not in _VALID_MEDIA_TYPES:
-            print(
-                f"[edit-video] scene {scene.get('scene_id')} beat {beat_index + 1}/{total_beats} "
-                f"returned invalid media_type {raw.get('media_type')!r} — defaulting to 'video'"
-            )
-            media_type = "video"
-
-        raw_motion = str(raw.get("motion_type") or "").strip().lower()
-        if raw_motion not in _VALID_MOTION_TYPES:
-            print(
-                f"[edit-video] scene {scene.get('scene_id')} beat {beat_index + 1}/{total_beats} "
-                f"returned invalid motion_type {raw.get('motion_type')!r} — picking a diversified default"
-            )
-            motion_type = _pick_diversified_motion_type(previous_motion_type, beat_index)
-        else:
-            motion_type = raw_motion
-
-        return deduped[:BROLL_KEYWORDS_MAX], media_type, motion_type
-
-    except Exception as e:
-        print(
-            f"[edit-video] scene {scene.get('scene_id')} beat {beat_index + 1}/{total_beats} "
-            f"keyword generation failed, using fallback: {e}"
-        )
-        extra = [beat_vo_text.strip()[:60]] if beat_vo_text.strip() else []
-        combined = (fallback_keywords or []) + extra
-        seen = set()
-        out = []
-        for k in combined:
-            key = (k or "").strip().lower()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            out.append(k.strip())
-        fallback_motion = _pick_diversified_motion_type(previous_motion_type, beat_index)
-        return out[:BROLL_KEYWORDS_MAX], "video", fallback_motion
-
-
-def _dedupe_beats_media_across_scene(beats: list) -> None:
-    """
-    FIX (rotation bug): each beat's Pexels search runs independently, so
-    two adjacent beats with similar keywords very often come back with the
-    same top-ranked asset as their #1 candidate. Since beat selection
-    (`_resolve_beat_broll_selection`) always takes each beat's own
-    candidates[0], that made consecutive beats silently pick the *same*
-    clip — which is exactly why the rendered video showed one piece of
-    footage holding for far longer than one beat's window (multiple beats
-    in a row, all "different" beats, all showing identical footage).
-
-    This walks a scene's beats in order and, for each beat's video/image
-    candidate list, moves any asset id already selected by an earlier beat
-    in this scene to the back of the list — so the default pick
-    (candidates[0]) is a fresh asset whenever the beat's own pool has one.
-    If a beat's entire pool was already used elsewhere in the scene, it
-    falls back to reusing an asset rather than showing nothing — repetition
-    only happens when there's truly no alternative footage available.
-
-    Mutates `beats` in place (reorders each beat's media.videos/images
-    results list); does not change which beats exist or their timing.
-    """
-    used_ids: set = set()
-    for beat in beats:
-        media = beat.get("media") or {}
-        for pool_key in ("videos", "images"):
-            pool = media.get(pool_key) or {}
-            results = pool.get("results") or []
-            if not results:
-                continue
-            fresh = [r for r in results if r.get("id") not in used_ids]
-            reused = [r for r in results if r.get("id") in used_ids]
-            pool["results"] = fresh + reused
-        beat["media"] = media
-
-        # Mark whichever asset this beat will actually default to (per its
-        # AI-decided preferred_media_type — see _resolve_beat_broll_selection)
-        # as used, so the *next* beat avoids picking the same one.
-        default_asset, _source = _resolve_beat_broll_selection(beat)
-        if default_asset and default_asset.get("id") is not None:
-            used_ids.add(default_asset["id"])
-
-
 def _beat_media_is_empty(beat: dict) -> bool:
     media = beat.get("media") or {}
     return not (media.get("videos") or {}).get("results") and not (media.get("images") or {}).get("results")
 
 
-# FIX (blank beats): a handful of broad, near-universally-available search
-# terms used only as an absolute last resort when nothing scene- or
-# beat-specific returned anything — real photographic footage instead of a
-# flat color card, even in the worst case.
 _LAST_RESORT_BROLL_TERMS = [
     "abstract background", "soft light texture", "historical documents",
     "old map parchment", "clouds sky timelapse", "city skyline aerial",
@@ -10874,29 +10864,6 @@ _LAST_RESORT_BROLL_TERMS = [
 
 
 async def _fill_empty_beats(scene: dict, beats: list, fallback_keywords: list) -> None:
-    """
-    A beat whose own keywords return zero results in BOTH the video and
-    image pools falls straight through to a flat color card at render time
-    (`_prepare_broll_clip`'s last-resort fallback) — visually indistinguishable
-    from a bug, and confirmed happening in real renders (exact RGB match to
-    the default fallback color 0x111827). This repair chain runs right after
-    the initial per-beat Pexels fetch and tries, in order, to replace an
-    empty beat's media with something real before ever letting it stay empty:
-
-      1. Retry with the scene-level broll_keywords — broader/more generic
-         than one beat's narrow phrasing, so it often has hits the beat's
-         own search didn't.
-      2. Borrow the candidate pool from the nearest sibling beat in this
-         SAME scene that has real candidates (closest by beat_index first).
-         Reused footage for one beat beats a flat color card.
-      3. If literally every beat in the scene is empty (usually a sign of
-         an API/config problem, not a content problem), fetch a small set
-         of generic, near-universally-available terms as an absolute last
-         resort so the scene shows *something* photographic.
-
-    Mutates `beats` in place. Marks any beat that had to fall back to (2)
-    or (3) with `_media_fallback_reason` for traceability in the timeline.
-    """
     scene_id = scene.get("scene_id")
 
     empty_beats = [b for b in beats if _beat_media_is_empty(b)]
@@ -10919,14 +10886,8 @@ async def _fill_empty_beats(scene: dict, beats: list, fallback_keywords: list) -
     non_empty = [b for b in beats if not _beat_media_is_empty(b)]
     if non_empty:
         for b in still_empty:
-            idx = b["beat_index"]
-            nearest = min(non_empty, key=lambda o: abs(o["beat_index"] - idx))
-            # Shallow-copy the outer dict so this beat and the one it
-            # borrowed from don't share the exact same mutable container —
-            # `_dedupe_beats_media_across_scene` reorders pool result lists
-            # in place, and giving each beat its own outer dict (while still
-            # sharing the underlying candidate objects, which is fine/cheap)
-            # keeps that reordering from having surprising cross-beat effects.
+            idx = b.get("beat_index", 0)
+            nearest = min(non_empty, key=lambda o: abs(o.get("beat_index", 0) - idx))
             b["media"] = {
                 "videos": dict(nearest["media"].get("videos") or {}),
                 "images": dict(nearest["media"].get("images") or {}),
@@ -10948,142 +10909,7 @@ async def _fill_empty_beats(scene: dict, beats: list, fallback_keywords: list) -
         )
 
 
-async def _build_scene_beats(scene: dict) -> list:
-    """
-    Splits a scene's aligned narration into ~10s beats (8-12s each, see
-    BEAT_MIN_SECONDS/BEAT_MAX_SECONDS) and, for each beat, generates its own
-    B-roll keywords, media type (video/image), and — new — image motion
-    effect (LLM, all three in one call — see _generate_beat_keywords /
-    BEAT_KEYWORDS_PROMPT). This is what makes the B-roll rotate mid-scene
-    instead of one static clip stretched across the whole voiceover, AND
-    what makes still-image beats pan/zoom/tilt instead of sitting frozen.
-
-    After fetching each beat's candidates, `_dedupe_beats_media_across_scene`
-    reorders each beat's candidate pool so consecutive beats don't default
-    to the exact same Pexels asset (see its docstring) — the actual fix for
-    "one clip plays for way longer than one beat".
-
-    Falls back to a single implicit beat (using the scene-level
-    broll_keywords / whole-scene Pexels search) when there's no timed
-    narration to split — e.g. silent scenes, or scenes whose voice/alignment
-    step failed. That implicit beat gets the default motion_type since no
-    LLM call runs for it.
-    """
-    scene_id = scene.get("scene_id")
-    word_segments = scene.get("word_segments") or []
-    timed_words = [w for w in word_segments if "start" in w and "end" in w]
-
-    if not timed_words:
-        media = await _fetch_scene_media(scene)
-        if not media["videos"]["results"] and not media["images"]["results"]:
-            print(
-                f"[edit-video][WARN] scene {scene_id}: single implicit beat came back "
-                f"empty — trying generic last-resort terms"
-            )
-            last_resort_media = await _fetch_media_for_keywords(
-                _LAST_RESORT_BROLL_TERMS, f"{scene_id}:last-resort"
-            )
-            media["videos"] = last_resort_media["videos"]
-            media["images"] = last_resort_media["images"]
-        return [{
-            "beat_id": f"{scene_id}_b1",
-            "beat_index": 0,
-            "start": None,
-            "end": None,
-            "vo_text": scene.get("vo_text", ""),
-            "keywords": media["keywords"],
-            "motion_type": _DEFAULT_MOTION_TYPE,
-            "media": {"videos": media["videos"], "images": media["images"]},
-        }]
-
-    scene_start = timed_words[0]["start"]
-    scene_end = timed_words[-1]["end"]
-    boundaries = _compute_beat_boundaries(scene_start, scene_end)
-    fallback_keywords = _get_scene_broll_keywords(scene)
-
-    beats = []
-    for i, (b_start, b_end) in enumerate(boundaries):
-        beats.append({
-            "beat_id": f"{scene_id}_b{i + 1}",
-            "beat_index": i,
-            "start": b_start,
-            "end": b_end,
-            "vo_text": _words_in_range(timed_words, b_start, b_end),
-        })
-
-    # NOTE: this loop runs sequentially (not asyncio.gather) rather than
-    # in parallel, specifically so each beat's media_type/motion_type
-    # decision can be told what the PREVIOUS beat actually got
-    # (previous_media_type / previous_motion_type) — that is what lets the
-    # prompt alternate video/image and vary pan/zoom/tilt deliberately
-    # across a scene instead of every beat guessing independently and, by
-    # chance, all landing on the same choice. This trades a little latency
-    # for beats that visually vary on purpose.
-    previous_media_type = None
-    previous_motion_type = None
-    for b in beats:
-        kws, media_type, motion_type = await _generate_beat_keywords(
-            scene, b["vo_text"], b["beat_index"], len(beats), fallback_keywords,
-            previous_media_type=previous_media_type,
-            previous_motion_type=previous_motion_type,
-        )
-        b["keywords"] = kws
-        b["preferred_media_type"] = media_type
-        b["motion_type"] = motion_type
-        previous_media_type = media_type
-        # Only update the "previous image motion" memory when this beat
-        # actually was an image — a video beat in between two image beats
-        # shouldn't reset the diversity tracking back to null.
-        if media_type == "image":
-            previous_motion_type = motion_type
-
-    media_results = await asyncio.gather(*[
-        _fetch_media_for_keywords(b["keywords"], f"{scene_id}:{b['beat_id']}")
-        for b in beats
-    ])
-    for b, media in zip(beats, media_results):
-        b["media"] = media
-        # NEW: honor the CLIP accuracy gate computed in
-        # _fetch_media_for_keywords — if even the best video candidate for
-        # this beat wasn't a confident match and a good image exists
-        # instead, use the image regardless of what the LLM originally
-        # preferred for this beat (see BEAT_KEYWORDS_PROMPT). Accuracy
-        # takes priority over the LLM's creative video/image preference.
-        if media.get("force_image_fallback") and b.get("preferred_media_type") != "image":
-            print(
-                f"[edit-video] beat {b['beat_id']}: overriding LLM's "
-                f"preferred_media_type={b.get('preferred_media_type')!r} -> 'image' "
-                f"(CLIP accuracy gate: video too weak a match)"
-            )
-            b["preferred_media_type"] = "image"
-
-    await _fill_empty_beats(scene, beats, fallback_keywords)
-
-    _dedupe_beats_media_across_scene(beats)
-
-    expected_min_beats = math.ceil((scene_end - scene_start) / BEAT_MAX_SECONDS)
-    if len(beats) < expected_min_beats:
-        # Defensive tripwire: if this ever fires, `_compute_beat_boundaries`
-        # itself under-split the scene relative to BEAT_MAX_SECONDS — flag
-        # it loudly rather than silently shipping a scene that will show
-        # one clip for way longer than BEAT_MAX_SECONDS on screen.
-        print(
-            f"[edit-video][WARN] scene {scene_id}: {scene_end - scene_start:.1f}s of narration "
-            f"only produced {len(beats)} beat(s), expected at least {expected_min_beats} "
-            f"given BEAT_MAX_SECONDS={BEAT_MAX_SECONDS} — B-roll may hold too long on screen"
-        )
-
-    print(
-        f"[edit-video] scene {scene_id}: {scene_end - scene_start:.1f}s of narration "
-        f"split into {len(beats)} rotating B-roll beat(s)"
-    )
-    return beats
-
-
 def _aggregate_beats_media(beats: list) -> dict:
-    """Merges every beat's candidate pool into one scene-level view, kept
-    on scene['media'] purely for backward-compatible UIs that expect a
-    single 'all candidates for this scene' list."""
     all_videos, all_images = [], []
     for b in beats:
         m = b.get("media") or {}
@@ -11098,116 +10924,261 @@ def _aggregate_beats_media(beats: list) -> dict:
     }
 
 
-def _default_animation(scene: dict) -> dict:
-    on_screen_text = (scene.get("on_screen_text") or "").strip()
+CLIP_MEDIA_SWITCH_MARGIN = float(os.getenv("CLIP_MEDIA_SWITCH_MARGIN", "0.03"))
 
-    if on_screen_text:
-        # Placement defaults to top_center, not bottom_center: captions now
-        # sit in the very-bottom safe zone (see DEFAULT_CAPTION_STYLE /
-        # ANIMATION_PLANNER_PROMPT), so an overlay_text fallback needs to
-        # stay out of that band to avoid overlapping the caption line.
-        return {
-            "animation_type": "lower_third",
-            "category": "overlay_text",
-            "placement": "top_center",
-            "z_index_layer": "foreground",
-            "trigger": "scene_start",
-            "duration_frames": 60,
-            "content_binding": "text:on_screen_text",
-            "render_engine_hint": "remotion",
-            "text_animation_style": _DEFAULT_TEXT_ANIMATION_STYLE,
-        }
 
+def _resolve_beat_broll_selection(beat: dict) -> tuple:
+    override = beat.get("broll_override")
+    if override and override.get("asset_id") is not None:
+        source = override.get("source")
+        file_url = _resolve_broll_file_url(override, source)
+        if file_url:
+            return (
+                {
+                    "id": override.get("asset_id"), "file_url": file_url, "source": source,
+                    **{k: v for k, v in override.items() if k not in ("asset_id", "source", "file_url")},
+                },
+                source,
+            )
+        print(f"[timeline] beat {beat.get('beat_id')} has a broll_override that couldn't be resolved to a landscape file — falling back to default candidate")
+
+    media = beat.get("media") or {}
+    video_candidates = (media.get("videos") or {}).get("results") or []
+    image_candidates = (media.get("images") or {}).get("results") or []
+
+    best_video = video_candidates[0] if video_candidates else None
+    best_image = image_candidates[0] if image_candidates else None
+    video_score = best_video.get("_clip_score") if best_video else None
+    image_score = best_image.get("_clip_score") if best_image else None
+
+    if video_score is not None and image_score is not None:
+        video_is_weak = video_score < CLIP_MIN_VIDEO_SCORE
+        image_is_usable = image_score >= CLIP_MIN_IMAGE_SCORE
+        if video_is_weak and image_is_usable:
+            return best_image, "image"
+
+        if image_score > video_score + CLIP_MEDIA_SWITCH_MARGIN:
+            return best_image, "image"
+        if video_score > image_score + CLIP_MEDIA_SWITCH_MARGIN:
+            return best_video, "video"
+
+    preferred = beat.get("preferred_media_type")
+    if preferred == "image":
+        if best_image:
+            return best_image, "image"
+        if best_video:
+            return best_video, "video"
+        return None, None
+
+    if best_video:
+        return best_video, "video"
+    if best_image:
+        return best_image, "image"
+    return None, None
+
+_VALID_MEDIA_TYPES = {"video", "image"}
+
+_MOTION_TYPE_LIST = ["zoom_in", "zoom_out", "pan_left", "pan_right", "tilt_up", "tilt_down"]
+_VALID_MOTION_TYPES = set(_MOTION_TYPE_LIST)
+_DEFAULT_MOTION_TYPE = "zoom_in"
+
+
+def _pick_diversified_motion_type(previous_motion_type: Optional[str], beat_index: int) -> str:
+    """B-roll Ken-Burns pan/zoom motion (distinct from the overlay `motion`
+    object the Animation Planner returns). The new BEAT_KEYWORDS_PROMPT no
+    longer asks the model for this, so it's assigned deterministically."""
+    candidates = [m for m in _MOTION_TYPE_LIST if m != previous_motion_type] or list(_MOTION_TYPE_LIST)
+    return candidates[beat_index % len(candidates)]
+
+
+def _resolve_beat_motion_type(beat: dict) -> str:
+    override = beat.get("broll_override") or {}
+    motion = override.get("motion_type")
+    if motion in _VALID_MOTION_TYPES:
+        return motion
+    motion = beat.get("motion_type")
+    if motion in _VALID_MOTION_TYPES:
+        return motion
+    return _DEFAULT_MOTION_TYPE
+
+
+def _find_beat_broll_candidate(beat: dict, asset_id: Any, source: str) -> Optional[dict]:
+    media = beat.get("media") or {}
+    pool_key = "videos" if source == "video" else "images"
+    candidates = (media.get(pool_key) or {}).get("results") or []
+    for c in candidates:
+        if str(c.get("id")) == str(asset_id):
+            return c
+    return None
+
+
+async def _fetch_pexels_asset_by_id(asset_id: Any, source: str) -> Optional[dict]:
+    if not PEXELS_API_KEY:
+        return None
+
+    url = (
+        f"https://api.pexels.com/videos/videos/{asset_id}"
+        if source == "video"
+        else f"https://api.pexels.com/v1/photos/{asset_id}"
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"Authorization": PEXELS_API_KEY}, timeout=15.0)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        print(f"[broll] direct Pexels lookup failed for {source} asset {asset_id}: {e}")
+        return None
+
+    return _format_video_result(data) if source == "video" else _format_image_result(data)
+
+
+def _seconds_to_frames(seconds: float, fps: int = TIMELINE_FPS) -> int:
+    return max(round((seconds or 0.0) * fps), 0)
+
+
+def _slim_selected_asset(selected: Optional[dict]) -> Optional[dict]:
+    if not selected:
+        return None
     return {
-        "animation_type": "full_screen_broll",
-        "category": "full_screen",
-        "placement": "full_frame",
-        "z_index_layer": "background",
-        "trigger": "scene_start",
-        "duration_frames": 150,
-        "content_binding": "broll:visual_intent",
-        "render_engine_hint": "ffmpeg",
-        "text_animation_style": _DEFAULT_TEXT_ANIMATION_STYLE,
+        "asset_id": selected.get("asset_id") if "asset_id" in selected else selected.get("id"),
+        "file_url": selected.get("file_url"),
+        "source": selected.get("source"),
+        "width": selected.get("width"),
+        "height": selected.get("height"),
     }
 
 
-def _validate_animation(raw: dict, scene: dict) -> dict:
-    fallback = _default_animation(scene)
+def _words_in_range(timed_words: list, start: float, end: float) -> str:
+    words = [
+        (w.get("word") or "").strip()
+        for w in timed_words
+        if w.get("start", -1) >= start - 1e-6 and w.get("start", -1) < end + 1e-6
+    ]
+    return " ".join(w for w in words if w)
 
+
+
+def _validate_entity(e: Any) -> Optional[dict]:
+    if not isinstance(e, dict):
+        return None
+    name = e.get("name")
+    etype = e.get("entity_type")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if etype not in ("real_person", "fictional_character", "element"):
+        etype = "element"
+    return {"name": name.strip(), "entity_type": etype}
+
+
+def _validate_scene_direction(raw: Any) -> dict:
     if not isinstance(raw, dict):
-        return fallback
+        raw = {}
+    setting = raw.get("setting") if isinstance(raw.get("setting"), dict) else {}
+    location = setting.get("location") if isinstance(setting.get("location"), str) else ""
+    time_period = setting.get("time_period") if isinstance(setting.get("time_period"), str) else ""
+    mood = raw.get("mood") if isinstance(raw.get("mood"), str) and raw.get("mood").strip() else "neutral"
+    key_action = (
+        raw.get("key_action")
+        if isinstance(raw.get("key_action"), str) and raw.get("key_action").strip()
+        else "narration continues"
+    )
+    return {"setting": {"location": location, "time_period": time_period}, "mood": mood, "key_action": key_action}
 
-    animation_type = raw.get("animation_type")
-    if animation_type not in _VALID_ANIMATION_TYPES:
-        return fallback
 
-    category = _ANIMATION_TYPE_TO_CATEGORY[animation_type]
+def _validate_animation_signal(raw: Any) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    needs_animation = bool(raw.get("needs_animation"))
+    intent = raw.get("intent") if isinstance(raw.get("intent"), str) else ""
+    suggested_category = raw.get("suggested_category")
+    if suggested_category not in ANIMATION_TAXONOMY:
+        suggested_category = None
+    key_subject = raw.get("key_subject") if isinstance(raw.get("key_subject"), str) else ""
+    source_type = raw.get("source_type") if raw.get("source_type") in ("quoted_source", "narrative") else "narrative"
+    quoted_excerpt = raw.get("quoted_excerpt") if isinstance(raw.get("quoted_excerpt"), str) else None
+    source_name_guess = raw.get("source_name_guess") if isinstance(raw.get("source_name_guess"), str) else None
+    key_subject_entity_type = raw.get("key_subject_entity_type")
+    if key_subject_entity_type not in ("real_person", "fictional_character", "element"):
+        key_subject_entity_type = None
+    return {
+        "needs_animation": needs_animation,
+        "intent": intent,
+        "suggested_category": suggested_category,
+        "key_subject": key_subject,
+        "source_type": source_type,
+        "quoted_excerpt": quoted_excerpt,
+        "source_name_guess": source_name_guess,
+        "key_subject_entity_type": key_subject_entity_type,
+    }
 
-    placement = raw.get("placement")
-    if placement not in _VALID_PLACEMENTS:
-        placement = "full_frame" if category in ("full_screen", "transition") else "top_center"
 
-    # Caption safe zone: word-by-word captions are always burned in along
-    # the very bottom of the frame (see DEFAULT_CAPTION_STYLE). If the LLM
-    # nonetheless returned a bottom_* placement for an overlay_text/
-    # overlay_graphic animation, remap it up and out of that band rather
-    # than trusting it verbatim — full_screen/transition categories are
-    # exempt since they own the whole frame anyway.
-    if category in ("overlay_text", "overlay_graphic") and placement in (
-        "bottom_left", "bottom_center", "bottom_right",
-    ):
-        placement = "top_center"
+def _validate_beat(raw: Any, id_prefix: str, index: int) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
 
-    z_index_layer = raw.get("z_index_layer")
-    if z_index_layer not in _VALID_Z_LAYERS:
-        z_index_layer = "background" if category == "full_screen" else "foreground"
+    vo_text = raw.get("vo_text") if isinstance(raw.get("vo_text"), str) else ""
 
-    trigger = raw.get("trigger")
-    if trigger not in _VALID_TRIGGERS:
-        trigger = "scene_start"
+    keywords_raw = raw.get("keywords")
+    keywords = []
+    if isinstance(keywords_raw, list):
+        keywords = [k.strip() for k in keywords_raw if isinstance(k, str) and k.strip()]
+        seen, deduped = set(), []
+        for k in keywords:
+            key = k.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(k)
+        keywords = deduped
 
-    duration_frames = raw.get("duration_frames")
+    media_type = str(raw.get("media_type") or "").strip().lower()
+    if media_type not in _VALID_MEDIA_TYPES:
+        media_type = "video"
+
+    entities = [v for v in (_validate_entity(e) for e in (raw.get("entities") or [])) if v]
+    scene_direction = _validate_scene_direction(raw.get("scene_direction"))
+    animation_signal = _validate_animation_signal(raw.get("animation_signal"))
+
     try:
-        duration_frames = int(duration_frames)
-        if duration_frames <= 0 or duration_frames > 900:
+        est = int(raw.get("estimated_duration_seconds"))
+        if est <= 0:
             raise ValueError
     except (TypeError, ValueError):
-        duration_frames = fallback["duration_frames"]
-
-    content_binding = raw.get("content_binding")
-    if not isinstance(content_binding, str) or not content_binding.strip():
-        content_binding = fallback["content_binding"]
-
-    render_engine_hint = raw.get("render_engine_hint")
-    if render_engine_hint not in _VALID_RENDER_HINTS:
-        render_engine_hint = "remotion" if category in ("overlay_text", "overlay_graphic", "pip", "branding") else "ffmpeg"
-
-    # NEW: only meaningful for overlay_text, but validated/defaulted
-    # regardless so the field is always present and safe to read.
-    text_animation_style = raw.get("text_animation_style")
-    if text_animation_style not in _VALID_TEXT_ANIMATION_STYLES:
-        text_animation_style = _DEFAULT_TEXT_ANIMATION_STYLE
+        est = max(1, round(len(vo_text.split()) / 2.33))
 
     return {
-        "animation_type": animation_type,
-        "category": category,
-        "placement": placement,
-        "z_index_layer": z_index_layer,
-        "trigger": trigger,
-        "duration_frames": duration_frames,
-        "content_binding": content_binding,
-        "render_engine_hint": render_engine_hint,
-        "text_animation_style": text_animation_style,
+        "beat_id": f"{id_prefix}_beat{index + 1}",
+        "beat_index": index,
+        "vo_text": vo_text,
+        "estimated_duration_seconds": est,
+        "keywords": keywords,
+        "media_type": media_type,
+        "preferred_media_type": media_type,
+        "entities": entities,
+        "scene_direction": scene_direction,
+        "animation_signal": animation_signal,
     }
 
 
-async def _plan_scene_animation(scene: dict) -> dict:
-    scene_context = {
-        "scene_id": scene.get("scene_id"),
-        "vo_text": scene.get("vo_text", ""),
-        "visual_intent": scene.get("visual_intent", ""),
-        "on_screen_text": scene.get("on_screen_text", ""),
-        "requires_animation": scene.get("requires_animation", False),
+async def _run_beat_director(
+    *, scene_vo_text: str, category: str, style_profile: dict, script_language: str,
+    scene_id: str, scene_visual_intent: str, scene_animation_density: str, scene_on_screen_text: str,
+    previous_scene_last_media_type: Optional[str], known_entities: list, known_setting: dict,
+    id_prefix: str,
+) -> list[dict]:
+    context = {
+        "category": category,
+        "style_profile": style_profile,
+        "script_language": script_language,
+        "scene_id": scene_id,
+        "scene_visual_intent": scene_visual_intent,
+        "scene_animation_density": scene_animation_density,
+        "scene_on_screen_text": scene_on_screen_text,
+        "scene_vo_text": scene_vo_text,
+        "previous_scene_last_media_type": previous_scene_last_media_type,
+        "known_entities": known_entities,
+        "known_setting": known_setting,
     }
 
     try:
@@ -11215,8 +11186,341 @@ async def _plan_scene_animation(scene: dict) -> dict:
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
                 messages=[
+                    {"role": "system", "content": BEAT_KEYWORDS_PROMPT},
+                    {"role": "user", "content": json.dumps(context)},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("edit video - beat director", res)
+
+        content = (res.choices[0].message.content or "").strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            if content.lower().startswith("json"):
+                content = content[4:].strip()
+
+        raw = json.loads(content)
+        raw_beats = raw.get("beats")
+        if not isinstance(raw_beats, list) or not raw_beats:
+            raise ValueError("beat director returned no beats")
+
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} beat director failed, using a single fallback beat: {e}")
+        fallback_keywords = _get_scene_broll_keywords(
+            {"broll_keywords": [], "visual_intent": scene_visual_intent, "vo_text": scene_vo_text}
+        )
+        return [{
+            "beat_id": f"{id_prefix}_beat1",
+            "beat_index": 0,
+            "vo_text": scene_vo_text,
+            "estimated_duration_seconds": max(1, round(len(scene_vo_text.split()) / 2.33)),
+            "keywords": fallback_keywords,
+            "media_type": "video",
+            "preferred_media_type": "video",
+            "entities": [],
+            "scene_direction": {
+                "setting": dict(known_setting or {"location": "", "time_period": ""}),
+                "mood": "neutral",
+                "key_action": "narration continues",
+            },
+            "animation_signal": _validate_animation_signal(None),
+        }]
+
+    beats = [_validate_beat(b, id_prefix, i) for i, b in enumerate(raw_beats)]
+
+    covered_words = sum(len(b["vo_text"].split()) for b in beats)
+    original_words = len(scene_vo_text.split())
+    if covered_words != original_words:
+        print(
+            f"[edit-video][WARN] scene {scene_id}: beat director word count "
+            f"mismatch ({covered_words} vs {original_words} original) — "
+            f"narration may have been dropped, duplicated, or paraphrased across beats"
+        )
+
+    for b in beats:
+        if len(b["keywords"]) < BROLL_KEYWORDS_MIN:
+            fallback = _get_scene_broll_keywords(
+                {"broll_keywords": [], "visual_intent": scene_visual_intent, "vo_text": b["vo_text"]}
+            )
+            merged, seen = [], set()
+            for k in b["keywords"] + fallback:
+                key = k.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(k)
+            b["keywords"] = merged[:BROLL_KEYWORDS_MAX]
+
+    previous_motion = None
+    for b in beats:
+        b["motion_type"] = _pick_diversified_motion_type(previous_motion, b["beat_index"])
+        previous_motion = b["motion_type"]
+
+    return beats
+
+
+def _align_beats_to_timed_words(beats: list, timed_words: list) -> None:
+    """Beats partition the scene's vo_text verbatim and in order, so we can
+    map each beat's word count onto a contiguous slice of WhisperX's
+    word-level timestamps."""
+    ptr = 0
+    n_words = len(timed_words)
+    for i, b in enumerate(beats):
+        count = len(b["vo_text"].split())
+        if count <= 0:
+            b["start"], b["end"] = None, None
+            continue
+        end_ptr = n_words if i == len(beats) - 1 else min(ptr + count, n_words)
+        chunk = timed_words[ptr:end_ptr]
+        if chunk:
+            b["start"] = chunk[0].get("start")
+            b["end"] = chunk[-1].get("end")
+        else:
+            b["start"], b["end"] = None, None
+        ptr = end_ptr
+
+    for i, b in enumerate(beats):
+        if b.get("start") is not None and b.get("end") is not None:
+            continue
+        prev_end = (
+            beats[i - 1]["end"] if i > 0 and beats[i - 1].get("end") is not None
+            else (timed_words[0]["start"] if timed_words else 0.0)
+        )
+        next_start = (
+            beats[i + 1]["start"] if i + 1 < len(beats) and beats[i + 1].get("start") is not None
+            else (timed_words[-1]["end"] if timed_words else prev_end + 1.0)
+        )
+        b["start"] = prev_end
+        b["end"] = max(next_start, prev_end + 0.5)
+
+
+async def _fetch_beats_media(beats: list, label_prefix: str) -> None:
+    results = await asyncio.gather(*[
+        _fetch_media_for_keywords(b["keywords"], f"{label_prefix}:{b['beat_id']}") for b in beats
+    ])
+    for b, media in zip(beats, results):
+        b["media"] = media
+        if media.get("force_image_fallback") and b.get("preferred_media_type") != "image":
+            print(f"[edit-video] beat {b['beat_id']}: overriding to 'image' (CLIP accuracy gate: video too weak a match)")
+            b["preferred_media_type"] = "image"
+
+
+def _dedupe_beats_media_across_scene(beats: list) -> None:
+    used_ids: set = set()
+    for beat in beats:
+        media = beat.get("media") or {}
+        for pool_key in ("videos", "images"):
+            pool = media.get(pool_key) or {}
+            results = pool.get("results") or []
+            if not results:
+                continue
+            fresh = [r for r in results if r.get("id") not in used_ids]
+            reused = [r for r in results if r.get("id") in used_ids]
+            pool["results"] = fresh + reused
+        beat["media"] = media
+
+        default_asset, _source = _resolve_beat_broll_selection(beat)
+        if default_asset and default_asset.get("id") is not None:
+            used_ids.add(default_asset["id"])
+
+
+
+def _validate_geometry_px(raw: Any, category: str) -> dict:
+    if category in ("full_screen", "transition"):
+        return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
+
+    default = {"x": 700, "y": 64, "width": 520, "height": 160}
+    if not isinstance(raw, dict):
+        geo = dict(default)
+    else:
+        try:
+            geo = {
+                "x": int(raw.get("x", default["x"])),
+                "y": int(raw.get("y", default["y"])),
+                "width": int(raw.get("width", default["width"])),
+                "height": int(raw.get("height", default["height"])),
+            }
+        except (TypeError, ValueError):
+            geo = dict(default)
+
+    geo["width"] = max(40, min(geo["width"], ANIMATION_CANVAS_WIDTH))
+    geo["height"] = max(40, min(geo["height"], ANIMATION_CANVAS_HEIGHT))
+    geo["x"] = max(0, min(geo["x"], ANIMATION_CANVAS_WIDTH - geo["width"]))
+    geo["y"] = max(0, min(geo["y"], ANIMATION_CANVAS_HEIGHT - geo["height"]))
+
+    if category in ("overlay_text", "overlay_graphic"):
+        if geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
+            if geo["height"] < CAPTION_SAFE_ZONE_Y:
+                geo["y"] = CAPTION_SAFE_ZONE_Y - geo["height"]
+            else:
+                geo["height"] = CAPTION_SAFE_ZONE_Y - 4
+                geo["y"] = 4
+
+    return geo
+
+
+def _validate_motion(raw: Any, geometry: dict) -> dict:
+    default_xy = [geometry["x"], geometry["y"]]
+    motion = {"start_xy_px": default_xy, "end_xy_px": default_xy, "motion_style": "fade in"}
+    if isinstance(raw, dict):
+        for key in ("start_xy_px", "end_xy_px"):
+            val = raw.get(key)
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                try:
+                    motion[key] = [float(val[0]), float(val[1])]
+                except (TypeError, ValueError):
+                    pass
+        style = raw.get("motion_style")
+        if isinstance(style, str) and style.strip():
+            motion["motion_style"] = style.strip()[:300]
+    return motion
+
+
+def _validate_beat_animation(raw: Any, beat_ids: set) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    beat_id = raw.get("beat_id")
+    if beat_id not in beat_ids:
+        return None
+    animation_type = raw.get("animation_type")
+    if animation_type not in _VALID_ANIMATION_TYPES:
+        return None
+    category = _ANIMATION_TYPE_TO_CATEGORY[animation_type]
+
+    placement = raw.get("placement")
+    if placement not in _VALID_PLACEMENTS:
+        placement = "full_frame" if category in ("full_screen", "transition") else "top_center"
+    if category in ("overlay_text", "overlay_graphic") and placement in ("bottom_left", "bottom_center", "bottom_right"):
+        placement = "top_center"
+
+    geometry_px = _validate_geometry_px(raw.get("geometry_px"), category)
+    motion = _validate_motion(raw.get("motion"), geometry_px)
+
+    z_index_layer = raw.get("z_index_layer")
+    if z_index_layer not in _VALID_Z_LAYERS:
+        z_index_layer = "background" if category == "full_screen" else "foreground"
+
+    trigger = raw.get("trigger")
+    if trigger not in _VALID_TRIGGERS:
+        trigger = "on_beat"
+
+    try:
+        duration_frames = int(raw.get("duration_frames"))
+        if duration_frames <= 0 or duration_frames > 900:
+            raise ValueError
+    except (TypeError, ValueError):
+        duration_frames = 90
+
+    content_binding = raw.get("content_binding")
+    if not isinstance(content_binding, str):
+        content_binding = ""
+
+    icon_name = raw.get("icon_name")
+    icon_layout = raw.get("icon_layout")
+    if category in ("overlay_graphic", "branding"):
+        if isinstance(icon_name, str) and icon_name in _ICON_VOCAB:
+            icon_layout = None
+        elif isinstance(icon_name, list):
+            cleaned = [i for i in icon_name if isinstance(i, str) and i in _ICON_VOCAB][:4]
+            if len(cleaned) >= 2:
+                icon_name = cleaned
+                if icon_layout not in _VALID_ICON_LAYOUTS:
+                    icon_layout = "sequence" if animation_type == "icon_sequence" else "cluster"
+            else:
+                icon_name, icon_layout = "sparkles", None
+        else:
+            icon_name, icon_layout = "sparkles", None
+    else:
+        icon_name, icon_layout = None, None
+
+    display_text = raw.get("display_text")
+    if display_text is not None and not isinstance(display_text, (str, list)):
+        display_text = None
+    if isinstance(display_text, list):
+        display_text = [str(d) for d in display_text if isinstance(d, (str, int, float))][:8]
+
+    color_hint = raw.get("color_hint")
+    if not isinstance(color_hint, str) or not _HEX_COLOR_RE.match(color_hint.strip()):
+        color_hint = "#F5A623"
+    else:
+        color_hint = color_hint.strip()
+        if not color_hint.startswith("#"):
+            color_hint = f"#{color_hint}"
+
+    highlight_target_text = raw.get("highlight_target_text")
+    if not isinstance(highlight_target_text, str) or not highlight_target_text.strip():
+        highlight_target_text = None
+
+    render_prompt = raw.get("render_prompt")
+    if not isinstance(render_prompt, str):
+        render_prompt = ""
+
+    render_engine_hint = raw.get("render_engine_hint")
+    if render_engine_hint not in _VALID_RENDER_HINTS:
+        render_engine_hint = "remotion" if category in ("overlay_text", "overlay_graphic", "pip", "branding") else "ffmpeg"
+
+    return {
+        "beat_id": beat_id,
+        "animation_type": animation_type,
+        "category": category,
+        "placement": placement,
+        "geometry_px": geometry_px,
+        "motion": motion,
+        "z_index_layer": z_index_layer,
+        "trigger": trigger,
+        "duration_frames": duration_frames,
+        "content_binding": content_binding,
+        "icon_name": icon_name,
+        "icon_layout": icon_layout,
+        "display_text": display_text,
+        "color_hint": color_hint,
+        "highlight_target_text": highlight_target_text,
+        "render_prompt": render_prompt,
+        "render_engine_hint": render_engine_hint,
+    }
+
+
+async def _run_animation_planner(
+    *, scene_id: str, scene_visual_intent: str, scene_on_screen_text: str, requires_animation: bool,
+    scene_animation_density: str, category: str, style_profile: dict, script_language: str,
+    beats: list, previous_scene_last_animation: Optional[dict],
+) -> list[dict]:
+    if not requires_animation:
+        return []
+
+    beats_context = [
+        {
+            "beat_id": b["beat_id"],
+            "vo_text": b["vo_text"],
+            "estimated_duration_seconds": b["estimated_duration_seconds"],
+            "entities": b["entities"],
+            "scene_direction": b["scene_direction"],
+            "animation_signal": b["animation_signal"],
+        }
+        for b in beats
+    ]
+    context = {
+        "category": category,
+        "style_profile": style_profile,
+        "script_language": script_language,
+        "scene_id": scene_id,
+        "scene_visual_intent": scene_visual_intent,
+        "scene_on_screen_text": scene_on_screen_text,
+        "requires_animation": requires_animation,
+        "scene_animation_density": scene_animation_density,
+        "beats": beats_context,
+        "previous_scene_last_animation": previous_scene_last_animation,
+    }
+    beat_ids = {b["beat_id"] for b in beats}
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
                     {"role": "system", "content": ANIMATION_PLANNER_PROMPT},
-                    {"role": "user", "content": json.dumps(scene_context)},
+                    {"role": "user", "content": json.dumps(context)},
                 ],
                 stream=False,
             )
@@ -11230,237 +11534,27 @@ async def _plan_scene_animation(scene: dict) -> dict:
                 content = content[4:].strip()
 
         raw = json.loads(content)
+        raw_animations = raw.get("animations")
+        if not isinstance(raw_animations, list):
+            raise ValueError("animation planner returned no 'animations' list")
 
     except Exception as e:
-        print(f"[edit-video] scene {scene.get('scene_id')} animation planning failed, using fallback: {e}")
-        return _default_animation(scene)
+        print(f"[edit-video] scene {scene_id} animation planning failed, using no animations: {e}")
+        return []
 
-    return _validate_animation(raw, scene)
-
-
-def _props_title_card(scene: dict, animation: dict) -> dict:
-    return {
-        "title": (scene.get("on_screen_text") or "").strip() or (scene.get("scene_id") or ""),
-        "subtitle": "",
-    }
-
-
-def _props_quote_card(scene: dict, animation: dict) -> dict:
-    vo_text = (scene.get("vo_text") or "").strip()
-    quote = vo_text.split(". ")[0].strip()
-    if quote and not quote.endswith((".", "!", "?")):
-        quote += "."
-    return {
-        "quote": quote,
-        "attribution": "",
-    }
-
-
-def _props_stat_counter(scene: dict, animation: dict) -> dict:
-    on_screen_text = (scene.get("on_screen_text") or "").strip()
-    match = re.search(r"[\d,]+(?:\.\d+)?", on_screen_text)
-    value = match.group(0) if match else on_screen_text
-    label = on_screen_text.replace(value, "").strip(" •-") if match else ""
-    return {
-        "value": value,
-        "label": label or on_screen_text,
-    }
-
-
-def _props_bullet_list(scene: dict, animation: dict) -> dict:
-    on_screen_text = (scene.get("on_screen_text") or "").strip()
-    if "•" in on_screen_text:
-        items = [item.strip() for item in on_screen_text.split("•") if item.strip()]
-    elif on_screen_text:
-        items = [on_screen_text]
-    else:
-        vo_text = (scene.get("vo_text") or "").strip()
-        items = [s.strip() for s in re.split(r"[.;]", vo_text) if s.strip()][:4]
-    return {
-        "title": "",
-        "items": items,
-    }
-
-
-def _props_data_viz(scene: dict, animation: dict) -> dict:
-    return {
-        "label": (scene.get("on_screen_text") or "").strip(),
-        "caption": (scene.get("visual_intent") or "").strip(),
-    }
-
-
-def _props_icon_sequence(scene: dict, animation: dict) -> dict:
-    binding = animation.get("content_binding", "")
-    icon = binding.split(":", 1)[1] if ":" in binding else "circle"
-    return {
-        "icons": [icon],
-        "label": (scene.get("on_screen_text") or "").strip(),
-    }
-
-
-REMOTION_INFOGRAPHIC_LIBRARY = {
-    "full_screen_title_card": {
-        "composition_id": "TitleCard",
-        "props_builder": _props_title_card,
-    },
-    "full_screen_quote_card": {
-        "composition_id": "QuoteCard",
-        "props_builder": _props_quote_card,
-    },
-    "full_screen_data_viz": {
-        "composition_id": "DataVizFullScreen",
-        "props_builder": _props_data_viz,
-    },
-    "stat_counter_overlay": {
-        "composition_id": "StatCounterOverlay",
-        "props_builder": _props_stat_counter,
-    },
-    "bullet_list_reveal": {
-        "composition_id": "BulletListReveal",
-        "props_builder": _props_bullet_list,
-    },
-    "icon_sequence": {
-        "composition_id": "IconSequenceOverlay",
-        "props_builder": _props_icon_sequence,
-    },
-    "icon_pop_in": {
-        "composition_id": "IconPopIn",
-        "props_builder": _props_icon_sequence,
-    },
-}
-
-
-def _get_scene_infographic(scene: dict, animation: dict) -> dict:
-    animation_type = animation.get("animation_type")
-    template = REMOTION_INFOGRAPHIC_LIBRARY.get(animation_type)
-
-    if not template:
-        return None
-
-    try:
-        props = template["props_builder"](scene, animation)
-    except Exception as e:
-        print(f"[edit-video] scene {scene.get('scene_id')} infographic prop-building failed: {e}")
-        props = {}
-
-    return {
-        "composition_id": template["composition_id"],
-        "animation_type": animation_type,
-        "props": props,
-        "duration_frames": animation.get("duration_frames"),
-        "trigger": animation.get("trigger"),
-        "placement": animation.get("placement"),
-        "render_engine_hint": "remotion",
-    }
+    validated, seen_beat_ids = [], set()
+    for raw_anim in raw_animations:
+        v = _validate_beat_animation(raw_anim, beat_ids)
+        if v and v["beat_id"] not in seen_beat_ids:
+            validated.append(v)
+            seen_beat_ids.add(v["beat_id"])
+    return validated
 
 
 async def _get_or_create_tagged_text(scene: dict, scene_id, user_id: str, vo_text: str) -> str:
-    """
-    Voice tags are mandatory before any TTS call — narration must always be
-    run through add_script_tags first, at initial scene creation. This
-    raises on failure rather than ever silently falling back to the raw,
-    untagged script, so callers must handle the exception (see
-    _process_scene for how that's surfaced).
-    """
-    tags_request = AddScriptTagsRequest(
-        userId=user_id,
-        script=vo_text,
-    )
+    tags_request = AddScriptTagsRequest(userId=user_id, script=vo_text)
     tags_result = await add_script_tags(tags_request)
     return tags_result["tagged_script"]
-
-
-async def _process_scene(scene: dict, request: EditVideo) -> dict:
-    scene_out = dict(scene)
-    vo_text = scene.get("vo_text", "")
-
-    # Animation/placement planning has no dependency on audio timing, so it
-    # can run fully in parallel with everything below.
-    animation_task = asyncio.create_task(_plan_scene_animation(scene))
-
-    async def _finalize() -> dict:
-        # Beats depend on scene_out["word_segments"]/["start"]/["end"]
-        # already being set by the caller before _finalize() runs — this is
-        # why beat-building happens AFTER voice + alignment instead of in
-        # parallel with them like the old scene-level media fetch did.
-        scene_out["beats"] = await _build_scene_beats(scene_out)
-        scene_out["media"] = _aggregate_beats_media(scene_out["beats"])
-        scene_out["animation"] = await animation_task
-        scene_out["infographics"] = _get_scene_infographic(scene, scene_out["animation"])
-        if scene_out.get("start") is not None and scene_out.get("end") is not None:
-            scene_out["duration_seconds"] = round(scene_out["end"] - scene_out["start"], 3)
-        else:
-            scene_out["duration_seconds"] = None
-        return scene_out
-
-    if not vo_text.strip():
-        scene_out["voiceover"] = None
-        scene_out["start"] = None
-        scene_out["end"] = None
-        scene_out["word_segments"] = []
-        scene_out["error"] = None
-        return await _finalize()
-
-    # Voice tags are mandatory before any voiceover is generated — narration
-    # must always go through add_script_tags first. If tagging fails, the
-    # scene fails its voiceover step outright (same as a voice-gen or
-    # alignment failure) instead of silently speaking the raw, untagged
-    # script.
-    try:
-        tagged_text = await _get_or_create_tagged_text(scene, scene.get("scene_id"), request.userId, vo_text)
-    except Exception as e:
-        print(f"[edit-video] scene {scene.get('scene_id')} tagging failed: {e}")
-        scene_out["tagged_vo_text"] = None
-        scene_out["voiceover"] = None
-        scene_out["start"] = None
-        scene_out["end"] = None
-        scene_out["word_segments"] = []
-        scene_out["error"] = f"voice tagging failed: {e}"
-        return await _finalize()
-
-    try:
-        speech_result = await _generate_speech_possibly_chunked(
-            user_id=request.userId,
-            tagged_text=tagged_text,
-            voice=request.voice,
-            lang_code=request.langCode,
-            volume=request.volume,
-            loudness_normalization=request.loudness_normalization,
-            text_normalization=request.text_normalization,
-        )
-    except Exception as e:
-        print(f"[edit-video] scene {scene.get('scene_id')} voice generation failed: {e}")
-        scene_out["tagged_vo_text"] = tagged_text
-        scene_out["voiceover"] = None
-        scene_out["start"] = None
-        scene_out["end"] = None
-        scene_out["word_segments"] = []
-        scene_out["error"] = f"voice generation failed: {e}"
-        return await _finalize()
-
-    try:
-        scene_timestamps = await _generate_word_timestamps(speech_result["url"])
-    except Exception as e:
-        print(f"[edit-video] scene {scene.get('scene_id')} whisperx alignment failed: {e}")
-        scene_out["tagged_vo_text"] = tagged_text
-        scene_out["voiceover"] = speech_result
-        scene_out["start"] = None
-        scene_out["end"] = None
-        scene_out["word_segments"] = []
-        scene_out["error"] = f"timestamp alignment failed: {e}"
-        return await _finalize()
-
-    word_segments = scene_timestamps.get("word_segments", [])
-    timed_words = [w for w in word_segments if "start" in w and "end" in w]
-
-    scene_out["tagged_vo_text"] = tagged_text
-    scene_out["voiceover"] = speech_result
-    scene_out["start"] = timed_words[0]["start"] if timed_words else None
-    scene_out["end"] = timed_words[-1]["end"] if timed_words else None
-    scene_out["word_segments"] = word_segments
-    scene_out["error"] = None
-
-    return await _finalize()
 
 
 def _enforce_scene_limit(scenes: list, max_scenes: int = 5) -> list:
@@ -11480,276 +11574,255 @@ def _enforce_scene_limit(scenes: list, max_scenes: int = 5) -> list:
     return kept + [last_scene]
 
 
-# =============================================================================
-# BEAT-LEVEL B-ROLL SELECTION  (replaces the old scene-level resolver)
-# =============================================================================
 
-def _resolve_beat_broll_selection(beat: dict) -> tuple:
-    """Per-beat equivalent of the old `_resolve_scene_broll_selection`.
-    Each beat carries its own candidate pool and its own optional manual
-    override, so B-roll selection/override now happens beat by beat."""
-    override = beat.get("broll_override")
-    if override and override.get("asset_id") is not None:
-        source = override.get("source")
-        file_url = _resolve_broll_file_url(override, source)
-        if file_url:
-            return (
-                {
-                    "id": override.get("asset_id"),
-                    "file_url": file_url,
-                    "source": source,
-                    **{k: v for k, v in override.items() if k not in ("asset_id", "source", "file_url")},
-                },
-                source,
-            )
-        print(
-            f"[timeline] beat {beat.get('beat_id')} has a broll_override "
-            f"that couldn't be resolved to a landscape file — falling back to default candidate"
+async def _process_scene(scene: dict, request: EditVideo, category: str, script_language: str, video_ctx: dict) -> dict:
+    scene_out = dict(scene)
+    vo_text = scene.get("vo_text", "")
+    scene_id = scene.get("scene_id")
+    style_profile = STYLE_PROFILES.get(category, STYLE_PROFILES["general_documentary"])
+    scene_animation_density = scene.get("scene_animation_density") or style_profile.get("animation_density", "medium")
+
+    known_entities_in = list(video_ctx["known_entities"])
+    known_setting_in = dict(video_ctx["known_setting"])
+    previous_media_type_in = video_ctx["previous_scene_last_media_type"]
+    previous_animation_in = video_ctx["previous_scene_last_animation"]
+
+    scene_out["_beat_director_context"] = {
+        "category": category,
+        "style_profile": style_profile,
+        "script_language": script_language,
+        "known_entities": known_entities_in,
+        "known_setting": known_setting_in,
+        "previous_scene_last_media_type": previous_media_type_in,
+    }
+    scene_out["_previous_scene_last_animation"] = previous_animation_in
+
+    async def _finalize(timed_words: list) -> dict:
+        beats = await _run_beat_director(
+            scene_vo_text=vo_text, category=category, style_profile=style_profile, script_language=script_language,
+            scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
+            scene_animation_density=scene_animation_density, scene_on_screen_text=scene.get("on_screen_text", ""),
+            previous_scene_last_media_type=previous_media_type_in,
+            known_entities=known_entities_in, known_setting=known_setting_in, id_prefix=scene_id,
         )
 
-    media = beat.get("media") or {}
-    video_candidates = (media.get("videos") or {}).get("results") or []
-    image_candidates = (media.get("images") or {}).get("results") or []
+        if timed_words:
+            _align_beats_to_timed_words(beats, timed_words)
+        else:
+            for b in beats:
+                b["start"], b["end"] = None, None
 
-    # FIX (images almost never used): this used to always try video first
-    # and only fall back to images when zero video candidates existed —
-    # which meant "use an image here" was never a real creative choice, it
-    # only ever happened by accident of Pexels having no video results.
-    # `preferred_media_type` is now decided per-beat by the LLM in
-    # `_generate_beat_keywords` (see BEAT_KEYWORDS_PROMPT), so respect that
-    # choice first and only fall through to the other pool if the
-    # AI-preferred type genuinely has no candidates available.
-    preferred = beat.get("preferred_media_type")
-    if preferred == "image":
-        if image_candidates:
-            return image_candidates[0], "image"
-        if video_candidates:
-            return video_candidates[0], "video"
-        return None, None
+        fallback_keywords = _get_scene_broll_keywords(scene)
+        await _fetch_beats_media(beats, str(scene_id))
+        await _fill_empty_beats(scene, beats, fallback_keywords)
+        _dedupe_beats_media_across_scene(beats)
 
-    # preferred == "video", or no preference recorded (legacy beats) —
-    # keep the original video-first behavior.
-    if video_candidates:
-        return video_candidates[0], "video"
-    if image_candidates:
-        return image_candidates[0], "image"
-    return None, None
+        animations = await _run_animation_planner(
+            scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
+            scene_on_screen_text=scene.get("on_screen_text", ""),
+            requires_animation=bool(scene.get("requires_animation", False)),
+            scene_animation_density=scene_animation_density, category=category,
+            style_profile=style_profile, script_language=script_language,
+            beats=beats, previous_scene_last_animation=previous_animation_in,
+        )
 
+        scene_out["beats"] = beats
+        scene_out["media"] = _aggregate_beats_media(beats)
+        scene_out["animations"] = animations
 
-def _resolve_beat_motion_type(beat: dict) -> str:
-    """
-    NEW: resolves which image motion effect (pan/zoom/tilt) a beat should
-    use if it renders as a still image. Precedence:
+        # Advance video-level continuity for the NEXT scene.
+        for b in beats:
+            for e in b["entities"]:
+                if not any(existing["name"].lower() == e["name"].lower() for existing in video_ctx["known_entities"]):
+                    video_ctx["known_entities"].append(e)
+            loc = b["scene_direction"]["setting"]["location"]
+            per = b["scene_direction"]["setting"]["time_period"]
+            if loc or per:
+                video_ctx["known_setting"] = {
+                    "location": loc or video_ctx["known_setting"].get("location", ""),
+                    "time_period": per or video_ctx["known_setting"].get("time_period", ""),
+                }
+        if beats:
+            video_ctx["previous_scene_last_media_type"] = beats[-1].get("preferred_media_type")
+        if animations:
+            last_anim = animations[-1]
+            video_ctx["previous_scene_last_animation"] = {
+                "animation_type": last_anim["animation_type"],
+                "placement": last_anim["placement"],
+                "category": last_anim["category"],
+            }
 
-      1. A manual override's motion_type (set via
-         PATCH /timeline/{video_id}/scene/{scene_id}/broll with
-         motion_type provided) — an explicit user choice always wins.
-      2. The motion_type the LLM chose for this beat in
-         `_generate_beat_keywords` (see BEAT_KEYWORDS_PROMPT).
-      3. `_DEFAULT_MOTION_TYPE`, only ever reached for legacy beats saved
-         before this feature existed.
+        if scene_out.get("start") is not None and scene_out.get("end") is not None:
+            scene_out["duration_seconds"] = round(scene_out["end"] - scene_out["start"], 3)
+        else:
+            scene_out["duration_seconds"] = None
+        return scene_out
 
-    This is purely a lookup — no new motion selection happens here. The
-    only two places any motion_type value is ever actually CHOSEN are the
-    LLM call (_generate_beat_keywords) and its failure-path diversified
-    default (_pick_diversified_motion_type).
-    """
-    override = beat.get("broll_override") or {}
-    motion = override.get("motion_type")
-    if motion in _VALID_MOTION_TYPES:
-        return motion
+    if not vo_text.strip():
+        scene_out["voiceover"] = None
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = None
+        return await _finalize([])
 
-    motion = beat.get("motion_type")
-    if motion in _VALID_MOTION_TYPES:
-        return motion
-
-    return _DEFAULT_MOTION_TYPE
-
-
-def _find_beat_broll_candidate(beat: dict, asset_id: Any, source: str) -> Optional[dict]:
-    media = beat.get("media") or {}
-    pool_key = "videos" if source == "video" else "images"
-    candidates = (media.get(pool_key) or {}).get("results") or []
-    for c in candidates:
-        if str(c.get("id")) == str(asset_id):
-            return c
-    return None
-
-
-async def _fetch_pexels_asset_by_id(asset_id: Any, source: str) -> Optional[dict]:
-    """
-    Fallback for /broll: an asset picked from an external search/matching
-    tool (relevance-scored results across the whole video, not this one
-    beat's own auto-fetched candidate pool) won't be found by
-    _find_beat_broll_candidate, since that only checks the 4-6 results this
-    specific beat's keywords happened to return. Rather than rejecting any
-    asset outside that narrow pool, fetch it directly from Pexels by ID —
-    this also guarantees we get the full video_files/src variants (so
-    _resolve_broll_file_url can pick the actual best-quality file) instead
-    of trusting a client-supplied assetUrl, which may point at a small
-    preview/SD rendition rather than the asset's real best quality.
-    """
-    if not PEXELS_API_KEY:
-        return None
-
-    url = (
-        f"https://api.pexels.com/videos/videos/{asset_id}"
-        if source == "video"
-        else f"https://api.pexels.com/v1/photos/{asset_id}"
-    )
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url, headers={"Authorization": PEXELS_API_KEY}, timeout=15.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        tagged_text = await _get_or_create_tagged_text(scene, scene_id, request.userId, vo_text)
     except Exception as e:
-        print(f"[broll] direct Pexels lookup failed for {source} asset {asset_id}: {e}")
-        return None
+        print(f"[edit-video] scene {scene_id} tagging failed: {e}")
+        scene_out["tagged_vo_text"] = None
+        scene_out["voiceover"] = None
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = f"voice tagging failed: {e}"
+        return await _finalize([])
 
-    return _format_video_result(data) if source == "video" else _format_image_result(data)
+    try:
+        speech_result = await _generate_speech_possibly_chunked(
+            user_id=request.userId, tagged_text=tagged_text, voice=request.voice, lang_code=request.langCode,
+            volume=request.volume, loudness_normalization=request.loudness_normalization,
+            text_normalization=request.text_normalization,
+        )
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} voice generation failed: {e}")
+        scene_out["tagged_vo_text"] = tagged_text
+        scene_out["voiceover"] = None
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = f"voice generation failed: {e}"
+        return await _finalize([])
+
+    try:
+        scene_timestamps = await _generate_word_timestamps(speech_result["url"])
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} whisperx alignment failed: {e}")
+        scene_out["tagged_vo_text"] = tagged_text
+        scene_out["voiceover"] = speech_result
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = f"timestamp alignment failed: {e}"
+        return await _finalize([])
+
+    word_segments = scene_timestamps.get("word_segments", [])
+    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+
+    scene_out["tagged_vo_text"] = tagged_text
+    scene_out["voiceover"] = speech_result
+    scene_out["start"] = timed_words[0]["start"] if timed_words else None
+    scene_out["end"] = timed_words[-1]["end"] if timed_words else None
+    scene_out["word_segments"] = word_segments
+    scene_out["error"] = None
+
+    return await _finalize(timed_words)
 
 
-def _seconds_to_frames(seconds: float, fps: int = TIMELINE_FPS) -> int:
-    return max(round((seconds or 0.0) * fps), 0)
-
-
-# =============================================================================
-# RESPONSE SLIMMING  (NEW)
-#
-# Full beat/track data (every Pexels candidate, every resolution variant
-# in video_files, the whole "candidates" pool) has to stay in raw_scenes /
-# timeline_json — reselection (/broll), dedupe, and blur-pad render
-# fallbacks all read that full data later. But none of that belongs in
-# what a caller actually sees after /edit-video or GET /timeline: they
-# want to know what beat exists, what keywords found its footage, and
-# which single asset/resolution actually got picked — not the other 5
-# candidates and every resolution Pexels offers for each of them.
-#
-# These helpers build a slimmed VIEW for API responses only; they never
-# mutate or replace what gets stored.
-# =============================================================================
-
-def _slim_selected_asset(selected: Optional[dict]) -> Optional[dict]:
-    if not selected:
-        return None
-    return {
-        "asset_id": selected.get("asset_id") if "asset_id" in selected else selected.get("id"),
-        "file_url": selected.get("file_url"),
-        "source": selected.get("source"),
-        "width": selected.get("width"),
-        "height": selected.get("height"),
+async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
+    """Used by the /beats/rebuild endpoint: re-runs the Beat Director +
+    Animation Planner for a single scene using the continuity context that
+    was captured when the scene was first processed."""
+    ctx = scene.get("_beat_director_context") or {
+        "category": "general_documentary",
+        "style_profile": STYLE_PROFILES["general_documentary"],
+        "script_language": "en",
+        "known_entities": [],
+        "known_setting": {"location": "", "time_period": ""},
+        "previous_scene_last_media_type": None,
     }
-
-
-def _slim_beat_for_response(beat: dict, broll_track: Optional[dict] = None) -> dict:
-    default_asset, default_source = _resolve_beat_broll_selection(beat)
-    selected = None
-    if default_asset:
-        selected = {
-            "asset_id": default_asset.get("id"),
-            "file_url": _resolve_broll_file_url(default_asset, default_source),
-            "source": default_source,
-            "width": default_asset.get("width"),
-            "height": default_asset.get("height"),
-        }
-    return {
-        "beat_id": beat.get("beat_id"),
-        "start": beat.get("start"),
-        "end": beat.get("end"),
-        # NEW: ABSOLUTE position in the final assembled video, in seconds
-        # — sourced directly from this beat's own "broll" track in the
-        # already-built timeline (build_timeline_from_scenes), so it's
-        # always exactly consistent with what actually renders, rather
-        # than recomputed here. None only if this beat has no matching
-        # track yet (shouldn't normally happen once beats exist).
-        "start_sec": (broll_track or {}).get("start_sec"),
-        "end_sec": (broll_track or {}).get("end_sec"),
-        "keywords": beat.get("keywords"),
-        "preferred_media_type": beat.get("preferred_media_type"),
-        "motion_type": _resolve_beat_motion_type(beat),
-        "selected_asset": selected,
-    }
-
-
-def _slim_scene_for_response(scene: dict, timeline: Optional[dict] = None) -> dict:
-    """
-    `timeline` is the already-built build_timeline_from_scenes output —
-    passed through so every beat, and this scene's text/infographic
-    overlay, can carry its ABSOLUTE start_sec/end_sec (position in the
-    final assembled video), not just the scene-local start/end already
-    on the raw beat/scene dicts. Audio deliberately does NOT get this
-    treatment here — voice_url has no on-screen "window" the way B-roll/
-    text/infographics do, so there's nothing meaningful to timestamp for
-    it beyond the scene's own start/end already returned.
-    """
+    previous_animation = scene.get("_previous_scene_last_animation")
     scene_id = scene.get("scene_id")
+    vo_text = scene.get("vo_text", "")
+    scene_animation_density = scene.get("scene_animation_density") or ctx["style_profile"].get("animation_density", "medium")
 
-    broll_track_by_beat_id = {}
-    overlay_track = None
-    if timeline:
-        for t in timeline.get("tracks", []):
-            if t.get("type") == "broll" and t.get("scene_id") == scene_id:
-                broll_track_by_beat_id[t.get("beat_id")] = t
-            elif t.get("type") in ("infographic", "animation") and t.get("scene_id") == scene_id:
-                overlay_track = t  # at most one per scene
+    beats = await _run_beat_director(
+        scene_vo_text=vo_text, category=ctx["category"], style_profile=ctx["style_profile"],
+        script_language=ctx["script_language"], scene_id=scene_id,
+        scene_visual_intent=scene.get("visual_intent", ""), scene_animation_density=scene_animation_density,
+        scene_on_screen_text=scene.get("on_screen_text", ""),
+        previous_scene_last_media_type=ctx["previous_scene_last_media_type"],
+        known_entities=ctx["known_entities"], known_setting=ctx["known_setting"], id_prefix=scene_id,
+    )
 
-    animation_out = dict(scene.get("animation")) if scene.get("animation") else None
-    infographics_out = dict(scene.get("infographics")) if scene.get("infographics") else None
-    if overlay_track:
-        if animation_out is not None:
-            animation_out["start_sec"] = overlay_track.get("start_sec")
-            animation_out["end_sec"] = overlay_track.get("end_sec")
-        if infographics_out is not None:
-            infographics_out["start_sec"] = overlay_track.get("start_sec")
-            infographics_out["end_sec"] = overlay_track.get("end_sec")
+    timed_words = [w for w in (scene.get("word_segments") or []) if "start" in w and "end" in w]
+    if timed_words:
+        _align_beats_to_timed_words(beats, timed_words)
 
-    return {
-        "scene_id": scene_id,
-        "vo_text": scene.get("vo_text"),
-        "visual_intent": scene.get("visual_intent"),
-        "on_screen_text": scene.get("on_screen_text"),
-        "start": scene.get("start"),
-        "end": scene.get("end"),
-        "duration_seconds": scene.get("duration_seconds"),
-        "voice_url": (scene.get("voiceover") or {}).get("url"),
-        "error": scene.get("error"),
-        "beats": [
-            _slim_beat_for_response(b, broll_track_by_beat_id.get(b.get("beat_id")))
-            for b in (scene.get("beats") or [])
-        ],
-        "animation": animation_out,
-        "infographics": infographics_out,
-        "caption_style": scene.get("caption_style"),
-        "background_color": scene.get("background_color"),
+    fallback_keywords = _get_scene_broll_keywords(scene)
+    await _fetch_beats_media(beats, str(scene_id))
+    await _fill_empty_beats(scene, beats, fallback_keywords)
+    _dedupe_beats_media_across_scene(beats)
+
+    animations = await _run_animation_planner(
+        scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
+        scene_on_screen_text=scene.get("on_screen_text", ""),
+        requires_animation=bool(scene.get("requires_animation", False)),
+        scene_animation_density=scene_animation_density, category=ctx["category"],
+        style_profile=ctx["style_profile"], script_language=ctx["script_language"],
+        beats=beats, previous_scene_last_animation=previous_animation,
+    )
+
+    scene["beats"] = beats
+    scene["media"] = _aggregate_beats_media(beats)
+    scene["animations"] = animations
+    return scene
+
+
+async def _rebuild_fragment_beats(scene: dict, local_start: float, local_end: float, id_prefix: str) -> list:
+    """Re-runs the Beat Director scoped to a single sub-range of a scene's
+    narration (used by split/insert). The Director still decides how many
+    beats the fragment needs — usually one, but not necessarily."""
+    ctx = scene.get("_beat_director_context") or {
+        "category": "general_documentary",
+        "style_profile": STYLE_PROFILES["general_documentary"],
+        "script_language": "en",
+        "known_entities": [],
+        "known_setting": {"location": "", "time_period": ""},
+        "previous_scene_last_media_type": None,
     }
+    word_segments = scene.get("word_segments") or []
+    timed_words_all = [w for w in word_segments if "start" in w and "end" in w]
+    fragment_timed_words = [
+        w for w in timed_words_all if w["start"] >= local_start - 1e-6 and w["start"] < local_end + 1e-6
+    ]
+    fragment_vo_text = _words_in_range(timed_words_all, local_start, local_end)
+
+    if not fragment_vo_text.strip():
+        return [{
+            "beat_id": f"{id_prefix}_beat1", "beat_index": 0, "vo_text": "",
+            "estimated_duration_seconds": max(1, round(local_end - local_start)),
+            "keywords": _get_scene_broll_keywords(scene), "media_type": "video", "preferred_media_type": "video",
+            "entities": [], "scene_direction": {"setting": dict(ctx["known_setting"]), "mood": "neutral", "key_action": "narration continues"},
+            "animation_signal": _validate_animation_signal(None), "motion_type": _DEFAULT_MOTION_TYPE,
+            "start": local_start, "end": local_end,
+        }]
+
+    beats = await _run_beat_director(
+        scene_vo_text=fragment_vo_text, category=ctx["category"], style_profile=ctx["style_profile"],
+        script_language=ctx["script_language"], scene_id=scene.get("scene_id"),
+        scene_visual_intent=scene.get("visual_intent", ""),
+        scene_animation_density=scene.get("scene_animation_density") or ctx["style_profile"].get("animation_density", "medium"),
+        scene_on_screen_text="",  # avoid re-triggering the same on-screen-text checklist item twice
+        previous_scene_last_media_type=None, known_entities=ctx["known_entities"], known_setting=ctx["known_setting"],
+        id_prefix=id_prefix,
+    )
+
+    if fragment_timed_words:
+        _align_beats_to_timed_words(beats, fragment_timed_words)
+    else:
+        for b in beats:
+            b["start"], b["end"] = local_start, local_end
+
+    fallback_keywords = _get_scene_broll_keywords(scene)
+    await _fetch_beats_media(beats, f"{scene.get('scene_id')}:{id_prefix}")
+    await _fill_empty_beats(scene, beats, fallback_keywords)
+    return beats
 
 
-def _slim_timeline_for_response(timeline: dict) -> dict:
-    slim_tracks = []
-    for track in timeline.get("tracks", []):
-        if track.get("type") != "broll":
-            slim_tracks.append(track)
-            continue
-        slim_tracks.append({
-            "track_id": track.get("track_id"),
-            "type": "broll",
-            "scene_id": track.get("scene_id"),
-            "beat_id": track.get("beat_id"),
-            "layer": track.get("layer"),
-            "startFrame": track.get("startFrame"),
-            "endFrame": track.get("endFrame"),
-            "beat_start_sec": track.get("beat_start_sec"),
-            "beat_end_sec": track.get("beat_end_sec"),
-            "keywords": track.get("keywords"),
-            "preferred_media_type": track.get("preferred_media_type"),
-            "motion_type": track.get("motion_type"),
-            "selected_asset": _slim_selected_asset(track.get("selected_asset")),
-            "background_color": track.get("background_color"),
-        })
-    return {**timeline, "tracks": slim_tracks}
-
+# ---------------------------------------------------------------------------
+# Timeline building
+# ---------------------------------------------------------------------------
 
 def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
     tracks = []
@@ -11767,28 +11840,11 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
         voiceover = scene.get("voiceover")
         if voiceover and voiceover.get("url"):
             tracks.append({
-                "track_id": f"audio_{scene_id}",
-                "scene_id": scene_id,
-                "type": "audio",
-                "file_url": voiceover["url"],
-                "vo_text": scene.get("vo_text"),
-                "startFrame": scene_start_frame,
-                "endFrame": scene_end_frame,
-                # NEW: ABSOLUTE position in the final assembled video, in
-                # seconds — this is what a frontend timeline scrubber
-                # actually needs (startFrame/fps, endFrame/fps). Distinct
-                # from scene_start_sec/scene_end_sec below, which are
-                # SCENE-LOCAL (position within this scene's own generated
-                # audio file) — those two numbers only match for the very
-                # first scene in a video; every scene after that starts
-                # partway through the assembled timeline while its own
-                # local clock still starts near 0.
-                "start_sec": scene_start_frame / fps,
-                "end_sec": scene_end_frame / fps,
-                # Scene-local timing, in seconds, alongside the frame
-                # numbers — persisted verbatim into timeline_json/raw_scenes.
-                "scene_start_sec": start_sec,
-                "scene_end_sec": end_sec,
+                "track_id": f"audio_{scene_id}", "scene_id": scene_id, "type": "audio",
+                "file_url": voiceover["url"], "vo_text": scene.get("vo_text"),
+                "startFrame": scene_start_frame, "endFrame": scene_end_frame,
+                "start_sec": scene_start_frame / fps, "end_sec": scene_end_frame / fps,
+                "scene_start_sec": start_sec, "scene_end_sec": end_sec,
             })
 
         word_segments = scene.get("word_segments") or []
@@ -11802,51 +11858,29 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "endFrame": scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps),
             })
         if words:
-            caption_track = {
-                "track_id": f"caption_{scene_id}",
-                "scene_id": scene_id,
-                "type": "caption_word",
-                "words": words,
-            }
-            # Always attach a style — merge the scene's custom caption_style
-            # (if any) on top of DEFAULT_CAPTION_STYLE, so captions render
-            # very low on screen unless a scene explicitly overrides the
-            # position, while still keeping any other custom style fields
-            # (font_size, text_color, etc.) intact.
+            caption_track = {"track_id": f"caption_{scene_id}", "scene_id": scene_id, "type": "caption_word", "words": words}
             caption_track["style"] = {**DEFAULT_CAPTION_STYLE, **(scene.get("caption_style") or {})}
             tracks.append(caption_track)
 
-        # ---------------------------------------------------------------
-        # ROTATING B-ROLL: one track per beat (~10s each), instead of a
-        # single broll track spanning the whole scene. This is what makes
-        # the visible footage change mid-scene. Each track also now carries
-        # `motion_type` — the LLM-chosen (or manually overridden) pan/zoom/
-        # tilt effect to apply if this beat's selected_asset is an image.
-        # ---------------------------------------------------------------
         beats = scene.get("beats") or []
         if not beats:
-            # Legacy fallback for rows saved before the beats refactor —
-            # synthesize a single beat from the old scene-level shape so
-            # old videos keep rendering.
             beats = [{
-                "beat_id": f"{scene_id}_b1",
-                "start": start_sec,
-                "end": end_sec,
-                "media": scene.get("media") or {},
-                "broll_override": scene.get("broll_override"),
+                "beat_id": f"{scene_id}_b1", "start": start_sec, "end": end_sec,
+                "media": scene.get("media") or {}, "broll_override": scene.get("broll_override"),
             }]
 
+        beat_frame_ranges = {}
         for beat in beats:
             b_start = beat.get("start")
             b_end = beat.get("end")
             if b_start is None or b_end is None:
-                beat_start_frame = scene_start_frame
-                beat_end_frame = scene_end_frame
+                beat_start_frame, beat_end_frame = scene_start_frame, scene_end_frame
             else:
                 beat_start_frame = scene_start_frame + _seconds_to_frames(b_start - start_sec, fps)
                 beat_end_frame = scene_start_frame + _seconds_to_frames(b_end - start_sec, fps)
                 beat_end_frame = min(beat_end_frame, scene_end_frame)
                 beat_start_frame = max(scene_start_frame, min(beat_start_frame, beat_end_frame))
+            beat_frame_ranges[beat.get("beat_id")] = (beat_start_frame, beat_end_frame)
 
             default_asset, default_source = _resolve_beat_broll_selection(beat)
             media = beat.get("media") or {}
@@ -11854,29 +11888,12 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             image_candidates = (media.get("images") or {}).get("results") or []
 
             broll_track = {
-                "track_id": f"broll_{scene_id}_{beat.get('beat_id')}",
-                "scene_id": scene_id,
-                "beat_id": beat.get("beat_id"),
-                "type": "broll",
-                "layer": "background",
-                "startFrame": beat_start_frame,
-                "endFrame": beat_end_frame,
-                # NEW: ABSOLUTE position in the final assembled video, in
-                # seconds — use THESE for a frontend timeline (a clip's
-                # real on-screen window), not beat_start_sec/beat_end_sec
-                # below, which are SCENE-LOCAL (position within this
-                # beat's own scene's audio) and only equal the absolute
-                # position for a scene's very first beat in the very
-                # first scene of the video.
-                "start_sec": beat_start_frame / fps,
-                "end_sec": beat_end_frame / fps,
-                "beat_start_sec": b_start,
-                "beat_end_sec": b_end,
-                "keywords": beat.get("keywords"),
-                "preferred_media_type": beat.get("preferred_media_type"),
-                # NEW: resolved motion effect for this beat (LLM choice,
-                # or manual override if one was set). The render step reads
-                # this directly — see _render_scene / _prepare_broll_clip.
+                "track_id": f"broll_{scene_id}_{beat.get('beat_id')}", "scene_id": scene_id,
+                "beat_id": beat.get("beat_id"), "type": "broll", "layer": "background",
+                "startFrame": beat_start_frame, "endFrame": beat_end_frame,
+                "start_sec": beat_start_frame / fps, "end_sec": beat_end_frame / fps,
+                "beat_start_sec": b_start, "beat_end_sec": b_end,
+                "keywords": beat.get("keywords"), "preferred_media_type": beat.get("preferred_media_type"),
                 "motion_type": _resolve_beat_motion_type(beat),
                 "selected_asset": {
                     "asset_id": (default_asset or {}).get("id"),
@@ -11887,10 +11904,7 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                     "video_files": (default_asset or {}).get("video_files"),
                     "src": (default_asset or {}).get("src"),
                 } if default_asset else None,
-                "candidates": {
-                    "videos": video_candidates,
-                    "images": image_candidates,
-                },
+                "candidates": {"videos": video_candidates, "images": image_candidates},
             }
 
             background_color = scene.get("background_color")
@@ -11899,82 +11913,197 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
 
             tracks.append(broll_track)
 
-        # ---------------------------------------------------------------
-        # ANIMATION / INFOGRAPHIC — placement is entirely LLM-directed
-        # (see ANIMATION_PLANNER_PROMPT). The renderer draws it at exactly
-        # animation["placement"] / z_index_layer / trigger below; nothing
-        # else in this pipeline decides where it goes.
-        # ---------------------------------------------------------------
-        animation = scene.get("animation") or {}
-        infographic = scene.get("infographics")
+        for animation in (scene.get("animations") or []):
+            beat_id = animation.get("beat_id")
+            rng = beat_frame_ranges.get(beat_id)
+            if not rng:
+                continue
+            b_start_frame, b_end_frame = rng
+            anim_span = b_end_frame - b_start_frame if b_end_frame > b_start_frame else animation.get("duration_frames", 90)
+            anim_start_frame = b_start_frame
+            anim_end_frame = min(b_start_frame + animation.get("duration_frames", 90), b_start_frame + max(anim_span, 1))
 
-        # NEW: prefer an explicit start/end window (seconds, relative to
-        # this scene's own start) set via SceneStyleUpdate.text_start/
-        # text_end or SceneInfographicUpdate.start_seconds/end_seconds —
-        # see those endpoints. Falls back to the original "starts at scene
-        # start, runs for duration_frames" behavior when neither offset is
-        # set, so scenes that never used the new fields render unchanged.
-        start_offset_seconds = animation.get("start_offset_seconds")
-        end_offset_seconds = animation.get("end_offset_seconds")
-
-        if start_offset_seconds is not None and end_offset_seconds is not None:
-            overlay_start = scene_start_frame + _seconds_to_frames(start_offset_seconds, fps)
-            overlay_end = scene_start_frame + _seconds_to_frames(end_offset_seconds, fps)
-            overlay_start = max(scene_start_frame, min(overlay_start, scene_end_frame))
-            overlay_end = max(overlay_start, min(overlay_end, scene_end_frame))
-        else:
-            overlay_duration = animation.get("duration_frames") or (scene_end_frame - scene_start_frame)
-            overlay_start = scene_start_frame
-            overlay_end = min(scene_start_frame + overlay_duration, scene_end_frame)
-
-        if infographic:
             tracks.append({
-                "track_id": f"infographic_{scene_id}",
-                "scene_id": scene_id,
-                "type": "infographic",
-                "layer": "foreground",
-                "composition_id": infographic.get("composition_id"),
-                "animation_type": infographic.get("animation_type"),
-                "placement": infographic.get("placement"),
-                "props": infographic.get("props", {}),
-                "startFrame": overlay_start,
-                "endFrame": overlay_end,
-                # NEW: absolute on-screen window, in seconds — what a
-                # frontend timeline should actually display for this
-                # infographic's start/end.
-                "start_sec": overlay_start / fps,
-                "end_sec": overlay_end / fps,
-                "duration_frames": overlay_end - overlay_start,
-                "status": "pending_render",
-                "asset_url": None,
-                "render_engine_hint": "remotion",
-            })
-        elif animation:
-            tracks.append({
-                "track_id": f"overlay_{scene_id}",
-                "scene_id": scene_id,
-                "type": "animation",
+                "track_id": f"anim_{scene_id}_{beat_id}",
+                "scene_id": scene_id, "beat_id": beat_id, "type": "animation",
                 "layer": animation.get("z_index_layer", "foreground"),
-                "animation_type": animation.get("animation_type"),
-                "placement": animation.get("placement"),
-                "content_binding": animation.get("content_binding"),
-                "startFrame": overlay_start,
-                "endFrame": overlay_end,
-                # NEW: same absolute-seconds addition as infographic
-                # tracks above, for this scene's plain text overlay.
-                "start_sec": overlay_start / fps,
-                "end_sec": overlay_end / fps,
+                "animation_type": animation.get("animation_type"), "category": animation.get("category"),
+                "placement": animation.get("placement"), "geometry_px": animation.get("geometry_px"),
+                "motion": animation.get("motion"), "icon_name": animation.get("icon_name"),
+                "icon_layout": animation.get("icon_layout"), "display_text": animation.get("display_text"),
+                "color_hint": animation.get("color_hint"), "highlight_target_text": animation.get("highlight_target_text"),
+                "content_binding": animation.get("content_binding"), "render_prompt": animation.get("render_prompt"),
+                "trigger": animation.get("trigger"),
+                "startFrame": anim_start_frame, "endFrame": anim_end_frame,
+                "start_sec": anim_start_frame / fps, "end_sec": anim_end_frame / fps,
+                "duration_frames": anim_end_frame - anim_start_frame,
+                "status": "pending_render" if animation.get("render_engine_hint") == "remotion" else "ready",
+                "asset_url": None,
                 "render_engine_hint": animation.get("render_engine_hint"),
             })
 
         cumulative_frames = scene_end_frame
 
     return {
-        "fps": fps,
-        "total_frames": cumulative_frames,
+        "fps": fps, "total_frames": cumulative_frames,
         "resolution": {"width": TIMELINE_WIDTH, "height": TIMELINE_HEIGHT},
         "tracks": tracks,
     }
+
+
+
+_TEXT_ONLY_ANIMATION_TYPES = {
+    "lower_third", "kinetic_caption", "bullet_list_reveal", "callout_textbox",
+    "stat_counter_overlay", "full_screen_title_card", "full_screen_quote_card",
+}
+
+
+def _next_animation_id(raw_scenes: list) -> int:
+    max_id = 0
+    for s in raw_scenes:
+        for a in (s.get("animations") or []):
+            aid = a.get("id")
+            if isinstance(aid, int) and aid > max_id:
+                max_id = aid
+    return max_id + 1
+
+
+def _assign_animation_ids(raw_scenes: list) -> None:
+    next_id = _next_animation_id(raw_scenes)
+    for s in raw_scenes:
+        for a in (s.get("animations") or []):
+            if not isinstance(a.get("id"), int):
+                a["id"] = next_id
+                next_id += 1
+
+
+def _find_animation_by_id(raw_scenes: list, animation_id: int) -> Optional[tuple]:
+    for si, s in enumerate(raw_scenes):
+        animations = s.get("animations") or []
+        for ai, a in enumerate(animations):
+            if a.get("id") == animation_id:
+                return si, ai, s.get("scene_id"), a.get("beat_id")
+    return None
+
+
+def _compute_infographics_and_text_lists(raw_scenes: list, timeline: dict) -> tuple[list, list]:
+    _assign_animation_ids(raw_scenes)
+
+    anim_timing_by_scene_beat = {}
+    for t in (timeline or {}).get("tracks", []):
+        if t.get("type") != "animation":
+            continue
+        anim_timing_by_scene_beat[(t.get("scene_id"), t.get("beat_id"))] = {
+            "start": t.get("start_sec"),
+            "end": t.get("end_sec"),
+        }
+
+    infographics, text_list = [], []
+    for scene in raw_scenes:
+        scene_id = scene.get("scene_id")
+        for anim in (scene.get("animations") or []):
+            beat_id = anim.get("beat_id")
+            animation_type = anim.get("animation_type")
+            has_icon = bool(anim.get("icon_name"))
+            timing = anim_timing_by_scene_beat.get((scene_id, beat_id)) or {"start": None, "end": None}
+            entry = {
+                "id": anim.get("id"),
+                "scene_id": scene_id, "beat_id": beat_id,
+                "animation_type": animation_type, "category": anim.get("category"),
+                "placement": anim.get("placement"), "display_text": anim.get("display_text"),
+                "color_hint": anim.get("color_hint"),
+                "start": timing["start"], "end": timing["end"],
+            }
+            is_text_only = animation_type in _TEXT_ONLY_ANIMATION_TYPES and not has_icon
+            if is_text_only:
+                text_list.append(entry)
+            else:
+                infographics.append(entry)
+    return infographics, text_list
+
+def _compute_broll_list(timeline: dict) -> list:
+    return [
+        {
+            "track_id": t.get("track_id"), "scene_id": t.get("scene_id"), "beat_id": t.get("beat_id"),
+            "start_sec": t.get("start_sec"), "end_sec": t.get("end_sec"),
+            "selected_asset": _slim_selected_asset(t.get("selected_asset")),
+        }
+        for t in timeline.get("tracks", []) if t.get("type") == "broll"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Response slimming
+# ---------------------------------------------------------------------------
+
+def _slim_beat_for_response(beat: dict, broll_track: Optional[dict] = None) -> dict:
+    default_asset, default_source = _resolve_beat_broll_selection(beat)
+    selected = None
+    if default_asset:
+        selected = {
+            "asset_id": default_asset.get("id"), "file_url": _resolve_broll_file_url(default_asset, default_source),
+            "source": default_source, "width": default_asset.get("width"), "height": default_asset.get("height"),
+        }
+    return {
+        "beat_id": beat.get("beat_id"), "start": beat.get("start"), "end": beat.get("end"),
+        "start_sec": (broll_track or {}).get("start_sec"), "end_sec": (broll_track or {}).get("end_sec"),
+        "vo_text": beat.get("vo_text"), "keywords": beat.get("keywords"),
+        "preferred_media_type": beat.get("preferred_media_type"), "motion_type": _resolve_beat_motion_type(beat),
+        "entities": beat.get("entities"), "scene_direction": beat.get("scene_direction"),
+        "selected_asset": selected,
+    }
+
+
+def _slim_scene_for_response(scene: dict, timeline: Optional[dict] = None) -> dict:
+    scene_id = scene.get("scene_id")
+
+    broll_track_by_beat_id = {}
+    animation_track_by_beat_id = {}
+    if timeline:
+        for t in timeline.get("tracks", []):
+            if t.get("type") == "broll" and t.get("scene_id") == scene_id:
+                broll_track_by_beat_id[t.get("beat_id")] = t
+            elif t.get("type") == "animation" and t.get("scene_id") == scene_id:
+                animation_track_by_beat_id[t.get("beat_id")] = t
+
+    animations_out = []
+    for anim in (scene.get("animations") or []):
+        anim = dict(anim)
+        track = animation_track_by_beat_id.get(anim.get("beat_id"))
+        if track:
+            anim["start_sec"] = track.get("start_sec")
+            anim["end_sec"] = track.get("end_sec")
+        animations_out.append(anim)
+
+    return {
+        "scene_id": scene_id, "vo_text": scene.get("vo_text"), "visual_intent": scene.get("visual_intent"),
+        "on_screen_text": scene.get("on_screen_text"), "requires_animation": scene.get("requires_animation"),
+        "scene_animation_density": scene.get("scene_animation_density"),
+        "start": scene.get("start"), "end": scene.get("end"), "duration_seconds": scene.get("duration_seconds"),
+        "voice_url": (scene.get("voiceover") or {}).get("url"), "error": scene.get("error"),
+        "beats": [_slim_beat_for_response(b, broll_track_by_beat_id.get(b.get("beat_id"))) for b in (scene.get("beats") or [])],
+        "animations": animations_out,
+        "caption_style": scene.get("caption_style"), "background_color": scene.get("background_color"),
+    }
+
+
+def _slim_timeline_for_response(timeline: dict) -> dict:
+    slim_tracks = []
+    for track in timeline.get("tracks", []):
+        if track.get("type") != "broll":
+            slim_tracks.append(track)
+            continue
+        slim_tracks.append({
+            "track_id": track.get("track_id"), "type": "broll", "scene_id": track.get("scene_id"),
+            "beat_id": track.get("beat_id"), "layer": track.get("layer"),
+            "startFrame": track.get("startFrame"), "endFrame": track.get("endFrame"),
+            "beat_start_sec": track.get("beat_start_sec"), "beat_end_sec": track.get("beat_end_sec"),
+            "keywords": track.get("keywords"), "preferred_media_type": track.get("preferred_media_type"),
+            "motion_type": track.get("motion_type"), "selected_asset": _slim_selected_asset(track.get("selected_asset")),
+            "background_color": track.get("background_color"),
+        })
+    return {**timeline, "tracks": slim_tracks}
+
 
 
 @app.post("/edit-video")
@@ -11993,7 +12122,6 @@ async def edit_video(request: EditVideo):
         _record_token_usage("edit video", res)
 
         content = (res.choices[0].message.content or "").strip()
-
         if content.startswith("```"):
             content = content.strip("`")
             if content.lower().startswith("json"):
@@ -12007,23 +12135,33 @@ async def edit_video(request: EditVideo):
 
     try:
         parsed = json.loads(content)
-
         if isinstance(parsed, dict) and "scenes" in parsed:
             scenes = parsed["scenes"]
+            category = parsed.get("category") or "general_documentary"
+            script_language = parsed.get("script_language") or "en"
         elif isinstance(parsed, list):
             scenes = parsed
+            category = "general_documentary"
+            script_language = "en"
         else:
             raise ValueError(f"Unexpected JSON shape: {type(parsed)}")
-
     except (json.JSONDecodeError, ValueError) as e:
         print(f"[edit-video] JSON parse failed: {e} | raw content: {content[:500]}")
         raise HTTPException(status_code=502, detail="Model did not return valid JSON")
 
+    if category not in STYLE_PROFILES:
+        print(f"[edit-video] model returned unknown category {category!r} — defaulting to general_documentary")
+        category = "general_documentary"
+
     scenes = _enforce_scene_limit(scenes, max_scenes=5)
 
+    video_ctx = {
+        "known_entities": [], "known_setting": {"location": "", "time_period": ""},
+        "previous_scene_last_media_type": None, "previous_scene_last_animation": None,
+    }
     scenes_with_voice_and_timestamps = []
     for scene in scenes:
-        scene_result = await _process_scene(scene, request)
+        scene_result = await _process_scene(scene, request, category, script_language, video_ctx)
         scenes_with_voice_and_timestamps.append(scene_result)
 
     failed_scenes = [s["scene_id"] for s in scenes_with_voice_and_timestamps if s.get("error")]
@@ -12032,64 +12170,37 @@ async def edit_video(request: EditVideo):
 
     timeline_json = build_timeline_from_scenes(scenes_with_voice_and_timestamps)
 
-    # Explicit start/end (and duration) summary per scene, independent of
-    # the deeper raw_scenes/timeline_json shapes — convenient for clients
-    # that just want "when does each scene start/end" without walking
-    # tracks, and persisted into the DB row below via scene_timings.
     scene_timings = [
         {
-            "scene_id": s.get("scene_id"),
-            "start": s.get("start"),
-            "end": s.get("end"),
+            "scene_id": s.get("scene_id"), "start": s.get("start"), "end": s.get("end"),
             "duration_seconds": s.get("duration_seconds"),
-            "beats": [
-                {"beat_id": b.get("beat_id"), "start": b.get("start"), "end": b.get("end")}
-                for b in (s.get("beats") or [])
-            ],
+            "beats": [{"beat_id": b.get("beat_id"), "start": b.get("start"), "end": b.get("end")} for b in (s.get("beats") or [])],
         }
         for s in scenes_with_voice_and_timestamps
     ]
 
-    # FIX: "infographics" was previously anything whose animation_type
-    # NEW: computed BEFORE the insert below (previously computed after),
-    # specifically so both lists can be persisted as their own columns —
-    # not just returned in this one response — and stay available on
-    # every later GET/PATCH of this video, not only right after creation.
-    # See _compute_infographics_and_text_lists for the classification
-    # rules (also reused by /style and /infographic to keep these columns
-    # in sync after edits).
     infographics, text_overlays = _compute_infographics_and_text_lists(scenes_with_voice_and_timestamps, timeline_json)
     broll_list = _compute_broll_list(timeline_json)
 
     video_id = str(uuid.uuid4())
     try:
         supabase.table("videos").insert({
-            "id": video_id,
-            "user_id": request.userId,
-            "script": request.script,
-            "voice": request.voice,
-            "lang_code": request.langCode,
-            "timeline_json": timeline_json,
-            "timeline_version": 1,
-            "raw_scenes": scenes_with_voice_and_timestamps,
-            "scene_timings": scene_timings,
-            "infographics_list": infographics,
-            "text_list": text_overlays,
-            "broll_list": broll_list,
+            "id": video_id, "user_id": request.userId, "script": request.script, "voice": request.voice,
+            "lang_code": request.langCode, "category": category, "script_language": script_language,
+            "timeline_json": timeline_json, "timeline_version": 1,
+            "raw_scenes": scenes_with_voice_and_timestamps, "scene_timings": scene_timings,
+            "infographics_list": infographics, "text_list": text_overlays, "broll_list": broll_list,
         }).execute()
     except Exception as e:
         print(f"[edit-video] failed to persist video row: {e}")
         raise HTTPException(status_code=500, detail="Failed to save video")
 
     return {
-        "video_id": video_id,
+        "video_id": video_id, "category": category, "script_language": script_language,
         "timeline": _slim_timeline_for_response(timeline_json),
         "scenes": [_slim_scene_for_response(s, timeline_json) for s in scenes_with_voice_and_timestamps],
-        "scene_timings": scene_timings,
-        "failed_scene_ids": failed_scenes,
-        "infographics_list": infographics,
-        "text_list": text_overlays,
-        "broll_list": broll_list,
+        "scene_timings": scene_timings, "failed_scene_ids": failed_scenes,
+        "infographics_list": infographics, "text_list": text_overlays, "broll_list": broll_list,
     }
 
 
@@ -12099,9 +12210,7 @@ async def get_timeline(video_id: str):
         row = (
             supabase.table("videos")
             .select("timeline_json, timeline_version, scene_timings, infographics_list, text_list, broll_list")
-            .eq("id", video_id)
-            .single()
-            .execute()
+            .eq("id", video_id).single().execute()
         )
     except Exception as e:
         print(f"[get-timeline] failed to fetch video {video_id}: {e}")
@@ -12120,11 +12229,8 @@ async def get_timeline(video_id: str):
 async def patch_timeline(video_id: str, patch: TrackPatch):
     try:
         row = (
-            supabase.table("videos")
-            .select("timeline_json, timeline_version, raw_scenes")
-            .eq("id", video_id)
-            .single()
-            .execute()
+            supabase.table("videos").select("timeline_json, timeline_version, raw_scenes")
+            .eq("id", video_id).single().execute()
         )
     except Exception as e:
         print(f"[patch-timeline] failed to fetch video {video_id}: {e}")
@@ -12162,23 +12268,14 @@ async def patch_timeline(video_id: str, patch: TrackPatch):
             if "selected_asset" in patch.updates and patch.updates["selected_asset"]:
                 sel = patch.updates["selected_asset"]
                 override = {
-                    "asset_id": sel.get("asset_id") or sel.get("id"),
-                    "source": sel.get("source"),
-                    "file_url": sel.get("file_url"),
-                    "width": sel.get("width"),
-                    "height": sel.get("height"),
-                    "video_files": sel.get("video_files"),
-                    "src": sel.get("src"),
-                    # NEW: allow a motion_type to travel along with a manual
-                    # asset override applied via generic track patching too,
-                    # not just the dedicated /broll endpoint below.
-                    "motion_type": sel.get("motion_type"),
+                    "asset_id": sel.get("asset_id") or sel.get("id"), "source": sel.get("source"),
+                    "file_url": sel.get("file_url"), "width": sel.get("width"), "height": sel.get("height"),
+                    "video_files": sel.get("video_files"), "src": sel.get("src"), "motion_type": sel.get("motion_type"),
                 }
                 if beat_idx is not None:
                     beats[beat_idx] = {**beats[beat_idx], "broll_override": override}
                     scene["beats"] = beats
                 else:
-                    # legacy rows without beats: keep the old scene-level override behavior
                     scene["broll_override"] = override
                 visual_change = True
 
@@ -12195,34 +12292,24 @@ async def patch_timeline(video_id: str, patch: TrackPatch):
                 visual_change = True
 
         elif track_found.get("type") == "animation":
-            # NEW: lets a non-infographic overlay's on-screen duration be
-            # patched the same way infographic duration already is via
-            # /scene/{scene_id}/infographic. Persisted onto scene["animation"]
-            # so it survives the next build_timeline_from_scenes call,
-            # not just this one track's endFrame in the current snapshot.
-            if "duration_frames" in patch.updates:
+            beat_id = track_found.get("beat_id")
+            animations = scene.get("animations") or []
+            anim_idx = next((i for i, a in enumerate(animations) if a.get("beat_id") == beat_id), None)
+            if anim_idx is not None and "duration_frames" in patch.updates:
                 try:
                     new_duration = int(patch.updates["duration_frames"])
                     if new_duration <= 0 or new_duration > 900:
                         raise ValueError
                 except (TypeError, ValueError):
-                    raise HTTPException(
-                        status_code=422,
-                        detail="duration_frames must be an integer between 1 and 900 (30s @30fps)",
-                    )
-                animation = dict(scene.get("animation") or {})
-                animation["duration_frames"] = new_duration
-                scene["animation"] = animation
+                    raise HTTPException(status_code=422, detail="duration_frames must be an integer between 1 and 900 (30s @30fps)")
+                animations[anim_idx] = {**animations[anim_idx], "duration_frames": new_duration}
+                scene["animations"] = animations
                 visual_change = True
 
         raw_scenes[scene_index] = scene
 
     new_version = current_version + 1
-
-    update_payload = {
-        "timeline_json": timeline,
-        "timeline_version": new_version,
-    }
+    update_payload = {"timeline_json": timeline, "timeline_version": new_version}
     if scene_index is not None:
         update_payload["raw_scenes"] = raw_scenes
     if visual_change:
@@ -12235,54 +12322,28 @@ async def patch_timeline(video_id: str, patch: TrackPatch):
         print(f"[patch-timeline] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save edit")
 
-    return {
-        "timeline_version": new_version,
-        "track_id": patch.track_id,
-        "needs_render": visual_change,
-    }
+    return {"timeline_version": new_version, "track_id": patch.track_id, "needs_render": visual_change}
 
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/style")
 async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpdate):
+    """Pure burned-in-caption styling. Overlay/infographic text is edited
+    via PATCH .../beat/{beat_id}/animation instead — see BeatAnimationUpdate."""
     if update.animation_type is not None and update.animation_type not in _VALID_CAPTION_ANIMATION_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"animation_type must be one of {sorted(_VALID_CAPTION_ANIMATION_TYPES)}",
-        )
+        raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_CAPTION_ANIMATION_TYPES)}")
     _validate_hex_color(update.text_color, "text_color")
     _validate_hex_color(update.outline_color, "outline_color")
     _validate_hex_color(update.background_color, "background_color")
 
-    if (update.text_start is None) != (update.text_end is None):
-        raise HTTPException(status_code=422, detail="text_start and text_end must be provided together")
-    if update.text_start is not None and update.text_end is not None and update.text_end <= update.text_start:
-        raise HTTPException(status_code=422, detail="text_end must be greater than text_start")
-
-    if update.text_animation_style is not None and update.text_animation_style not in _VALID_TEXT_ANIMATION_STYLES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"text_animation_style must be one of {sorted(_VALID_TEXT_ANIMATION_STYLES)}",
-        )
-
     if (
-        update.font_size is None and update.text_color is None
-        and update.outline_color is None and update.animation_type is None
-        and update.background_color is None and update.vertical_position is None
-        and update.margin_bottom_percent is None and update.text_start is None
-        and update.text_end is None and update.text_animation_style is None
-        and update.horizontal_position is None and update.margin_horizontal_percent is None
-        and update.text is None
+        update.font_size is None and update.text_color is None and update.outline_color is None
+        and update.animation_type is None and update.background_color is None and update.vertical_position is None
+        and update.margin_bottom_percent is None and update.horizontal_position is None and update.margin_horizontal_percent is None
     ):
         raise HTTPException(status_code=422, detail="Provide at least one field to update")
 
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[update-scene-style] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -12300,17 +12361,12 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     scene = dict(raw_scenes[scene_index])
 
     style_fields = {
-        "font_size": update.font_size,
-        "text_color": update.text_color,
-        "outline_color": update.outline_color,
-        "animation_type": update.animation_type,
-        "vertical_position": update.vertical_position,
-        "margin_bottom_percent": update.margin_bottom_percent,
-        "horizontal_position": update.horizontal_position,
+        "font_size": update.font_size, "text_color": update.text_color, "outline_color": update.outline_color,
+        "animation_type": update.animation_type, "vertical_position": update.vertical_position,
+        "margin_bottom_percent": update.margin_bottom_percent, "horizontal_position": update.horizontal_position,
         "margin_horizontal_percent": update.margin_horizontal_percent,
     }
     style_fields = {k: v for k, v in style_fields.items() if v is not None}
-
     if style_fields:
         existing_style = scene.get("caption_style") or {}
         scene["caption_style"] = {**existing_style, **style_fields}
@@ -12318,94 +12374,34 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     if update.background_color is not None:
         scene["background_color"] = update.background_color
 
-    if update.text_start is not None and update.text_end is not None:
-        animation = dict(scene.get("animation") or _default_animation(scene))
-        animation["start_offset_seconds"] = update.text_start
-        animation["end_offset_seconds"] = update.text_end
-        scene["animation"] = animation
-
-    if update.text_animation_style is not None:
-        animation = dict(scene.get("animation") or _default_animation(scene))
-        animation["text_animation_style"] = update.text_animation_style
-        scene["animation"] = animation
-
-    if update.text is not None:
-        scene["on_screen_text"] = update.text
-        # If this scene currently has an infographic composition, its
-        # props (title/quote/value+label/items) were derived from the OLD
-        # text at creation time via _get_scene_infographic's deterministic
-        # parsing (regex for stat_counter, sentence-splitting for
-        # bullet_list, etc.) — re-run that same parsing against the new
-        # text so the composition doesn't go stale/mismatched. If the
-        # scene has no infographic (plain overlay_text, or no overlay at
-        # all), there's no derived structure to refresh — on_screen_text
-        # is read directly at render time in that case.
-        if scene.get("infographics"):
-            animation_for_infographic = scene.get("animation") or _default_animation(scene)
-            scene["infographics"] = _get_scene_infographic(scene, animation_for_infographic)
-
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
 
-    # NEW: keep the persisted infographics_list/text_list columns in sync
-    # with this edit — text_animation_style (and, less commonly here,
-    # animation_type via a future endpoint) changes which list a scene's
-    # overlay belongs in or what text it displays, so these need
-    # recomputing on every style change, not just at video creation.
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
-
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-            "infographics_list": infographics_list,
-            "text_list": text_list,
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-style] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save style edit")
 
     return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "id": scene_index + 1,  # NEW: same 1-indexed convention as infographics_list/text_list/delete_overlay_by_id, so frontend can address this overlay later without a separate lookup
-        "timeline_version": new_version,
-        "caption_style": scene.get("caption_style"),
-        "background_color": scene.get("background_color"),
-        "text": scene.get("on_screen_text"),
-        "text_start": (scene.get("animation") or {}).get("start_offset_seconds"),
-        "text_end": (scene.get("animation") or {}).get("end_offset_seconds"),
-        "text_animation_style": (scene.get("animation") or {}).get("text_animation_style"),
-        "infographics_list": infographics_list,
-        "text_list": text_list,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "scene_id": scene_id, "timeline_version": new_version,
+        "caption_style": scene.get("caption_style"), "background_color": scene.get("background_color"),
+        "timeline": timeline_json, "needs_render": True,
     }
-
-
 
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/trim")
 async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdate):
     if update.start < 0 or update.end <= update.start:
-        raise HTTPException(
-            status_code=422,
-            detail="`end` must be greater than `start`, and `start` must be >= 0",
-        )
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`, and `start` must be >= 0")
 
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[update-scene-trim] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -12428,10 +12424,7 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
         scene["word_segments_full"] = full_word_segments
 
     if not full_word_segments:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Scene {scene_id} has no word-level timestamps to trim against",
-        )
+        raise HTTPException(status_code=400, detail=f"Scene {scene_id} has no word-level timestamps to trim against")
 
     clip_start = full_word_segments[0].get("start", 0.0)
     clip_end = full_word_segments[-1].get("end", 0.0)
@@ -12439,15 +12432,11 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
     if update.start < clip_start - 1e-3 or update.end > clip_end + 1e-3:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"Trim range [{update.start}, {update.end}] is outside this scene's "
-                f"original audio bounds [{clip_start}, {clip_end}]"
-            ),
+            detail=f"Trim range [{update.start}, {update.end}] is outside this scene's original audio bounds [{clip_start}, {clip_end}]",
         )
 
     trimmed_words = [
-        w for w in full_word_segments
-        if "start" in w and "end" in w and w["start"] >= update.start and w["end"] <= update.end
+        w for w in full_word_segments if "start" in w and "end" in w and w["start"] >= update.start and w["end"] <= update.end
     ]
 
     scene["trim"] = {"start": update.start, "end": update.end}
@@ -12456,11 +12445,7 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
     scene["end"] = trimmed_words[-1]["end"] if trimmed_words else update.end
     scene["error"] = None
 
-    # Trimming changes the scene's effective duration, so the rotating
-    # ~10s B-roll beats need to be recomputed against the trimmed window
-    # too (fewer/shorter beats if the trim shortened the scene a lot).
-    scene["beats"] = await _build_scene_beats(scene)
-    scene["media"] = _aggregate_beats_media(scene["beats"])
+    scene = await _regenerate_scene_beats_and_animations(scene)
     scene["duration_seconds"] = round(scene["end"] - scene["start"], 3)
 
     raw_scenes[scene_index] = scene
@@ -12470,49 +12455,23 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-trim] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save trim edit")
 
     return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "trim": scene["trim"],
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "scene_id": scene_id, "trim": scene["trim"], "timeline_version": new_version,
+        "timeline": timeline_json, "needs_render": True,
     }
 
 
 @app.post("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/split")
 async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSplitUpdate):
-    """
-    NEW: splits one rotating B-roll beat into two independent beats at
-    `split_at`. This is a real content split, not just a time-window
-    split — each half gets its own fresh LLM keyword/media_type/
-    motion_type pass (_generate_beat_keywords, same call used when beats
-    are first built in _build_scene_beats) and its own Pexels search,
-    since the two halves likely correspond to different narration and
-    should be free to pick different footage/motion independently from
-    here on. Continuity context (previous_media_type/previous_motion_type)
-    is threaded through exactly like the normal sequential beat-build
-    loop, so the first half considers whatever beat preceded the original,
-    and the second half considers the first half's own result.
-    """
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[split-beat] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -12532,108 +12491,40 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
 
     beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
     if beat_idx is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Beat {beat_id} not found in scene {scene_id} (available: "
-                   f"{[b.get('beat_id') for b in beats]})",
-        )
+        raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
 
     beat = beats[beat_idx]
-    b_start = beat.get("start")
-    b_end = beat.get("end")
-
+    b_start, b_end = beat.get("start"), beat.get("end")
     if b_start is None or b_end is None:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Beat {beat_id} has no start/end timing to split (silent/implicit beat)",
-        )
+        raise HTTPException(status_code=422, detail=f"Beat {beat_id} has no start/end timing to split (silent/implicit beat)")
 
-    # Keeps either resulting half from being too short to actually register
-    # on screen as its own distinct beat.
     MIN_HALF_SECONDS = 1.5
     if update.split_at <= b_start + MIN_HALF_SECONDS or update.split_at >= b_end - MIN_HALF_SECONDS:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"split_at must leave at least {MIN_HALF_SECONDS}s on each side — "
-                f"beat spans [{b_start}, {b_end}], got split_at={update.split_at}"
-            ),
+            detail=f"split_at must leave at least {MIN_HALF_SECONDS}s on each side — beat spans [{b_start}, {b_end}], got split_at={update.split_at}",
         )
 
-    word_segments = scene.get("word_segments") or []
-    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+    id_prefix_a = f"{beat_id}_split_{uuid.uuid4().hex[:6]}_a"
+    id_prefix_b = f"{beat_id}_split_{uuid.uuid4().hex[:6]}_b"
 
-    first_vo_text = _words_in_range(timed_words, b_start, update.split_at)
-    second_vo_text = _words_in_range(timed_words, update.split_at, b_end)
+    first_beats = await _rebuild_fragment_beats(scene, b_start, update.split_at, id_prefix_a)
+    second_beats = await _rebuild_fragment_beats(scene, update.split_at, b_end, id_prefix_b)
 
-    fallback_keywords = _get_scene_broll_keywords(scene)
-
-    prior_beat = beats[beat_idx - 1] if beat_idx > 0 else None
-    previous_media_type = (prior_beat or {}).get("preferred_media_type")
-    previous_motion_type = (
-        (prior_beat or {}).get("motion_type")
-        if (prior_beat or {}).get("preferred_media_type") == "image" else None
-    )
-
-    first_kws, first_media_type, first_motion_type = await _generate_beat_keywords(
-        scene, first_vo_text, beat_idx, len(beats) + 1, fallback_keywords,
-        previous_media_type=previous_media_type,
-        previous_motion_type=previous_motion_type,
-    )
-    second_kws, second_media_type, second_motion_type = await _generate_beat_keywords(
-        scene, second_vo_text, beat_idx + 1, len(beats) + 1, fallback_keywords,
-        previous_media_type=first_media_type,
-        previous_motion_type=first_motion_type if first_media_type == "image" else previous_motion_type,
-    )
-
-    first_media, second_media = await asyncio.gather(
-        _fetch_media_for_keywords(first_kws, f"{scene_id}:{beat_id}:split-a"),
-        _fetch_media_for_keywords(second_kws, f"{scene_id}:{beat_id}:split-b"),
-    )
-
-    # NEW: same CLIP accuracy gate as the normal beat-build path — if a
-    # half's best video isn't a confident match and a good image exists,
-    # use the image regardless of the LLM's preference for that half.
-    if first_media.get("force_image_fallback") and first_media_type != "image":
-        print(f"[split-beat] {beat_id}:split-a: overriding to 'image' (CLIP accuracy gate)")
-        first_media_type = "image"
-    if second_media.get("force_image_fallback") and second_media_type != "image":
-        print(f"[split-beat] {beat_id}:split-b: overriding to 'image' (CLIP accuracy gate)")
-        second_media_type = "image"
-
-    first_beat = {
-        "beat_id": f"{scene_id}_split_{uuid.uuid4().hex[:6]}_a",
-        "start": b_start,
-        "end": update.split_at,
-        "vo_text": first_vo_text,
-        "keywords": first_kws,
-        "preferred_media_type": first_media_type,
-        "motion_type": first_motion_type,
-        "media": first_media,
-    }
-    second_beat = {
-        "beat_id": f"{scene_id}_split_{uuid.uuid4().hex[:6]}_b",
-        "start": update.split_at,
-        "end": b_end,
-        "vo_text": second_vo_text,
-        "keywords": second_kws,
-        "preferred_media_type": second_media_type,
-        "motion_type": second_motion_type,
-        "media": second_media,
-    }
-
-    new_beats = beats[:beat_idx] + [first_beat, second_beat] + beats[beat_idx + 1:]
+    new_beats = beats[:beat_idx] + first_beats + second_beats + beats[beat_idx + 1:]
     for i, b in enumerate(new_beats):
         b["beat_index"] = i
 
-    # Same repair/dedupe passes the normal beat-build path runs, so a split
-    # that happens to land on a keyword with no Pexels hits still gets
-    # filled, and neither new half defaults to the exact same asset as a
-    # sibling beat elsewhere in the scene.
+    fallback_keywords = _get_scene_broll_keywords(scene)
     await _fill_empty_beats(scene, new_beats, fallback_keywords)
     _dedupe_beats_media_across_scene(new_beats)
 
+    # The old animations tied to the removed beat no longer apply.
+    animations = [a for a in (scene.get("animations") or []) if a.get("beat_id") != beat_id]
+
     scene["beats"] = new_beats
+    scene["animations"] = animations
+    scene["media"] = _aggregate_beats_media(new_beats)
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
@@ -12642,48 +12533,26 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-            "broll_list": broll_list,
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[split-beat] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save beat split")
 
     return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "original_beat_id": beat_id,
+        "video_id": video_id, "scene_id": scene_id, "original_beat_id": beat_id,
         "new_beats": [
-            {
-                "beat_id": first_beat["beat_id"], "start": first_beat["start"], "end": first_beat["end"],
-                "media_type": first_media_type, "motion_type": first_motion_type,
-            },
-            {
-                "beat_id": second_beat["beat_id"], "start": second_beat["start"], "end": second_beat["end"],
-                "media_type": second_media_type, "motion_type": second_motion_type,
-            },
+            {"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end"),
+             "media_type": b.get("preferred_media_type"), "motion_type": b.get("motion_type")}
+            for b in (first_beats + second_beats)
         ],
-        "broll_list": broll_list,
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "broll_list": broll_list, "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
 
 @app.post("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/insert")
 async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatInsertUpdate):
-    """
-    Inserts a brand new, independently AI-directed B-roll beat inside an
-    existing beat's [start, end] window, at [update.start, update.end].
-    Unlike /split, the surrounding footage is NOT regenerated — only the
-    new middle piece gets a fresh LLM keyword/media_type/motion_type pass
-    and its own Pexels search. Whatever's left before/after the new clip
-    keeps the original beat's existing asset, just trimmed in time.
-    """
     MIN_SECONDS = 1.0
     if update.end <= update.start:
         raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
@@ -12691,13 +12560,7 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
         raise HTTPException(status_code=422, detail=f"the new clip must be at least {MIN_SECONDS}s long")
 
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[insert-beat] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -12717,86 +12580,43 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
 
     beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
     if beat_idx is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Beat {beat_id} not found in scene {scene_id} (available: "
-                   f"{[b.get('beat_id') for b in beats]})",
-        )
+        raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
 
     beat = beats[beat_idx]
-    b_start = beat.get("start")
-    b_end = beat.get("end")
-
+    b_start, b_end = beat.get("start"), beat.get("end")
     if b_start is None or b_end is None:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Beat {beat_id} has no start/end timing to insert into (silent/implicit beat)",
-        )
+        raise HTTPException(status_code=422, detail=f"Beat {beat_id} has no start/end timing to insert into (silent/implicit beat)")
     if update.start < b_start - 1e-3 or update.end > b_end + 1e-3:
-        raise HTTPException(
-            status_code=422,
-            detail=f"[{update.start}, {update.end}] must fall inside beat {beat_id}'s own [{b_start}, {b_end}]",
-        )
+        raise HTTPException(status_code=422, detail=f"[{update.start}, {update.end}] must fall inside beat {beat_id}'s own [{b_start}, {b_end}]")
 
-    word_segments = scene.get("word_segments") or []
-    timed_words = [w for w in word_segments if "start" in w and "end" in w]
-    new_vo_text = _words_in_range(timed_words, update.start, update.end)
-    fallback_keywords = _get_scene_broll_keywords(scene)
+    id_prefix = f"{beat_id}_insert_{uuid.uuid4().hex[:6]}"
+    new_beats = await _rebuild_fragment_beats(scene, update.start, update.end, id_prefix)
 
-    previous_media_type = beat.get("preferred_media_type")
-    previous_motion_type = beat.get("motion_type") if previous_media_type == "image" else None
-
-    new_kws, new_media_type, new_motion_type = await _generate_beat_keywords(
-        scene, new_vo_text, beat_idx, len(beats) + 1, fallback_keywords,
-        previous_media_type=previous_media_type,
-        previous_motion_type=previous_motion_type,
-    )
-    new_media = await _fetch_media_for_keywords(new_kws, f"{scene_id}:{beat_id}:insert")
-
-    # NEW: same CLIP accuracy gate as the normal beat-build path.
-    if new_media.get("force_image_fallback") and new_media_type != "image":
-        print(f"[insert-beat] {beat_id}: overriding to 'image' (CLIP accuracy gate)")
-        new_media_type = "image"
-
-    new_beat = {
-        "beat_id": f"{scene_id}_insert_{uuid.uuid4().hex[:6]}",
-        "start": update.start,
-        "end": update.end,
-        "vo_text": new_vo_text,
-        "keywords": new_kws,
-        "preferred_media_type": new_media_type,
-        "motion_type": new_motion_type,
-        "media": new_media,
-    }
-
-    # Whatever's left before/after the new clip keeps the original beat's
-    # existing content (same keywords/media/motion), just trimmed to the
-    # remaining time — no regeneration for these, unlike the new middle piece.
     pieces = []
     if update.start > b_start + 1e-3:
         before = dict(beat)
         before["beat_id"] = f"{beat_id}_pre"
-        before["start"] = b_start
-        before["end"] = update.start
+        before["start"], before["end"] = b_start, update.start
         pieces.append(before)
 
-    pieces.append(new_beat)
+    pieces.extend(new_beats)
 
     if update.end < b_end - 1e-3:
         after = dict(beat)
         after["beat_id"] = f"{beat_id}_post"
-        after["start"] = update.end
-        after["end"] = b_end
+        after["start"], after["end"] = update.end, b_end
         pieces.append(after)
 
-    new_beats = beats[:beat_idx] + pieces + beats[beat_idx + 1:]
-    for i, b in enumerate(new_beats):
+    combined_beats = beats[:beat_idx] + pieces + beats[beat_idx + 1:]
+    for i, b in enumerate(combined_beats):
         b["beat_index"] = i
 
-    await _fill_empty_beats(scene, new_beats, fallback_keywords)
-    _dedupe_beats_media_across_scene(new_beats)
+    fallback_keywords = _get_scene_broll_keywords(scene)
+    await _fill_empty_beats(scene, combined_beats, fallback_keywords)
+    _dedupe_beats_media_across_scene(combined_beats)
 
-    scene["beats"] = new_beats
+    scene["beats"] = combined_beats
+    scene["media"] = _aggregate_beats_media(combined_beats)
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
@@ -12805,66 +12625,28 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-            "broll_list": broll_list,
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[insert-beat] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save beat insert")
 
     return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "original_beat_id": beat_id,
-        "new_beat": {
-            "beat_id": new_beat["beat_id"], "start": new_beat["start"], "end": new_beat["end"],
-            "media_type": new_media_type, "motion_type": new_motion_type,
-        },
-        "broll_list": broll_list,
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "scene_id": scene_id, "original_beat_id": beat_id,
+        "new_beats": [
+            {"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end"),
+             "media_type": b.get("preferred_media_type"), "motion_type": b.get("motion_type")}
+            for b in new_beats
+        ],
+        "broll_list": broll_list, "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
 
 @app.post("/timeline/{video_id}/scene/{scene_id}/beats/rebuild")
 async def rebuild_scene_beats(video_id: str, scene_id: str):
-    """
-    Repairs a scene whose `beats` array is empty or missing — the state
-    that makes /broll, /split, and /insert all fail with "Scene has no
-    B-roll beats to select from yet".
-
-    FIX: this used to only re-run _build_scene_beats against whatever
-    word_segments/start/end were already stored on the scene — but if
-    THOSE were also empty (the actual root cause in at least one observed
-    case: a merged multi-section scene whose word_segments never got
-    persisted, despite its caption track clearly having full per-word
-    timing), _build_scene_beats silently takes its "no timed narration"
-    fallback path and produces a single beat spanning the ENTIRE scene
-    duration instead of properly rotating every ~10s. That's a strictly
-    worse outcome than the original bug — one clip now holds for the
-    whole scene (potentially 60s+) instead of just failing loudly.
-
-    Now: if word_segments/start/end are missing but the scene already has
-    a generated voiceover, re-run WhisperX alignment against that existing
-    audio (_generate_word_timestamps) to repopulate them BEFORE building
-    beats — same alignment step _process_scene runs once at creation, just
-    reapplied here without regenerating the voice itself. Only scenes with
-    no voiceover at all (or no vo_text) fall back to the single-implicit-
-    beat path, which is the correct behavior for those.
-    """
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[rebuild-beats] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -12882,17 +12664,11 @@ async def rebuild_scene_beats(video_id: str, scene_id: str):
     scene = dict(raw_scenes[scene_index])
     realigned = False
 
-    has_timed_words = any(
-        "start" in w and "end" in w for w in (scene.get("word_segments") or [])
-    )
+    has_timed_words = any("start" in w and "end" in w for w in (scene.get("word_segments") or []))
     voiceover = scene.get("voiceover") or {}
 
     if not has_timed_words and voiceover.get("url"):
-        print(
-            f"[rebuild-beats] scene {scene_id} has a voiceover but no timed "
-            f"word_segments — re-running WhisperX alignment on the existing "
-            f"audio before rebuilding beats"
-        )
+        print(f"[rebuild-beats] scene {scene_id} has a voiceover but no timed word_segments — re-running WhisperX alignment first")
         try:
             scene_timestamps = await _generate_word_timestamps(voiceover["url"])
             word_segments = scene_timestamps.get("word_segments", [])
@@ -12903,24 +12679,13 @@ async def rebuild_scene_beats(video_id: str, scene_id: str):
                 scene["end"] = timed_words[-1]["end"]
                 realigned = True
             else:
-                print(
-                    f"[rebuild-beats][WARN] scene {scene_id}: re-alignment produced "
-                    f"no timed words — falling back to single-beat behavior"
-                )
+                print(f"[rebuild-beats][WARN] scene {scene_id}: re-alignment produced no timed words")
         except Exception as e:
-            print(
-                f"[rebuild-beats][WARN] scene {scene_id}: WhisperX re-alignment "
-                f"failed ({e}) — falling back to single-beat behavior"
-            )
+            print(f"[rebuild-beats][WARN] scene {scene_id}: WhisperX re-alignment failed ({e})")
     elif not has_timed_words:
-        print(
-            f"[rebuild-beats] scene {scene_id} has no voiceover to re-align against "
-            f"— will produce a single implicit beat (expected for silent scenes)"
-        )
+        print(f"[rebuild-beats] scene {scene_id} has no voiceover to re-align against — will produce a single implicit beat")
 
-    scene["beats"] = await _build_scene_beats(scene)
-    scene["media"] = _aggregate_beats_media(scene["beats"])
-
+    scene = await _regenerate_scene_beats_and_animations(scene)
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
@@ -12928,75 +12693,37 @@ async def rebuild_scene_beats(video_id: str, scene_id: str):
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[rebuild-beats] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save rebuilt beats")
 
     return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "realigned_word_timing": realigned,
-        "beats": [
-            {"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end")}
-            for b in scene["beats"]
-        ],
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "scene_id": scene_id, "realigned_word_timing": realigned,
+        "beats": [{"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end")} for b in scene["beats"]],
+        "animations": scene.get("animations"),
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
 
-@app.patch("/timeline/{video_id}/scene/{scene_id}/infographic")
-async def update_scene_infographic(video_id: str, scene_id: str, update: SceneInfographicUpdate):
-    if (
-        update.animation_type is None and update.props is None and update.duration_frames is None
-        and update.start_seconds is None and update.end_seconds is None
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail="Provide at least one of animation_type, props, duration_frames, start_seconds/end_seconds",
-        )
+@app.patch("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/animation")
+async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, update: BeatAnimationUpdate):
+    """Create or edit the animation attached to a specific beat. Replaces
+    the old scene-level `update_scene_infographic` endpoint, since a scene
+    can now carry many beat-owned animations rather than one."""
+    provided = {k: v for k, v in update.dict().items() if v is not None}
+    if not provided:
+        raise HTTPException(status_code=422, detail="Provide at least one field to update")
 
-    if update.props is not None and update.animation_type is None:
-        raise HTTPException(
-            status_code=422,
-            detail="animation_type is required whenever props is provided, so they don't end up mismatched",
-        )
-
-    if update.animation_type is not None and update.animation_type not in REMOTION_INFOGRAPHIC_LIBRARY:
-        raise HTTPException(
-            status_code=422,
-            detail=f"animation_type must be one of {sorted(REMOTION_INFOGRAPHIC_LIBRARY.keys())}",
-        )
-
-    if update.duration_frames is not None:
-        if update.duration_frames <= 0 or update.duration_frames > 900:
-            raise HTTPException(
-                status_code=422,
-                detail="duration_frames must be between 1 and 900 (30s @30fps)",
-            )
-
-    if (update.start_seconds is None) != (update.end_seconds is None):
-        raise HTTPException(status_code=422, detail="start_seconds and end_seconds must be provided together")
-    if update.start_seconds is not None and update.end_seconds is not None and update.end_seconds <= update.start_seconds:
-        raise HTTPException(status_code=422, detail="end_seconds must be greater than start_seconds")
+    if "color_hint" in provided:
+        _validate_hex_color(provided["color_hint"], "color_hint")
 
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
-        print(f"[update-scene-infographic] failed to fetch video {video_id}: {e}")
+        print(f"[update-beat-animation] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
 
     if not row.data:
@@ -13010,71 +12737,228 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
         raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
 
     scene = dict(raw_scenes[scene_index])
-    animation = dict(scene.get("animation") or _default_animation(scene))
+    beats = scene.get("beats") or []
+    beat_ids = {b.get("beat_id") for b in beats}
+    if beat_id not in beat_ids:
+        raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id}")
 
-    if update.animation_type is not None:
-        animation["animation_type"] = update.animation_type
-        animation["category"] = _ANIMATION_TYPE_TO_CATEGORY[update.animation_type]
+    animations = list(scene.get("animations") or [])
+    anim_idx = next((i for i, a in enumerate(animations) if a.get("beat_id") == beat_id), None)
 
-    if update.duration_frames is not None:
-        animation["duration_frames"] = update.duration_frames
+    if anim_idx is None:
+        if not provided.get("animation_type"):
+            raise HTTPException(status_code=422, detail="animation_type is required to create a new animation on this beat")
+        merged_raw = {"beat_id": beat_id, **provided}
+    else:
+        merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
 
-    animation = _validate_animation(animation, scene)
+    validated = _validate_beat_animation(merged_raw, {beat_id})
+    if not validated:
+        raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
+    if isinstance(merged_raw.get("id"), int):
+        # Editing an existing animation — keep its id stable rather than
+        # letting _assign_animation_ids (called inside
+        # _compute_infographics_and_text_lists below) treat this as a new
+        # entry and hand it a fresh one.
+        validated["id"] = merged_raw["id"]
 
-    # NEW: _validate_animation only preserves its own known fields, so the
-    # start/end window has to be re-applied after validation rather than
-    # before — otherwise it would be silently dropped here.
-    if update.start_seconds is not None and update.end_seconds is not None:
-        animation["start_offset_seconds"] = update.start_seconds
-        animation["end_offset_seconds"] = update.end_seconds
+    if anim_idx is None:
+        animations.append(validated)
+    else:
+        animations[anim_idx] = validated
 
-    infographic = _get_scene_infographic(scene, animation)
-    if infographic is None:
-        raise HTTPException(
-            status_code=422,
-            detail=f"'{animation['animation_type']}' is not an infographic composition",
-        )
-
-    if update.props is not None:
-        infographic["props"] = {**infographic.get("props", {}), **update.props}
-
-    scene["animation"] = animation
-    scene["infographics"] = infographic
+    scene["animations"] = animations
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
-
-    # NEW: keep the persisted infographics_list/text_list columns in sync —
-    # changing animation_type here can move a scene between the two lists
-    # entirely (e.g. icon_sequence <-> full_screen_title_card), and prop
-    # changes can change the displayed text, so recompute on every edit.
     infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-            "infographics_list": infographics_list,
-            "text_list": text_list,
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
-        print(f"[update-scene-infographic] failed to save video {video_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save infographic edit")
+        print(f"[update-beat-animation] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save animation edit")
 
     return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "animation": animation,
-        "infographic": infographic,
-        "timeline_version": new_version,
-        "infographics_list": infographics_list,
-        "text_list": text_list,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "scene_id": scene_id, "beat_id": beat_id, "animation": validated,
+        "timeline_version": new_version, "infographics_list": infographics_list, "text_list": text_list,
+        "timeline": timeline_json, "needs_render": True,
+    }
+
+
+@app.delete("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/animation")
+async def delete_beat_animation(video_id: str, scene_id: str, beat_id: str):
+    """Replaces the old int-id `delete_overlay_by_id` endpoint, which
+    assumed exactly one overlay per scene. Overlays are now addressed by
+    (scene_id, beat_id) since a scene can carry many."""
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[delete-beat-animation] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    animations = scene.get("animations") or []
+    remaining = [a for a in animations if a.get("beat_id") != beat_id]
+    if len(remaining) == len(animations):
+        raise HTTPException(status_code=422, detail=f"Beat {beat_id} (scene {scene_id}) has no animation to delete")
+
+    scene["animations"] = remaining
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[delete-beat-animation] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete animation")
+
+    return {
+        "video_id": video_id, "scene_id": scene_id, "beat_id": beat_id,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+    }
+
+
+@app.patch("/timeline/{video_id}/animation/{animation_id}")
+async def update_animation_by_id(video_id: str, animation_id: int, update: BeatAnimationUpdate):
+    """
+    Same edit as PATCH .../beat/{beat_id}/animation, but located purely
+    by the animation's stable integer id — no need to already know which
+    scene/beat it lives on. Reuses the same validation
+    (_validate_beat_animation) and preserves the id across the edit.
+    """
+    provided = {k: v for k, v in update.dict().items() if v is not None}
+    if not provided:
+        raise HTTPException(status_code=422, detail="Provide at least one field to update")
+
+    if "color_hint" in provided:
+        _validate_hex_color(provided["color_hint"], "color_hint")
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[update-animation-by-id] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    found = _find_animation_by_id(raw_scenes, animation_id)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"No animation with id {animation_id} in this video")
+    scene_index, anim_index, scene_id, beat_id = found
+
+    scene = dict(raw_scenes[scene_index])
+    animations = list(scene.get("animations") or [])
+    merged_raw = {**animations[anim_index], **provided, "beat_id": beat_id}
+
+    validated = _validate_beat_animation(merged_raw, {beat_id})
+    if not validated:
+        raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
+    validated["id"] = animation_id
+
+    animations[anim_index] = validated
+    scene["animations"] = animations
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-animation-by-id] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save animation edit")
+
+    return {
+        "video_id": video_id, "animation_id": animation_id, "scene_id": scene_id, "beat_id": beat_id,
+        "animation": validated, "timeline_version": new_version,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline": timeline_json, "needs_render": True,
+    }
+
+
+@app.delete("/timeline/{video_id}/animation/{animation_id}")
+async def delete_animation_by_id(video_id: str, animation_id: int):
+    """
+    Same delete as DELETE .../beat/{beat_id}/animation, but located
+    purely by the animation's stable integer id — this is the "easy
+    deletion" path: a client holding just the `id` from text_list or
+    infographics_list can delete directly, without also tracking which
+    scene/beat it came from.
+    """
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[delete-animation-by-id] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    found = _find_animation_by_id(raw_scenes, animation_id)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"No animation with id {animation_id} in this video")
+    scene_index, anim_index, scene_id, beat_id = found
+
+    scene = dict(raw_scenes[scene_index])
+    animations = list(scene.get("animations") or [])
+    del animations[anim_index]
+    scene["animations"] = animations
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[delete-animation-by-id] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete animation")
+
+    return {
+        "video_id": video_id, "animation_id": animation_id, "scene_id": scene_id, "beat_id": beat_id,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
 
@@ -13082,31 +12966,15 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
 async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSelectUpdate):
     if update.source not in ("video", "image"):
         raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
-
-    # NEW: validate a manually-provided motion_type up front. Omitted
-    # (None) is fine — the beat's existing (LLM-chosen) motion_type is kept
-    # in that case, see _resolve_beat_motion_type.
     if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}",
-        )
-
-    # NEW: B-roll duration override, folded into this same endpoint instead
-    # of a separate one — must be provided together, end after start.
+        raise HTTPException(status_code=422, detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}")
     if (update.start is None) != (update.end is None):
         raise HTTPException(status_code=422, detail="start and end must be provided together")
     if update.start is not None and update.end is not None and update.end <= update.start:
         raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
 
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[update-scene-broll] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -13125,182 +12993,80 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
     beats = scene.get("beats") or []
 
     if not beats:
-        # FIX: build_timeline_from_scenes synthesizes a single implicit
-        # beat ("{scene_id}_b1") on the fly whenever a scene's real beats
-        # array is empty, purely so the rendered timeline shows *something*
-        # selectable instead of a blank scene. That synthesized beat was
-        # visible to callers via GET /timeline but invisible to this
-        # endpoint, which only ever checked the real, persisted array and
-        # rejected the exact beat_id the user could see and click on.
-        #
-        # Mirror that same synthesis here — using the scene's own
-        # start/end and whole-scene media pool, identical to
-        # build_timeline_from_scenes's fallback — and PERSIST it as a real
-        # beat immediately. This makes the beat the user sees always
-        # selectable, and it stops being synthetic after this call: once
-        # persisted, subsequent /broll, /split, /insert, and
-        # /beats/rebuild calls all see a normal, real beat going forward.
         media = scene.get("media") or {}
         beats = [{
-            "beat_id": f"{scene_id}_b1",
-            "beat_index": 0,
-            "start": scene.get("start"),
-            "end": scene.get("end"),
-            "vo_text": scene.get("vo_text", ""),
-            "keywords": None,
-            "motion_type": _DEFAULT_MOTION_TYPE,
+            "beat_id": f"{scene_id}_b1", "beat_index": 0, "start": scene.get("start"), "end": scene.get("end"),
+            "vo_text": scene.get("vo_text", ""), "keywords": None, "motion_type": _DEFAULT_MOTION_TYPE,
             "preferred_media_type": None,
             "media": {
                 "videos": media.get("videos") or {"total_results": 0, "results": [], "error": None},
                 "images": media.get("images") or {"total_results": 0, "results": [], "error": None},
             },
         }]
-        print(
-            f"[update-scene-broll] scene {scene_id} had no persisted beats — "
-            f"materializing the implicit '{scene_id}_b1' beat the timeline "
-            f"already displayed, so it's usable and persists going forward"
-        )
+        print(f"[update-scene-broll] scene {scene_id} had no persisted beats — materializing implicit '{scene_id}_b1'")
 
     if update.beat_id:
         beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == update.beat_id), None)
         if beat_idx is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Beat {update.beat_id} not found in scene {scene_id} (available: "
-                       f"{[b.get('beat_id') for b in beats]})",
-            )
+            raise HTTPException(status_code=404, detail=f"Beat {update.beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
     else:
-        # No beat specified: search every beat in the scene for one whose
-        # own candidate pool already contains this asset_id, so callers
-        # that only know the asset (not which time-slot it belongs to)
-        # don't have to guess. Falls back to the first beat — same as
-        # before — only if the asset isn't in ANY beat's pool (in which
-        # case the direct Pexels-by-ID fallback below still has a shot).
-        beat_idx = next(
-            (i for i, b in enumerate(beats) if _find_beat_broll_candidate(b, update.asset_id, update.source)),
-            0,
-        )
+        beat_idx = next((i for i, b in enumerate(beats) if _find_beat_broll_candidate(b, update.asset_id, update.source)), 0)
 
     beat = dict(beats[beat_idx])
 
     candidate = _find_beat_broll_candidate(beat, update.asset_id, update.source)
     if candidate is None:
-        # Not in this beat's own auto-fetched pool — could be an asset
-        # picked from a broader search/matching tool. Try fetching it
-        # directly from Pexels by ID before giving up.
         candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
 
     if candidate is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No {update.source} candidate with id {update.asset_id} in beat "
-                   f"{beat.get('beat_id')}'s media pool, and it couldn't be fetched directly from Pexels either",
-        )
+        raise HTTPException(status_code=404, detail=f"No {update.source} candidate with id {update.asset_id} in beat {beat.get('beat_id')}'s media pool, and it couldn't be fetched directly from Pexels either")
 
     file_url = _resolve_broll_file_url(candidate, update.source)
     if not file_url:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Candidate {update.asset_id} has no landscape/horizontal file available — only horizontal videos are allowed",
-        )
+        raise HTTPException(status_code=422, detail=f"Candidate {update.asset_id} has no landscape/horizontal file available — only horizontal videos are allowed")
 
-    # Previously: scene.pop("background_color", None) ran unconditionally,
-    # deleting the scene's fallback base layer as soon as an override was
-    # set — even though nothing here confirms the renderer can actually
-    # draw this particular file_url. If the render step fails/skips this
-    # asset for any reason (unsupported source, fetch failure, orientation
-    # mismatch, etc.), there is now nothing underneath it, which is a
-    # plausible cause of a fully black frame instead of at least a
-    # fallback color. Keep it stashed instead of discarding it, so a
-    # renderer-side fallback (if one exists) still has something to use.
     if "background_color" in scene:
         scene["_previous_background_color"] = scene["background_color"]
         scene.pop("background_color", None)
 
     beat["broll_override"] = {
-        "asset_id": candidate.get("id"),
-        "source": update.source,
-        "file_url": file_url,
-        "width": candidate.get("width"),
-        "height": candidate.get("height"),
-        "video_files": candidate.get("video_files"),
-        "src": candidate.get("src"),
-        # NEW: only set when the caller explicitly provided one; otherwise
-        # left as None so _resolve_beat_motion_type falls through to the
-        # beat's own LLM-chosen motion_type instead of silently resetting
-        # it to the default on every manual asset pick.
-        "motion_type": update.motion_type,
+        "asset_id": candidate.get("id"), "source": update.source, "file_url": file_url,
+        "width": candidate.get("width"), "height": candidate.get("height"),
+        "video_files": candidate.get("video_files"), "src": candidate.get("src"), "motion_type": update.motion_type,
     }
 
-    # NEW: apply the duration override to this same beat, in the same call
-    # that picked its asset.
     if update.start is not None and update.end is not None:
         scene_start = scene.get("start")
         scene_end = scene.get("end")
 
-        # FIX (B-roll couldn't start before the voice): this used to
-        # reject any start earlier than the scene's own start outright.
-        # But a scene's "start" is literally the first spoken word's
-        # timestamp — the raw generated audio always has real (silent)
-        # content before that, so trimming the AUDIO earlier is completely
-        # safe, it just adds a bit of lead-in silence before speech
-        # begins. The old rejection made "B-roll starts a moment before
-        # the voice" impossible even though there was nothing actually
-        # stopping it.
-        #
-        # This only applies to the scene's FIRST beat (beat_idx == 0) —
-        # any other beat sits after earlier beats/scenes and genuinely
-        # can't reach further back without overlapping them. Requesting
-        # this on a later beat still gets clamped to the previous beat's
-        # end, same as before.
         if beat_idx == 0 and scene_start is not None and update.start < scene_start - 1e-3:
             if update.start < 0:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"start {update.start} cannot be negative",
-                )
+                raise HTTPException(status_code=422, detail=f"start {update.start} cannot be negative")
             print(
-                f"[update-scene-broll] scene {scene_id}: extending scene start "
-                f"{scene_start} -> {update.start} so beat {beat.get('beat_id')} "
-                f"can visually begin before the voice's first word (this adds "
-                f"~{scene_start - update.start:.2f}s of lead-in silence to the "
-                f"scene's audio and total video duration, it does not shift "
-                f"anything else in the timeline earlier)"
+                f"[update-scene-broll] scene {scene_id}: extending scene start {scene_start} -> {update.start} "
+                f"so beat {beat.get('beat_id')} can visually begin before the voice's first word"
             )
             scene["start"] = update.start
             scene_start = update.start
         elif scene_start is not None and update.start < scene_start - 1e-3:
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    f"start {update.start} is before this scene's own start "
-                    f"({scene_start}) — only the scene's FIRST beat can start "
-                    f"earlier than the scene, since any other beat would have "
-                    f"to overlap the beat before it"
-                ),
+                detail=f"start {update.start} is before this scene's own start ({scene_start}) — only the scene's FIRST beat can start earlier than the scene",
             )
 
         if scene_end is not None and update.end > scene_end + 1e-3:
-            raise HTTPException(
-                status_code=422,
-                detail=f"end {update.end} is after this scene's own end ({scene_end})",
-            )
+            raise HTTPException(status_code=422, detail=f"end {update.end} is after this scene's own end ({scene_end})")
         beat["start"] = update.start
         beat["end"] = update.end
 
     beats[beat_idx] = beat
 
-    # Keep beats contiguous by default: pull the following beat's start up
-    # to match this beat's new end. Without this, shortening a beat leaves
-    # a gap (no B-roll track covers that span) and lengthening it overlaps
-    # the next beat's window.
     if update.start is not None and update.end is not None and update.adjust_next_beat and beat_idx + 1 < len(beats):
         next_beat = dict(beats[beat_idx + 1])
         next_beat["start"] = update.end
         beats[beat_idx + 1] = next_beat
 
     scene["beats"] = beats
-
     raw_scenes[scene_index] = scene
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
@@ -13309,114 +13075,37 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-            "broll_list": broll_list,
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-broll] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save broll selection")
 
     return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "beat_id": beat.get("beat_id"),
-        "selected_asset": beat["broll_override"],
-        "resolved_motion_type": _resolve_beat_motion_type(beat),
-        "start": beat.get("start"),
-        "end": beat.get("end"),
-        "broll_list": broll_list,
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "scene_id": scene_id, "beat_id": beat.get("beat_id"),
+        "selected_asset": beat["broll_override"], "resolved_motion_type": _resolve_beat_motion_type(beat),
+        "start": beat.get("start"), "end": beat.get("end"), "broll_list": broll_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
-
-# =============================================================================
-# GLOBAL / ABSOLUTE-TIMELINE B-ROLL PLACEMENT  (NEW)
-#
-# The endpoint above (`PATCH /timeline/{video_id}/scene/{scene_id}/broll`)
-# requires knowing which scene AND which beat a change belongs to, and a
-# beat's own [start, end] is bounded by its parent scene — B-roll simply
-# cannot move outside the scene it was created in, and can only reach
-# earlier than its scene's own start if it happens to be that scene's
-# first beat. That's a real structural limit, not a validation nitpick:
-# beats are stored per-scene, and a scene's own frame budget is what
-# positions everything after it in the whole video.
-#
-# This endpoint removes that constraint entirely. The caller thinks in
-# ABSOLUTE seconds — position in the final assembled video, exactly the
-# same numbers startFrame/endFrame/fps already describe — and picks ANY
-# Pexels asset (any video or image, regardless of which scene's search
-# originally found it, or whether it was ever "found" by this video at
-# all — same direct-by-ID Pexels lookup /broll already uses). No scene_id
-# or beat_id is required in the request at all.
-#
-# What it does under the hood:
-#   1. Resolves the requested asset once (direct Pexels lookup by ID).
-#   2. Computes each scene's current ABSOLUTE [start, end] window in
-#      seconds from cumulative scene durations (same math
-#      build_timeline_from_scenes uses for frames, done here in seconds).
-#   3. If the requested start is earlier than the very first scene's
-#      absolute start (the "even though the video starts at 0.24, I want
-#      0.00" case), the FIRST scene's own `start` is pulled earlier to
-#      genuinely make room — same mechanism the per-beat version already
-#      used, just generalized to not require a specific beat_id.
-#   4. For every scene the requested [start, end] range actually overlaps
-#      (it can span more than one scene), that scene's beat list is
-#      "carved": any beat fully inside the range is removed, any beat
-#      only partially overlapped is trimmed to keep its untouched edge
-#      (with its ORIGINAL asset — this endpoint never invents new footage
-#      for the parts you didn't ask to change), and exactly one new beat
-#      carrying the requested asset is inserted to cover that scene's
-#      share of the range.
-#   5. All touched scenes are saved together in one edit.
-# =============================================================================
 
 class AbsoluteBrollUpdate(BaseModel):
     asset_id: Any
     source: str
-    # Absolute seconds — position in the FINAL ASSEMBLED VIDEO, the same
-    # timebase as startFrame/endFrame/fps in the timeline, NOT scene-local
-    # time. This is the whole point of this endpoint: no scene/beat
-    # bookkeeping required from the caller.
     start: float
     end: float
     motion_type: Optional[str] = None
 
 
-def _carve_scene_beats_for_absolute_range(
-    scene: dict, local_start: float, local_end: float, override: dict, id_prefix: str,
-) -> list:
-    """
-    Rewrites one scene's beat list so that [local_start, local_end]
-    (already converted to THIS scene's own local timebase by the caller)
-    is covered by exactly one new beat carrying `override`'s asset, while
-    every untouched portion of the scene keeps whatever beat/asset it had
-    before. Any beat fully inside the range is dropped; a beat only
-    partially overlapped is trimmed down to its untouched edge (its
-    original asset/keywords/media are preserved unchanged for that
-    remaining sliver — this function only ever touches the requested
-    window, never anything outside it).
-    """
+def _carve_scene_beats_for_absolute_range(scene: dict, local_start: float, local_end: float, override: dict, id_prefix: str) -> list:
     beats = scene.get("beats") or []
 
     if not beats:
-        # Scene has no beats yet at all — synthesize the same implicit
-        # single beat build_timeline_from_scenes/`/broll` already do, so
-        # there's something to carve into.
         media = scene.get("media") or {}
         beats = [{
-            "beat_id": f"{id_prefix}_b1",
-            "beat_index": 0,
-            "start": scene.get("start"),
-            "end": scene.get("end"),
-            "vo_text": scene.get("vo_text", ""),
-            "keywords": None,
-            "motion_type": _DEFAULT_MOTION_TYPE,
+            "beat_id": f"{id_prefix}_b1", "beat_index": 0, "start": scene.get("start"), "end": scene.get("end"),
+            "vo_text": scene.get("vo_text", ""), "keywords": None, "motion_type": _DEFAULT_MOTION_TYPE,
             "preferred_media_type": None,
             "media": {
                 "videos": media.get("videos") or {"total_results": 0, "results": [], "error": None},
@@ -13426,15 +13115,10 @@ def _carve_scene_beats_for_absolute_range(
 
     kept_fragments = []
     for b in beats:
-        b_start = b.get("start")
-        b_end = b.get("end")
+        b_start, b_end = b.get("start"), b.get("end")
         if b_start is None or b_end is None:
-            # No timing at all on this beat (legacy/implicit) — nothing
-            # meaningful to trim; just drop it, the new beat covers the
-            # whole scene anyway in that case.
             continue
         if b_end <= local_start + 1e-6 or b_start >= local_end - 1e-6:
-            # No overlap at all with the requested range — keep as-is.
             kept_fragments.append(b)
             continue
         if b_start < local_start - 1e-6:
@@ -13447,25 +13131,12 @@ def _carve_scene_beats_for_absolute_range(
             after["beat_id"] = f"{b.get('beat_id')}_post"
             after["start"] = local_end
             kept_fragments.append(after)
-        # A beat fully inside [local_start, local_end] contributes no
-        # fragment at all — it's entirely replaced by the new beat below.
 
     new_beat = {
-        "beat_id": f"{id_prefix}_abs_{uuid.uuid4().hex[:6]}",
-        "start": local_start,
-        "end": local_end,
-        "vo_text": "",
-        "keywords": None,
-        "preferred_media_type": override.get("source"),
+        "beat_id": f"{id_prefix}_abs_{uuid.uuid4().hex[:6]}", "start": local_start, "end": local_end,
+        "vo_text": "", "keywords": None, "preferred_media_type": override.get("source"),
         "motion_type": override.get("motion_type") or _DEFAULT_MOTION_TYPE,
-        "media": {
-            "videos": {"total_results": 0, "results": [], "error": None},
-            "images": {"total_results": 0, "results": [], "error": None},
-        },
-        # Directly assigning the resolved asset here (rather than running
-        # keyword search/CLIP reranking) is intentional — the user picked
-        # this exact asset for this exact position, there's nothing to
-        # search for.
+        "media": {"videos": {"total_results": 0, "results": [], "error": None}, "images": {"total_results": 0, "results": [], "error": None}},
         "broll_override": override,
     }
 
@@ -13479,10 +13150,6 @@ def _carve_scene_beats_for_absolute_range(
 
 @app.patch("/timeline/{video_id}/broll")
 async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
-    """
-    Place any Pexels asset at any absolute position in the assembled
-    video. See the module docstring above for the full mechanics.
-    """
     if update.source not in ("video", "image"):
         raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
     if update.start < 0:
@@ -13490,43 +13157,23 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
     if update.end <= update.start:
         raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
     if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}",
-        )
+        raise HTTPException(status_code=422, detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}")
 
     candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
     if candidate is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Could not fetch {update.source} asset {update.asset_id} from Pexels",
-        )
+        raise HTTPException(status_code=404, detail=f"Could not fetch {update.source} asset {update.asset_id} from Pexels")
     file_url = _resolve_broll_file_url(candidate, update.source)
     if not file_url:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Asset {update.asset_id} has no landscape/horizontal file available",
-        )
+        raise HTTPException(status_code=422, detail=f"Asset {update.asset_id} has no landscape/horizontal file available")
 
     override = {
-        "asset_id": candidate.get("id"),
-        "source": update.source,
-        "file_url": file_url,
-        "width": candidate.get("width"),
-        "height": candidate.get("height"),
-        "video_files": candidate.get("video_files"),
-        "src": candidate.get("src"),
-        "motion_type": update.motion_type,
+        "asset_id": candidate.get("id"), "source": update.source, "file_url": file_url,
+        "width": candidate.get("width"), "height": candidate.get("height"),
+        "video_files": candidate.get("video_files"), "src": candidate.get("src"), "motion_type": update.motion_type,
     }
 
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_json, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_json, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[update-broll-absolute] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -13541,68 +13188,42 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
     current_version = row.data.get("timeline_version", 1)
     fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
 
-    def _compute_boundaries(scenes: list) -> list:
-        boundaries = []
-        cumulative = 0.0
+    def _compute_boundaries(scenes: list):
+        boundaries, cumulative = [], 0.0
         for i, s in enumerate(scenes):
-            s_start = s.get("start") or 0.0
-            s_end = s.get("end") or 0.0
+            s_start, s_end = s.get("start") or 0.0, s.get("end") or 0.0
             dur = max(s_end - s_start, 1.0 / fps)
-            boundaries.append({
-                "index": i, "abs_start": cumulative, "abs_end": cumulative + dur,
-                "scene_start": s_start, "scene_end": s_end,
-            })
+            boundaries.append({"index": i, "abs_start": cumulative, "abs_end": cumulative + dur, "scene_start": s_start, "scene_end": s_end})
             cumulative += dur
         return boundaries, cumulative
 
     boundaries, total_duration = _compute_boundaries(raw_scenes)
 
-    # Extend the very front of the video if requested — this is what
-    # makes "the video currently starts at 0.24 but I want 0.00" work,
-    # generalized from the old per-beat-only version: it no longer matters
-    # which beat you were thinking about, just the absolute time you want.
     if update.start < boundaries[0]["abs_start"] - 1e-3:
         extend_by = boundaries[0]["abs_start"] - update.start
         first_scene = dict(raw_scenes[0])
         first_scene["start"] = max(0.0, (first_scene.get("start") or 0.0) - extend_by)
-        print(
-            f"[update-broll-absolute] extending video start from "
-            f"{boundaries[0]['abs_start']:.3f}s to {update.start:.3f}s by pulling "
-            f"scene {first_scene.get('scene_id')}'s own start earlier "
-            f"(adds ~{extend_by:.2f}s of lead-in to the video's total duration)"
-        )
+        print(f"[update-broll-absolute] extending video start to {update.start:.3f}s by pulling scene {first_scene.get('scene_id')}'s own start earlier")
         raw_scenes[0] = first_scene
         boundaries, total_duration = _compute_boundaries(raw_scenes)
 
     if update.end > total_duration + 1e-3:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"end {update.end} is beyond the video's current total duration "
-                f"({total_duration:.2f}s) — extending the END of the video isn't "
-                f"supported yet, only the start"
-            ),
-        )
+        raise HTTPException(status_code=422, detail=f"end {update.end} is beyond the video's current total duration ({total_duration:.2f}s) — extending the END of the video isn't supported yet, only the start")
 
     touched = []
     for b in boundaries:
         if b["abs_end"] <= update.start + 1e-6 or b["abs_start"] >= update.end - 1e-6:
-            continue  # this scene doesn't overlap the requested range at all
+            continue
         local_start = max(update.start, b["abs_start"]) - b["abs_start"] + b["scene_start"]
         local_end = min(update.end, b["abs_end"]) - b["abs_start"] + b["scene_start"]
         scene = dict(raw_scenes[b["index"]])
         scene_id = scene.get("scene_id")
-        scene["beats"] = _carve_scene_beats_for_absolute_range(
-            scene, local_start, local_end, override, id_prefix=scene_id,
-        )
+        scene["beats"] = _carve_scene_beats_for_absolute_range(scene, local_start, local_end, override, id_prefix=scene_id)
         raw_scenes[b["index"]] = scene
         touched.append(scene_id)
 
     if not touched:
-        raise HTTPException(
-            status_code=422,
-            detail=f"[{update.start}, {update.end}] didn't overlap any scene in this video",
-        )
+        raise HTTPException(status_code=422, detail=f"[{update.start}, {update.end}] didn't overlap any scene in this video")
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
@@ -13610,27 +13231,17 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-            "broll_list": broll_list,
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-broll-absolute] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to save B-roll placement")
 
     return {
-        "video_id": video_id,
-        "start": update.start,
-        "end": update.end,
-        "selected_asset": override,
-        "touched_scenes": touched,
-        "broll_list": broll_list,
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "start": update.start, "end": update.end, "selected_asset": override,
+        "touched_scenes": touched, "broll_list": broll_list, "timeline_version": new_version,
+        "timeline": timeline_json, "needs_render": True,
     }
 
 
@@ -13642,7 +13253,6 @@ class BrollInsertGapUpdate(BaseModel):
     motion_type: Optional[str] = None
 
 
-
 @app.post("/timeline/{video_id}/broll/insert")
 async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
     if update.source not in ("video", "image"):
@@ -13652,45 +13262,25 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
     if update.end <= update.start:
         raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
     if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}",
-        )
+        raise HTTPException(status_code=422, detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}")
 
     duration = update.end - update.start
 
     candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
     if candidate is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Could not fetch {update.source} asset {update.asset_id} from Pexels",
-        )
+        raise HTTPException(status_code=404, detail=f"Could not fetch {update.source} asset {update.asset_id} from Pexels")
     file_url = _resolve_broll_file_url(candidate, update.source)
     if not file_url:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Asset {update.asset_id} has no landscape/horizontal file available",
-        )
+        raise HTTPException(status_code=422, detail=f"Asset {update.asset_id} has no landscape/horizontal file available")
 
     override = {
-        "asset_id": candidate.get("id"),
-        "source": update.source,
-        "file_url": file_url,
-        "width": candidate.get("width"),
-        "height": candidate.get("height"),
-        "video_files": candidate.get("video_files"),
-        "src": candidate.get("src"),
-        "motion_type": update.motion_type,
+        "asset_id": candidate.get("id"), "source": update.source, "file_url": file_url,
+        "width": candidate.get("width"), "height": candidate.get("height"),
+        "video_files": candidate.get("video_files"), "src": candidate.get("src"), "motion_type": update.motion_type,
     }
 
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_json, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_json, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[insert-broll-gap] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -13705,37 +13295,29 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
     current_version = row.data.get("timeline_version", 1)
     fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
 
-    boundaries = []
-    cumulative = 0.0
+    boundaries, cumulative = [], 0.0
     for i, s in enumerate(raw_scenes):
-        s_start = s.get("start") or 0.0
-        s_end = s.get("end") or 0.0
+        s_start, s_end = s.get("start") or 0.0, s.get("end") or 0.0
         dur = max(s_end - s_start, 1.0 / fps)
         boundaries.append({"index": i, "abs_start": cumulative, "abs_end": cumulative + dur})
         cumulative += dur
     total_duration = cumulative
 
     if update.start <= 0:
-        insert_index = 0
-        actual_at = 0.0
+        insert_index, actual_at = 0, 0.0
     elif update.start >= total_duration:
-        insert_index = len(raw_scenes)
-        actual_at = total_duration
+        insert_index, actual_at = len(raw_scenes), total_duration
     else:
-        insert_index = None
-        actual_at = None
+        insert_index, actual_at = None, None
         for b in boundaries:
             if abs(update.start - b["abs_start"]) < 1e-3:
-                insert_index = b["index"]
-                actual_at = b["abs_start"]
+                insert_index, actual_at = b["index"], b["abs_start"]
                 break
             if abs(update.start - b["abs_end"]) < 1e-3:
-                insert_index = b["index"] + 1
-                actual_at = b["abs_end"]
+                insert_index, actual_at = b["index"] + 1, b["abs_end"]
                 break
             if b["abs_start"] < update.start < b["abs_end"]:
-                insert_index = b["index"] + 1
-                actual_at = b["abs_end"]
+                insert_index, actual_at = b["index"] + 1, b["abs_end"]
                 break
         if insert_index is None:
             raise HTTPException(status_code=500, detail="Could not resolve an insertion point")
@@ -13744,35 +13326,17 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
 
     new_scene_id = f"s_ins_{uuid.uuid4().hex[:6]}"
     new_beat = {
-        "beat_id": f"{new_scene_id}_b1",
-        "beat_index": 0,
-        "start": 0.0,
-        "end": duration,
-        "vo_text": "",
-        "keywords": None,
-        "preferred_media_type": update.source,
+        "beat_id": f"{new_scene_id}_b1", "beat_index": 0, "start": 0.0, "end": duration,
+        "vo_text": "", "keywords": None, "preferred_media_type": update.source,
         "motion_type": update.motion_type or _DEFAULT_MOTION_TYPE,
-        "media": {
-            "videos": {"total_results": 0, "results": [], "error": None},
-            "images": {"total_results": 0, "results": [], "error": None},
-        },
+        "media": {"videos": {"total_results": 0, "results": [], "error": None}, "images": {"total_results": 0, "results": [], "error": None}},
         "broll_override": override,
     }
     new_scene = {
-        "scene_id": new_scene_id,
-        "vo_text": "",
-        "visual_intent": "",
-        "on_screen_text": "",
-        "start": 0.0,
-        "end": duration,
-        "duration_seconds": duration,
-        "voiceover": None,
-        "word_segments": [],
-        "error": None,
-        "beats": [new_beat],
-        "media": new_beat["media"],
-        "animation": {},
-        "infographics": None,
+        "scene_id": new_scene_id, "vo_text": "", "visual_intent": "", "on_screen_text": "",
+        "start": 0.0, "end": duration, "duration_seconds": duration, "voiceover": None, "word_segments": [],
+        "error": None, "beats": [new_beat], "media": new_beat["media"], "animations": [],
+        "requires_animation": False, "scene_animation_density": "low",
     }
 
     raw_scenes = raw_scenes[:insert_index] + [new_scene] + raw_scenes[insert_index:]
@@ -13782,79 +13346,32 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[insert-broll-gap] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to insert B-roll segment")
 
     return {
-        "video_id": video_id,
-        "new_scene_id": new_scene_id,
-        "requested_start": update.start,
-        "actual_start": actual_at,
-        "snapped_to_scene_boundary": snapped,
-        "duration": duration,
-        "end": actual_at + duration,
-        "new_total_duration": total_duration + duration,
-        "selected_asset": override,
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "new_scene_id": new_scene_id, "requested_start": update.start, "actual_start": actual_at,
+        "snapped_to_scene_boundary": snapped, "duration": duration, "end": actual_at + duration,
+        "new_total_duration": total_duration + duration, "selected_asset": override,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
-
-
 
 
 @app.delete("/timeline/{video_id}/scene/{scene_id}/content")
 async def delete_scene_content(
-    video_id: str,
-    scene_id: str,
+    video_id: str, scene_id: str,
     content_type: Literal["video", "image", "text", "infographics"],
     beat_id: Optional[str] = None,
 ):
-    """
-    Removes content from a scene, by type:
-
-    - content_type="video" or "image": clears the B-roll for ONE beat
-      (beat_id required) — the beat's asset and candidate pool are wiped,
-      so it falls back to a plain color card at render time instead of
-      any footage. The beat's own time slot (its [start, end] window,
-      captions, audio) is untouched — this deletes what's SHOWN during
-      that window, not the window itself. "video" and "image" behave
-      identically (there's nothing type-specific to clear beyond "the
-      asset"); both are accepted since callers may not always know which
-      one is currently selected.
-    - content_type="text": clears a scene's plain overlay_text animation
-      (lower_third, callout_textbox, kinetic_caption) — the scene reverts
-      to having no overlay at all. Does nothing if the scene's overlay is
-      actually an infographic (use content_type="infographics" instead).
-    - content_type="infographics": clears a scene's infographic
-      composition (title card, quote card, stat counter, bullet list,
-      data viz, icon sequence/pop-in) the same way. Does nothing if the
-      scene's overlay is actually plain text.
-
-    beat_id is required (and only meaningful) for "video"/"image";
-    omit it for "text"/"infographics".
-    """
-    if content_type in ("video", "image") and not beat_id:
-        raise HTTPException(
-            status_code=422,
-            detail="beat_id is required when content_type is 'video' or 'image'",
-        )
+    if beat_id is None:
+        raise HTTPException(status_code=422, detail="beat_id is required — content is now beat-owned, not scene-owned")
 
     try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
         print(f"[delete-scene-content] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
@@ -13876,40 +13393,24 @@ async def delete_scene_content(
         beats = scene.get("beats") or []
         beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
         if beat_idx is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Beat {beat_id} not found in scene {scene_id} (available: "
-                       f"{[b.get('beat_id') for b in beats]})",
-            )
+            raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
         beat = dict(beats[beat_idx])
         beat["broll_override"] = None
         beat["preferred_media_type"] = None
-        beat["media"] = {
-            "videos": {"total_results": 0, "results": [], "error": None},
-            "images": {"total_results": 0, "results": [], "error": None},
-        }
+        beat["media"] = {"videos": {"total_results": 0, "results": [], "error": None}, "images": {"total_results": 0, "results": [], "error": None}}
         beats[beat_idx] = beat
         scene["beats"] = beats
         deleted_something = True
 
-    elif content_type == "infographics":
-        if scene.get("infographics"):
-            scene["infographics"] = None
-            scene["animation"] = {}
-            deleted_something = True
-
-    elif content_type == "text":
-        animation = scene.get("animation") or {}
-        if animation.get("category") == "overlay_text" and not scene.get("infographics"):
-            scene["animation"] = {}
+    elif content_type in ("text", "infographics"):
+        animations = scene.get("animations") or []
+        remaining = [a for a in animations if a.get("beat_id") != beat_id]
+        if len(remaining) != len(animations):
+            scene["animations"] = remaining
             deleted_something = True
 
     if not deleted_something:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Scene {scene_id} has no {content_type} content to delete "
-                   f"(check the scene's current animation_type/infographics via GET /timeline first)",
-        )
+        raise HTTPException(status_code=422, detail=f"Beat {beat_id} in scene {scene_id} has no {content_type} content to delete")
 
     raw_scenes[scene_index] = scene
 
@@ -13921,135 +13422,39 @@ async def delete_scene_content(
 
     try:
         supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-            "infographics_list": infographics_list,
-            "text_list": text_list,
-            "broll_list": broll_list,
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list, "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[delete-scene-content] failed to save video {video_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete content")
 
     return {
-        "video_id": video_id,
-        "scene_id": scene_id,
-        "content_type": content_type,
-        "beat_id": beat_id,
-        "infographics_list": infographics_list,
-        "text_list": text_list,
-        "broll_list": broll_list,
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
+        "video_id": video_id, "scene_id": scene_id, "content_type": content_type, "beat_id": beat_id,
+        "infographics_list": infographics_list, "text_list": text_list, "broll_list": broll_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
 
-@app.delete("/timeline/{video_id}/overlay/{id}")
-async def delete_overlay_by_id(video_id: str, id: int):
-    """
-    Simpler counterpart to DELETE /scene/{scene_id}/content for text and
-    infographics specifically — takes just the numeric "id" field already
-    present on every entry in infographics_list/text_list (see
-    _compute_infographics_and_text_lists), no content_type or separate
-    scene_id lookup needed. `id` is the scene's 1-indexed position in the
-    video (a scene can only ever have one active overlay at a time, so
-    position is already a stable, unique, NUMERIC identifier for it) —
-    this endpoint just auto-detects whether that scene currently holds an
-    infographic or a plain text overlay and clears whichever one is there.
-
-    Does NOT touch video/image B-roll — a video can have several B-roll
-    beats per scene, so those still need DELETE .../content with an
-    explicit beat_id (see delete_scene_content above); there's no single
-    unambiguous numeric id for a beat the way there is for a scene's one
-    overlay.
-    """
-    if id < 1:
-        raise HTTPException(status_code=422, detail="id must be a positive integer")
-
-    try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, timeline_version")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
-    except Exception as e:
-        print(f"[delete-overlay-by-id] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    raw_scenes = row.data.get("raw_scenes") or []
-    current_version = row.data.get("timeline_version", 1)
-
-    scene_index = id - 1
-    if scene_index < 0 or scene_index >= len(raw_scenes):
-        raise HTTPException(
-            status_code=404,
-            detail=f"No overlay found with id {id} (video has {len(raw_scenes)} scene(s), valid ids: 1-{len(raw_scenes)})",
-        )
-
-    scene = dict(raw_scenes[scene_index])
-    scene_id = scene.get("scene_id")
-    animation = scene.get("animation") or {}
-    infographic = scene.get("infographics")
-
-    if infographic:
-        deleted_type = "infographics"
-        scene["infographics"] = None
-        scene["animation"] = {}
-    elif animation.get("category") == "overlay_text":
-        deleted_type = "text"
-        scene["animation"] = {}
-    else:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Overlay {id} (scene {scene_id}) has no text or infographic content to delete",
-        )
-
-    raw_scenes[scene_index] = scene
-
-    timeline_json = build_timeline_from_scenes(raw_scenes)
-    new_version = current_version + 1
-
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
-
-    try:
-        supabase.table("videos").update({
-            "raw_scenes": raw_scenes,
-            "timeline_json": timeline_json,
-            "timeline_version": new_version,
-            "final_video_url": None,
-            "render_status": "stale_needs_render",
-            "infographics_list": infographics_list,
-            "text_list": text_list,
-        }).eq("id", video_id).execute()
-    except Exception as e:
-        print(f"[delete-overlay-by-id] failed to save video {video_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete overlay")
-
-    return {
-        "video_id": video_id,
-        "id": id,
-        "scene_id": scene_id,
-        "deleted_type": deleted_type,
-        "infographics_list": infographics_list,
-        "text_list": text_list,
-        "timeline_version": new_version,
-        "timeline": timeline_json,
-        "needs_render": True,
-    }
 
 
-# =============================================================================
-# RENDER SERVICE
-# =============================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 from fastapi import HTTPException, BackgroundTasks, Response, status
 
@@ -14057,24 +13462,11 @@ from fastapi import HTTPException, BackgroundTasks, Response, status
 RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
- 
+
 REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR", "")
- 
-# SPEED: default concurrency now scales with available CPUs instead of a
-# hardcoded "2" — each scene render is CPU-bound (multiple ffmpeg encodes),
-# so on an 8-core box this alone roughly quadruples scene-level parallelism.
-# Override with RENDER_CONCURRENCY env var if you need to cap it (e.g. to
-# limit memory use on a shared box).
+
 RENDER_CONCURRENCY = int(os.getenv("RENDER_CONCURRENCY", str(max(os.cpu_count() or 2, 2))))
- 
-# SPEED: x264 defaults to "-preset medium" with no explicit thread count when
-# neither is passed, which is needlessly slow for what is essentially
-# throwaway intermediate encoding (broll fit, caption burn, etc.) followed by
-# a final encode. "veryfast" trades a small amount of compression efficiency
-# (slightly larger files at the same CRF) for a large speed win — typically
-# 3-6x faster than "medium" on the same hardware. CRF 23 keeps visual quality
-# effectively unchanged from the previous unset default (23 is libx264's own
-# default CRF). "-threads 0" lets x264 use all available cores per encode.
+
 FFMPEG_X264_PRESET = os.getenv("FFMPEG_X264_PRESET", "veryfast")
 FFMPEG_X264_CRF = os.getenv("FFMPEG_X264_CRF", "23")
 FFMPEG_X264_FLAGS = [
@@ -14084,41 +13476,75 @@ FFMPEG_X264_FLAGS = [
     "-pix_fmt", "yuv420p",
     "-threads", "0",
 ]
- 
+
 SILENT_AUDIO_SAMPLE_RATE = int(os.getenv("SILENT_AUDIO_SAMPLE_RATE", "48000"))
 SILENT_AUDIO_CHANNEL_LAYOUT = os.getenv("SILENT_AUDIO_CHANNEL_LAYOUT", "stereo")
- 
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RENDER_OUTPUT_DIR = os.environ.get("RENDER_OUTPUT_DIR", os.path.join(BASE_DIR, "rendered_videos"))
 os.makedirs(RENDER_OUTPUT_DIR, exist_ok=True)
- 
+
 LANDSCAPE_RESOLUTION = {"width": 1920, "height": 1080}
 PORTRAIT_RESOLUTION = {"width": 1080, "height": 1920}
- 
+
 SUPABASE_RENDERED_VIDEOS_BUCKET = os.getenv("SUPABASE_RENDERED_VIDEOS_BUCKET", "rendered-videos")
+
+_REMOTION_COMPOSITION_BY_ANIMATION_TYPE = {
+    # full_screen
+    "full_screen_title_card": "TitleCard",
+    "full_screen_quote_card": "QuoteCard",
+    "full_screen_data_viz": "DataVizFullScreen",
+    "full_screen_broll": "FullScreenBroll",  # no-op by design — see compositions.tsx
+    "full_screen_transition": "FullScreenTransitionFx",
+    "full_screen_color_wash": "FullScreenColorWash",
+    "full_screen_document_highlight": "FullScreenDocumentHighlight",  # degraded, no real screenshot yet
+    # overlay_text
+    "stat_counter_overlay": "StatCounterOverlay",
+    "bullet_list_reveal": "BulletListReveal",
+    "lower_third": "LowerThird",
+    "kinetic_caption": "KineticCaption",
+    "callout_textbox": "CalloutTextbox",
+    # overlay_graphic
+    "icon_sequence": "IconSequenceOverlay",
+    "icon_pop_in": "IconPopIn",
+    "logo_watermark": "LogoWatermark",
+    "emoji_reaction": "EmojiReaction",
+    "arrow_highlight": "ArrowHighlight",
+    "badge_sticker": "BadgeSticker",
+    # pip — chrome/frame only, no second video source in the schema yet
+    "pip_video": "PipVideoFrame",
+    "split_screen": "SplitScreenDivider",
+    "multi_panel_grid": "MultiPanelGrid",
+    # branding — icon placeholder only, no avatar/mascot asset in the schema yet
+    "avatar_overlay": "AvatarOverlayPlaceholder",
+    "mascot_animation": "MascotAnimationPlaceholder",
+    # transition — accents/no-ops only; true shake/speed/parallax need an
+    # FFmpeg pass on the beat clip itself, not a Remotion overlay (see
+    # compositions.tsx for why)
+    "ken_burns_pan_zoom": "KenBurnsNoOp",
+    "parallax_layering": "ParallaxAccent",
+    "shake_impact": "ShakeImpactFlash",
+    "speed_ramp_indicator": "SpeedRampIndicator",
+}
+
+# Concurrent scene renders can each spawn their own `npx remotion render`
+# (and therefore its own headless Chrome instance). Uncapped, that's a
+# plausible source of the "Was not able to close puppeteer page /
+# No target found for targetId" warnings under RENDER_CONCURRENCY > a
+# couple — that error was cosmetic (it fired during cleanup of an
+# already-failed render), but capping concurrent Remotion invocations
+# is worth doing regardless of the composition-id fix below.
+REMOTION_MAX_CONCURRENT = int(os.getenv("REMOTION_MAX_CONCURRENT", "2"))
+_remotion_semaphore = asyncio.Semaphore(REMOTION_MAX_CONCURRENT)
 
 
 # =============================================================================
-# IMAGE MOTION EFFECTS  (NEW)
-#
-# Pure translation layer from an LLM-chosen motion_type (one of
-# _VALID_MOTION_TYPES, always decided upstream in _generate_beat_keywords /
-# BEAT_KEYWORDS_PROMPT — see that section) into the matching FFmpeg
-# zoompan filter expression. Nothing in this section makes a creative
-# choice; it only implements whichever choice it's handed. If motion_type
-# is missing or invalid by the time it reaches here, it falls back to
-# _DEFAULT_MOTION_TYPE rather than failing the whole render.
+# IMAGE MOTION EFFECTS  (unchanged — already per-beat via `motion_type` on
+# each beat's broll timeline track, resolved by `_resolve_beat_motion_type`
+# upstream. Nothing here changes with the animations refactor.)
 # =============================================================================
 
 def _ease_expr(duration_frames: int) -> str:
-    """
-    Cosine ease-in/ease-out progress curve, 0 -> 1 across the clip's frames,
-    referencing zoompan's built-in `on` (output frame number) variable.
-    Applying this instead of a raw linear on/d ramp is what keeps the
-    pan/zoom/tilt from looking like it's moving at constant speed — it
-    starts slow, speeds up through the middle, and eases out at the end,
-    which reads as far more polished ("Ken Burns with easing").
-    """
     d = max(duration_frames - 1, 1)
     return f"(1-cos(PI*min(on/{d},1)))/2"
 
@@ -14126,19 +13552,6 @@ def _ease_expr(duration_frames: int) -> str:
 def _build_image_motion_filter(
     motion_type: str, duration_frames: int, fps: int, width: int, height: int,
 ) -> str:
-    """
-    Builds the full `-vf` filter string for animating a still image with
-    the given motion_type. Always pre-scales the source far larger than
-    the output (scale=8000:-1) before zoompan — without this, zoompan
-    re-samples a static-resolution source every frame and produces visible
-    judder instead of a smooth pan/zoom.
-
-    motion_type must be one of _VALID_MOTION_TYPES; anything else falls
-    through to a subtle "breathing" zoom as a safe default rather than
-    raising, since this only ever runs after LLM selection has already
-    happened — by the time we're here, a bad value means "render it
-    anyway with something reasonable," not "fail the beat."
-    """
     ease = _ease_expr(duration_frames)
     zoom_base = 1.2
     zoom_amount = 0.3
@@ -14152,22 +13565,18 @@ def _build_image_motion_filter(
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
     elif motion_type == "pan_left":
-        # left -> right drift at a fixed zoom level
         z_expr = f"{zoom_base}"
         x_expr = f"({ease})*(iw-iw/zoom)"
         y_expr = "ih/2-(ih/zoom/2)"
     elif motion_type == "pan_right":
-        # right -> left drift at a fixed zoom level
         z_expr = f"{zoom_base}"
         x_expr = f"(1-({ease}))*(iw-iw/zoom)"
         y_expr = "ih/2-(ih/zoom/2)"
     elif motion_type == "tilt_up":
-        # bottom -> top drift at a fixed zoom level
         z_expr = f"{zoom_base}"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = f"(1-({ease}))*(ih-ih/zoom)"
     elif motion_type == "tilt_down":
-        # top -> bottom drift at a fixed zoom level
         z_expr = f"{zoom_base}"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = f"({ease})*(ih-ih/zoom)"
@@ -14182,59 +13591,36 @@ def _build_image_motion_filter(
         f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
         f"d={duration_frames}:s={width}x{height}:fps={fps}"
     )
- 
- 
+
+
 def _upload_rendered_video_to_supabase(local_path: str, video_id: str, filename: Optional[str] = None) -> str:
-    # FIX C (stale/cached video served after re-render): every render used
-    # to overwrite the exact same object at the exact same path
-    # ("{video_id}/final.mp4"), which means every render also produced the
-    # exact same public URL. Overwriting the object does NOT invalidate any
-    # cache — browser cache, a CDN in front of Supabase Storage, or any
-    # proxy in between — that already has that URL cached, so a fresh,
-    # correctly-rendered file can silently keep being shadowed by old
-    # cached bytes at the same URL forever.
-    #
-    # Giving each render its own filename means each render gets its own
-    # URL, so there is never a stale cache entry to collide with.
     if filename is None:
         filename = f"final_{uuid.uuid4().hex}.mp4"
     dest_path = f"{video_id}/{filename}"
- 
+
     with open(local_path, "rb") as f:
         file_bytes = f.read()
- 
+
     supabase.storage.from_(SUPABASE_RENDERED_VIDEOS_BUCKET).upload(
         path=dest_path,
         file=file_bytes,
-        file_options={
-            "content-type": "video/mp4",
-            "upsert": "true",  # overwrite if this video_id was rendered before
-        },
+        file_options={"content-type": "video/mp4", "upsert": "true"},
     )
- 
-    public_url = supabase.storage.from_(SUPABASE_RENDERED_VIDEOS_BUCKET).get_public_url(dest_path)
-    return public_url
- 
- 
+
+    return supabase.storage.from_(SUPABASE_RENDERED_VIDEOS_BUCKET).get_public_url(dest_path)
+
+
 class RenderVideoRequest(BaseModel):
     force: bool = False
-    # FIX: explicit orientation, defaults to landscape (YouTube long-form).
     orientation: Literal["landscape", "portrait"] = "landscape"
- 
- 
+
+
 RUN_SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("RUN_SUBPROCESS_TIMEOUT_SECONDS", "300"))
 
 
 async def _run(cmd: list[str], cwd: Optional[str] = None, timeout: Optional[float] = None) -> None:
-    # FIX D (silent hang risk): stdin=DEVNULL means npx can never block
-    # forever on an interactive "install this package? (y)" prompt it will
-    # never get an answer to in a server process. The timeout is a backstop
-    # for any other subprocess that wedges (network stall, browser launch
-    # failure, etc.) — turns an indefinite hang into a clear, loggable
-    # error instead.
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=cwd,
+        *cmd, cwd=cwd,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -14255,8 +13641,8 @@ async def _run(cmd: list[str], cwd: Optional[str] = None, timeout: Optional[floa
             f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
             f"--- stderr ---\n{stderr.decode(errors='replace')[-4000:]}"
         )
- 
- 
+
+
 async def _probe_duration_seconds(path: str) -> float:
     cmd = [
         FFPROBE_BIN, "-v", "error",
@@ -14274,8 +13660,8 @@ async def _probe_duration_seconds(path: str) -> float:
         return float(stdout.decode().strip())
     except ValueError:
         raise RuntimeError(f"ffprobe returned unparsable duration for {path}: {stdout!r}")
- 
- 
+
+
 async def _probe_video_dimensions(path: str) -> Optional[tuple[int, int]]:
     cmd = [
         FFPROBE_BIN, "-v", "error",
@@ -14291,19 +13677,19 @@ async def _probe_video_dimensions(path: str) -> Optional[tuple[int, int]]:
     if proc.returncode != 0:
         print(f"[render] ffprobe dimension check failed on {path}: {stderr.decode(errors='replace')[-500:]}")
         return None
- 
+
     try:
         data = json.loads(stdout.decode())
         streams = data.get("streams") or []
         if not streams:
             return None
         stream = streams[0]
- 
+
         width = int(stream.get("width", 0) or 0)
         height = int(stream.get("height", 0) or 0)
         if width <= 0 or height <= 0:
             return None
- 
+
         rotation = 0
         tags_rotate = (stream.get("tags") or {}).get("rotate")
         if tags_rotate is not None:
@@ -14311,31 +13697,31 @@ async def _probe_video_dimensions(path: str) -> Optional[tuple[int, int]]:
                 rotation = int(float(tags_rotate))
             except (TypeError, ValueError):
                 rotation = 0
- 
+
         for sd in (stream.get("side_data_list") or []):
             if "rotation" in sd:
                 try:
                     rotation = int(float(sd["rotation"]))
                 except (TypeError, ValueError):
                     pass
- 
+
         rotation = abs(rotation) % 360
         if rotation in (90, 270):
             width, height = height, width
- 
+
         return width, height
     except (ValueError, KeyError, IndexError, json.JSONDecodeError):
         return None
- 
- 
+
+
 async def _download(url: str, dest: str, client: httpx.AsyncClient) -> str:
     resp = await client.get(url, follow_redirects=True, timeout=60.0)
     resp.raise_for_status()
     with open(dest, "wb") as f:
         f.write(resp.content)
     return dest
- 
- 
+
+
 async def _make_color_fallback(
     duration_frames: int, fps: int, width: int, height: int, tmp_dir: str,
     color: str = "0x111827",
@@ -14351,35 +13737,29 @@ async def _make_color_fallback(
     ]
     await _run(cmd)
     return out_path
- 
- 
+
+
 async def _make_blurpad_fallback(
-    local_src: str,
-    source_kind: str,
-    duration_frames: int,
-    fps: int,
-    width: int,
-    height: int,
-    tmp_dir: str,
+    local_src: str, source_kind: str, duration_frames: int, fps: int,
+    width: int, height: int, tmp_dir: str,
 ) -> Optional[str]:
     target_seconds = duration_frames / fps
     out_path = os.path.join(tmp_dir, "broll_blurpad.mp4")
- 
+
     filter_complex = (
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},gblur=sigma=30,eq=brightness=-0.05[bg];"
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
         f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={fps}[outv]"
     )
- 
+
     if source_kind == "image":
         cmd = [
             FFMPEG_BIN, "-y",
             "-loop", "1", "-i", local_src,
             "-t", f"{target_seconds:.3f}",
             "-filter_complex", filter_complex,
-            "-map", "[outv]",
-            "-an",
+            "-map", "[outv]", "-an",
             *FFMPEG_X264_FLAGS,
             out_path,
         ]
@@ -14389,20 +13769,19 @@ async def _make_blurpad_fallback(
         except Exception as e:
             print(f"[render] blur-pad image composite failed: {e}")
             return None
- 
+
     try:
         source_seconds = await _probe_duration_seconds(local_src)
     except Exception:
         source_seconds = target_seconds
- 
+
     if source_seconds >= target_seconds:
         cmd = [
             FFMPEG_BIN, "-y",
             "-i", local_src,
             "-t", f"{target_seconds:.3f}",
             "-filter_complex", filter_complex,
-            "-map", "[outv]",
-            "-an",
+            "-map", "[outv]", "-an",
             *FFMPEG_X264_FLAGS,
             out_path,
         ]
@@ -14414,28 +13793,22 @@ async def _make_blurpad_fallback(
             "-i", local_src,
             "-t", f"{target_seconds:.3f}",
             "-filter_complex", filter_complex,
-            "-map", "[outv]",
-            "-an",
+            "-map", "[outv]", "-an",
             *FFMPEG_X264_FLAGS,
             out_path,
         ]
- 
+
     try:
         await _run(cmd)
         return out_path
     except Exception as e:
         print(f"[render] blur-pad video composite failed: {e}")
         return None
- 
- 
+
+
 async def _prepare_broll_clip(
-    broll_track: dict,
-    scene_duration_frames: int,
-    fps: int,
-    width: int,
-    height: int,
-    tmp_dir: str,
-    client: httpx.AsyncClient,
+    broll_track: dict, scene_duration_frames: int, fps: int, width: int, height: int,
+    tmp_dir: str, client: httpx.AsyncClient,
     background_color_override: Optional[str] = None,
     motion_type: Optional[str] = None,
 ) -> str:
@@ -14444,29 +13817,27 @@ async def _prepare_broll_clip(
             scene_duration_frames, fps, width, height, tmp_dir,
             color=_normalize_ffmpeg_color(background_color_override),
         )
- 
+
     selected = broll_track.get("selected_asset")
- 
+
     if not selected:
-        print("[render] no b-roll asset selected for this scene at all — using color fallback")
+        print("[render] no b-roll asset selected for this beat — using color fallback")
         return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
- 
+
     source = selected.get("source", "video")
- 
-    # First choice: strict landscape-only URL.
     landscape_url = _resolve_broll_file_url(selected, source)
- 
+
     if landscape_url:
         target_seconds = scene_duration_frames / fps
         ext = ".mp4" if source == "video" else ".jpg"
         local_src = os.path.join(tmp_dir, f"broll_src{ext}")
- 
+
         try:
             await _download(landscape_url, local_src, client)
         except Exception as e:
             print(f"[render] broll download failed ({landscape_url}): {e} — trying blur-pad fallback")
-            landscape_url = None  # fall through to the any-orientation path below
- 
+            landscape_url = None
+
         if landscape_url:
             if source == "video":
                 dims = await _probe_video_dimensions(local_src)
@@ -14482,16 +13853,10 @@ async def _prepare_broll_clip(
                     if blurpad:
                         return blurpad
                     return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
- 
+
             out_path = os.path.join(tmp_dir, "broll_fit.mp4")
 
             if source == "image":
-                # NEW: still images now get an LLM-chosen Ken Burns-style
-                # pan/zoom/tilt via zoompan instead of a static scale+crop.
-                # motion_type comes from the timeline's broll track
-                # (already resolved through _resolve_beat_motion_type at
-                # timeline-build time) — this call never picks the motion
-                # itself, only maps it to a filter expression.
                 resolved_motion = motion_type if motion_type in _VALID_MOTION_TYPES else _DEFAULT_MOTION_TYPE
                 motion_filter = _build_image_motion_filter(
                     resolved_motion, duration_frames=scene_duration_frames,
@@ -14520,8 +13885,7 @@ async def _prepare_broll_clip(
                     FFMPEG_BIN, "-y",
                     "-i", local_src,
                     "-t", f"{target_seconds:.3f}",
-                    "-vf", scale_crop,
-                    "-an",
+                    "-vf", scale_crop, "-an",
                     *FFMPEG_X264_FLAGS,
                     out_path,
                 ]
@@ -14532,19 +13896,13 @@ async def _prepare_broll_clip(
                     "-stream_loop", str(loops_needed),
                     "-i", local_src,
                     "-t", f"{target_seconds:.3f}",
-                    "-vf", scale_crop,
-                    "-an",
+                    "-vf", scale_crop, "-an",
                     *FFMPEG_X264_FLAGS,
                     out_path,
                 ]
             await _run(cmd)
             return out_path
- 
-    # FIX A: no landscape file for this candidate — try blur-pad with the
-    # ORIGINAL asset (any orientation) rather than showing a blank card.
-    # (Motion is intentionally not applied on this fallback path — it's
-    # already a degraded-quality fallback, and keeping it simple/static
-    # avoids compounding two different failure-recovery filters at once.)
+
     any_url = _resolve_broll_file_url_any_orientation(selected, source)
     if not any_url:
         print(
@@ -14552,7 +13910,7 @@ async def _prepare_broll_clip(
             f"{selected.get('asset_id') or selected.get('id')} — using color fallback"
         )
         return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
- 
+
     ext = ".mp4" if source == "video" else ".jpg"
     local_src = os.path.join(tmp_dir, f"broll_anyorient{ext}")
     try:
@@ -14560,17 +13918,15 @@ async def _prepare_broll_clip(
     except Exception as e:
         print(f"[render] any-orientation broll download failed ({any_url}): {e} — using color fallback")
         return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
- 
-    blurpad = await _make_blurpad_fallback(
-        local_src, source, scene_duration_frames, fps, width, height, tmp_dir
-    )
+
+    blurpad = await _make_blurpad_fallback(local_src, source, scene_duration_frames, fps, width, height, tmp_dir)
     if blurpad:
         return blurpad
- 
+
     print("[render] blur-pad composite failed — using color fallback as last resort")
     return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
- 
- 
+
+
 async def _make_silent_audio(duration_frames: int, fps: int, tmp_dir: str) -> str:
     out_path = os.path.join(tmp_dir, "silence.aac")
     seconds = max(duration_frames / fps, 1 / fps)
@@ -14584,91 +13940,74 @@ async def _make_silent_audio(duration_frames: int, fps: int, tmp_dir: str) -> st
     ]
     await _run(cmd)
     return out_path
- 
- 
+
+
 async def render_infographic_via_remotion(
-    composition_id: str,
-    props: dict,
-    duration_frames: int,
-    fps: int,
-    width: int,
-    height: int,
-    tmp_dir: str,
+    composition_id: str, props: dict, duration_frames: int, fps: int,
+    width: int, height: int, tmp_dir: str,
 ) -> Optional[str]:
-    print(f"[DEBUG] render_infographic_via_remotion called: composition_id={composition_id!r}, REMOTION_PROJECT_DIR={REMOTION_PROJECT_DIR!r}")
+    """Renders one animation as a transparent ProRes4444 clip via Remotion.
+    `composition_id` is the animation_type (e.g. "icon_pop_in",
+    "full_screen_quote_card") — the Remotion project is expected to expose
+    one composition per animation_type in ANIMATION_TAXONOMY."""
     if not REMOTION_PROJECT_DIR:
         print(
             f"[render] REMOTION_PROJECT_DIR not configured — skipping "
-            f"infographic '{composition_id}'. Set up a Remotion project and "
+            f"animation '{composition_id}'. Set up a Remotion project and "
             f"point REMOTION_PROJECT_DIR at it to enable overlays."
         )
         return None
- 
-    out_path = os.path.join(tmp_dir, f"infographic_{uuid.uuid4().hex}.mov")
-    props_path = os.path.join(tmp_dir, "props.json")
+
+    out_path = os.path.join(tmp_dir, f"anim_{uuid.uuid4().hex}.mov")
+    props_path = os.path.join(tmp_dir, f"props_{uuid.uuid4().hex}.json")
     with open(props_path, "w") as f:
         json.dump(props, f)
- 
+
     def _build_cmd(frame_range: Optional[str]) -> list[str]:
-        cmd = [
-            "npx", "remotion", "render",
-            composition_id,
-            out_path,
-            f"--props={props_path}",
-        ]
+        cmd = ["npx", "remotion", "render", composition_id, out_path, f"--props={props_path}"]
         if frame_range:
             cmd.append(f"--frames={frame_range}")
         cmd += [
-            f"--fps={fps}",
-            f"--width={width}",
-            f"--height={height}",
-            "--codec=prores",
-            # FIX E (opaque black background instead of transparent):
-            # --codec=prores alone defaults to Remotion's "hq" ProRes
-            # profile, which is 4:2:2 and has NO alpha channel at all,
-            # regardless of the pixel-format requested below. Only the
-            # "4444" and "4444-xq" profiles carry an alpha channel.
-            "--prores-profile=4444",
-            "--pixel-format=yuva444p10le",
+            f"--fps={fps}", f"--width={width}", f"--height={height}",
+            "--codec=prores", "--prores-profile=4444", "--pixel-format=yuva444p10le",
         ]
         return cmd
- 
-    try:
-        await _run(_build_cmd(f"0-{duration_frames - 1}"), cwd=REMOTION_PROJECT_DIR)
-    except RuntimeError as e:
-        msg = str(e)
-        m = re.search(
-            r"durationInFrames.*?evaluated to be (\d+).*?not inbetween 0-(\d+)",
-            msg, re.IGNORECASE | re.DOTALL,
-        )
-        if not m:
-            print(f"[render] Remotion render failed for '{composition_id}': {e}")
-            return None
- 
-        actual_duration = int(m.group(1))
-        max_frame = int(m.group(2))
-        print(
-            f"[render] '{composition_id}' has a fixed durationInFrames of "
-            f"{actual_duration} (requested {duration_frames}) — retrying "
-            f"within its native bounds (0-{max_frame})"
-        )
+
+    async with _remotion_semaphore:
         try:
-            await _run(_build_cmd(f"0-{max_frame}"), cwd=REMOTION_PROJECT_DIR)
-        except Exception as e2:
-            print(f"[render] retry also failed for '{composition_id}': {e2}")
-            return None
- 
+            await _run(_build_cmd(f"0-{duration_frames - 1}"), cwd=REMOTION_PROJECT_DIR)
+        except RuntimeError as e:
+            msg = str(e)
+            m = re.search(
+                r"durationInFrames.*?evaluated to be (\d+).*?not inbetween 0-(\d+)",
+                msg, re.IGNORECASE | re.DOTALL,
+            )
+            if not m:
+                print(f"[render] Remotion render failed for '{composition_id}': {e}")
+                return None
+
+            max_frame = int(m.group(2))
+            print(
+                f"[render] '{composition_id}' has a fixed durationInFrames "
+                f"— retrying within its native bounds (0-{max_frame})"
+            )
+            try:
+                await _run(_build_cmd(f"0-{max_frame}"), cwd=REMOTION_PROJECT_DIR)
+            except Exception as e2:
+                print(f"[render] retry also failed for '{composition_id}': {e2}")
+                return None
+
     return out_path
- 
- 
+
+
 def _frames_to_ass_time(frame: int, fps: int) -> str:
     total_seconds = frame / fps
     h = int(total_seconds // 3600)
     m = int((total_seconds % 3600) // 60)
     s = total_seconds % 60
     return f"{h:d}:{m:02d}:{s:05.2f}"
- 
- 
+
+
 def _build_ass_from_words(
     words: list[dict], scene_start_frame: int, fps: int, width: int, height: int,
     style: Optional[dict] = None,
@@ -14679,31 +14018,6 @@ def _build_ass_from_words(
     outline_color = _hex_to_ass_color(style.get("outline_color") or "#000000", alpha_hex="00")
     animation_type = style.get("animation_type") or "kinetic_caption"
 
-    # FIX (captions not actually low): this used to hardcode Alignment=2
-    # and MarginV=200 directly in the style string below, completely
-    # ignoring `vertical_position`/`margin_bottom_percent` — the fields
-    # DEFAULT_CAPTION_STYLE sets upstream specifically to push captions
-    # very low. Those fields were being computed and stored in the
-    # timeline JSON correctly, then silently dropped here at burn-in time.
-    #
-    # NEW: horizontal_position/margin_horizontal_percent add the other
-    # axis — captions were previously always horizontally centered
-    # (alignment always 2/5/8, the center column of the numpad grid below)
-    # with no way to left- or right-align them.
-    #
-    # ASS numpad alignment is a 3x3 grid:
-    #   7 top-left     8 top-center     9 top-right
-    #   4 middle-left   5 middle-center  6 middle-right
-    #   1 bottom-left  2 bottom-center  3 bottom-right
-    # MarginV is the margin from whichever edge the VERTICAL component
-    # anchors to (bottom for 1-3, top for 7-9; ignored for the middle row).
-    # MarginL/MarginR are the margins from the left/right edges — only the
-    # one matching the HORIZONTAL component actually offsets the text (the
-    # other is irrelevant for a given alignment), computed as a percentage
-    # of frame WIDTH so it holds regardless of canvas resolution, same
-    # principle as the vertical margin. Both default to a small fixed
-    # inset (60px) when horizontal_position is "center" or unset, since
-    # centered text ignores side margins entirely.
     vertical_position = (style.get("vertical_position") or "bottom").lower()
     horizontal_position = (style.get("horizontal_position") or "center").lower()
     try:
@@ -14736,11 +14050,11 @@ ScriptType: v4.00+
 PlayResX: {width}
 PlayResY: {height}
 WrapStyle: 0
- 
+
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV
 Style: Caption,Arial Black,{font_size},{primary_color},{outline_color},&H80000000,1,4,0,{alignment},{margin_l},{margin_r},{margin_v}
- 
+
 [Events]
 Format: Layer, Start, End, Style, Text
 """
@@ -14755,7 +14069,7 @@ Format: Layer, Start, End, Style, Text
             end_ts = _frames_to_ass_time(end_frame, fps)
             return header + f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}\n"
         return header
- 
+
     lines = []
     chunk: list[dict] = []
     CHUNK_SIZE = 4
@@ -14766,7 +14080,7 @@ Format: Layer, Start, End, Style, Text
             chunk = []
     if chunk:
         lines.append(chunk)
- 
+
     events = []
     for line_words in lines:
         start_frame = line_words[0]["startFrame"] - scene_start_frame
@@ -14777,23 +14091,22 @@ Format: Layer, Start, End, Style, Text
         start_ts = _frames_to_ass_time(start_frame, fps)
         end_ts = _frames_to_ass_time(end_frame, fps)
         events.append(f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}")
- 
+
     return header + "\n".join(events) + "\n"
- 
- 
+
+
 async def _burn_captions(
     input_path: str, words: list[dict], scene_start_frame: int, fps: int,
-    width: int, height: int, tmp_dir: str,
-    style: Optional[dict] = None,
+    width: int, height: int, tmp_dir: str, style: Optional[dict] = None,
 ) -> str:
     if not words:
         return input_path
- 
+
     ass_content = _build_ass_from_words(words, scene_start_frame, fps, width, height, style=style)
     ass_path = os.path.join(tmp_dir, "captions.ass")
     with open(ass_path, "w") as f:
         f.write(ass_content)
- 
+
     out_path = os.path.join(tmp_dir, "with_captions.mp4")
     cmd = [
         FFMPEG_BIN, "-y",
@@ -14805,8 +14118,8 @@ async def _burn_captions(
     ]
     await _run(cmd, cwd=tmp_dir)
     return out_path
- 
- 
+
+
 def _escape_drawtext(text: str) -> str:
     if not text:
         return ""
@@ -14819,395 +14132,248 @@ def _escape_drawtext(text: str) -> str:
     )
 
 
-_PLACEMENT_TO_XY = {
-    "top_left": ("40", "40"),
-    "top_center": ("(w-text_w)/2", "40"),
-    "top_right": ("w-text_w-40", "40"),
-    "center_left": ("40", "(h-text_h)/2"),
-    "center": ("(w-text_w)/2", "(h-text_h)/2"),
-    "center_right": ("w-text_w-40", "(h-text_h)/2"),
-    "bottom_left": ("40", "h-text_h-160"),
-    "bottom_center": ("(w-text_w)/2", "h-text_h-160"),
-    "bottom_right": ("w-text_w-40", "h-text_h-160"),
-    "full_frame": ("(w-text_w)/2", "(h-text_h)/2"),
-}
-
-
-def _animation_overlay_text(animation: dict, scene: dict, infographic: Optional[dict]) -> Optional[str]:
-    if infographic:
-        props = infographic.get("props") or {}
-        items = props.get("items")
-        if items:
-            return "\n".join(f"- {i}" for i in items[:4])
-        for key in ("title", "quote", "label", "value"):
-            if props.get(key):
-                text = str(props[key])
-                extra = props.get("subtitle") or props.get("caption") or props.get("attribution")
-                if extra:
-                    text = f"{text}\n{extra}"
-                return text
-
-    on_screen_text = (scene.get("on_screen_text") or "").strip()
-    return on_screen_text or None
-
-
-def _compute_infographics_and_text_lists(scenes: list, timeline: dict) -> tuple[list, list]:
-    """
-    Shared classification logic behind the "infographics_list"/"text_list"
-    fields — factored out of /edit-video so /style and /infographic can
-    call it too and keep the PERSISTED infographics_list/text_list columns
-    in sync whenever an edit changes a scene's animation_type,
-    text_animation_style, or infographic props/placement, not just at
-    initial video creation.
-
-    Only icon_sequence and icon_pop_in actually carry a graphic asset
-    (props["icons"]) — every other REMOTION_INFOGRAPHIC_LIBRARY type
-    (full_screen_title_card, full_screen_quote_card, full_screen_data_viz,
-    stat_counter_overlay, bullet_list_reveal) is pure text presented via a
-    styled Remotion composition, so it's classified into text_list, not
-    infographics_list, regardless of which renderer draws it.
-
-    NEW: `timeline` (the already-built build_timeline_from_scenes output)
-    is used to attach real ABSOLUTE start_sec/end_sec to every entry —
-    position in the FINAL ASSEMBLED VIDEO, not scene-local time — for a
-    frontend timeline UI to place these directly on a scrubber without
-    doing any frame/scene-boundary math itself. Sourced from the actual
-    "infographic"/"animation" track's startFrame/endFrame rather than
-    recomputed here, so it's always exactly consistent with what
-    build_timeline_from_scenes (and therefore the render itself) actually
-    produced — including any manual text_start/text_end window a caller
-    set via /style or /infographic.
-    """
-    fps = timeline.get("fps", TIMELINE_FPS)
-    # One infographic/animation track per scene at most (a scene can only
-    # ever have one active overlay), so a simple scene_id -> track lookup
-    # is enough — no need to disambiguate multiple matches.
-    track_by_scene = {}
-    for t in timeline.get("tracks", []):
-        if t.get("type") in ("infographic", "animation") and t.get("scene_id"):
-            track_by_scene[t["scene_id"]] = t
-
-    infographics = []
-    text_overlays = []
-    for idx, s in enumerate(scenes):
-        animation = s.get("animation") or {}
-        infographic = s.get("infographics")
-        has_icon_graphic = bool(infographic and (infographic.get("props") or {}).get("icons"))
-        scene_id = s.get("scene_id")
-        # NEW: numeric id (1-indexed position of this scene in the video),
-        # NOT the scene_id string — a scene can only ever have one active
-        # overlay at a time, so its position is already a stable, unique,
-        # NUMERIC identifier for that overlay. Used directly by
-        # DELETE /timeline/{video_id}/overlay/{id}.
-        content_id = idx + 1
-
-        track = track_by_scene.get(scene_id)
-        start_sec = round(track["startFrame"] / fps, 3) if track else None
-        end_sec = round(track["endFrame"] / fps, 3) if track else None
-
-        if infographic and has_icon_graphic:
-            infographics.append({
-                "id": content_id,
-                "scene_id": scene_id,
-                "animation_type": infographic.get("animation_type"),
-                "composition_id": infographic.get("composition_id"),
-                "placement": infographic.get("placement"),
-                "props": infographic.get("props", {}),
-                "duration_frames": infographic.get("duration_frames"),
-                "start_sec": start_sec,
-                "end_sec": end_sec,
-            })
-        elif infographic:
-            text_overlays.append({
-                "id": content_id,
-                "scene_id": scene_id,
-                "animation_type": infographic.get("animation_type"),
-                "placement": infographic.get("placement"),
-                "text": (_animation_overlay_text(animation, s, infographic) or "").strip(),
-                "duration_frames": infographic.get("duration_frames"),
-                "text_animation_style": animation.get("text_animation_style"),
-                "start_sec": start_sec,
-                "end_sec": end_sec,
-            })
-        elif animation.get("category") == "overlay_text":
-            text_overlays.append({
-                "id": content_id,
-                "scene_id": scene_id,
-                "animation_type": animation.get("animation_type"),
-                "placement": animation.get("placement"),
-                "text": (s.get("on_screen_text") or "").strip(),
-                "duration_frames": animation.get("duration_frames"),
-                "text_animation_style": animation.get("text_animation_style"),
-                "start_sec": start_sec,
-                "end_sec": end_sec,
-            })
-
-    return infographics, text_overlays
-
-
-def _compute_broll_list(timeline: dict) -> list:
-    """
-    Flattens every "broll" track (one per beat, across every scene) into a
-    single flat list with a numeric id and ABSOLUTE start_sec/end_sec —
-    same purpose as _compute_infographics_and_text_lists, for B-roll
-    specifically. Reads purely from the already-built timeline (no scenes
-    param needed) since a broll track already carries everything a
-    frontend timeline needs: which asset is selected, its source
-    (video/image), motion effect, and Pexels file URL.
-
-    `id` here is simply the 1-indexed position of the track within
-    timeline order (chronological, since tracks are appended scene by
-    scene, beat by beat, in order) — stable for a given timeline_version,
-    same numbering convention as the overlay id (position, not a random
-    UUID), though NOT currently wired to a dedicated delete-by-id
-    endpoint the way overlays are (B-roll deletion still goes through
-    DELETE .../content with an explicit beat_id, since a scene can have
-    several B-roll beats where it can only ever have one overlay).
-    """
-    fps = timeline.get("fps", TIMELINE_FPS)
-    broll_list = []
-    for i, t in enumerate(timeline.get("tracks", [])):
-        if t.get("type") != "broll":
-            continue
-        selected = t.get("selected_asset") or {}
-        broll_list.append({
-            "id": i + 1,
-            "scene_id": t.get("scene_id"),
-            "beat_id": t.get("beat_id"),
-            "source": selected.get("source"),
-            "asset_id": selected.get("asset_id"),
-            "file_url": selected.get("file_url"),
-            "motion_type": t.get("motion_type"),
-            "start_sec": round(t["startFrame"] / fps, 3),
-            "end_sec": round(t["endFrame"] / fps, 3),
-        })
-    return broll_list
-
-
 # =============================================================================
-# TEXT ENTRANCE ANIMATION RENDERING  (NEW)
-#
-# text_animation_style was previously stored, validated, and returned in
-# API responses, but never actually reached a renderer — the FFmpeg path
-# below (_burn_animation_overlay) drew static text with no entrance
-# animation, and the Remotion path never included the field in props. This
-# section makes the FFmpeg path — which is what actually runs whenever
-# REMOTION_PROJECT_DIR isn't configured, i.e. most local/test setups —
-# genuinely render each of the 10 styles using FFmpeg drawtext's per-frame
-# x/y/alpha expressions (all evaluated once per frame using drawtext's
-# built-in `t` = seconds since this clip started).
-#
-# Honesty about two approximations, since drawtext has real limits:
-# - "zoom_in": drawtext's fontsize is NOT reliably animatable per-frame
-#   across ffmpeg versions, so true scale-up isn't available. Approximated
-#   as a fast fade + a small settle-in vertical move — reads as "arriving"
-#   but does not actually change text size.
-# - "wipe": a true left-to-right reveal needs a moving crop/mask over the
-#   text, which drawtext can't do on its own. Approximated as a fast
-#   slide_in_left.
-# Every other style (fade_in, slide_in_left/right, slide_up/down, bounce,
-# pop, typewriter) is a genuine implementation, not an approximation.
+# BEAT ANIMATION RENDERING  (rewritten for the new per-beat animations
+# schema — see the module docstring at the top of this file for the full
+# rationale.)
 # =============================================================================
 
-def _clip01_expr(inner: str) -> str:
-    return f"min(max({inner},0),1)"
-
-
-def _build_animated_drawtext(
-    text: str,
-    style: str,
-    x_final: str,
-    y_final: str,
-    font_size: int,
-    start_sec: float,
-    end_sec: Optional[float],
-) -> str:
+def _scale_geometry_px(geometry_px: dict, out_width: int, out_height: int) -> dict:
     """
-    Returns one or more comma-joined `drawtext=...` filter clauses that
-    animate `text` into place at (x_final, y_final) using `style`, gated
-    to be visible starting at start_sec (and, if end_sec is given, hidden
-    again after it — matching the on-screen window set via
-    SceneStyleUpdate.text_start/text_end or
-    SceneInfographicUpdate.start_seconds/end_seconds). If end_sec is None,
-    the text stays visible for the rest of the clip once it appears,
-    matching the original (pre-animation) behavior.
+    geometry_px is always expressed on a fixed 1920x1080 (16:9) canvas
+    (ANIMATION_CANVAS_WIDTH/HEIGHT, from the edit-video module). Scales
+    uniformly by width (contain-fit) and centers vertically when the
+    actual output is a different aspect ratio (e.g. 1080x1920 portrait) —
+    this keeps proportions correct instead of stretching text/icons.
     """
-    enable_expr = (
-        f"between(t,{start_sec},{end_sec})" if end_sec is not None else f"gte(t,{start_sec})"
-    )
-    box_clause = "box=1:boxcolor=black@0.55:boxborderw=20"
-    base = f"fontcolor=white:fontsize={font_size}:{box_clause}:line_spacing=8:enable='{enable_expr}'"
+    geometry_px = geometry_px or {"x": 0, "y": 0, "width": 200, "height": 100}
+    scale = out_width / ANIMATION_CANVAS_WIDTH
+    scaled_canvas_height = ANIMATION_CANVAS_HEIGHT * scale
+    y_offset = (out_height - scaled_canvas_height) / 2
 
-    entrance = 0.6  # seconds the entrance animation itself takes
-    reveal = _clip01_expr(f"(t-{start_sec})/{entrance}")
-
-    if style == "typewriter":
-        # Genuine per-step reveal: cut the text into N coarse chunks (not
-        # per-character, to avoid chaining dozens of drawtext filters) and
-        # enable each chunk only during its own slice of a longer entrance
-        # window, so the text visibly builds up left-to-right over time.
-        steps = 8
-        typewriter_entrance = 1.2
-        step_len = typewriter_entrance / steps
-        clauses = []
-        for i in range(steps):
-            cut = max(1, round(len(text) * (i + 1) / steps))
-            prefix = _escape_drawtext(text[:cut])
-            step_start = start_sec + i * step_len
-            step_end = start_sec + (i + 1) * step_len
-            if i < steps - 1:
-                step_enable = f"between(t,{step_start},{step_end})"
-            else:
-                # Final chunk (full text) stays up through end_sec (or
-                # indefinitely) once fully typed, not just its own slice.
-                step_enable = (
-                    f"between(t,{step_start},{end_sec})" if end_sec is not None
-                    else f"gte(t,{step_start})"
-                )
-            clauses.append(
-                f"drawtext=text='{prefix}':fontcolor=white:fontsize={font_size}:"
-                f"{box_clause}:line_spacing=8:enable='{step_enable}':x={x_final}:y={y_final}"
-            )
-        return ",".join(clauses)
-
-    if style == "fade_in":
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y={y_final}"
-
-    if style == "slide_in_left":
-        x_start = "-text_w-20"
-        x_anim = f"(({x_start}))+((({x_final}))-(({x_start})))*({reveal})"
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x='{x_anim}':y={y_final}"
-
-    if style == "slide_in_right":
-        x_start = "w+20"
-        x_anim = f"(({x_start}))+((({x_final}))-(({x_start})))*({reveal})"
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x='{x_anim}':y={y_final}"
-
-    if style == "slide_up":
-        y_start = "h+20"
-        y_anim = f"(({y_start}))+((({y_final}))-(({y_start})))*({reveal})"
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y='{y_anim}'"
-
-    if style == "slide_down":
-        y_start = "-text_h-20"
-        y_anim = f"(({y_start}))+((({y_final}))-(({y_start})))*({reveal})"
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y='{y_anim}'"
-
-    if style == "bounce":
-        # Decaying oscillation settling on y_final — amplitude shrinks as
-        # reveal approaches 1, so it ends exactly on the resting position.
-        y_anim = f"(({y_final}))-(18*sin(({reveal})*3*PI))*(1-({reveal}))"
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y='{y_anim}'"
-
-    if style == "pop":
-        # Fast, punchy alpha ramp with no position travel.
-        pop_reveal = _clip01_expr(f"(t-{start_sec})/0.2")
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{pop_reveal}':x={x_final}:y={y_final}"
-
-    if style == "zoom_in":
-        # Approximation — see module docstring above.
-        y_anim = f"(({y_final}))-(10*(1-({reveal})))"
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y='{y_anim}'"
-
-    if style == "wipe":
-        # Approximation — see module docstring above.
-        wipe_reveal = _clip01_expr(f"(t-{start_sec})/0.35")
-        x_start = "-text_w-20"
-        x_anim = f"(({x_start}))+((({x_final}))-(({x_start})))*({wipe_reveal})"
-        return f"drawtext=text='{{TEXT}}':{base}:alpha='{wipe_reveal}':x='{x_anim}':y={y_final}"
-
-    # Unknown/default style — plain fade_in.
-    return f"drawtext=text='{{TEXT}}':{base}:alpha='{reveal}':x={x_final}:y={y_final}"
+    return {
+        "x": geometry_px.get("x", 0) * scale,
+        "y": geometry_px.get("y", 0) * scale + y_offset,
+        "width": geometry_px.get("width", 0) * scale,
+        "height": geometry_px.get("height", 0) * scale,
+        "scale": scale,
+    }
 
 
-async def _burn_animation_overlay(
-    input_path: str,
-    animation: dict,
-    scene: dict,
-    infographic: Optional[dict],
-    width: int,
-    height: int,
-    fps: int,
-    tmp_dir: str,
-) -> str:
-    text = _animation_overlay_text(animation, scene, infographic)
-    print(f"[DEBUG] _burn_animation_overlay called for scene {scene.get('scene_id')}: animation_type={(animation or {}).get('animation_type')!r}, resolved_text={text!r}")
+def _display_text_to_string(display_text: Any) -> str:
+    if isinstance(display_text, list):
+        return "\n".join(str(d) for d in display_text if d)
+    if isinstance(display_text, str):
+        return display_text
+    return ""
+
+
+def _font_size_for_geometry(geo: dict, text: str) -> int:
+    """Loose implementation of the Animation Planner's own sizing rule of
+    thumb (~14-18 chars per 100px of box width) — solves for a font size
+    that keeps the longest line inside the (already-scaled) box."""
+    lines = text.split("\n") or [text]
+    longest = max((len(l) for l in lines), default=1) or 1
+    chars_per_100px = 16
+    width_based = max(int((geo["width"] / max(longest, 1)) * (100 / chars_per_100px) * 0.6), 18)
+    height_based = int(geo["height"] / max(len(lines), 1) * 0.7) if geo["height"] else width_based
+    return max(18, min(width_based, height_based, 120))
+
+
+def _build_beat_animation_drawtext(
+    animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
+) -> Optional[str]:
+    """
+    FFmpeg fallback for animation categories that are pure text —
+    `overlay_text`, and `full_screen` animations that carry `display_text`
+    or `highlight_target_text` with nothing to actually screenshot.
+    `overlay_graphic` / `pip` / `branding` (icons, PiP frames, avatars)
+    have no honest FFmpeg equivalent — callers should not route those here.
+    """
+    text = _display_text_to_string(animation.get("display_text"))
+    if not text and animation.get("highlight_target_text"):
+        # No real screenshot asset to composite — degrade to showing the
+        # quoted text itself rather than dropping the beat's emphasis.
+        text = animation["highlight_target_text"]
     if not text:
-        return input_path
+        return None
 
-    animation = animation or {}
-    placement = animation.get("placement") or "bottom_center"
-    x_expr, y_expr = _PLACEMENT_TO_XY.get(placement, _PLACEMENT_TO_XY["bottom_center"])
-    font_size = max(round(height / 22), 28)
-    safe_text = _escape_drawtext(text)
+    geo = _scale_geometry_px(animation.get("geometry_px") or {}, out_width, out_height)
+    font_size = _font_size_for_geometry(geo, text)
 
-    style = animation.get("text_animation_style")
-    if style not in _VALID_TEXT_ANIMATION_STYLES:
-        style = _DEFAULT_TEXT_ANIMATION_STYLE
-    start_sec = animation.get("start_offset_seconds") or 0.0
-    end_sec = animation.get("end_offset_seconds")
-
-    filter_str = _build_animated_drawtext(
-        text=text, style=style, x_final=x_expr, y_final=y_expr,
-        font_size=font_size, start_sec=start_sec, end_sec=end_sec,
+    duration_seconds = max(clip_duration_frames / fps, 0.2)
+    fade_in = min(0.4, duration_seconds / 4)
+    fade_out = min(0.4, duration_seconds / 4)
+    alpha_expr = (
+        f"if(lt(t,{fade_in}),t/{fade_in},"
+        f"if(gt(t,{duration_seconds - fade_out}),({duration_seconds}-t)/{fade_out},1))"
     )
-    # typewriter builds its own per-chunk drawtext clauses with the text
-    # already embedded; every other style has a single {TEXT} placeholder
-    # to fill in (kept as a placeholder above so the escaped text is
-    # substituted in exactly one place, rather than repeated through each
-    # style's branch).
-    if style != "typewriter":
-        filter_str = filter_str.replace("{TEXT}", safe_text)
 
-    out_path = os.path.join(tmp_dir, "with_animation.mp4")
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-i", input_path,
-        "-vf", filter_str,
-        *FFMPEG_X264_FLAGS,
-        "-c:a", "copy",
-        out_path,
-    ]
-    try:
-        await _run(cmd)
-        return out_path
-    except Exception as e:
-        print(
-            f"[render] scene {scene.get('scene_id')}: animated ffmpeg text-overlay "
-            f"failed ({e}) — retrying with a plain static overlay instead of failing the scene"
-        )
-        # Fall back to the original, non-animated overlay so a broken
-        # animation expression degrades to "static text" rather than
-        # dropping the overlay entirely.
-        plain = (
-            f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
-            f"box=1:boxcolor=black@0.55:boxborderw=20:x={x_expr}:y={y_expr}:line_spacing=8"
-        )
+    safe_text = _escape_drawtext(text)
+    x = f"{geo['x']:.1f}"
+    y = f"{geo['y']:.1f}"
+
+    return (
+        f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
+        f"box=1:boxcolor=black@0.55:boxborderw=16:line_spacing=8:"
+        f"x={x}:y={y}:alpha='{alpha_expr}'"
+    )
+
+
+def _build_remotion_props(animation_type: str, animation: dict, width: int, height: int) -> dict:
+    """
+    Your first 7 compositions (TitleCard, QuoteCard, DataVizFullScreen,
+    StatCounterOverlay, BulletListReveal, IconSequenceOverlay, IconPopIn)
+    each expect their OWN specific field names (title/subtitle,
+    quote/attribution, label/caption, value/label, items, icons) — not
+    the generic displayText/iconName/colorHint shape the animation track
+    carries. Sending the generic shape to those meant they were either
+    rendering with their defaultProps (ignoring your beat's actual text)
+    or failing zod validation outright. This maps animation_type to the
+    right prop shape per composition.
+
+    Every OTHER composition (everything in compositions/Extra.tsx) shares
+    one generic schema (baseAnimSchema) and accepts the raw shape
+    directly, so those fall through to the generic branch unchanged.
+    """
+    text = _display_text_to_string(animation.get("display_text"))
+    lines = [l for l in text.split("\n") if l.strip()] if text else []
+
+    icons = animation.get("icon_name")
+    if isinstance(icons, str):
+        icons = [icons]
+    elif not isinstance(icons, list):
+        icons = []
+
+    if animation_type == "full_screen_title_card":
+        return {"title": lines[0] if lines else text, "subtitle": lines[1] if len(lines) > 1 else ""}
+
+    if animation_type == "full_screen_quote_card":
+        quote = lines[0] if lines else (animation.get("highlight_target_text") or text)
+        return {"quote": quote, "attribution": lines[1] if len(lines) > 1 else ""}
+
+    if animation_type == "full_screen_data_viz":
+        return {"label": lines[0] if lines else text, "caption": lines[1] if len(lines) > 1 else ""}
+
+    if animation_type == "stat_counter_overlay":
+        return {"value": lines[0] if lines else text, "label": lines[1] if len(lines) > 1 else ""}
+
+    if animation_type == "bullet_list_reveal":
+        items = lines if lines else ([text] if text else ["", ""])
+        return {"title": "", "items": items[:6] or ["", ""]}
+
+    if animation_type == "icon_sequence":
+        return {"icons": icons or ["sparkles"], "label": text}
+
+    if animation_type == "icon_pop_in":
+        return {"icons": (icons[:1] or ["sparkles"]), "label": text}
+
+    # Everything else (compositions/Extra.tsx) — generic shape.
+    return {
+        "displayText": animation.get("display_text"),
+        "colorHint": animation.get("color_hint"),
+        "geometryPx": _scale_geometry_px(animation.get("geometry_px") or {}, width, height),
+        "iconName": animation.get("icon_name"),
+        "iconLayout": animation.get("icon_layout"),
+        "highlightTargetText": animation.get("highlight_target_text"),
+        "motion": animation.get("motion"),
+    }
+
+
+async def _apply_beat_animation(
+    beat_clip_path: str, animation: dict, width: int, height: int, fps: int, tmp_dir: str,
+) -> str:
+    """
+    Applies ONE animation (a timeline "animation" track dict, already
+    scoped to a single beat) onto that beat's own clip. Returns the
+    animated clip path, or the original `beat_clip_path` unchanged if
+    nothing could be rendered for it.
+    """
+    category = animation.get("category")
+    animation_type = animation.get("animation_type")
+    duration_frames = animation.get("duration_frames") or fps * 2
+
+    # A separate async Remotion pipeline may already have pre-rendered
+    # this animation and populated `asset_url` on the timeline track —
+    # use it directly instead of invoking Remotion synchronously again.
+    asset_url = animation.get("asset_url")
+    overlay_clip = None
+
+    if asset_url:
         try:
-            fallback_out = os.path.join(tmp_dir, "with_animation_fallback.mp4")
-            await _run([
-                FFMPEG_BIN, "-y", "-i", input_path, "-vf", plain,
-                *FFMPEG_X264_FLAGS, "-c:a", "copy", fallback_out,
-            ])
-            return fallback_out
-        except Exception as e2:
-            print(f"[render] scene {scene.get('scene_id')}: plain overlay fallback also failed: {e2}")
-            return input_path
+            ext = ".mov" if asset_url.lower().endswith((".mov", ".mp4")) else ".png"
+            local_asset = os.path.join(tmp_dir, f"preRendered_{uuid.uuid4().hex}{ext}")
+            async with httpx.AsyncClient() as client:
+                await _download(asset_url, local_asset, client)
+            overlay_clip = local_asset
+        except Exception as e:
+            print(f"[render] failed to fetch pre-rendered asset for '{animation_type}': {e} — falling back")
+
+    composition_id = _REMOTION_COMPOSITION_BY_ANIMATION_TYPE.get(animation_type)
+
+    if overlay_clip is None and animation.get("render_engine_hint") == "remotion" and REMOTION_PROJECT_DIR:
+        if composition_id:
+            props = _build_remotion_props(animation_type, animation, width, height)
+            overlay_clip = await render_infographic_via_remotion(
+                composition_id=composition_id, props=props,
+                duration_frames=duration_frames, fps=fps, width=width, height=height, tmp_dir=tmp_dir,
+            )
+        else:
+            # No composition built for this animation_type yet — don't
+            # even spawn `npx remotion render`, it can only fail. Fall
+            # straight through to the text/skip logic below.
+            print(
+                f"[render] no Remotion composition mapped for animation_type "
+                f"'{animation_type}' yet (see _REMOTION_COMPOSITION_BY_ANIMATION_TYPE) "
+                f"— trying the FFmpeg text fallback instead"
+            )
+
+    if overlay_clip:
+        composited = os.path.join(tmp_dir, f"anim_composited_{uuid.uuid4().hex}.mp4")
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-i", beat_clip_path,
+            "-i", overlay_clip,
+            "-filter_complex", "[1:v]format=yuva420p[fg];[0:v][fg]overlay=0:0:eof_action=pass:format=auto",
+            "-r", str(fps),
+            *FFMPEG_X264_FLAGS,
+            "-an",
+            composited,
+        ]
+        try:
+            await _run(cmd)
+            return composited
+        except Exception as e:
+            print(f"[render] compositing rendered animation '{animation_type}' failed: {e} — falling back")
+
+    text_eligible = category == "overlay_text" or (
+        category == "full_screen" and (animation.get("display_text") or animation.get("highlight_target_text"))
+    )
+    if text_eligible:
+        drawtext = _build_beat_animation_drawtext(animation, width, height, duration_frames, fps)
+        if drawtext:
+            out_path = os.path.join(tmp_dir, f"anim_text_{uuid.uuid4().hex}.mp4")
+            try:
+                await _run([
+                    FFMPEG_BIN, "-y", "-i", beat_clip_path, "-vf", drawtext,
+                    *FFMPEG_X264_FLAGS, "-an", out_path,
+                ])
+                return out_path
+            except Exception as e:
+                print(f"[render] FFmpeg text-overlay fallback for '{animation_type}' failed: {e}")
+        return beat_clip_path
+
+    print(
+        f"[render] animation '{animation_type}' (category={category}) needs Remotion "
+        f"(icon/PiP/branding/transition content has no FFmpeg equivalent) and none "
+        f"was available — this beat renders without it"
+    )
+    return beat_clip_path
 
 
 async def _lock_clip_to_frame_count(
     input_path: str, duration_frames: int, fps: int, width: int, height: int, tmp_dir: str,
 ) -> str:
-    """
-    Beat clips are each rounded to their own duration independently, so a
-    concatenated multi-beat scene clip can land a frame or two short of or
-    over the scene's own `duration_frames`. Re-encodes to land on EXACTLY
-    `duration_frames`: `tpad=stop_mode=clone:stop=100` pads with cloned
-    trailing frames if the concat came up short (100 is just a generous
-    buffer — it gets hard-cut right after), then `-frames:v` trims to the
-    exact count either way. Keeps the caption/audio mux downstream (which
-    trusts `duration_frames` as exact) from drifting out of sync.
-    """
     out_path = os.path.join(tmp_dir, "locked.mp4")
     cmd = [
         FFMPEG_BIN, "-y",
@@ -15227,23 +14393,27 @@ async def _render_scene(
     client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
     timeline_tracks_by_scene: Optional[dict] = None,
     caption_tracks_by_scene: Optional[dict] = None,
-    infographic_tracks_by_scene: Optional[dict] = None,
-    animation_tracks_by_scene: Optional[dict] = None,
+    animation_tracks_by_scene_beat: Optional[dict] = None,
 ) -> str:
+    """
+    `animation_tracks_by_scene_beat` is {scene_id: {beat_id: track}} — a
+    scene can carry several animated beats, so this MUST be keyed by both
+    scene and beat, not scene alone (see module docstring, point 1).
+    """
     async with semaphore:
         scene_id = scene.get("scene_id", uuid.uuid4().hex)
         tmp_dir = os.path.join(work_root, f"scene_{scene_id}")
         os.makedirs(tmp_dir, exist_ok=True)
- 
+
         trim = scene.get("trim") or {}
         start_sec = scene.get("start")
         if start_sec is None:
             start_sec = trim.get("start", 0.0)
- 
+
         end_sec = scene.get("end")
         if end_sec is None:
             end_sec = trim.get("end", 0.0)
- 
+
         if (start_sec in (None, 0.0)) or (end_sec in (None, 0.0)):
             word_segments = scene.get("word_segments") or []
             timed = [w for w in word_segments if "start" in w and "end" in w]
@@ -15252,20 +14422,12 @@ async def _render_scene(
                     start_sec = timed[0]["start"]
                 if end_sec in (None, 0.0):
                     end_sec = timed[-1]["end"]
- 
+
         duration_frames = max(round((end_sec - start_sec) * fps), fps)
         target_seconds = duration_frames / fps
- 
-        selected = None
-        source = None
 
-        # FIX (B-roll never rotates): timeline_tracks_by_scene[scene_id] is
-        # now a list of this scene's beat-level broll tracks (sorted by
-        # startFrame), not a single track. Render each beat as its own clip
-        # at its own duration, then concat them into one scene-length clip —
-        # this is what actually makes the footage change mid-scene, instead
-        # of stretching a single asset across the whole scene.
         scene_beat_tracks = (timeline_tracks_by_scene or {}).get(scene_id) or []
+        beat_animations = (animation_tracks_by_scene_beat or {}).get(scene_id) or {}
 
         if scene_beat_tracks:
             beat_clip_paths = []
@@ -15273,8 +14435,6 @@ async def _render_scene(
                 b_start_sec = beat_track.get("beat_start_sec")
                 b_end_sec = beat_track.get("beat_end_sec")
                 if b_start_sec is None or b_end_sec is None:
-                    # Legacy/no-timing beat (e.g. a silent scene's single
-                    # implicit beat) — it covers the whole scene.
                     b_start_sec, b_end_sec = start_sec, end_sec
 
                 beat_duration_frames = max(round((b_end_sec - b_start_sec) * fps), 1)
@@ -15285,12 +14445,6 @@ async def _render_scene(
                     beat_broll_track = {"selected_asset": dict(beat_selected)}
 
                 beat_bg_override = beat_track.get("background_color") or scene.get("background_color")
-
-                # NEW: resolved image motion effect for this beat, read
-                # straight off the timeline track (build_timeline_from_scenes
-                # already resolved override-vs-LLM-choice via
-                # _resolve_beat_motion_type). Ignored by _prepare_broll_clip
-                # when the beat's selected asset turns out to be a video.
                 beat_motion_type = beat_track.get("motion_type")
 
                 beat_tmp_dir = os.path.join(tmp_dir, f"beat_{i}")
@@ -15301,6 +14455,16 @@ async def _render_scene(
                     background_color_override=beat_bg_override,
                     motion_type=beat_motion_type,
                 )
+
+                # NEW: apply THIS beat's own animation (if any) onto its
+                # own clip before concatenation — this is what actually
+                # lets a scene carry more than one animated moment.
+                this_beat_animation = beat_animations.get(beat_track.get("beat_id"))
+                if this_beat_animation:
+                    beat_clip = await _apply_beat_animation(
+                        beat_clip, this_beat_animation, width, height, fps, beat_tmp_dir,
+                    )
+
                 beat_clip_paths.append(beat_clip)
 
             if len(beat_clip_paths) == 1:
@@ -15308,112 +14472,37 @@ async def _render_scene(
             else:
                 base_clip = await _concat_scenes(beat_clip_paths, tmp_dir, fps=fps)
 
-            # Beat durations are rounded independently per-beat, so their sum
-            # can land a frame or two off `duration_frames` (the scene's own
-            # rounding of end_sec - start_sec). Force the concatenated clip
-            # to the exact scene frame count here so the caption/audio mux
-            # below — which trusts `duration_frames` — stays frame-accurate.
             base_clip = await _lock_clip_to_frame_count(base_clip, duration_frames, fps, width, height, tmp_dir)
         else:
             # Legacy fallback: no beat tracks at all for this scene (older
-            # timeline_json predating the beats refactor) — behave exactly
-            # as before, one asset for the whole scene, default motion.
-            timeline_broll = None
-            if not selected:
-                media = scene.get("media") or {}
-                video_candidates = (media.get("videos") or {}).get("results") or []
-                image_candidates = (media.get("images") or {}).get("results") or []
-                if video_candidates:
-                    selected, source = dict(video_candidates[0]), "video"
-                elif image_candidates:
-                    selected, source = dict(image_candidates[0]), "image"
+            # timeline_json predating the beats refactor). No beat-level
+            # animation to apply here since there's no beat to key it by.
+            selected, source = None, None
+            media = scene.get("media") or {}
+            video_candidates = (media.get("videos") or {}).get("results") or []
+            image_candidates = (media.get("images") or {}).get("results") or []
+            if video_candidates:
+                selected, source = dict(video_candidates[0]), "video"
+            elif image_candidates:
+                selected, source = dict(image_candidates[0]), "image"
 
             broll_track = {"selected_asset": None}
             if selected:
-                broll_track = {
-                    "selected_asset": {**selected, "source": source}
-                }
+                broll_track = {"selected_asset": {**selected, "source": source}}
 
             background_color_override = scene.get("background_color")
 
             base_clip = await _prepare_broll_clip(
                 broll_track, duration_frames, fps, width, height, tmp_dir, client,
                 background_color_override=background_color_override,
-                motion_type=scene.get("motion_type"),
+                motion_type=None,
             )
- 
-        timeline_infographic = (infographic_tracks_by_scene or {}).get(scene_id)
-        if timeline_infographic and timeline_infographic.get("composition_id"):
-            infographic = {
-                "composition_id": timeline_infographic.get("composition_id"),
-                "props": timeline_infographic.get("props", {}),
-                "duration_frames": timeline_infographic.get("duration_frames") or duration_frames,
-            }
-        else:
-            infographic = scene.get("infographics")
-
-        timeline_animation = (animation_tracks_by_scene or {}).get(scene_id)
-        animation = timeline_animation or scene.get("animation") or {}
 
         current = base_clip
-        animation_applied = False
 
-        if infographic and infographic.get("composition_id"):
-            remotion_props = dict(infographic.get("props", {}))
-            # Pass the chosen entrance animation through to Remotion too —
-            # previously computed/validated but never included in props,
-            # so composition components had no way to read it even if they
-            # implemented per-style animation logic.
-            remotion_props.setdefault(
-                "text_animation_style",
-                animation.get("text_animation_style") or _DEFAULT_TEXT_ANIMATION_STYLE,
-            )
-            # NEW: same gap as text_animation_style had — `placement`
-            # (chosen by the LLM in ANIMATION_PLANNER_PROMPT, validated by
-            # _validate_animation) was computed and stored on
-            # infographic["placement"] but never actually included in the
-            # props sent to Remotion, so composition components had no way
-            # to honor it even if they implemented placement-aware layout.
-            remotion_props.setdefault("placement", infographic.get("placement") or "bottom_left")
-            overlay_clip = await render_infographic_via_remotion(
-                composition_id=infographic["composition_id"],
-                props=remotion_props,
-                duration_frames=infographic.get("duration_frames") or duration_frames,
-                fps=fps, width=width, height=height, tmp_dir=tmp_dir,
-            )
-            if overlay_clip:
-                composited = os.path.join(tmp_dir, "composited.mp4")
-                cmd = [
-                    FFMPEG_BIN, "-y",
-                    "-i", current,
-                    "-i", overlay_clip,
-                    "-filter_complex", "[1:v]format=yuva420p[fg];[0:v][fg]overlay=0:0:eof_action=pass:format=auto",
-                    "-r", str(fps),
-                    *FFMPEG_X264_FLAGS,
-                    composited,
-                ]
-                await _run(cmd)
-                current = composited
-                animation_applied = True
-            else:
-                print(
-                    f"[render] scene {scene_id}: Remotion composition "
-                    f"'{infographic['composition_id']}' unavailable — using "
-                    f"FFmpeg text-overlay fallback so the infographic still renders"
-                )
-                current = await _burn_animation_overlay(
-                    current, animation, scene, infographic, width, height, fps, tmp_dir,
-                )
-                animation_applied = True
-
-        if not animation_applied and animation.get("animation_type"):
-            current = await _burn_animation_overlay(
-                current, animation, scene, None, width, height, fps, tmp_dir,
-            )
- 
         timeline_caption = (caption_tracks_by_scene or {}).get(scene_id)
         caption_style = (timeline_caption or {}).get("style") or scene.get("caption_style")
- 
+
         words = scene.get("word_segments") or []
         words = [
             w for w in words
@@ -15431,14 +14520,14 @@ async def _render_scene(
         current = await _burn_captions(
             current, frame_words, 0, fps, width, height, tmp_dir, style=caption_style
         )
- 
+
         voiceover = scene.get("voiceover")
         final_scene_path = os.path.join(work_root, f"scene_{scene_id}_final.mp4")
- 
+
         if voiceover and voiceover.get("url"):
             audio_path_raw = os.path.join(tmp_dir, "audio_raw.mp3")
             await _download(voiceover["url"], audio_path_raw, client)
- 
+
             audio_path = os.path.join(tmp_dir, "audio_trimmed.m4a")
             trim_cmd = [
                 FFMPEG_BIN, "-y",
@@ -15452,7 +14541,7 @@ async def _render_scene(
         else:
             print(f"[render] scene {scene_id} has no voiceover ({scene.get('error')}) — muxing silent audio instead")
             audio_path = await _make_silent_audio(duration_frames, fps, tmp_dir)
- 
+
         locked_audio_path = os.path.join(tmp_dir, "audio_locked.m4a")
         lock_cmd = [
             FFMPEG_BIN, "-y",
@@ -15463,7 +14552,7 @@ async def _render_scene(
             locked_audio_path,
         ]
         await _run(lock_cmd)
- 
+
         cmd = [
             FFMPEG_BIN, "-y",
             "-i", current,
@@ -15493,25 +14582,19 @@ async def _render_scene(
                 final_scene_path,
             ]
             await _run(cmd)
- 
+
         return final_scene_path
- 
- 
+
+
 async def _concat_scenes(scene_paths: list[str], work_root: str, fps: int = TIMELINE_FPS) -> str:
     list_path = os.path.join(work_root, "concat_list.txt")
     with open(list_path, "w") as f:
         for p in scene_paths:
             f.write(f"file '{p}'\n")
- 
+
     out_path = os.path.join(work_root, "final_output.mp4")
- 
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", list_path,
-        "-c", "copy",
-        out_path,
-    ]
+
+    cmd = [FFMPEG_BIN, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path]
     try:
         await _run(cmd)
     except Exception as e:
@@ -15527,28 +14610,21 @@ async def _concat_scenes(scene_paths: list[str], work_root: str, fps: int = TIME
             out_path,
         ]
         await _run(cmd)
- 
+
     return out_path
- 
- 
+
+
 async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientation: str) -> Optional[str]:
     no_voice_scene_ids = [
         s.get("scene_id") for s in scenes
         if not (s.get("voiceover") and s.get("voiceover", {}).get("url"))
     ]
     if no_voice_scene_ids:
-        print(
-            f"[render] video {video_id}: scenes with NO voiceover "
-            f"(will render silent): {no_voice_scene_ids}"
-        )
- 
+        print(f"[render] video {video_id}: scenes with NO voiceover (will render silent): {no_voice_scene_ids}")
+
     fps = timeline.get("fps", 30)
- 
-    if orientation == "portrait":
-        resolution = PORTRAIT_RESOLUTION
-    else:
-        resolution = LANDSCAPE_RESOLUTION
- 
+    resolution = PORTRAIT_RESOLUTION if orientation == "portrait" else LANDSCAPE_RESOLUTION
+
     stored_resolution = timeline.get("resolution")
     if stored_resolution and (
         stored_resolution.get("width") != resolution["width"]
@@ -15556,82 +14632,43 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
     ):
         print(
             f"[render] video {video_id}: overriding stored timeline resolution "
-            f"{stored_resolution} -> {resolution} to match requested "
-            f"orientation='{orientation}'"
+            f"{stored_resolution} -> {resolution} to match requested orientation='{orientation}'"
         )
- 
+
     width, height = resolution["width"], resolution["height"]
- 
-    # FIX (B-roll never rotates): this used to be a plain
-    # {scene_id: track} dict. build_timeline_from_scenes creates ONE
-    # "broll" track PER BEAT for a scene, so a multi-beat scene produced
-    # several tracks sharing the same scene_id — and each one silently
-    # overwrote the last in this dict, leaving only the final beat's asset
-    # for the whole scene. That is why footage held static for an entire
-    # scene regardless of how many beats were computed upstream.
-    #
-    # Now scene_id maps to a LIST of that scene's beat tracks, sorted by
-    # startFrame, so `_render_scene` can render — and concatenate — one
-    # clip per beat instead of one clip for the whole scene. Each of those
-    # tracks also carries its own resolved `motion_type` (see
-    # build_timeline_from_scenes).
+
+    # timeline_tracks_by_scene: scene_id -> [broll tracks] (one per beat).
+    # caption_tracks_by_scene: scene_id -> single caption_word track.
+    # animation_tracks_by_scene_beat: scene_id -> {beat_id: animation
+    #   track} — NOT a single track per scene, since a scene can have
+    #   several animated beats (see module docstring, point 1). There is
+    #   no "infographic" track type any more — the timeline only ever
+    #   emits "audio" / "caption_word" / "broll" / "animation".
     timeline_tracks_by_scene = {}
     caption_tracks_by_scene = {}
-    infographic_tracks_by_scene = {}
-    animation_tracks_by_scene = {}
+    animation_tracks_by_scene_beat = {}
     for track in timeline.get("tracks", []):
         if track.get("type") == "broll" and track.get("scene_id"):
             timeline_tracks_by_scene.setdefault(track["scene_id"], []).append(track)
         elif track.get("type") == "caption_word" and track.get("scene_id"):
             caption_tracks_by_scene[track["scene_id"]] = track
-        elif track.get("type") == "infographic" and track.get("scene_id"):
-            infographic_tracks_by_scene[track["scene_id"]] = track
         elif track.get("type") == "animation" and track.get("scene_id"):
-            animation_tracks_by_scene[track["scene_id"]] = track
+            animation_tracks_by_scene_beat.setdefault(track["scene_id"], {})[track.get("beat_id")] = track
 
     for beat_tracks in timeline_tracks_by_scene.values():
         beat_tracks.sort(key=lambda t: t.get("startFrame", 0))
- 
+
     try:
         supabase.table("videos").update({"render_status": "rendering"}).eq("id", video_id).execute()
     except Exception as e:
         print(f"[render] failed to set render_status=rendering for {video_id}: {e}")
- 
+
     work_root = os.path.join(RENDER_TMP_ROOT, video_id)
     os.makedirs(work_root, exist_ok=True)
     semaphore = asyncio.Semaphore(RENDER_CONCURRENCY)
- 
+
     try:
         async with httpx.AsyncClient() as client:
-            # FIX F (rendering takes far longer than it needs to): scenes
-            # were previously rendered strictly one at a time in a plain
-            # `for` loop that fully awaited each scene before starting the
-            # next — even though a concurrency-aware `semaphore` was
-            # already being created above and threaded all the way into
-            # `_render_scene` (`async with semaphore:` at its top). That
-            # semaphore had nothing to actually limit, because nothing ever
-            # launched more than one scene at a time in the first place.
-            #
-            # Each scene independently pays for: a b-roll download, a
-            # separate `npx remotion render` invocation (which re-bundles
-            # the whole Remotion project from scratch on every call — ~4s
-            # of "Bundled code" overhead alone before any real rendering
-            # happens), caption burn-in, and a final audio mux. None of
-            # that depends on any other scene finishing first. Running
-            # them sequentially means total wall-clock time is the SUM of
-            # every scene's time — 5 scenes at a few minutes each adds up
-            # to the ~30 minutes reported.
-            #
-            # Launching every scene as a task and awaiting them together
-            # with asyncio.gather lets independent scenes' downloads /
-            # Remotion renders / ffmpeg passes overlap instead of queuing
-            # behind each other. The semaphore inside _render_scene still
-            # caps how many run concurrently (RENDER_CONCURRENCY, CPU-based
-            # by default), so this doesn't overwhelm the box — it just
-            # actually uses the concurrency budget that was already being
-            # computed but never spent. On a multi-core machine this is
-            # typically a 3-5x wall-clock improvement for a handful of
-            # scenes.
             async def _render_one(scene: dict):
                 scene_id = scene.get("scene_id")
                 try:
@@ -15639,8 +14676,7 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
                         scene, fps, width, height, work_root, client, semaphore,
                         timeline_tracks_by_scene=timeline_tracks_by_scene,
                         caption_tracks_by_scene=caption_tracks_by_scene,
-                        infographic_tracks_by_scene=infographic_tracks_by_scene,
-                        animation_tracks_by_scene=animation_tracks_by_scene,
+                        animation_tracks_by_scene_beat=animation_tracks_by_scene_beat,
                     )
                     return scene_id, path, None
                 except Exception as e:
@@ -15651,11 +14687,6 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
 
             scene_paths_by_id = {sid: path for sid, path, _ in results if path}
             failed_scenes = [sid for _, path, sid in results if path is None]
-            # Concatenation order still matters even though render order no
-            # longer does — asyncio.gather returns results in the same
-            # order as the input list regardless of completion order, but
-            # this makes that ordering guarantee explicit so concat stays
-            # correct even if _render_one is refactored later.
             scene_paths = [
                 scene_paths_by_id[s.get("scene_id")]
                 for s in scenes
@@ -15666,21 +14697,20 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
                 print(f"[render] video {video_id}: all scenes failed to render")
                 try:
                     supabase.table("videos").update({
-                        "render_status": "failed",
-                        "failed_render_scene_ids": failed_scenes,
+                        "render_status": "failed", "failed_render_scene_ids": failed_scenes,
                     }).eq("id", video_id).execute()
                 except Exception as e:
                     print(f"[render] failed to persist all-scenes-failed status for {video_id}: {e}")
                 raise HTTPException(status_code=500, detail="All scenes failed to render")
- 
+
             final_path = await _concat_scenes(scene_paths, work_root, fps=fps)
- 
+
         try:
             final_duration = await _probe_duration_seconds(final_path)
             print(f"[render] video {video_id}: final output duration = {final_duration:.3f}s")
         except Exception as e:
             print(f"[render] could not probe final output duration: {e}")
- 
+
         try:
             public_url = _upload_rendered_video_to_supabase(final_path, video_id)
             render_status = "completed" if not failed_scenes else "completed_with_errors"
@@ -15692,7 +14722,7 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
             shutil.copy2(final_path, dest_path)
             public_url = None
             render_status = "completed_upload_failed"
- 
+
         try:
             supabase.table("videos").update({
                 "final_video_url": public_url,
@@ -15701,17 +14731,17 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
             }).eq("id", video_id).execute()
         except Exception as e:
             print(f"[render] failed to persist final status for {video_id}: {e}")
- 
+
         print(
             f"[render] video {video_id}: done, status={render_status}, "
             f"failed_scenes={failed_scenes}, no_voiceover_scenes={no_voice_scene_ids}"
         )
- 
+
         if public_url is None:
             raise HTTPException(status_code=500, detail="Render completed but upload to storage failed")
- 
+
         return public_url
- 
+
     except HTTPException:
         try:
             supabase.table("videos").update({"render_status": "failed"}).eq("id", video_id).execute()
@@ -15727,14 +14757,10 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
         raise HTTPException(status_code=500, detail=f"Render failed: {e}")
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
- 
- 
+
+
 @app.post("/render/{video_id}")
-async def render_video(
-    video_id: str,
-    request: RenderVideoRequest = RenderVideoRequest(),
-):
-    print("hit")
+async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoRequest()):
     try:
         row = (
             supabase.table("videos")
@@ -15746,18 +14772,18 @@ async def render_video(
     except Exception as e:
         print(f"[render] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
- 
+
     if not row.data:
         raise HTTPException(status_code=404, detail="Video not found")
- 
+
     if row.data.get("final_video_url") and not request.force:
         return {"final_video_url": row.data["final_video_url"]}
- 
+
     timeline = row.data.get("timeline_json") or {}
     scenes = row.data.get("raw_scenes") or []
     if not scenes:
         raise HTTPException(status_code=400, detail="No scenes to render for this video")
- 
+
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
- 
+
     return {"final_video_url": final_video_url}
