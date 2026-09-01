@@ -9212,10 +9212,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
 import re
 import os
 import json
@@ -11647,7 +11643,7 @@ def _slim_selected_asset(selected: Optional[dict]) -> Optional[dict]:
     }
 
 
-def _slim_beat_for_response(beat: dict) -> dict:
+def _slim_beat_for_response(beat: dict, broll_track: Optional[dict] = None) -> dict:
     default_asset, default_source = _resolve_beat_broll_selection(beat)
     selected = None
     if default_asset:
@@ -11662,6 +11658,14 @@ def _slim_beat_for_response(beat: dict) -> dict:
         "beat_id": beat.get("beat_id"),
         "start": beat.get("start"),
         "end": beat.get("end"),
+        # NEW: ABSOLUTE position in the final assembled video, in seconds
+        # — sourced directly from this beat's own "broll" track in the
+        # already-built timeline (build_timeline_from_scenes), so it's
+        # always exactly consistent with what actually renders, rather
+        # than recomputed here. None only if this beat has no matching
+        # track yet (shouldn't normally happen once beats exist).
+        "start_sec": (broll_track or {}).get("start_sec"),
+        "end_sec": (broll_track or {}).get("end_sec"),
         "keywords": beat.get("keywords"),
         "preferred_media_type": beat.get("preferred_media_type"),
         "motion_type": _resolve_beat_motion_type(beat),
@@ -11669,9 +11673,40 @@ def _slim_beat_for_response(beat: dict) -> dict:
     }
 
 
-def _slim_scene_for_response(scene: dict) -> dict:
+def _slim_scene_for_response(scene: dict, timeline: Optional[dict] = None) -> dict:
+    """
+    `timeline` is the already-built build_timeline_from_scenes output —
+    passed through so every beat, and this scene's text/infographic
+    overlay, can carry its ABSOLUTE start_sec/end_sec (position in the
+    final assembled video), not just the scene-local start/end already
+    on the raw beat/scene dicts. Audio deliberately does NOT get this
+    treatment here — voice_url has no on-screen "window" the way B-roll/
+    text/infographics do, so there's nothing meaningful to timestamp for
+    it beyond the scene's own start/end already returned.
+    """
+    scene_id = scene.get("scene_id")
+
+    broll_track_by_beat_id = {}
+    overlay_track = None
+    if timeline:
+        for t in timeline.get("tracks", []):
+            if t.get("type") == "broll" and t.get("scene_id") == scene_id:
+                broll_track_by_beat_id[t.get("beat_id")] = t
+            elif t.get("type") in ("infographic", "animation") and t.get("scene_id") == scene_id:
+                overlay_track = t  # at most one per scene
+
+    animation_out = dict(scene.get("animation")) if scene.get("animation") else None
+    infographics_out = dict(scene.get("infographics")) if scene.get("infographics") else None
+    if overlay_track:
+        if animation_out is not None:
+            animation_out["start_sec"] = overlay_track.get("start_sec")
+            animation_out["end_sec"] = overlay_track.get("end_sec")
+        if infographics_out is not None:
+            infographics_out["start_sec"] = overlay_track.get("start_sec")
+            infographics_out["end_sec"] = overlay_track.get("end_sec")
+
     return {
-        "scene_id": scene.get("scene_id"),
+        "scene_id": scene_id,
         "vo_text": scene.get("vo_text"),
         "visual_intent": scene.get("visual_intent"),
         "on_screen_text": scene.get("on_screen_text"),
@@ -11680,9 +11715,12 @@ def _slim_scene_for_response(scene: dict) -> dict:
         "duration_seconds": scene.get("duration_seconds"),
         "voice_url": (scene.get("voiceover") or {}).get("url"),
         "error": scene.get("error"),
-        "beats": [_slim_beat_for_response(b) for b in (scene.get("beats") or [])],
-        "animation": scene.get("animation"),
-        "infographics": scene.get("infographics"),
+        "beats": [
+            _slim_beat_for_response(b, broll_track_by_beat_id.get(b.get("beat_id")))
+            for b in (scene.get("beats") or [])
+        ],
+        "animation": animation_out,
+        "infographics": infographics_out,
         "caption_style": scene.get("caption_style"),
         "background_color": scene.get("background_color"),
     }
@@ -11736,7 +11774,18 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "vo_text": scene.get("vo_text"),
                 "startFrame": scene_start_frame,
                 "endFrame": scene_end_frame,
-                # explicit scene timing, in seconds, alongside the frame
+                # NEW: ABSOLUTE position in the final assembled video, in
+                # seconds — this is what a frontend timeline scrubber
+                # actually needs (startFrame/fps, endFrame/fps). Distinct
+                # from scene_start_sec/scene_end_sec below, which are
+                # SCENE-LOCAL (position within this scene's own generated
+                # audio file) — those two numbers only match for the very
+                # first scene in a video; every scene after that starts
+                # partway through the assembled timeline while its own
+                # local clock still starts near 0.
+                "start_sec": scene_start_frame / fps,
+                "end_sec": scene_end_frame / fps,
+                # Scene-local timing, in seconds, alongside the frame
                 # numbers — persisted verbatim into timeline_json/raw_scenes.
                 "scene_start_sec": start_sec,
                 "scene_end_sec": end_sec,
@@ -11812,6 +11861,15 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "layer": "background",
                 "startFrame": beat_start_frame,
                 "endFrame": beat_end_frame,
+                # NEW: ABSOLUTE position in the final assembled video, in
+                # seconds — use THESE for a frontend timeline (a clip's
+                # real on-screen window), not beat_start_sec/beat_end_sec
+                # below, which are SCENE-LOCAL (position within this
+                # beat's own scene's audio) and only equal the absolute
+                # position for a scene's very first beat in the very
+                # first scene of the video.
+                "start_sec": beat_start_frame / fps,
+                "end_sec": beat_end_frame / fps,
                 "beat_start_sec": b_start,
                 "beat_end_sec": b_end,
                 "keywords": beat.get("keywords"),
@@ -11881,6 +11939,11 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "props": infographic.get("props", {}),
                 "startFrame": overlay_start,
                 "endFrame": overlay_end,
+                # NEW: absolute on-screen window, in seconds — what a
+                # frontend timeline should actually display for this
+                # infographic's start/end.
+                "start_sec": overlay_start / fps,
+                "end_sec": overlay_end / fps,
                 "duration_frames": overlay_end - overlay_start,
                 "status": "pending_render",
                 "asset_url": None,
@@ -11897,6 +11960,10 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "content_binding": animation.get("content_binding"),
                 "startFrame": overlay_start,
                 "endFrame": overlay_end,
+                # NEW: same absolute-seconds addition as infographic
+                # tracks above, for this scene's plain text overlay.
+                "start_sec": overlay_start / fps,
+                "end_sec": overlay_end / fps,
                 "render_engine_hint": animation.get("render_engine_hint"),
             })
 
@@ -11991,7 +12058,8 @@ async def edit_video(request: EditVideo):
     # See _compute_infographics_and_text_lists for the classification
     # rules (also reused by /style and /infographic to keep these columns
     # in sync after edits).
-    infographics, text_overlays = _compute_infographics_and_text_lists(scenes_with_voice_and_timestamps)
+    infographics, text_overlays = _compute_infographics_and_text_lists(scenes_with_voice_and_timestamps, timeline_json)
+    broll_list = _compute_broll_list(timeline_json)
 
     video_id = str(uuid.uuid4())
     try:
@@ -12007,6 +12075,7 @@ async def edit_video(request: EditVideo):
             "scene_timings": scene_timings,
             "infographics_list": infographics,
             "text_list": text_overlays,
+            "broll_list": broll_list,
         }).execute()
     except Exception as e:
         print(f"[edit-video] failed to persist video row: {e}")
@@ -12015,11 +12084,12 @@ async def edit_video(request: EditVideo):
     return {
         "video_id": video_id,
         "timeline": _slim_timeline_for_response(timeline_json),
-        "scenes": [_slim_scene_for_response(s) for s in scenes_with_voice_and_timestamps],
+        "scenes": [_slim_scene_for_response(s, timeline_json) for s in scenes_with_voice_and_timestamps],
         "scene_timings": scene_timings,
         "failed_scene_ids": failed_scenes,
         "infographics_list": infographics,
         "text_list": text_overlays,
+        "broll_list": broll_list,
     }
 
 
@@ -12028,7 +12098,7 @@ async def get_timeline(video_id: str):
     try:
         row = (
             supabase.table("videos")
-            .select("timeline_json, timeline_version, scene_timings")
+            .select("timeline_json, timeline_version, scene_timings, infographics_list, text_list, broll_list")
             .eq("id", video_id)
             .single()
             .execute()
@@ -12284,7 +12354,7 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     # animation_type via a future endpoint) changes which list a scene's
     # overlay belongs in or what text it displays, so these need
     # recomputing on every style change, not just at video creation.
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
@@ -12301,9 +12371,9 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
         raise HTTPException(status_code=500, detail="Failed to save style edit")
 
     return {
-        "id": scene_index + 1,  
         "video_id": video_id,
         "scene_id": scene_id,
+        "id": scene_index + 1,  # NEW: same 1-indexed convention as infographics_list/text_list/delete_overlay_by_id, so frontend can address this overlay later without a separate lookup
         "timeline_version": new_version,
         "caption_style": scene.get("caption_style"),
         "background_color": scene.get("background_color"),
@@ -12568,6 +12638,7 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
+    broll_list = _compute_broll_list(timeline_json)
 
     try:
         supabase.table("videos").update({
@@ -12576,6 +12647,7 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
             "timeline_version": new_version,
             "final_video_url": None,
             "render_status": "stale_needs_render",
+            "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[split-beat] failed to save video {video_id}: {e}")
@@ -12595,6 +12667,7 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
                 "media_type": second_media_type, "motion_type": second_motion_type,
             },
         ],
+        "broll_list": broll_list,
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
@@ -12728,6 +12801,7 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
+    broll_list = _compute_broll_list(timeline_json)
 
     try:
         supabase.table("videos").update({
@@ -12736,6 +12810,7 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
             "timeline_version": new_version,
             "final_video_url": None,
             "render_status": "stale_needs_render",
+            "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[insert-beat] failed to save video {video_id}: {e}")
@@ -12749,6 +12824,7 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
             "beat_id": new_beat["beat_id"], "start": new_beat["start"], "end": new_beat["end"],
             "media_type": new_media_type, "motion_type": new_motion_type,
         },
+        "broll_list": broll_list,
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
@@ -12973,7 +13049,7 @@ async def update_scene_infographic(video_id: str, scene_id: str, update: SceneIn
     # changing animation_type here can move a scene between the two lists
     # entirely (e.g. icon_sequence <-> full_screen_title_card), and prop
     # changes can change the displayed text, so recompute on every edit.
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
@@ -13229,6 +13305,7 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
+    broll_list = _compute_broll_list(timeline_json)
 
     try:
         supabase.table("videos").update({
@@ -13237,6 +13314,7 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
             "timeline_version": new_version,
             "final_video_url": None,
             "render_status": "stale_needs_render",
+            "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-broll] failed to save video {video_id}: {e}")
@@ -13250,6 +13328,7 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
         "resolved_motion_type": _resolve_beat_motion_type(beat),
         "start": beat.get("start"),
         "end": beat.get("end"),
+        "broll_list": broll_list,
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
@@ -13527,6 +13606,7 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
+    broll_list = _compute_broll_list(timeline_json)
 
     try:
         supabase.table("videos").update({
@@ -13535,6 +13615,7 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
             "timeline_version": new_version,
             "final_video_url": None,
             "render_status": "stale_needs_render",
+            "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-broll-absolute] failed to save video {video_id}: {e}")
@@ -13546,6 +13627,7 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
         "end": update.end,
         "selected_asset": override,
         "touched_scenes": touched,
+        "broll_list": broll_list,
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
@@ -13558,6 +13640,7 @@ class BrollInsertGapUpdate(BaseModel):
     start: float
     end: float
     motion_type: Optional[str] = None
+
 
 
 @app.post("/timeline/{video_id}/broll/insert")
@@ -13727,9 +13810,6 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
 
 
 
-_VALID_DELETE_CONTENT_TYPES = {"video", "image", "text", "infographics"}
-
-
 @app.delete("/timeline/{video_id}/scene/{scene_id}/content")
 async def delete_scene_content(
     video_id: str,
@@ -13836,7 +13916,8 @@ async def delete_scene_content(
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
 
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+    broll_list = _compute_broll_list(timeline_json)
 
     try:
         supabase.table("videos").update({
@@ -13847,6 +13928,7 @@ async def delete_scene_content(
             "render_status": "stale_needs_render",
             "infographics_list": infographics_list,
             "text_list": text_list,
+            "broll_list": broll_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[delete-scene-content] failed to save video {video_id}: {e}")
@@ -13859,6 +13941,7 @@ async def delete_scene_content(
         "beat_id": beat_id,
         "infographics_list": infographics_list,
         "text_list": text_list,
+        "broll_list": broll_list,
         "timeline_version": new_version,
         "timeline": timeline_json,
         "needs_render": True,
@@ -13935,7 +14018,7 @@ async def delete_overlay_by_id(video_id: str, id: int):
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
 
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
@@ -14768,7 +14851,7 @@ def _animation_overlay_text(animation: dict, scene: dict, infographic: Optional[
     return on_screen_text or None
 
 
-def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
+def _compute_infographics_and_text_lists(scenes: list, timeline: dict) -> tuple[list, list]:
     """
     Shared classification logic behind the "infographics_list"/"text_list"
     fields — factored out of /edit-video so /style and /infographic can
@@ -14783,7 +14866,27 @@ def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
     stat_counter_overlay, bullet_list_reveal) is pure text presented via a
     styled Remotion composition, so it's classified into text_list, not
     infographics_list, regardless of which renderer draws it.
+
+    NEW: `timeline` (the already-built build_timeline_from_scenes output)
+    is used to attach real ABSOLUTE start_sec/end_sec to every entry —
+    position in the FINAL ASSEMBLED VIDEO, not scene-local time — for a
+    frontend timeline UI to place these directly on a scrubber without
+    doing any frame/scene-boundary math itself. Sourced from the actual
+    "infographic"/"animation" track's startFrame/endFrame rather than
+    recomputed here, so it's always exactly consistent with what
+    build_timeline_from_scenes (and therefore the render itself) actually
+    produced — including any manual text_start/text_end window a caller
+    set via /style or /infographic.
     """
+    fps = timeline.get("fps", TIMELINE_FPS)
+    # One infographic/animation track per scene at most (a scene can only
+    # ever have one active overlay), so a simple scene_id -> track lookup
+    # is enough — no need to disambiguate multiple matches.
+    track_by_scene = {}
+    for t in timeline.get("tracks", []):
+        if t.get("type") in ("infographic", "animation") and t.get("scene_id"):
+            track_by_scene[t["scene_id"]] = t
+
     infographics = []
     text_overlays = []
     for idx, s in enumerate(scenes):
@@ -14798,6 +14901,10 @@ def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
         # DELETE /timeline/{video_id}/overlay/{id}.
         content_id = idx + 1
 
+        track = track_by_scene.get(scene_id)
+        start_sec = round(track["startFrame"] / fps, 3) if track else None
+        end_sec = round(track["endFrame"] / fps, 3) if track else None
+
         if infographic and has_icon_graphic:
             infographics.append({
                 "id": content_id,
@@ -14807,6 +14914,8 @@ def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
                 "placement": infographic.get("placement"),
                 "props": infographic.get("props", {}),
                 "duration_frames": infographic.get("duration_frames"),
+                "start_sec": start_sec,
+                "end_sec": end_sec,
             })
         elif infographic:
             text_overlays.append({
@@ -14817,6 +14926,8 @@ def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
                 "text": (_animation_overlay_text(animation, s, infographic) or "").strip(),
                 "duration_frames": infographic.get("duration_frames"),
                 "text_animation_style": animation.get("text_animation_style"),
+                "start_sec": start_sec,
+                "end_sec": end_sec,
             })
         elif animation.get("category") == "overlay_text":
             text_overlays.append({
@@ -14827,9 +14938,50 @@ def _compute_infographics_and_text_lists(scenes: list) -> tuple[list, list]:
                 "text": (s.get("on_screen_text") or "").strip(),
                 "duration_frames": animation.get("duration_frames"),
                 "text_animation_style": animation.get("text_animation_style"),
+                "start_sec": start_sec,
+                "end_sec": end_sec,
             })
 
     return infographics, text_overlays
+
+
+def _compute_broll_list(timeline: dict) -> list:
+    """
+    Flattens every "broll" track (one per beat, across every scene) into a
+    single flat list with a numeric id and ABSOLUTE start_sec/end_sec —
+    same purpose as _compute_infographics_and_text_lists, for B-roll
+    specifically. Reads purely from the already-built timeline (no scenes
+    param needed) since a broll track already carries everything a
+    frontend timeline needs: which asset is selected, its source
+    (video/image), motion effect, and Pexels file URL.
+
+    `id` here is simply the 1-indexed position of the track within
+    timeline order (chronological, since tracks are appended scene by
+    scene, beat by beat, in order) — stable for a given timeline_version,
+    same numbering convention as the overlay id (position, not a random
+    UUID), though NOT currently wired to a dedicated delete-by-id
+    endpoint the way overlays are (B-roll deletion still goes through
+    DELETE .../content with an explicit beat_id, since a scene can have
+    several B-roll beats where it can only ever have one overlay).
+    """
+    fps = timeline.get("fps", TIMELINE_FPS)
+    broll_list = []
+    for i, t in enumerate(timeline.get("tracks", [])):
+        if t.get("type") != "broll":
+            continue
+        selected = t.get("selected_asset") or {}
+        broll_list.append({
+            "id": i + 1,
+            "scene_id": t.get("scene_id"),
+            "beat_id": t.get("beat_id"),
+            "source": selected.get("source"),
+            "asset_id": selected.get("asset_id"),
+            "file_url": selected.get("file_url"),
+            "motion_type": t.get("motion_type"),
+            "start_sec": round(t["startFrame"] / fps, 3),
+            "end_sec": round(t["endFrame"] / fps, 3),
+        })
+    return broll_list
 
 
 # =============================================================================
@@ -15609,41 +15761,3 @@ async def render_video(
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
  
     return {"final_video_url": final_video_url}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
