@@ -9211,11 +9211,9 @@ import os
 import json
 import math
 import uuid
-import zlib
 import shutil
 import tempfile
 import asyncio
-from pathlib import Path
 from typing import Any, Optional, Literal
 
 import httpx
@@ -9928,25 +9926,73 @@ _VALID_TRIGGERS = {"time_offset", "on_keyword", "on_beat", "scene_start"}
 _VALID_RENDER_HINTS = {"remotion", "ffmpeg"}
 _VALID_ICON_LAYOUTS = {"sequence", "cluster", "pair"}
 
-_ICON_VOCAB = set([
-    'activity', 'alert-triangle', 'anchor', 'archive', 'arrow-right', 'atom', 'award', 'banknote',
-    'bar-chart', 'battery', 'bell', 'bird', 'book', 'brain', 'brain-circuit', 'briefcase', 'bug',
-    'building', 'building-2', 'bus', 'calendar', 'camera', 'car', 'castle', 'cat', 'chart-column',
-    'chart-line', 'check', 'church', 'clapperboard', 'clock', 'code', 'coffee', 'coins', 'compass',
-    'cpu', 'credit-card', 'cross', 'crown', 'database', 'dna', 'dog', 'dollar-sign', 'drama',
-    'dumbbell', 'factory', 'file-text', 'film', 'fingerprint-pattern', 'fish', 'flag', 'flame',
-    'flask-conical', 'folder', 'gauge', 'gavel', 'globe', 'graduation-cap', 'handshake', 'heart',
-    'heart-handshake', 'infinity', 'key', 'landmark', 'laptop', 'leaf', 'library', 'lightbulb',
-    'line-chart', 'lock', 'luggage', 'map', 'map-pin', 'map-pinned', 'medal', 'megaphone',
-    'message-circle', 'mic', 'microscope', 'moon', 'moon-star', 'mountain', 'music', 'network',
-    'newspaper', 'orbit', 'paintbrush', 'palette', 'pen', 'pencil', 'pie-chart', 'piggy-bank',
-    'pill', 'pizza', 'plane', 'podcast', 'puzzle', 'quote', 'radio', 'receipt', 'ribbon', 'rocket',
-    'rss', 'satellite', 'scale', 'scroll', 'search', 'server', 'shield', 'ship', 'shirt',
-    'smartphone', 'snowflake', 'sparkles', 'sprout', 'star', 'stethoscope', 'sun', 'sword',
-    'target', 'telescope', 'tent', 'terminal', 'theater', 'thermometer', 'timer', 'train',
-    'trending-down', 'trending-up', 'trophy', 'tv', 'umbrella', 'user', 'users', 'users-round',
-    'utensils', 'vote', 'wallet', 'waves', 'wifi', 'wind', 'x', 'zap',
-])
+_ICON_LIBRARY_GROUPS = {
+    "general_ui": ["arrow-right", "bell", "calendar", "camera", "check", "clock", "infinity", "lightbulb", "puzzle", "quote", "search", "sparkles", "target", "timer", "x"],
+    "emotion_people": ["crown", "handshake", "heart", "heart-handshake", "user", "users", "users-round"],
+    "business_finance_economics": ["banknote", "bar-chart", "briefcase", "building", "building-2", "chart-column", "chart-line", "coins", "credit-card", "dollar-sign", "factory", "line-chart", "pie-chart", "piggy-bank", "receipt", "trending-down", "trending-up", "wallet"],
+    "law_criminology": ["archive", "file-text", "fingerprint-pattern", "folder", "gavel", "key", "lock", "scale", "shield"],
+    "science_technology_neuroscience": ["atom", "battery", "brain", "brain-circuit", "code", "cpu", "database", "dna", "flask-conical", "gauge", "laptop", "microscope", "network", "server", "smartphone", "terminal", "wifi", "zap"],
+    "astronomy_geography": ["compass", "globe", "map", "map-pin", "map-pinned", "moon", "moon-star", "mountain", "orbit", "rocket", "satellite", "snowflake", "star", "sun", "telescope", "thermometer", "waves", "wind"],
+    "health": ["activity", "cross", "leaf", "pill", "sprout", "stethoscope"],
+    "history_religion_anthropology_culture": ["castle", "church", "flag", "landmark", "scroll", "sword", "vote"],
+    "travel_sports": ["anchor", "award", "bus", "car", "dumbbell", "luggage", "medal", "plane", "ribbon", "ship", "train", "trophy", "umbrella"],
+    "communication_film_media": ["clapperboard", "drama", "film", "message-circle", "mic", "newspaper", "podcast", "radio", "rss", "theater", "tv"],
+    "knowledge_education": ["book", "graduation-cap", "library", "pen", "pencil"],
+    "nature_misc": ["bird", "bug", "cat", "coffee", "dog", "fish", "flame", "music", "paintbrush", "palette", "pizza", "shirt", "tent", "utensils"],
+    "alerts": ["alert-triangle", "megaphone"],
+}
+_ICON_VOCAB = {icon for group in _ICON_LIBRARY_GROUPS.values() for icon in group}
+
+# icon_name -> emoji glyph, used by the FFmpeg fallback renderer below when
+# Remotion isn't available. Every key must exist in _ICON_VOCAB.
+_ICON_EMOJI_FALLBACK = {
+    "arrow-right": "\u27a1", "bell": "\U0001f514", "calendar": "\U0001f4c5", "camera": "\U0001f4f7",
+    "check": "\u2705", "clock": "\U0001f550", "infinity": "\u267e", "lightbulb": "\U0001f4a1",
+    "puzzle": "\U0001f9e9", "quote": "\U0001f4ac", "search": "\U0001f50d", "sparkles": "\u2728",
+    "target": "\U0001f3af", "timer": "\u23f2", "x": "\u274c",
+    "crown": "\U0001f451", "handshake": "\U0001f91d", "heart": "\u2764", "heart-handshake": "\U0001f491",
+    "user": "\U0001f464", "users": "\U0001f465", "users-round": "\U0001f465",
+    "banknote": "\U0001f4b5", "bar-chart": "\U0001f4ca", "briefcase": "\U0001f4bc", "building": "\U0001f3e2",
+    "building-2": "\U0001f3ec", "chart-column": "\U0001f4ca", "chart-line": "\U0001f4c8", "coins": "\U0001fa99",
+    "credit-card": "\U0001f4b3", "dollar-sign": "\U0001f4b2", "factory": "\U0001f3ed", "line-chart": "\U0001f4c8",
+    "pie-chart": "\U0001f4c8", "piggy-bank": "\U0001f437", "receipt": "\U0001f9fe", "trending-down": "\U0001f4c9",
+    "trending-up": "\U0001f4c8", "wallet": "\U0001f45b",
+    "archive": "\U0001f5c4", "file-text": "\U0001f4c4", "fingerprint-pattern": "\U0001faf2", "folder": "\U0001f4c1",
+    "gavel": "\U0001f528", "key": "\U0001f511", "lock": "\U0001f512", "scale": "\u2696", "shield": "\U0001f6e1",
+    "atom": "\u269b", "battery": "\U0001f50b", "brain": "\U0001f9e0", "brain-circuit": "\U0001f9e0",
+    "code": "\U0001f4bb", "cpu": "\U0001f5a5", "database": "\U0001f5c3", "dna": "\U0001f9ec",
+    "flask-conical": "\U0001f9ea", "gauge": "\U0001f4dd", "laptop": "\U0001f4bb", "microscope": "\U0001f52c",
+    "network": "\U0001f310", "server": "\U0001f5a5", "smartphone": "\U0001f4f1", "terminal": "\u2328",
+    "wifi": "\U0001f4f6", "zap": "\u26a1",
+    "compass": "\U0001f9ed", "globe": "\U0001f30d", "map": "\U0001f5fa", "map-pin": "\U0001f4cd",
+    "map-pinned": "\U0001f4cd", "moon": "\U0001f319", "moon-star": "\U0001f319", "mountain": "\u26f0",
+    "orbit": "\U0001fa90", "rocket": "\U0001f680", "satellite": "\U0001f6f0", "snowflake": "\u2744",
+    "star": "\u2b50", "sun": "\u2600", "telescope": "\U0001f52d", "thermometer": "\U0001f321",
+    "waves": "\U0001f30a", "wind": "\U0001f4a8",
+    "activity": "\U0001f4c9", "cross": "\u271d", "leaf": "\U0001f343", "pill": "\U0001f48a",
+    "sprout": "\U0001f331", "stethoscope": "\U0001fa7a",
+    "castle": "\U0001f3f0", "church": "\u26ea", "flag": "\U0001f6a9", "landmark": "\U0001f3db",
+    "scroll": "\U0001f4dc", "sword": "\u2694", "vote": "\U0001f5f3",
+    "anchor": "\u2693", "award": "\U0001f3c5", "bus": "\U0001f68c", "car": "\U0001f697", "dumbbell": "\U0001f3cb",
+    "luggage": "\U0001f9f3", "medal": "\U0001f3c5", "plane": "\u2708", "ribbon": "\U0001f397",
+    "ship": "\U0001f6a2", "train": "\U0001f686", "trophy": "\U0001f3c6", "umbrella": "\u2602",
+    "clapperboard": "\U0001f3ac", "drama": "\U0001f3ad", "film": "\U0001f39e", "message-circle": "\U0001f4ac",
+    "mic": "\U0001f3a4", "newspaper": "\U0001f4f0", "podcast": "\U0001f399", "radio": "\U0001f4fb",
+    "rss": "\U0001f4e1", "theater": "\U0001f3ad", "tv": "\U0001f4fa",
+    "book": "\U0001f4d6", "graduation-cap": "\U0001f393", "library": "\U0001f4da", "pen": "\U0001f58a",
+    "pencil": "\u270f",
+    "bird": "\U0001f426", "bug": "\U0001f41b", "cat": "\U0001f431", "coffee": "\u2615", "dog": "\U0001f436",
+    "fish": "\U0001f41f", "flame": "\U0001f525", "music": "\U0001f3b5", "paintbrush": "\U0001f58c",
+    "palette": "\U0001f3a8", "pizza": "\U0001f355", "shirt": "\U0001f455", "tent": "\u26fa",
+    "utensils": "\U0001f374",
+    "alert-triangle": "\u26a0", "megaphone": "\U0001f4e2",
+}
+_DEFAULT_ICON_EMOJI = "\u2b50"
+
+
+def _icon_glyph(icon_name: str) -> str:
+    return _ICON_EMOJI_FALLBACK.get(icon_name, _DEFAULT_ICON_EMOJI)
+
 
 _TEXT_ANIMATION_STYLES = [
     "fade_in", "slide_in_left", "slide_in_right", "slide_up", "slide_down",
@@ -14199,7 +14245,97 @@ def _font_size_for_geometry(geo: dict, text: str) -> int:
     height_based = int(geo["height"] / max(len(lines), 1) * 0.7) if geo["height"] else width_based
     return max(18, min(width_based, height_based, 120))
 
+def _build_icon_overlay_drawtext(
+    animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
+) -> Optional[str]:
+    """FFmpeg fallback for overlay_graphic/branding animations — draws the
+    icon's emoji glyph (+ optional label) at geometry_px, with fade in/out
+    and support for single / sequence / cluster / pair icon_layout."""
+    icon_name = animation.get("icon_name")
+    icons: list[str] = []
+    if isinstance(icon_name, str) and icon_name:
+        icons = [icon_name]
+    elif isinstance(icon_name, list):
+        icons = [i for i in icon_name if isinstance(i, str) and i]
 
+    label = _display_text_to_string(animation.get("display_text"))
+    if not icons and not label:
+        return None
+
+    geo = _scale_geometry_px(animation.get("geometry_px") or {}, out_width, out_height)
+
+    duration_seconds = max(clip_duration_frames / fps, 0.2)
+    fade_in = min(0.35, duration_seconds / 4)
+    fade_out = min(0.35, duration_seconds / 4)
+    alpha_expr = (
+        f"if(lt(t,{fade_in}),t/{fade_in},"
+        f"if(gt(t,{duration_seconds - fade_out}),({duration_seconds}-t)/{fade_out},1))"
+    )
+
+    icon_font_size = max(28, min(int(geo["height"] * 0.55), 140))
+    layout = animation.get("icon_layout")
+    filters = []
+
+    if len(icons) <= 1:
+        glyph = _icon_glyph(icons[0]) if icons else ""
+        text = f"{glyph}  {label}".strip() if (glyph and label) else (glyph or label)
+        safe_text = _escape_drawtext(text)
+        cx = geo["x"] + geo["width"] / 2
+        cy = geo["y"] + geo["height"] / 2
+        filters.append(
+            f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
+            f"box=1:boxcolor=black@0.5:boxborderw=14:"
+            f"x={cx:.1f}-text_w/2:y={cy:.1f}-text_h/2:alpha='{alpha_expr}'"
+        )
+    else:
+        n = min(len(icons), 4)
+        if layout == "sequence":
+            slice_seconds = duration_seconds / n
+            x0 = geo["x"] + geo["width"] / 2
+            y0 = geo["y"] + geo["height"] / 2
+            for i, icon in enumerate(icons[:n]):
+                glyph = _icon_glyph(icon)
+                safe_text = _escape_drawtext(glyph)
+                seg_start = i * slice_seconds
+                seg_end = duration_seconds if i == n - 1 else (i + 1) * slice_seconds
+                local_fade_in = min(0.2, slice_seconds / 4)
+                seg_alpha = (
+                    f"if(lt(t,{seg_start}),0,"
+                    f"if(lt(t,{seg_start + local_fade_in}),(t-{seg_start})/{local_fade_in},"
+                    f"if(lt(t,{seg_end}),1,0)))"
+                )
+                filters.append(
+                    f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
+                    f"box=1:boxcolor=black@0.5:boxborderw=14:"
+                    f"x={x0:.1f}-text_w/2:y={y0:.1f}-text_h/2:alpha='{seg_alpha}'"
+                )
+        else:
+            spacing = geo["width"] / n
+            y0 = geo["y"] + geo["height"] / 2
+            for i, icon in enumerate(icons[:n]):
+                glyph = _icon_glyph(icon)
+                safe_text = _escape_drawtext(glyph)
+                cx = geo["x"] + spacing * (i + 0.5)
+                filters.append(
+                    f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
+                    f"box=1:boxcolor=black@0.5:boxborderw=10:"
+                    f"x={cx:.1f}-text_w/2:y={y0:.1f}-text_h/2:alpha='{alpha_expr}'"
+                )
+        if label:
+            safe_label = _escape_drawtext(label)
+            label_font_size = max(20, min(int(geo["height"] * 0.28), 56))
+            lx = geo["x"] + geo["width"] / 2
+            ly = geo["y"] + geo["height"] * 0.82
+            filters.append(
+                f"drawtext=text='{safe_label}':fontcolor=white:fontsize={label_font_size}:"
+                f"box=1:boxcolor=black@0.5:boxborderw=10:"
+                f"x={lx:.1f}-text_w/2:y={ly:.1f}-text_h/2:alpha='{alpha_expr}'"
+            )
+
+    return ",".join(filters)
+
+
+    
 def _build_beat_animation_drawtext(
     animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
 ) -> Optional[str]:
@@ -14383,13 +14519,31 @@ async def _apply_beat_animation(
                 print(f"[render] FFmpeg text-overlay fallback for '{animation_type}' failed: {e}")
         return beat_clip_path
 
+    # --- ICON FIX: overlay_graphic/branding used to just fall through to
+    # "return beat_clip_path" below with no FFmpeg rendering at all.
+    icon_eligible = category in ("overlay_graphic", "branding")
+    if icon_eligible:
+        icon_drawtext = _build_icon_overlay_drawtext(animation, width, height, duration_frames, fps)
+        if icon_drawtext:
+            out_path = os.path.join(tmp_dir, f"anim_icon_{uuid.uuid4().hex}.mp4")
+            try:
+                await _run([
+                    FFMPEG_BIN, "-y", "-i", beat_clip_path, "-vf", icon_drawtext,
+                    *FFMPEG_X264_FLAGS, "-an", out_path,
+                ])
+                return out_path
+            except Exception as e:
+                print(f"[render] FFmpeg icon-overlay fallback for '{animation_type}' failed: {e}")
+        else:
+            print(f"[render] icon animation '{animation_type}' had no icon_name/display_text to draw — skipping")
+        return beat_clip_path
+
     print(
         f"[render] animation '{animation_type}' (category={category}) needs Remotion "
-        f"(icon/PiP/branding/transition content has no FFmpeg equivalent) and none "
+        f"(pip/transition content has no FFmpeg equivalent) and none "
         f"was available — this beat renders without it"
     )
     return beat_clip_path
-
 
 async def _lock_clip_to_frame_count(
     input_path: str, duration_frames: int, fps: int, width: int, height: int, tmp_dir: str,
