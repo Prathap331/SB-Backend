@@ -9203,8 +9203,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
 import re
 import os
 import json
@@ -9217,10 +9215,6 @@ from typing import Any, Optional, Literal
 
 import httpx
 import whisperx
-import torch
-from PIL import Image
-import io as _io
-from transformers import CLIPModel, CLIPProcessor
 from fastapi import HTTPException
 from pydantic import BaseModel
 
@@ -10627,134 +10621,6 @@ def _dedupe_and_trim(items: list, limit: Optional[int] = None) -> list:
     return deduped
 
 
-CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "wkcn/TinyCLIP-ViT-61M-32-Text-29M-LAION400M")
-CLIP_DEVICE = os.getenv("CLIP_DEVICE", "cpu")
-
-CLIP_RERANK_ENABLED = os.getenv("CLIP_RERANK_ENABLED", "true").lower() == "true"
-
-CLIP_MIN_VIDEO_SCORE = float(os.getenv("CLIP_MIN_VIDEO_SCORE", "0.24"))
-CLIP_MIN_IMAGE_SCORE = float(os.getenv("CLIP_MIN_IMAGE_SCORE", "0.22"))
-
-_clip_model = None
-_clip_processor = None
-
-
-def _get_clip():
-    global _clip_model, _clip_processor
-    if _clip_model is None:
-        print(f"[CLIP] loading '{CLIP_MODEL_NAME}' on {CLIP_DEVICE}")
-        _clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(CLIP_DEVICE).eval()
-        _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
-    return _clip_model, _clip_processor
-
-
-def _clip_score_images_sync(query_texts: list[str], images: list) -> dict:
-    model, processor = _get_clip()
-    pil_images = [img for _cid, img in images]
-    inputs = processor(text=query_texts, images=pil_images, return_tensors="pt", padding=True)
-    inputs = {k: v.to(CLIP_DEVICE) for k, v in inputs.items()}
-    with torch.no_grad():
-        image_embeds = model.get_image_features(pixel_values=inputs["pixel_values"])
-        text_embeds = model.get_text_features(input_ids=inputs["input_ids"], attention_mask=inputs.get("attention_mask"))
-        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
-        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-        sims = image_embeds @ text_embeds.T
-        best_per_image = sims.max(dim=-1).values.tolist()
-        if not isinstance(best_per_image, list):
-            best_per_image = [best_per_image]
-    return {images[i][0]: best_per_image[i] for i in range(len(images))}
-
-
-async def _rerank_images_with_clip(query_texts: list[str], image_candidates: list) -> list:
-    if not CLIP_RERANK_ENABLED or not image_candidates or not query_texts:
-        return image_candidates
-
-    downloaded = []
-    try:
-        async with httpx.AsyncClient() as client:
-            for cand in image_candidates:
-                url = _resolve_broll_file_url(cand, "image")
-                if not url:
-                    continue
-                try:
-                    resp = await client.get(url, timeout=20.0)
-                    resp.raise_for_status()
-                    img = Image.open(_io.BytesIO(resp.content)).convert("RGB")
-                    downloaded.append((str(cand.get("id")), img, cand))
-                except Exception as e:
-                    print(f"[CLIP] failed to download image {cand.get('id')}: {e}")
-    except Exception as e:
-        print(f"[CLIP] image download pass failed entirely, keeping original order: {e}")
-        return image_candidates
-
-    if not downloaded:
-        return image_candidates
-
-    try:
-        scores = await asyncio.to_thread(_clip_score_images_sync, query_texts, [(cid, img) for cid, img, _c in downloaded])
-    except Exception as e:
-        print(f"[CLIP] scoring failed, keeping original order: {e}")
-        return image_candidates
-
-    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], -1.0), reverse=True)
-    ranked_ids = {cid for cid, _img, _c in ranked}
-    result = []
-    for cid, _img, c in ranked:
-        c["_clip_score"] = scores.get(cid)
-        result.append(c)
-    result += [c for c in image_candidates if str(c.get("id")) not in ranked_ids]
-    return result
-
-
-async def _rerank_videos_with_clip(query_texts: list[str], video_candidates: list) -> list:
-    if not CLIP_RERANK_ENABLED or not video_candidates or not query_texts:
-        return video_candidates
-
-    downloaded = []
-    try:
-        async with httpx.AsyncClient() as client:
-            for cand in video_candidates:
-                url = cand.get("thumbnail")
-                if not url:
-                    continue
-                try:
-                    resp = await client.get(url, timeout=20.0)
-                    resp.raise_for_status()
-                    img = Image.open(_io.BytesIO(resp.content)).convert("RGB")
-                    downloaded.append((str(cand.get("id")), img, cand))
-                except Exception as e:
-                    print(f"[CLIP] failed to download video thumbnail {cand.get('id')}: {e}")
-    except Exception as e:
-        print(f"[CLIP] video thumbnail download pass failed entirely, keeping original order: {e}")
-        return video_candidates
-
-    if not downloaded:
-        return video_candidates
-
-    try:
-        scores = await asyncio.to_thread(_clip_score_images_sync, query_texts, [(cid, img) for cid, img, _c in downloaded])
-    except Exception as e:
-        print(f"[CLIP] video thumbnail scoring failed, keeping original order: {e}")
-        return video_candidates
-
-    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], -1.0), reverse=True)
-    ranked_ids = {cid for cid, _img, _c in ranked}
-    result = []
-    for cid, _img, c in ranked:
-        c["_clip_score"] = scores.get(cid)
-        result.append(c)
-    result += [c for c in video_candidates if str(c.get("id")) not in ranked_ids]
-    return result
-
-
-def _filter_by_min_clip_score(candidates: list, min_score: float) -> list:
-    if not candidates:
-        return candidates
-    if not any(c.get("_clip_score") is not None for c in candidates):
-        return candidates
-    return [c for c in candidates if c.get("_clip_score") is None or c["_clip_score"] >= min_score]
-
-
 async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     empty_result = {
         "videos": {"total_results": 0, "results": [], "error": None},
@@ -10823,60 +10689,18 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     if dropped_img:
         print(f"[edit-video] {label}: dropped {dropped_img} non-landscape image result(s) at fetch time")
 
-    # NEW: dedupe WITHOUT trimming first — the previous version trimmed to
-    # PEXELS_SCENE_RESULT_LIMIT (6) here, before CLIP ever scored anything.
-    # With 5-6 keywords each contributing their own Pexels results, the raw
-    # pool is routinely 20-30+ candidates; truncating before scoring meant
-    # the actual best match could be candidate #14 and never get evaluated
-    # at all. Now the full deduped pool is scored, and only trimmed to the
-    # display limit AFTER reranking + relevance filtering below.
-    videos_full = _dedupe_and_trim(videos_pool)
-    photos_full = _dedupe_and_trim(images_pool)
-
-    if photos_full:
-        photos_full = await _rerank_images_with_clip(keywords, photos_full)
-        pre_relevance_photo_count = len(photos_full)
-        photos_full = _filter_by_min_clip_score(photos_full, CLIP_MIN_IMAGE_SCORE)
-        dropped_irrelevant_photos = pre_relevance_photo_count - len(photos_full)
-        if dropped_irrelevant_photos:
-            print(f"[CLIP] {label}: dropped {dropped_irrelevant_photos} image candidate(s) below the relevance floor ({CLIP_MIN_IMAGE_SCORE})")
-    if videos_full:
-        videos_full = await _rerank_videos_with_clip(keywords, videos_full)
-        pre_relevance_video_count = len(videos_full)
-        videos_full = _filter_by_min_clip_score(videos_full, CLIP_MIN_VIDEO_SCORE)
-        dropped_irrelevant_videos = pre_relevance_video_count - len(videos_full)
-        if dropped_irrelevant_videos:
-            print(f"[CLIP] {label}: dropped {dropped_irrelevant_videos} video candidate(s) below the relevance floor ({CLIP_MIN_VIDEO_SCORE})")
-
-    # Trim to the display/storage limit only now, AFTER scoring — the pool
-    # is already sorted best-first by _rerank_*_with_clip, so this keeps
-    # the top N genuinely relevant candidates rather than the first N
-    # fetched.
-    videos = videos_full[:PEXELS_SCENE_RESULT_LIMIT]
-    photos = photos_full[:PEXELS_SCENE_RESULT_LIMIT]
+    # No reranking model — dedupe the per-keyword Pexels results and keep
+    # the top N in whatever order they were returned (keyword order, then
+    # within-keyword result order).
+    videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
+    photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
 
     videos_error = "; ".join(video_errors) if video_errors and not videos else None
     images_error = "; ".join(image_errors) if image_errors and not photos else None
 
-    best_video_score = videos[0].get("_clip_score") if videos else None
-    best_image_score = photos[0].get("_clip_score") if photos else None
-    force_image_fallback = (
-        best_video_score is not None and best_video_score < CLIP_MIN_VIDEO_SCORE
-        and best_image_score is not None and best_image_score >= CLIP_MIN_IMAGE_SCORE
-    )
-    if force_image_fallback:
-        print(
-            f"[CLIP] {label}: best video scored {best_video_score:.3f} "
-            f"(below {CLIP_MIN_VIDEO_SCORE}) — falling back to image "
-            f"(scored {best_image_score:.3f}) instead of an inaccurate video"
-        )
-
     return {
         "videos": {"total_results": len(videos), "results": videos, "error": videos_error},
         "images": {"total_results": len(photos), "results": photos, "error": images_error},
-        "force_image_fallback": force_image_fallback,
-        "best_video_score": best_video_score,
-        "best_image_score": best_image_score,
     }
 
 
@@ -10952,9 +10776,6 @@ def _aggregate_beats_media(beats: list) -> dict:
     }
 
 
-CLIP_MEDIA_SWITCH_MARGIN = float(os.getenv("CLIP_MEDIA_SWITCH_MARGIN", "0.03"))
-
-
 def _resolve_beat_broll_selection(beat: dict) -> tuple:
     override = beat.get("broll_override")
     if override and override.get("asset_id") is not None:
@@ -10976,19 +10797,6 @@ def _resolve_beat_broll_selection(beat: dict) -> tuple:
 
     best_video = video_candidates[0] if video_candidates else None
     best_image = image_candidates[0] if image_candidates else None
-    video_score = best_video.get("_clip_score") if best_video else None
-    image_score = best_image.get("_clip_score") if best_image else None
-
-    if video_score is not None and image_score is not None:
-        video_is_weak = video_score < CLIP_MIN_VIDEO_SCORE
-        image_is_usable = image_score >= CLIP_MIN_IMAGE_SCORE
-        if video_is_weak and image_is_usable:
-            return best_image, "image"
-
-        if image_score > video_score + CLIP_MEDIA_SWITCH_MARGIN:
-            return best_image, "image"
-        if video_score > image_score + CLIP_MEDIA_SWITCH_MARGIN:
-            return best_video, "video"
 
     preferred = beat.get("preferred_media_type")
     if preferred == "image":
@@ -10996,6 +10804,12 @@ def _resolve_beat_broll_selection(beat: dict) -> tuple:
             return best_image, "image"
         if best_video:
             return best_video, "video"
+        return None, None
+    if preferred == "video":
+        if best_video:
+            return best_video, "video"
+        if best_image:
+            return best_image, "image"
         return None, None
 
     if best_video:
@@ -11329,9 +11143,6 @@ async def _fetch_beats_media(beats: list, label_prefix: str) -> None:
     ])
     for b, media in zip(beats, results):
         b["media"] = media
-        if media.get("force_image_fallback") and b.get("preferred_media_type") != "image":
-            print(f"[edit-video] beat {b['beat_id']}: overriding to 'image' (CLIP accuracy gate: video too weak a match)")
-            b["preferred_media_type"] = "image"
 
 
 def _dedupe_beats_media_across_scene(beats: list) -> None:
