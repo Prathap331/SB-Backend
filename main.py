@@ -9184,6 +9184,28 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import re
 import os
 import json
@@ -9930,12 +9952,7 @@ _TEXT_ANIMATION_STYLES = [
     "fade_in", "slide_in_left", "slide_in_right", "slide_up", "slide_down",
     "zoom_in", "bounce", "pop", "typewriter", "wipe",
 ]
-_VALID_TEXT_ANIMATION_STYLES = set(_TEXT_ANIMATION_STYLES)
-_DEFAULT_TEXT_ANIMATION_STYLE = "fade_in"
 
-# Animation canvas per the new ANIMATION_PLANNER_PROMPT (16:9, distinct from
-# the vertical 1080x1920 TIMELINE render resolution defined further down —
-# the renderer is expected to scale/letterbox geometry_px accordingly).
 ANIMATION_CANVAS_WIDTH = 1920
 ANIMATION_CANVAS_HEIGHT = 1080
 CAPTION_SAFE_ZONE_Y = 918  # burned-in captions occupy the bottom 162px
@@ -10542,13 +10559,6 @@ def _get_scene_broll_keywords(scene: dict) -> list:
 
 
 def _dedupe_and_trim(items: list, limit: Optional[int] = None) -> list:
-    """
-    limit=None dedupes the FULL pool with no truncation — use this before
-    CLIP reranking, since trimming before scoring means the best match
-    can be discarded before it's ever evaluated (see _fetch_media_for_keywords).
-    Pass an actual limit only when you want the pool truncated in its
-    CURRENT order (e.g. AFTER reranking, to cap the final candidate list).
-    """
     def _identity(item: dict):
         for key in ("id", "video_id", "photo_id", "asset_id"):
             if key in item:
@@ -10594,19 +10604,6 @@ def _get_clip():
 
 
 def _clip_score_images_sync(query_texts: list[str], images: list) -> dict:
-    """
-    Scores each image against EVERY keyword phrase individually and takes
-    the MAX score per image — "how well does this candidate match its
-    single best keyword" — instead of blending all keywords into one
-    joined CLIP text query. A beat's 5-6 keywords are deliberately
-    different visual angles (wide vs. close-up, subject vs. action,
-    etc.); CLIP's text encoder also truncates at 77 tokens and degrades
-    on long multi-concept strings. Blending them into one query threw
-    away exactly the specificity that made having several keywords
-    useful — a candidate that's a perfect match for one keyword but
-    irrelevant to the rest used to lose to a mediocre match for
-    "everything at once."
-    """
     model, processor = _get_clip()
     pil_images = [img for _cid, img in images]
     inputs = processor(text=query_texts, images=pil_images, return_tensors="pt", padding=True)
@@ -10616,8 +10613,6 @@ def _clip_score_images_sync(query_texts: list[str], images: list) -> dict:
         text_embeds = model.get_text_features(input_ids=inputs["input_ids"], attention_mask=inputs.get("attention_mask"))
         image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
         text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-        # [num_images, num_texts] similarity matrix — take each image's
-        # BEST-matching keyword rather than an average across all of them.
         sims = image_embeds @ text_embeds.T
         best_per_image = sims.max(dim=-1).values.tolist()
         if not isinstance(best_per_image, list):
@@ -10708,18 +10703,6 @@ async def _rerank_videos_with_clip(query_texts: list[str], video_candidates: lis
 
 
 def _filter_by_min_clip_score(candidates: list, min_score: float) -> list:
-    """
-    Drops any candidate that WAS CLIP-scored and falls below the minimum
-    relevance threshold — this is the actual "only pick relevant media"
-    enforcement. Candidates with no score at all (CLIP disabled, or the
-    scoring pass failed and fell back to original order) are left
-    untouched: an unscored candidate isn't known to be irrelevant, so
-    filtering it out would be guessing, not enforcing relevance. If
-    filtering empties out a pool entirely, that's intentional — it means
-    nothing fetched for these keywords actually cleared the bar, and
-    _fill_empty_beats' retry/borrow/last-resort fallback chain takes over
-    from there rather than this function silently keeping a bad match.
-    """
     if not candidates:
         return candidates
     if not any(c.get("_clip_score") is not None for c in candidates):
@@ -11575,7 +11558,7 @@ def _enforce_scene_limit(scenes: list, max_scenes: int = 5) -> list:
 
 
 
-async def _process_scene(scene: dict, request: EditVideo, category: str, script_language: str, video_ctx: dict) -> dict:
+async def _process_scene(scene: dict, request: EditVideo, category: str, script_language: str, video_ctx: dict, is_first_scene: bool = False) -> dict:
     scene_out = dict(scene)
     vo_text = scene.get("vo_text", "")
     scene_id = scene.get("scene_id")
@@ -11708,6 +11691,18 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
 
     word_segments = scene_timestamps.get("word_segments", [])
     timed_words = [w for w in word_segments if "start" in w and "end" in w]
+
+    if is_first_scene and timed_words and timed_words[0].get("start", 0.0) > 0.0:
+        print(
+            f"[edit-video] scene {scene_id}: clamping first word start "
+            f"{timed_words[0]['start']:.3f}s -> 0.0s so no leading audio is trimmed"
+        )
+        first_word_obj = timed_words[0]
+        for w in word_segments:
+            if w is first_word_obj:
+                w["start"] = 0.0
+                break
+        timed_words[0]["start"] = 0.0
 
     scene_out["tagged_vo_text"] = tagged_text
     scene_out["voiceover"] = speech_result
@@ -12160,8 +12155,10 @@ async def edit_video(request: EditVideo):
         "previous_scene_last_media_type": None, "previous_scene_last_animation": None,
     }
     scenes_with_voice_and_timestamps = []
-    for scene in scenes:
-        scene_result = await _process_scene(scene, request, category, script_language, video_ctx)
+    for idx, scene in enumerate(scenes):
+        scene_result = await _process_scene(
+            scene, request, category, script_language, video_ctx, is_first_scene=(idx == 0)
+        )
         scenes_with_voice_and_timestamps.append(scene_result)
 
     failed_scenes = [s["scene_id"] for s in scenes_with_voice_and_timestamps if s.get("error")]
@@ -12452,11 +12449,13 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
             "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-trim] failed to save video {video_id}: {e}")
@@ -12464,6 +12463,7 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
 
     return {
         "video_id": video_id, "scene_id": scene_id, "trim": scene["trim"], "timeline_version": new_version,
+        "infographics_list": infographics_list, "text_list": text_list,
         "timeline": timeline_json, "needs_render": True,
     }
 
@@ -12519,7 +12519,6 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
     await _fill_empty_beats(scene, new_beats, fallback_keywords)
     _dedupe_beats_media_across_scene(new_beats)
 
-    # The old animations tied to the removed beat no longer apply.
     animations = [a for a in (scene.get("animations") or []) if a.get("beat_id") != beat_id]
 
     scene["beats"] = new_beats
@@ -12530,11 +12529,13 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
     broll_list = _compute_broll_list(timeline_json)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
             "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[split-beat] failed to save video {video_id}: {e}")
@@ -12547,9 +12548,9 @@ async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSpl
              "media_type": b.get("preferred_media_type"), "motion_type": b.get("motion_type")}
             for b in (first_beats + second_beats)
         ],
-        "broll_list": broll_list, "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+        "broll_list": broll_list, "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
-
 
 @app.post("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/insert")
 async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatInsertUpdate):
@@ -12622,11 +12623,13 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
     broll_list = _compute_broll_list(timeline_json)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
             "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[insert-beat] failed to save video {video_id}: {e}")
@@ -12639,7 +12642,8 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
              "media_type": b.get("preferred_media_type"), "motion_type": b.get("motion_type")}
             for b in new_beats
         ],
-        "broll_list": broll_list, "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+        "broll_list": broll_list, "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
 
@@ -12690,11 +12694,13 @@ async def rebuild_scene_beats(video_id: str, scene_id: str):
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
             "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[rebuild-beats] failed to save video {video_id}: {e}")
@@ -12704,8 +12710,10 @@ async def rebuild_scene_beats(video_id: str, scene_id: str):
         "video_id": video_id, "scene_id": scene_id, "realigned_word_timing": realigned,
         "beats": [{"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end")} for b in scene["beats"]],
         "animations": scene.get("animations"),
+        "infographics_list": infographics_list, "text_list": text_list,
         "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
+
 
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/animation")
@@ -13072,11 +13080,13 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
     broll_list = _compute_broll_list(timeline_json)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
             "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-scene-broll] failed to save video {video_id}: {e}")
@@ -13086,6 +13096,7 @@ async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSel
         "video_id": video_id, "scene_id": scene_id, "beat_id": beat.get("beat_id"),
         "selected_asset": beat["broll_override"], "resolved_motion_type": _resolve_beat_motion_type(beat),
         "start": beat.get("start"), "end": beat.get("end"), "broll_list": broll_list,
+        "infographics_list": infographics_list, "text_list": text_list,
         "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
@@ -13147,6 +13158,15 @@ def _carve_scene_beats_for_absolute_range(scene: dict, local_start: float, local
 
     return result
 
+
+
+
+class BrollInsertGapUpdate(BaseModel):
+    asset_id: Any
+    source: str
+    start: float
+    end: float
+    motion_type: Optional[str] = None
 
 @app.patch("/timeline/{video_id}/broll")
 async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
@@ -13228,11 +13248,13 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
     broll_list = _compute_broll_list(timeline_json)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
             "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[update-broll-absolute] failed to save video {video_id}: {e}")
@@ -13240,17 +13262,11 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
 
     return {
         "video_id": video_id, "start": update.start, "end": update.end, "selected_asset": override,
-        "touched_scenes": touched, "broll_list": broll_list, "timeline_version": new_version,
-        "timeline": timeline_json, "needs_render": True,
+        "touched_scenes": touched, "broll_list": broll_list,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
-
-class BrollInsertGapUpdate(BaseModel):
-    asset_id: Any
-    source: str
-    start: float
-    end: float
-    motion_type: Optional[str] = None
 
 
 @app.post("/timeline/{video_id}/broll/insert")
@@ -13343,11 +13359,13 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
 
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
 
     try:
         supabase.table("videos").update({
             "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
             "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
         print(f"[insert-broll-gap] failed to save video {video_id}: {e}")
@@ -13357,10 +13375,12 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
         "video_id": video_id, "new_scene_id": new_scene_id, "requested_start": update.start, "actual_start": actual_at,
         "snapped_to_scene_boundary": snapped, "duration": duration, "end": actual_at + duration,
         "new_total_duration": total_duration + duration, "selected_asset": override,
+        "infographics_list": infographics_list, "text_list": text_list,
         "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
 
 
+    
 @app.delete("/timeline/{video_id}/scene/{scene_id}/content")
 async def delete_scene_content(
     video_id: str, scene_id: str,
