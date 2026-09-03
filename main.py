@@ -9331,120 +9331,62 @@ def _image_is_landscape(p: dict) -> bool:
 
 
 SCRIPT_SCENE_PROMPT = """ 
-You are Storybit's Scene Planner, an AI that converts documentary-style
-narration into (a) a single category classification for the whole video and
-(b) a structured scene manifest for an automated video editing pipeline.
+You are Storybit's Scene Planner. Classify the entire documentary script once
+and divide its narration into canonical semantic scenes.
 
-Your output is consumed directly by backend services, so it must be valid
-JSON only with no markdown, explanations, comments, or code fences.
+RETURN JSON ONLY.
 
-Step A — Classify the whole script ONCE
+CATEGORY: choose exactly one category from {list(STYLE_PROFILES.keys())}, using
+the entire script and STYLE_PROFILES descriptions. If none clearly fits,
+choose general_documentary.
 
-Choose exactly one category from this fixed list, based on the overall
-subject and tone of the ENTIRE script (not any single sentence):
+LANGUAGE: detect script_language from the actual narration as ISO 639-1.
 
-['anthropology', 'biography', 'business', 'economics', 'entrepreneurship', 'finance', 'health', 'knowledge', 'law', 'personal_development', 'philosophy', 'politics', 'psychology', 'self_help', 'sociology', 'history', 'religion', 'travel', 'geography', 'astronomy', 'technology', 'sports', 'communication', 'science', 'neuroscience', 'film_theatre', 'social_science', 'criminology', 'cultural_studies', 'general_documentary']
+SCENE LENGTH — CRITICAL:
+Normal target = 260–280 spoken words, approximately 2 minutes at 130–140 WPM.
+This is a planning constraint, NOT actual playback timing.
+- Never exceed 280 words in a normal scene.
+- Prefer 260–280 words.
+- Below 260 is allowed only for a genuinely short script, the final/remainder
+  scene, or a strong semantic boundary where merging would damage coherence.
+- Rebalance nearby boundaries when a remainder below 260 can be avoided without
+  exceeding 280.
+- Do not split mechanically at 260; semantic coherence wins within the hard
+  280-word maximum.
 
-Category reference (use this to judge fit, do not invent new categories):
-{'anthropology': 'Human societies, cultures, evolution, ethnography.', 'biography': "A specific person's life story.", 'business': 'Companies, corporate strategy, case studies, industry.', 'economics': 'Markets, macro/micro economics, trade, policy.', 'entrepreneurship': 'Startups, founders, building and scaling businesses.', 'finance': 'Personal finance, investing, markets, money management.', 'health': 'Medicine, wellness, fitness, nutrition.', 'knowledge': "General facts, trivia, 'did you know' style content spanning any subject.", 'law': 'Legal systems, court cases, legislation.', 'personal_development': 'Habits, growth frameworks, productivity, self-improvement systems.', 'philosophy': 'Abstract ideas, ethics, philosophers, thought experiments.', 'politics': 'Political systems, elections, government, policy.', 'psychology': 'Mind, behavior, cognitive concepts, mental processes (behavioral framing).', 'self_help': 'Direct, prescriptive advice and how-to guidance for personal problems.', 'sociology': 'Social structures, group behavior, societal trends.', 'history': 'Historical events and periods, any era.', 'religion': 'Religious traditions, theology, practices.', 'travel': 'Destinations, travel guides, culture of places.', 'geography': 'Physical geography, countries, natural formations, maps.', 'astronomy': 'Space, planets, cosmology.', 'technology': 'Tech products, engineering, innovation, computing.', 'sports': 'Sports history, athletes, competitions, stats.', 'communication': 'Language, media, rhetoric, interpersonal/mass communication.', 'science': 'General science: physics, chemistry, biology, experimentation.', 'neuroscience': 'Brain, nervous system, cognitive science (research/clinical framing).', 'film_theatre': 'Film and theatre history, analysis, industry.', 'social_science': 'Social science research and theory (methodology/research framing).', 'criminology': 'Study of crime, criminal behavior, and the justice system.', 'cultural_studies': 'Culture, identity, media/cultural analysis.', 'general_documentary': "Fallback for scripts that don't clearly fit another category."}
+SOURCE INTEGRITY:
+Use 0-based character offsets with exclusive end:
+original_script[char_start:char_end] == vo_text.
+Every scene must be contiguous, ordered, non-overlapping, and together cover
+the complete original narration. Never paraphrase, translate, normalize,
+reorder, drop, or duplicate narration.
 
-If nothing fits clearly, choose "general_documentary". This category applies
-to the whole video and will be reused unchanged by later pipeline steps —
-choose it once, carefully, from the full script.
+VISUAL FIELDS:
+visual_intent = concise grounded documentary direction.
+on_screen_text = short viewer-facing text grounded in source, or "".
+animation_preference = avoid | optional | strong. It is NOT a veto.
+scene_animation_density = low | medium | high.
+broll_keywords = 5–6 distinct English retrieval seed phrases, 2–6 words each.
+estimated_duration_seconds is advisory only.
 
-Also detect script_language: the ISO 639-1 code of the language the
-narration is actually written in (e.g. "en", "hi", "ta", "te", "ur").
-Detect this from the actual text — do not assume it's English.
-
-Step B — Segment into scenes
-
-Objective: transform the narration into a sequence of visually coherent
-scenes while preserving the original narration exactly. The output must
-contain no timestamps — timing is generated later from voiceover alignment.
-
-Scene Segmentation Rules
-
-- Each scene's vo_text must represent NO more than approximately 2 minutes
-  of spoken narration, estimated at ~140 words per minute (~280 words).
-  This is a HARD limit that applies regardless of total script/video
-  length — there is NO cap on the number of scenes. A 3-minute script might
-  produce 2 scenes; a 20-minute script might produce 10+. Never merge
-  scenes together purely to reduce scene count — the 2-minute-per-scene
-  limit always wins over having fewer scenes.
-- Split whenever the spoken idea or visual changes, in addition to
-  splitting wherever needed to respect the 2-minute limit.
-- Preserve the narration verbatim inside vo_text. Every word of the
-  original script must appear in exactly one scene's vo_text, in order —
-  do not drop or paraphrase any narration.
-
-Animation density per scene
-
-Using the category's baseline "animation_density" from the reference table
-above, assign each scene a "scene_animation_density" of "low", "medium", or
-"high". Default to the category's baseline. Only deviate for a specific
-scene when its content clearly calls for it (e.g. a quiet emotional human
-story inside an otherwise "high" density business video can be "low").
-
-Output Schema
-
-Return exactly one JSON object:
-
+OUTPUT:
 {{
   "category": "business",
   "script_language": "en",
-  "scenes": [
-    {{
-      "scene_id": "s1",
-      "vo_text": "Exact narration for this scene.",
-      "visual_intent": "Concise documentary-style description of what should be shown.",
-      "on_screen_text": "Short text overlay or empty string.",
-      "requires_animation": true,
-      "scene_animation_density": "medium",
-      "estimated_duration_seconds": 95,
-      "broll_keywords": ["query one", "query two", "query three", "query four", "query five"]
-    }}
-  ]
+  "scenes": [{{
+    "scene_id": "s1",
+    "source_range": {{"char_start": 0, "char_end": 812,
+                     "word_start": 0, "word_end": 145}},
+    "vo_text": "Exact contiguous source substring.",
+    "visual_intent": "Grounded documentary visual direction.",
+    "on_screen_text": "",
+    "animation_preference": "optional",
+    "scene_animation_density": "medium",
+    "estimated_duration_seconds": 120,
+    "broll_keywords": ["specific subject", "relevant location",
+                       "related activity", "contextual view", "detail view"]
+  }}]
 }}
-
-Field Guidelines
-
-script_language: ISO 639-1 code detected from the narration text itself.
-This is passed unchanged to every later pipeline step — get it right once
-here.
-
-scene_id: Sequential: s1, s2, s3, ... — as many as the 2-minute-per-scene
-rule requires. There is no upper bound.
-
-vo_text: Copy the narration exactly. Do not paraphrase or rewrite.
-
-visual_intent: Concise documentary-style search query suitable for B-roll
-retrieval. Prefer real-world imagery matching the category's footage_style.
-Mention important subjects, locations, time periods, or events. Avoid
-cinematic adjectives like "epic" or "dramatic" unless explicitly stated.
-Keep under roughly 15 words.
-
-on_screen_text: Use only when helpful — years, dates, locations, people's
-names, statistics, short titles. Otherwise "".
-
-requires_animation: true only if the scene benefits from kinetic
-typography, lower-thirds, maps, charts, timelines, or infographics.
-
-scene_animation_density: see "Animation density per scene" above.
-
-estimated_duration_seconds: word count of this scene's vo_text divided by
-~2.33 words/sec (~140 wpm). Integer.
-
-broll_keywords: 5-6 distinct stock-footage search phrases, 2-6 words each,
-concrete and searchable, each targeting a different visual angle. These are
-a scene-level seed/fallback only — beat-level keywords (generated next in the
-pipeline) take precedence for actual footage rotation.
-
-Constraints
-
-Do not invent facts. Do not create timestamps. Do not include camera
-directions unless they improve B-roll retrieval (e.g. "aerial view",
-"satellite map", "close-up"). No scene may exceed ~280 words of vo_text.
-Ensure the output is valid, parseable JSON.
 """
 
 
@@ -9664,241 +9606,91 @@ STYLE_PROFILES = {
 
 BEAT_KEYWORDS_PROMPT = """
 
-You are Storybit's Beat Director for a single scene of a documentary-style
-video. Unlike a fixed clock grid, YOU decide how many beats this scene
-splits into and roughly how long each beat should run, based on how much
-visual/narrative complexity each stretch of narration carries.
+You are Storybit's Beat Director for one canonical scene.
 
-You are given, as JSON:
-- category: the video's overall category (fixed for the whole video).
-- style_profile: the STYLE_PROFILES entry for that category (footage_style,
-  animation_density baseline, favored/avoided animation types).
-- script_language: ISO 639-1 code of the narration's language (fixed for
-  the whole video).
-- scene_id, scene_visual_intent, scene_animation_density: from the Scene
-  Planner.
-- scene_on_screen_text: the Scene Planner's scene-level suggestion for
-  overlay-worthy content (a year, date, name, statistic, or short title) —
-  "" if it flagged nothing. Treat this as a checklist, not literal text to
-  copy: if scene_on_screen_text is non-empty, check whether the content it
-  names actually appears in this beat's vo_text; if so, that beat's
-  animation_signal should lean toward needs_animation=true with
-  key_subject capturing that exact content (so it isn't lost between the
-  scene-level suggestion and the beat-level decision). Don't force every
-  beat to react to it — only the beat(s) whose vo_text actually contains
-  it.
-- scene_vo_text: the full exact narration for this scene.
-- previous_scene_last_media_type: "video", "image", or null (null only for
-  the very first scene) — the media_type of the last beat in the scene
-  immediately before this one.
-- known_entities: an array of {"name": ..., "entity_type": ...} accumulated
-  from every scene processed so far in this video ([] for the very first
-  scene). Use this to stay consistent — if a name here was already
-  classified as "real_person", don't reclassify it as "fictional_character"
-  (or vice versa) if it recurs in this scene.
-- known_setting: {"location": ..., "time_period": ...} established by the
-  most recent prior scene ({"location": "", "time_period": ""} for the
-  very first scene). Use this to stay consistent — don't drift the
-  location/era without the narration itself explicitly moving the story.
+RETURN JSON ONLY.
 
-Your job
+INPUT:
+category, style_profile, script_language, scene_id, scene_visual_intent,
+scene_animation_density, scene_on_screen_text, scene_vo_text,
+scene_source_range, previous_scene_last_media_type, and continuity_state.
 
-1. Segment scene_vo_text into a sequence of beats. Typical beat length is
-   8-20 seconds of spoken narration (~19-47 words at ~140 wpm), but let
-   content decide: a dense idea that will carry a detailed animation or an
-   infographic can run toward the long end (up to ~20s); a fast-moving or
-   simple stretch of narration can be a short beat (down to ~8s). Do not
-   force a fixed count or fixed length — vary it scene to scene.
-2. Preserve scene_vo_text verbatim across beats — every word must appear in
-   exactly one beat's vo_text, in order, with nothing dropped, paraphrased,
-   or duplicated.
-3. For each beat, generate fresh B-roll keywords specific to that beat.
-4. For each beat, decide media_type ("video" or "image").
-5. For each beat, emit an animation SIGNAL — not a final decision. A later
-   step (Animation Planner) has final authority and may accept, reject, or
-   change what you propose here.
-6. For each beat, direct the scene: identify characters/elements, setting,
-   mood, and the central action (see "Scene Direction" below) — everything
-   needed to visually construct this beat, not just who's named in it.
+Split the scene into variable semantic visual beats. Typical planning target is
+8–20 spoken seconds; it is NOT authoritative timing. Do not split mid-thought
+just to hit a duration target.
 
-Scene Direction
+SOURCE INTEGRITY:
+Every beat must be an exact contiguous substring of scene_vo_text using
+0-based exclusive character ranges. Beats must be ordered, non-overlapping,
+and cover the entire scene narration exactly.
 
-You are directing this beat, not just labeling it. Provide:
+KEYWORDS:
+Return 5–6 distinct English retrieval phrases per beat, 2–6 words each.
+They must be concrete, photographable, and grounded in the literal narration.
+Never invent names, facts, dates, locations, actions, or subjects.
+For real people use the actual name plus useful context. For fictional
+characters do NOT search the invented name; search setting/archetype/action.
 
-- entities: every named character or significant recurring object in this
-  beat's vo_text, each classified:
-  - "real_person": an actual historical or contemporary person (e.g.
-    Cleopatra, a scientist, a CEO named in the script).
-  - "fictional_character": a character from a story, myth-as-narrative-
-    device, or invented scenario the script is telling (not the same as a
-    real mythological/religious figure being discussed factually — judge
-    by whether the narration asserts the figure existed/acted, or is
-    explicitly telling a fictional/illustrative story).
-  - "element": a significant recurring object, place, or symbol that isn't
-    a person but matters visually across the narration (e.g. "the Nile",
-    "a locked vault", "the company's first office").
-  Use known_entities to stay consistent: reuse an existing name's
-  entity_type rather than reclassifying it. Only list what's new or
-  freshly relevant in THIS beat — don't repeat an earlier beat's entity
-  just because it was mentioned before in the scene.
-- setting: {"location": ..., "time_period": ...} — where and when this
-  beat visually takes place, grounded in what the narration states or
-  strongly implies. Use "" for either field when the narration doesn't
-  establish it. Use known_setting to stay consistent: don't drift the
-  location/era from what's already established unless the narration
-  itself explicitly moves the story somewhere/somewhen else.
-- mood: one or two words for this beat's emotional/atmospheric tone (e.g.
-  "tense", "triumphant", "solemn", "playful", "urgent"), grounded in the
-  narration's actual content and phrasing — never invented flavor beyond
-  what the words support. Use "neutral" if nothing distinct comes through.
-- key_action: one concise sentence describing the central visual
-  event/activity happening in this beat — what should be SHOWN occurring,
-  not what's being said. This is often not a named entity at all (e.g.
-  "a ship sinking during a storm", "a verdict being read in a courtroom",
-  "two founders shaking hands over a contract") and should ground at least
-  one of this beat's keyword phrases when it names a concrete action.
+MEDIA:
+video = motion, process, action, change over time.
+image = static subject, portrait, document, archival frame, data point, quote.
+Variety is a preference, never a quota.
 
-Keyword Rules (accuracy is critical — bad keywords produce wrong footage)
+ENTITY CONTINUITY:
+Use stable canonical entity identity from continuity_state. Reuse entity_type;
+do not silently switch real_person and fictional_character. Resolve aliases or
+pronouns only when supported. Recurring entities need not be repeated every
+beat.
 
-- Each phrase: 2-6 words, concrete, real-world, photographable — never an
-  abstract concept on its own.
-- Every phrase must be grounded in a concrete noun or subject literally
-  present, or very directly implied, in this beat's vo_text.
-- If this beat's narration names a specific person, place, object, or
-  event, at least one phrase must center on that exact subject, and at
-  least one other phrase should combine that subject with the category's
-  era/style (footage_style) rather than being purely generic. Example: if
-  category is "history" and the beat mentions Cleopatra, include
-  something like "Cleopatra ancient Egyptian portrait" or "ancient Egyptian
-  queen depiction" — not just "Cleopatra" alone (too likely to surface
-  modern/unrelated results) and not just generic "ancient Egypt" (loses the
-  specific subject).
-- If the beat doesn't introduce new visual content beyond the scene's
-  overall visual_intent, still produce phrases giving a DIFFERENT concrete
-  angle on the same subject (wide vs. close-up, a related real subject, a
-  different moment in the same activity) — never just repeat the scene-level
-  query generically.
-- No cinematic adjectives. Prefer real, photographable subjects over
-  metaphors. Do not invent facts, names, dates, or subjects not present in
-  the text. Always return 5-6 phrases.
-- Always write keywords in ENGLISH, regardless of script_language. Stock
-  footage libraries are English-indexed and search quality drops sharply
-  on non-English queries — translate the concrete subject into English
-  even when scene_vo_text is in another language.
-- For a "real_person" entity, search using their actual name plus the
-  category's era/style (the existing Cleopatra rule above).
-- For a "fictional_character" entity, do NOT search using the character's
-  name — no stock library has a photo of someone who doesn't exist, and a
-  literal-name search returns irrelevant results. Instead, generate
-  keywords describing the SETTING, MOOD, or visual archetype the narration
-  implies for that moment (e.g. a shadowy detective scene → "person in
-  trench coat silhouette", "rain-soaked city street at night" — not the
-  character's invented name).
-- At least one keyword phrase should reflect key_action (the central
-  visual event you identified in Scene Direction) when it names a concrete
-  activity — footage of the ACTION happening is often more useful than
-  footage of just the subject standing still. Fold in setting.location
-  and mood where they sharpen the search (e.g. "verdict being read" +
-  "wood-paneled courtroom" for a tense key_action set in a courtroom).
+SETTING CONTINUITY:
+Track location and time_period. Inherit unchanged settings; represent explicit
+moves in the narration. Never invent a new setting.
 
-Media Type Rules
+ANIMATION:
+animation_signal is only a proposal to Step 3. It does not create a quota and
+does not veto Step 3.
 
-Choose "image" for: a specific static subject best shown as a single frame
-(portrait, named person, document, building exterior, product, a
-statistic/data point, a historical/archival moment), or a quote/definition/
-reflective beat with no motion implied.
+QUOTED SOURCE:
+source_type = quoted_source only when narration explicitly presents/attributes
+a source or quotation. quoted_excerpt must be an exact substring of vo_text.
+source_name_guess must be grounded in vo_text or null.
 
-Choose "video" for: motion, action, process, or change over time.
-
-Do not default to "video" out of habit. Avoid repeating the same
-media_type as the immediately preceding beat unless this beat's content
-clearly calls for it regardless of variety — consecutive beats should
-visually vary (motion, then a still, then motion again). This applies at
-the scene boundary too: this scene's FIRST beat should avoid repeating
-previous_scene_last_media_type unless its content clearly calls for it.
-
-Animation Signal Rules
-
-Set needs_animation based on whether this beat's content would genuinely
-benefit from an overlay/full-screen animation treatment (not just B-roll) —
-weigh this against scene_animation_density: a "low" density scene should
-have animation signals on only a small minority of beats; "high" density
-can flag most beats.
-
-- intent: one short sentence — what the animation would communicate or
-  emphasize (e.g. "highlight the specific casualty statistic just spoken").
-- suggested_category: your best guess at one of: full_screen, overlay_text,
-  overlay_graphic, pip, branding, transition — or null if needs_animation
-  is false. This is a suggestion; the Animation Planner may override it.
-- key_subject: the exact entity, number, quote, or short phrase from this
-  beat's vo_text that the animation should center on or highlight. Ground
-  this in the literal text — do not invent.
-- source_type: "quoted_source" if this beat is narrating or referencing a
-  specific quote from an article, study, publication, or named source that
-  should be visually presented as that source (e.g. "a report from X
-  found..." or a direct quotation); otherwise "narrative".
-- quoted_excerpt: if source_type is "quoted_source", the exact quoted text
-  from vo_text (verbatim substring). Otherwise null.
-- source_name_guess: if source_type is "quoted_source", the name of the
-  publication, study, report, or person the narration attributes this
-  quote to, exactly as stated in vo_text (e.g. "Reuters", "a Harvard
-  study", "the WHO report"). This is used downstream to attempt locating a
-  real source page to screenshot — a real screenshot asset, not a mockup.
-  If vo_text doesn't name a specific source, return null (the downstream
-  system will need a fallback treatment in that case).
-- key_subject_entity_type: if key_subject corresponds to one of this
-  beat's identified entities, its entity_type ("real_person",
-  "fictional_character", or "element"); otherwise null. This lets the
-  Animation Planner choose a treatment appropriate to whether the subject
-  is real (documentary-style, photo-realistic footage/animation) or
-  fictional (illustrative/symbolic treatment, since no real depiction
-  exists).
-
-Output Schema
-
-Return exactly one JSON object, nothing else — no markdown, no code fences:
-
+OUTPUT:
 {
-  "beats": [
-    {
-      "beat_id": "s1_beat1",
-      "vo_text": "Exact narration for this beat.",
-      "estimated_duration_seconds": 12,
-      "keywords": ["query one", "query two", "query three", "query four", "query five"],
-      "media_type": "video",
-      "entities": [
-        {"name": "Cleopatra", "entity_type": "real_person"}
-      ],
-      "scene_direction": {
-        "setting": {"location": "the royal palace in Alexandria", "time_period": "1st century BC"},
-        "mood": "tense",
-        "key_action": "Cleopatra negotiating with a Roman envoy"
-      },
-      "animation_signal": {
-        "needs_animation": true,
-        "intent": "Emphasize the named statistic just spoken.",
-        "suggested_category": "overlay_text",
-        "key_subject": "40 percent increase",
-        "source_type": "narrative",
-        "quoted_excerpt": null,
-        "source_name_guess": null,
-        "key_subject_entity_type": null
-      }
+  "beats": [{
+    "beat_id": "s1_b1",
+    "source_range": {"char_start": 0, "char_end": 220,
+                     "word_start": 0, "word_end": 41},
+    "vo_text": "Exact contiguous source substring.",
+    "visual_intent": "What should be visually communicated.",
+    "estimated_duration_seconds": 18,
+    "keywords": ["specific action", "relevant location",
+                  "contextual view", "close detail", "related activity"],
+    "media_type": "video",
+    "entities": [{
+      "entity_id": "e1", "canonical_name": "Example Person",
+      "aliases": [], "entity_type": "real_person"
+    }],
+    "scene_direction": {
+      "setting": {"location": "", "time_period": ""},
+      "mood": "neutral",
+      "key_action": "What should be shown."
+    },
+    "animation_signal": {
+      "needs_animation": false,
+      "intent": "",
+      "suggested_category": null,
+      "key_subject": "",
+      "source_type": "narrative",
+      "quoted_excerpt": null,
+      "source_name_guess": null,
+      "key_subject_entity_type": null
     }
-  ]
+  }]
 }
 
-Constraints
-
-Beats must be in narration order, contiguous, and non-overlapping.
-estimated_duration_seconds is a hint for downstream timing reconciliation
-against real voiceover alignment — not a hard timestamp. entities may be
-an empty list [] when a beat introduces no new named character/element —
-don't force an entry. scene_direction.setting fields may be "" when not
-established; mood and key_action are always required (use "neutral" for
-mood and a plain description of what's being said/shown for key_action if
-nothing more specific applies — never leave them blank). Do not invent
-facts. Ensure the output is valid, parseable JSON.
+Do not output pixels, frame counts, renderer commands, arbitrary colors, or
+executable rendering instructions.
 """
 
 
@@ -10150,19 +9942,35 @@ def _icon_glyph(icon_name: str) -> str:
     return _ICON_EMOJI_FALLBACK.get(icon_name, _DEFAULT_ICON_EMOJI)
 
 
-_TEXT_ANIMATION_STYLES = [
-    "fade_in", "slide_in_left", "slide_in_right", "slide_up", "slide_down",
-    "zoom_in", "bounce", "pop", "typewriter", "wipe",
-]
 
 ANIMATION_CANVAS_WIDTH = 1920
 ANIMATION_CANVAS_HEIGHT = 1080
-CAPTION_SAFE_ZONE_Y = 918  # burned-in captions occupy the bottom 162px
+CAPTION_SAFE_ZONE_Y = 918  
 
 PLACEMENT_ANCHORS_PX = {
     "top_left": (64, 64), "top_center": (960, 64), "top_right": (1856, 64),
     "center_left": (64, 540), "center": (960, 540), "center_right": (1856, 540),
     "bottom_left": (64, 854), "bottom_center": (960, 854), "bottom_right": (1856, 854),
+    "full_frame": (0, 0),
+}
+
+
+CANVAS_WIDTH = 1920
+CANVAS_HEIGHT = 1080
+_SAFE_MARGIN = 64
+_CAPTION_BAND_HEIGHT = round(CANVAS_HEIGHT * 0.15)  
+_CAPTION_BAND_TOP_Y = CANVAS_HEIGHT - _CAPTION_BAND_HEIGHT
+
+PLACEMENT_ANCHORS_PX = {
+    "top_left": (_SAFE_MARGIN, _SAFE_MARGIN),
+    "top_center": (CANVAS_WIDTH // 2, _SAFE_MARGIN),
+    "top_right": (CANVAS_WIDTH - _SAFE_MARGIN, _SAFE_MARGIN),
+    "center_left": (_SAFE_MARGIN, CANVAS_HEIGHT // 2),
+    "center": (CANVAS_WIDTH // 2, CANVAS_HEIGHT // 2),
+    "center_right": (CANVAS_WIDTH - _SAFE_MARGIN, CANVAS_HEIGHT // 2),
+    "bottom_left": (_SAFE_MARGIN, _CAPTION_BAND_TOP_Y - _SAFE_MARGIN),
+    "bottom_center": (CANVAS_WIDTH // 2, _CAPTION_BAND_TOP_Y - _SAFE_MARGIN),
+    "bottom_right": (CANVAS_WIDTH - _SAFE_MARGIN, _CAPTION_BAND_TOP_Y - _SAFE_MARGIN),
     "full_frame": (0, 0),
 }
 
@@ -10194,7 +10002,7 @@ is hearing. icon_name (fixed vocabulary), content_binding, and
 render_prompt stay in English regardless of script_language, since they
 are internal/documentation values, not viewer-facing text.
 
-Canvas: every video is 1920x1080px (16:9). All
+Canvas: every video is {CANVAS_WIDTH}x{CANVAS_HEIGHT}px (16:9). All
 positions and sizes you return must be real pixel values on this canvas —
 not vague fractions or percentages.
 
@@ -10202,9 +10010,9 @@ Placement anchor reference (top-left corner in px for each placement zone,
 before you add your own width/height offset):
 {PLACEMENT_ANCHORS_PX}
 
-Burned-in captions always occupy the bottom 162px of the
-frame (y >= 918). For overlay_text/overlay_graphic types,
-geometry_px must keep (y + height) at or above 918 minus
+Burned-in captions always occupy the bottom {_CAPTION_BAND_HEIGHT}px of the
+frame (y >= {_CAPTION_BAND_TOP_Y}). For overlay_text/overlay_graphic types,
+geometry_px must keep (y + height) at or above {_CAPTION_BAND_TOP_Y} minus
 a small buffer — this is the same caption safe-zone rule as before, just
 now expressed in exact pixels instead of only a placement name.
 
@@ -10260,31 +10068,17 @@ this scene have animation treatment AT ALL" decision; it overrides
 everything below. Only proceed past this point if requires_animation is
 true.
 
-Icon requirement (applies whenever requires_animation is true): this scene
-MUST include at least one animation whose category is "overlay_graphic" or
-"branding" (i.e. one that carries a non-null icon_name) on some beat —
-this is a floor, not a suggestion, and it holds even for categories whose
-favored_animation_types/avoided_animation_types lean away from icons.
-Choose the beat where an icon genuinely fits best (a named concept, a
-statistic, a listed item, a clear action) rather than bolting one onto an
-arbitrary beat, and prefer icon_pop_in, icon_sequence, or arrow_highlight
-unless the content calls for something else in that category. This
-requirement stacks with, and does not replace, whatever other
-full_screen/overlay_text animations the scene's density and content call
-for elsewhere.
-
 For each beat, decide whether it actually gets an animation. The beat's
 animation_signal is a PROPOSAL from an earlier step, not a final decision —
 you may accept it, reject it (needs_animation was true but you judge it
 unnecessary), or add one it didn't flag, if the scene's overall
 animation_density budget calls for it. As a guide: "low" density scenes
 should end up with animation on roughly one beat, "medium" on a couple,
-"high" on most beats — but use judgment over rigid counts. The icon
-requirement above still applies regardless of density.
+"high" on most beats — but use judgment over rigid counts.
 
 Prefer favored_animation_types for this category and avoid
 avoided_animation_types unless the specific beat content overrides that
-default — except for the icon requirement above, which always wins.
+default.
 
 Vary treatment across beats within the scene — do not give consecutive
 animated beats the same animation_type/placement combination back to back
@@ -10318,7 +10112,7 @@ coordinates for the highlight itself — instead:
   starting 1s after the screenshot appears, holding for the rest of the
   beat") and to name the source if inferable from vo_text;
 - geometry_px for this animation_type is always the full frame
-  (x=0, y=0, width=1920, height=1080) since the
+  (x=0, y=0, width={CANVAS_WIDTH}, height={CANVAS_HEIGHT}) since the
   screenshot itself fills the screen.
 
 ALLOWED animation_type VALUES (grouped by category):
@@ -10394,7 +10188,7 @@ beat_id: must match a beat_id from the input beats array. Only include
 beats that actually receive an animation — omit beats with no animation.
 
 geometry_px: {{x, y, width, height}} in real pixels on the
-1920x1080 canvas — the element's full rendered
+{CANVAS_WIDTH}x{CANVAS_HEIGHT} canvas — the element's full rendered
 footprint. Derive x/y from the PLACEMENT_ANCHORS_PX entry for your chosen
 placement, then choose width/height deliberately for this content: icons
 typically 120-240px square depending on emphasis; text overlay boxes sized
@@ -10402,7 +10196,7 @@ to fit the actual text at a readable size (roughly 36-64px font for
 overlay text, larger for full_screen title/quote cards); pip frames
 roughly 1/3 to 1/2 of canvas width/height. For full_screen and transition
 category types, geometry_px is always the full frame: {{"x": 0, "y": 0,
-"width": 1920, "height": 1080}}.
+"width": {CANVAS_WIDTH}, "height": {CANVAS_HEIGHT}}}.
 
 motion: {{start_xy_px, end_xy_px, motion_style}}. For a static element
 (appears in place, no travel), set start_xy_px equal to end_xy_px and
@@ -11544,7 +11338,7 @@ async def _run_animation_planner(
         {
             "beat_id": b["beat_id"],
             "vo_text": b["vo_text"],
-            "estimated_duration_seconds": b["estimated_duration_seconds"],
+            "ICON_LIBRARY_GROUPS": b["estimated_duration_seconds"],
             "entities": b["entities"],
             "scene_direction": b["scene_direction"],
             "animation_signal": b["animation_signal"],
@@ -13427,7 +13221,7 @@ async def delete_scene_content(
 
 
 
-from fastapi import HTTPException, BackgroundTasks, Response, status
+from fastapi import HTTPException
 
 
 RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
@@ -14884,3 +14678,5 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
+
+
