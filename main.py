@@ -9202,7 +9202,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
 import re
 import os
 import json
@@ -9936,6 +9935,150 @@ _ICON_LIBRARY_GROUPS = {
 }
 _ICON_VOCAB = {icon for group in _ICON_LIBRARY_GROUPS.values() for icon in group}
 
+# Maps each STYLE_PROFILES category to the icon-library group most likely
+# to fit its content, so the guaranteed-icon fallback below (see
+# _pick_fallback_icon) reaches for something topical instead of always
+# defaulting to "sparkles".
+_ICON_GROUP_BY_CATEGORY = {
+    "anthropology": "history_religion_anthropology_culture",
+    "biography": "emotion_people",
+    "business": "business_finance_economics",
+    "economics": "business_finance_economics",
+    "entrepreneurship": "business_finance_economics",
+    "finance": "business_finance_economics",
+    "health": "health",
+    "knowledge": "general_ui",
+    "law": "law_criminology",
+    "personal_development": "general_ui",
+    "philosophy": "general_ui",
+    "politics": "history_religion_anthropology_culture",
+    "psychology": "emotion_people",
+    "self_help": "general_ui",
+    "sociology": "emotion_people",
+    "history": "history_religion_anthropology_culture",
+    "religion": "history_religion_anthropology_culture",
+    "travel": "travel_sports",
+    "geography": "astronomy_geography",
+    "astronomy": "astronomy_geography",
+    "technology": "science_technology_neuroscience",
+    "sports": "travel_sports",
+    "communication": "communication_film_media",
+    "science": "science_technology_neuroscience",
+    "neuroscience": "science_technology_neuroscience",
+    "film_theatre": "communication_film_media",
+    "social_science": "emotion_people",
+    "criminology": "law_criminology",
+    "cultural_studies": "history_religion_anthropology_culture",
+    "general_documentary": "general_ui",
+}
+
+
+def _pick_fallback_icon(category: str) -> str:
+    group = _ICON_GROUP_BY_CATEGORY.get(category, "general_ui")
+    icons = _ICON_LIBRARY_GROUPS.get(group) or _ICON_LIBRARY_GROUPS["general_ui"]
+    return icons[0]
+
+
+def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
+    """Guaranteed icon_pop_in for a scene that came back from the
+    Animation Planner with zero icon-bearing animations. Kept intentionally
+    plain — a small pop-in icon, not competing for the same visual weight
+    as a model-authored animation."""
+    icon = _pick_fallback_icon(category)
+    key_action = ((beat.get("scene_direction") or {}).get("key_action") or "").strip()
+    on_screen_words = key_action.split()
+    label = " ".join(on_screen_words[:4]) if on_screen_words else None
+    est_seconds = beat.get("estimated_duration_seconds") or 3
+    duration_frames = max(30, min(90, int(est_seconds * TIMELINE_FPS * 0.4)))
+    return {
+        "beat_id": beat["beat_id"],
+        "animation_type": "icon_pop_in",
+        "placement": "top_right",
+        "geometry_px": {"x": 1696, "y": 64, "width": 160, "height": 160},
+        "motion": {
+            "start_xy_px": [1696, 44],
+            "end_xy_px": [1696, 64],
+            "motion_style": "pop-in with slight bounce, scale 80% to 100%",
+        },
+        "duration_frames": duration_frames,
+        "content_binding": f"fallback_icon:{icon}",
+        "icon_name": icon,
+        "icon_layout": None,
+        "display_text": label,
+        "color_hint": "#F5A623",
+        "highlight_target_text": None,
+        "render_prompt": (
+            f"A small '{icon}' icon pops in top-right with a light bounce and holds briefly. "
+            "Kept understated so it doesn't compete with the beat's main visual."
+        ),
+        "trigger": "on_beat",
+        "render_engine_hint": "remotion",
+    }
+
+
+def _infer_video_category(scenes: list) -> str:
+    """Best-effort category lookup from whatever scenes already carry —
+    used by the video-level icon guarantee below when it needs to pick a
+    fallback icon but isn't running inside the main /edit-video request
+    (e.g. a single-scene rebuild/trim endpoint) where `category` isn't
+    already in scope."""
+    for s in scenes:
+        ctx = s.get("_beat_director_context")
+        if ctx and ctx.get("category"):
+            return ctx["category"]
+    return "general_documentary"
+
+
+def _ensure_video_has_icon_animation(scenes: list, category: str) -> None:
+    """Final, video-wide safety net: guarantees at least one icon-bearing
+    animation (category "overlay_graphic" or "branding") exists SOMEWHERE
+    across the whole video, regardless of any individual scene's
+    requires_animation gate or how many animations the Animation Planner
+    (plus its own per-scene fallback) happened to produce. Call this once,
+    after all scenes for a video have been finalized, right before the
+    timeline is built. Mutates `scenes` in place.
+    """
+    for scene in scenes:
+        for anim in (scene.get("animations") or []):
+            if anim.get("category") in ("overlay_graphic", "branding"):
+                return  # video already has at least one icon — nothing to do
+
+    for scene in scenes:
+        beats = scene.get("beats") or []
+        if not beats:
+            continue
+
+        animated_beat_ids = {a.get("beat_id") for a in (scene.get("animations") or [])}
+        target_beat = next((b for b in beats if b["beat_id"] not in animated_beat_ids), None)
+        replacing = target_beat is None
+        if target_beat is None:
+            target_beat = beats[0]
+
+        beat_ids = {b["beat_id"] for b in beats}
+        beats_by_id = {b["beat_id"]: b for b in beats}
+        fallback_raw = _build_fallback_icon_animation(target_beat, category)
+        fallback_validated = _validate_beat_animation(fallback_raw, beat_ids, beats_by_id)
+        if not fallback_validated:
+            continue
+
+        animations = list(scene.get("animations") or [])
+        if replacing:
+            animations = [a for a in animations if a.get("beat_id") != target_beat["beat_id"]]
+        animations.append(fallback_validated)
+        scene["animations"] = animations
+        # requires_animation only gates the Animation Planner call itself —
+        # by the time this runs that call is already done, but keep the
+        # flag consistent for anything downstream that inspects it.
+        scene["requires_animation"] = True
+
+        print(
+            f"[edit-video] no icon animation anywhere in this video — injected a "
+            f"guaranteed icon_pop_in on scene {scene.get('scene_id')} beat {target_beat['beat_id']}"
+        )
+        return
+
+    print("[edit-video][WARN] video-wide icon guarantee found no beat in any scene to attach an icon to")
+
 # icon_name -> emoji glyph, used by the FFmpeg fallback renderer below when
 # Remotion isn't available. Every key must exist in _ICON_VOCAB.
 _ICON_EMOJI_FALLBACK = {
@@ -10097,17 +10240,31 @@ this scene have animation treatment AT ALL" decision; it overrides
 everything below. Only proceed past this point if requires_animation is
 true.
 
+Icon requirement (applies whenever requires_animation is true): this scene
+MUST include at least one animation whose category is "overlay_graphic" or
+"branding" (i.e. one that carries a non-null icon_name) on some beat —
+this is a floor, not a suggestion, and it holds even for categories whose
+favored_animation_types/avoided_animation_types lean away from icons.
+Choose the beat where an icon genuinely fits best (a named concept, a
+statistic, a listed item, a clear action) rather than bolting one onto an
+arbitrary beat, and prefer icon_pop_in, icon_sequence, or arrow_highlight
+unless the content calls for something else in that category. This
+requirement stacks with, and does not replace, whatever other
+full_screen/overlay_text animations the scene's density and content call
+for elsewhere.
+
 For each beat, decide whether it actually gets an animation. The beat's
 animation_signal is a PROPOSAL from an earlier step, not a final decision —
 you may accept it, reject it (needs_animation was true but you judge it
 unnecessary), or add one it didn't flag, if the scene's overall
 animation_density budget calls for it. As a guide: "low" density scenes
 should end up with animation on roughly one beat, "medium" on a couple,
-"high" on most beats — but use judgment over rigid counts.
+"high" on most beats — but use judgment over rigid counts. The icon
+requirement above still applies regardless of density.
 
 Prefer favored_animation_types for this category and avoid
 avoided_animation_types unless the specific beat content overrides that
-default.
+default — except for the icon requirement above, which always wins.
 
 Vary treatment across beats within the scene — do not give consecutive
 animated beats the same animation_type/placement combination back to back
@@ -11216,7 +11373,7 @@ def _validate_motion(raw: Any, geometry: dict) -> dict:
     return motion
 
 
-def _validate_beat_animation(raw: Any, beat_ids: set) -> Optional[dict]:
+def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict] = None) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
     beat_id = raw.get("beat_id")
@@ -11250,6 +11407,21 @@ def _validate_beat_animation(raw: Any, beat_ids: set) -> Optional[dict]:
             raise ValueError
     except (TypeError, ValueError):
         duration_frames = 90
+
+    # Clamp to the target beat's own length whenever we know it, so the
+    # animation object we store/return never claims a longer run than the
+    # beat (and therefore the voiceover) can actually support. Without
+    # this, duration_frames could be set to e.g. 900 (30s) on a 3s beat —
+    # build_timeline_from_scenes would still clamp the RENDERED track
+    # correctly, but the animation dict itself (what gets returned by the
+    # API and stored in raw_scenes) would keep claiming 900, which reads
+    # as "going beyond the voiceover" even though playback is fine.
+    beat_info = (beats_by_id or {}).get(beat_id)
+    if beat_info is not None:
+        b_start, b_end = beat_info.get("start"), beat_info.get("end")
+        if b_start is not None and b_end is not None and b_end > b_start:
+            beat_frames = max(1, round((b_end - b_start) * TIMELINE_FPS))
+            duration_frames = min(duration_frames, beat_frames)
 
     content_binding = raw.get("content_binding")
     if not isinstance(content_binding, str):
@@ -11382,11 +11554,36 @@ async def _run_animation_planner(
         return []
 
     validated, seen_beat_ids = [], set()
+    beats_by_id = {b["beat_id"]: b for b in beats}
     for raw_anim in raw_animations:
-        v = _validate_beat_animation(raw_anim, beat_ids)
+        v = _validate_beat_animation(raw_anim, beat_ids, beats_by_id)
         if v and v["beat_id"] not in seen_beat_ids:
             validated.append(v)
             seen_beat_ids.add(v["beat_id"])
+
+    # Guaranteed icon floor: the prompt asks for at least one icon-bearing
+    # animation per scene, but model output isn't guaranteed to comply —
+    # enforce it here rather than trusting the LLM alone. Prefer an
+    # unanimated beat so we don't clobber something the model chose;
+    # fall back to overwriting the first beat's animation only if every
+    # beat already has one.
+    has_icon = any(v["category"] in ("overlay_graphic", "branding") for v in validated)
+    if not has_icon and beats:
+        target_beat = next((b for b in beats if b["beat_id"] not in seen_beat_ids), None)
+        replacing = target_beat is None
+        if target_beat is None:
+            target_beat = beats[0]
+
+        fallback_raw = _build_fallback_icon_animation(target_beat, category)
+        fallback_validated = _validate_beat_animation(fallback_raw, beat_ids, beats_by_id)
+        if fallback_validated:
+            if replacing:
+                validated = [v for v in validated if v["beat_id"] != target_beat["beat_id"]]
+            else:
+                seen_beat_ids.add(target_beat["beat_id"])
+            validated.append(fallback_validated)
+            print(f"[edit-video] scene {scene_id}: no icon animation from the model — injected a guaranteed icon_pop_in on beat {target_beat['beat_id']}")
+
     return validated
 
 
@@ -11394,23 +11591,6 @@ async def _get_or_create_tagged_text(scene: dict, scene_id, user_id: str, vo_tex
     tags_request = AddScriptTagsRequest(userId=user_id, script=vo_text)
     tags_result = await add_script_tags(tags_request)
     return tags_result["tagged_script"]
-
-
-def _enforce_scene_limit(scenes: list, max_scenes: int = 5) -> list:
-    if len(scenes) <= max_scenes:
-        return scenes
-
-    print(f"[edit-video] model returned {len(scenes)} scenes, merging down to {max_scenes}")
-
-    kept = scenes[: max_scenes - 1]
-    overflow = scenes[max_scenes - 1:]
-
-    merged_vo_text = " ".join(s.get("vo_text", "").strip() for s in overflow if s.get("vo_text"))
-    last_scene = dict(overflow[0]) if overflow else {}
-    last_scene["scene_id"] = f"s{max_scenes}"
-    last_scene["vo_text"] = merged_vo_text
-
-    return kept + [last_scene]
 
 
 
@@ -11703,11 +11883,14 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
         for w in word_segments:
             if "start" not in w or "end" not in w:
                 continue
-            words.append({
-                "word": w.get("word", ""),
-                "startFrame": scene_start_frame + _seconds_to_frames(w["start"] - start_sec, fps),
-                "endFrame": scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps),
-            })
+            w_start_frame = scene_start_frame + _seconds_to_frames(w["start"] - start_sec, fps)
+            w_end_frame = scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps)
+            # Defensive clamp: WhisperX timestamps can round to a frame or
+            # two past the scene's own computed end — never let a caption
+            # word render past the scene/voiceover boundary.
+            w_start_frame = max(scene_start_frame, min(w_start_frame, scene_end_frame))
+            w_end_frame = max(w_start_frame, min(w_end_frame, scene_end_frame))
+            words.append({"word": w.get("word", ""), "startFrame": w_start_frame, "endFrame": w_end_frame})
         if words:
             caption_track = {"track_id": f"caption_{scene_id}", "scene_id": scene_id, "type": "caption_word", "words": words}
             caption_track["style"] = {**DEFAULT_CAPTION_STYLE, **(scene.get("caption_style") or {})}
@@ -11773,6 +11956,12 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             anim_span = b_end_frame - b_start_frame if b_end_frame > b_start_frame else animation.get("duration_frames", 90)
             anim_start_frame = b_start_frame
             anim_end_frame = min(b_start_frame + animation.get("duration_frames", 90), b_start_frame + max(anim_span, 1))
+            # Defensive clamp: b_start_frame/b_end_frame are already bounded
+            # to [scene_start_frame, scene_end_frame], so this is normally
+            # redundant — but never let an animation's computed frames slip
+            # past the scene/voiceover boundary regardless of how it got here.
+            anim_start_frame = max(scene_start_frame, min(anim_start_frame, scene_end_frame))
+            anim_end_frame = max(anim_start_frame, min(anim_end_frame, scene_end_frame))
 
             tracks.append({
                 "track_id": f"anim_{scene_id}_{beat_id}",
@@ -12004,7 +12193,10 @@ async def edit_video(request: EditVideo):
         print(f"[edit-video] model returned unknown category {category!r} — defaulting to general_documentary")
         category = "general_documentary"
 
-    scenes = _enforce_scene_limit(scenes, max_scenes=5)
+    # No scene-count cap: the Scene Planner prompt already governs scene
+    # count via the 2-minute-per-scene rule (SCRIPT_SCENE_PROMPT explicitly
+    # states there is no upper bound), so whatever it returns is used as-is.
+    print(f"[edit-video] scene planner produced {len(scenes)} scene(s)")
 
     video_ctx = {
         "known_entities": [], "known_setting": {"location": "", "time_period": ""},
@@ -12016,6 +12208,11 @@ async def edit_video(request: EditVideo):
             scene, request, category, script_language, video_ctx, is_first_scene=(idx == 0)
         )
         scenes_with_voice_and_timestamps.append(scene_result)
+
+    # Video-wide guarantee: at least one icon animation must exist
+    # somewhere in this video, regardless of which/how many scenes the
+    # Animation Planner (and its own per-scene fallback) actually animated.
+    _ensure_video_has_icon_animation(scenes_with_voice_and_timestamps, category)
 
     failed_scenes = [s["scene_id"] for s in scenes_with_voice_and_timestamps if s.get("error")]
     if failed_scenes:
@@ -12303,6 +12500,8 @@ async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdat
 
     raw_scenes[scene_index] = scene
 
+    _ensure_video_has_icon_animation(raw_scenes, _infer_video_category(raw_scenes))
+
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
     infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
@@ -12548,6 +12747,8 @@ async def rebuild_scene_beats(video_id: str, scene_id: str):
     scene = await _regenerate_scene_beats_and_animations(scene)
     raw_scenes[scene_index] = scene
 
+    _ensure_video_has_icon_animation(raw_scenes, _infer_video_category(raw_scenes))
+
     timeline_json = build_timeline_from_scenes(raw_scenes)
     new_version = current_version + 1
     infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
@@ -12603,6 +12804,7 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
     scene = dict(raw_scenes[scene_index])
     beats = scene.get("beats") or []
     beat_ids = {b.get("beat_id") for b in beats}
+    beats_by_id = {b.get("beat_id"): b for b in beats}
     if beat_id not in beat_ids:
         raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id}")
 
@@ -12616,7 +12818,7 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
     else:
         merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
 
-    validated = _validate_beat_animation(merged_raw, {beat_id})
+    validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id)
     if not validated:
         raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
     if isinstance(merged_raw.get("id"), int):
@@ -12742,7 +12944,8 @@ async def update_animation_by_id(video_id: str, animation_id: int, update: BeatA
     animations = list(scene.get("animations") or [])
     merged_raw = {**animations[anim_index], **provided, "beat_id": beat_id}
 
-    validated = _validate_beat_animation(merged_raw, {beat_id})
+    beats_by_id = {b.get("beat_id"): b for b in (scene.get("beats") or [])}
+    validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id)
     if not validated:
         raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
     validated["id"] = animation_id
@@ -14621,13 +14824,6 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
 
     width, height = resolution["width"], resolution["height"]
 
-    # timeline_tracks_by_scene: scene_id -> [broll tracks] (one per beat).
-    # caption_tracks_by_scene: scene_id -> single caption_word track.
-    # animation_tracks_by_scene_beat: scene_id -> {beat_id: animation
-    #   track} — NOT a single track per scene, since a scene can have
-    #   several animated beats (see module docstring, point 1). There is
-    #   no "infographic" track type any more — the timeline only ever
-    #   emits "audio" / "caption_word" / "broll" / "animation".
     timeline_tracks_by_scene = {}
     caption_tracks_by_scene = {}
     animation_tracks_by_scene_beat = {}
