@@ -12857,138 +12857,19 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
     }
 
 
-@app.delete("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/animation")
-async def delete_beat_animation(video_id: str, scene_id: str, beat_id: str):
-    """Replaces the old int-id `delete_overlay_by_id` endpoint, which
-    assumed exactly one overlay per scene. Overlays are now addressed by
-    (scene_id, beat_id) since a scene can carry many."""
-    try:
-        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
-    except Exception as e:
-        print(f"[delete-beat-animation] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    raw_scenes = row.data.get("raw_scenes") or []
-    current_version = row.data.get("timeline_version", 1)
-
-    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
-    if scene_index is None:
-        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
-
-    scene = dict(raw_scenes[scene_index])
-    animations = scene.get("animations") or []
-    remaining = [a for a in animations if a.get("beat_id") != beat_id]
-    if len(remaining) == len(animations):
-        raise HTTPException(status_code=422, detail=f"Beat {beat_id} (scene {scene_id}) has no animation to delete")
-
-    scene["animations"] = remaining
-    raw_scenes[scene_index] = scene
-
-    timeline_json = build_timeline_from_scenes(raw_scenes)
-    new_version = current_version + 1
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
-
-    try:
-        supabase.table("videos").update({
-            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
-            "final_video_url": None, "render_status": "stale_needs_render",
-            "infographics_list": infographics_list, "text_list": text_list,
-        }).eq("id", video_id).execute()
-    except Exception as e:
-        print(f"[delete-beat-animation] failed to save video {video_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete animation")
-
-    return {
-        "video_id": video_id, "scene_id": scene_id, "beat_id": beat_id,
-        "infographics_list": infographics_list, "text_list": text_list,
-        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
-    }
-
-
-@app.patch("/timeline/{video_id}/animation/{animation_id}")
-async def update_animation_by_id(video_id: str, animation_id: int, update: BeatAnimationUpdate):
-    """
-    Same edit as PATCH .../beat/{beat_id}/animation, but located purely
-    by the animation's stable integer id — no need to already know which
-    scene/beat it lives on. Reuses the same validation
-    (_validate_beat_animation) and preserves the id across the edit.
-    """
-    provided = {k: v for k, v in update.dict().items() if v is not None}
-    if not provided:
-        raise HTTPException(status_code=422, detail="Provide at least one field to update")
-
-    if "color_hint" in provided:
-        _validate_hex_color(provided["color_hint"], "color_hint")
-
-    try:
-        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
-    except Exception as e:
-        print(f"[update-animation-by-id] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    raw_scenes = row.data.get("raw_scenes") or []
-    current_version = row.data.get("timeline_version", 1)
-
-    found = _find_animation_by_id(raw_scenes, animation_id)
-    if not found:
-        raise HTTPException(status_code=404, detail=f"No animation with id {animation_id} in this video")
-    scene_index, anim_index, scene_id, beat_id = found
-
-    scene = dict(raw_scenes[scene_index])
-    animations = list(scene.get("animations") or [])
-    merged_raw = {**animations[anim_index], **provided, "beat_id": beat_id}
-
-    beats_by_id = {b.get("beat_id"): b for b in (scene.get("beats") or [])}
-    validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id)
-    if not validated:
-        raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
-    validated["id"] = animation_id
-
-    animations[anim_index] = validated
-    scene["animations"] = animations
-    raw_scenes[scene_index] = scene
-
-    timeline_json = build_timeline_from_scenes(raw_scenes)
-    new_version = current_version + 1
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
-
-    try:
-        supabase.table("videos").update({
-            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
-            "final_video_url": None, "render_status": "stale_needs_render",
-            "infographics_list": infographics_list, "text_list": text_list,
-        }).eq("id", video_id).execute()
-    except Exception as e:
-        print(f"[update-animation-by-id] failed to save video {video_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save animation edit")
-
-    return {
-        "video_id": video_id, "animation_id": animation_id, "scene_id": scene_id, "beat_id": beat_id,
-        "animation": validated, "timeline_version": new_version,
-        "infographics_list": infographics_list, "text_list": text_list,
-        "timeline": timeline_json, "needs_render": True,
-    }
-
-
-@app.delete("/timeline/{video_id}/animation/{animation_id}")
-async def delete_animation_by_id(video_id: str, animation_id: int):
+@app.delete("/timeline/{video_id}/overlay/{overlay_id}")
+async def delete_animation_by_id(video_id: str, overlay_id: int):
     """
     Same delete as DELETE .../beat/{beat_id}/animation, but located
-    purely by the animation's stable integer id — this is the "easy
-    deletion" path: a client holding just the `id` from text_list or
-    infographics_list can delete directly, without also tracking which
-    scene/beat it came from.
+    purely by the overlay's stable integer id — this is the "easy
+    deletion" path for BOTH text overlays and infographics: a client
+    holding just the `id` from text_list or infographics_list can delete
+    directly, without also tracking which scene/beat it came from.
     """
     try:
         row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
-        print(f"[delete-animation-by-id] failed to fetch video {video_id}: {e}")
+        print(f"[delete-overlay-by-id] failed to fetch video {video_id}: {e}")
         raise HTTPException(status_code=404, detail="Video not found")
 
     if not row.data:
@@ -12997,9 +12878,9 @@ async def delete_animation_by_id(video_id: str, animation_id: int):
     raw_scenes = row.data.get("raw_scenes") or []
     current_version = row.data.get("timeline_version", 1)
 
-    found = _find_animation_by_id(raw_scenes, animation_id)
+    found = _find_animation_by_id(raw_scenes, overlay_id)
     if not found:
-        raise HTTPException(status_code=404, detail=f"No animation with id {animation_id} in this video")
+        raise HTTPException(status_code=404, detail=f"No overlay with id {overlay_id} in this video")
     scene_index, anim_index, scene_id, beat_id = found
 
     scene = dict(raw_scenes[scene_index])
@@ -13019,11 +12900,11 @@ async def delete_animation_by_id(video_id: str, animation_id: int):
             "infographics_list": infographics_list, "text_list": text_list,
         }).eq("id", video_id).execute()
     except Exception as e:
-        print(f"[delete-animation-by-id] failed to save video {video_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete animation")
+        print(f"[delete-overlay-by-id] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete overlay")
 
     return {
-        "video_id": video_id, "animation_id": animation_id, "scene_id": scene_id, "beat_id": beat_id,
+        "video_id": video_id, "overlay_id": overlay_id, "scene_id": scene_id, "beat_id": beat_id,
         "infographics_list": infographics_list, "text_list": text_list,
         "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
@@ -13447,7 +13328,7 @@ async def delete_scene_content(
     beat_id: Optional[str] = None,
 ):
     """Broll-only. For deleting a text overlay or infographic, use
-    DELETE /timeline/{video_id}/animation/{animation_id} instead — id-only,
+    DELETE /timeline/{video_id}/overlay/{overlay_id} instead — id-only,
     no payload, no need to know which scene/beat it lives on."""
     if beat_id is None:
         raise HTTPException(status_code=422, detail="beat_id is required — content is now beat-owned, not scene-owned")
