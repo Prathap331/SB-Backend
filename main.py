@@ -13443,9 +13443,12 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
 @app.delete("/timeline/{video_id}/scene/{scene_id}/content")
 async def delete_scene_content(
     video_id: str, scene_id: str,
-    content_type: Literal["video", "image", "text", "infographics"],
+    content_type: Literal["video", "image"],
     beat_id: Optional[str] = None,
 ):
+    """Broll-only. For deleting a text overlay or infographic, use
+    DELETE /timeline/{video_id}/animation/{animation_id} instead — id-only,
+    no payload, no need to know which scene/beat it lives on."""
     if beat_id is None:
         raise HTTPException(status_code=422, detail="beat_id is required — content is now beat-owned, not scene-owned")
 
@@ -13466,30 +13469,17 @@ async def delete_scene_content(
         raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
 
     scene = dict(raw_scenes[scene_index])
-    deleted_something = False
 
-    if content_type in ("video", "image"):
-        beats = scene.get("beats") or []
-        beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
-        if beat_idx is None:
-            raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
-        beat = dict(beats[beat_idx])
-        beat["broll_override"] = None
-        beat["preferred_media_type"] = None
-        beat["media"] = {"videos": {"total_results": 0, "results": [], "error": None}, "images": {"total_results": 0, "results": [], "error": None}}
-        beats[beat_idx] = beat
-        scene["beats"] = beats
-        deleted_something = True
-
-    elif content_type in ("text", "infographics"):
-        animations = scene.get("animations") or []
-        remaining = [a for a in animations if a.get("beat_id") != beat_id]
-        if len(remaining) != len(animations):
-            scene["animations"] = remaining
-            deleted_something = True
-
-    if not deleted_something:
-        raise HTTPException(status_code=422, detail=f"Beat {beat_id} in scene {scene_id} has no {content_type} content to delete")
+    beats = scene.get("beats") or []
+    beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+    if beat_idx is None:
+        raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
+    beat = dict(beats[beat_idx])
+    beat["broll_override"] = None
+    beat["preferred_media_type"] = None
+    beat["media"] = {"videos": {"total_results": 0, "results": [], "error": None}, "images": {"total_results": 0, "results": [], "error": None}}
+    beats[beat_idx] = beat
+    scene["beats"] = beats
 
     raw_scenes[scene_index] = scene
 
@@ -14824,6 +14814,13 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
 
     width, height = resolution["width"], resolution["height"]
 
+    # timeline_tracks_by_scene: scene_id -> [broll tracks] (one per beat).
+    # caption_tracks_by_scene: scene_id -> single caption_word track.
+    # animation_tracks_by_scene_beat: scene_id -> {beat_id: animation
+    #   track} — NOT a single track per scene, since a scene can have
+    #   several animated beats (see module docstring, point 1). There is
+    #   no "infographic" track type any more — the timeline only ever
+    #   emits "audio" / "caption_word" / "broll" / "animation".
     timeline_tracks_by_scene = {}
     caption_tracks_by_scene = {}
     animation_tracks_by_scene_beat = {}
