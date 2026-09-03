@@ -9178,30 +9178,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -11497,11 +11473,26 @@ def _align_beats_to_timed_words(beats: list, timed_words: list) -> None:
         b["start"] = prev_end
         b["end"] = max(next_start, prev_end + 0.5)
 
+    # Close every gap between consecutive beats so they form a perfectly
+    # contiguous partition of the scene — not even a millisecond of dead
+    # space. WhisperX leaves small natural silences between a beat's last
+    # word and the next beat's first word; left alone, that stretch has no
+    # broll/animation covering it, and gaps like this compound: instead of
+    # showing as a pause where it belongs, the render pipeline concatenates
+    # beat clips back-to-back and pads the SHORTFALL as a single frozen
+    # hold at the very end of the scene — so broll silently drifts earlier
+    # than the voice for the rest of the scene. Extending each beat's end
+    # to meet the next beat's start (rather than shrinking the next beat's
+    # start) keeps every beat's audio-derived start_sec anchored to the
+    # word that actually begins it.
     for i in range(len(beats) - 1):
         cur_end = beats[i].get("end")
-        nxt_start = beats[i + 1].get("start")
-        if cur_end is not None and nxt_start is not None and nxt_start > cur_end:
-            beats[i]["end"] = nxt_start
+        next_start = beats[i + 1].get("start")
+        if cur_end is None or next_start is None:
+            continue
+        if next_start > cur_end:
+            beats[i]["end"] = next_start
+
 
 async def _fetch_beats_media(beats: list, label_prefix: str) -> None:
     results = await asyncio.gather(*[
@@ -14252,6 +14243,9 @@ def _font_size_for_geometry(geo: dict, text: str) -> int:
 def _build_icon_overlay_drawtext(
     animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
 ) -> Optional[str]:
+    """FFmpeg fallback for overlay_graphic/branding animations — draws the
+    icon's emoji glyph (+ optional label) at geometry_px, with fade in/out
+    and support for single / sequence / cluster / pair icon_layout."""
     icon_name = animation.get("icon_name")
     icons: list[str] = []
     if isinstance(icon_name, str) and icon_name:
@@ -14962,3 +14956,24 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
