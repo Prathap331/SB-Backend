@@ -11751,7 +11751,7 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
 
 
 async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
-    """Used by the /beats/rebuild endpoint: re-runs the Beat Director +
+    """Used by the scene trim endpoint: re-runs the Beat Director +
     Animation Planner for a single scene using the continuity context that
     was captured when the scene was first processed."""
     ctx = scene.get("_beat_director_context") or {
@@ -12254,27 +12254,6 @@ async def edit_video(request: EditVideo):
     }
 
 
-@app.get("/timeline/{video_id}")
-async def get_timeline(video_id: str):
-    try:
-        row = (
-            supabase.table("videos")
-            .select("timeline_json, timeline_version, scene_timings, infographics_list, text_list, broll_list")
-            .eq("id", video_id).single().execute()
-        )
-    except Exception as e:
-        print(f"[get-timeline] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    data = dict(row.data)
-    if data.get("timeline_json"):
-        data["timeline_json"] = _slim_timeline_for_response(data["timeline_json"])
-    return data
-
-
 @app.patch("/timeline/{video_id}")
 async def patch_timeline(video_id: str, patch: TrackPatch):
     try:
@@ -12700,77 +12679,6 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
         "broll_list": broll_list, "infographics_list": infographics_list, "text_list": text_list,
         "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
-
-
-@app.post("/timeline/{video_id}/scene/{scene_id}/beats/rebuild")
-async def rebuild_scene_beats(video_id: str, scene_id: str):
-    try:
-        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
-    except Exception as e:
-        print(f"[rebuild-beats] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    raw_scenes = row.data.get("raw_scenes") or []
-    current_version = row.data.get("timeline_version", 1)
-
-    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
-    if scene_index is None:
-        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
-
-    scene = dict(raw_scenes[scene_index])
-    realigned = False
-
-    has_timed_words = any("start" in w and "end" in w for w in (scene.get("word_segments") or []))
-    voiceover = scene.get("voiceover") or {}
-
-    if not has_timed_words and voiceover.get("url"):
-        print(f"[rebuild-beats] scene {scene_id} has a voiceover but no timed word_segments — re-running WhisperX alignment first")
-        try:
-            scene_timestamps = await _generate_word_timestamps(voiceover["url"])
-            word_segments = scene_timestamps.get("word_segments", [])
-            timed_words = [w for w in word_segments if "start" in w and "end" in w]
-            if timed_words:
-                scene["word_segments"] = word_segments
-                scene["start"] = timed_words[0]["start"]
-                scene["end"] = timed_words[-1]["end"]
-                realigned = True
-            else:
-                print(f"[rebuild-beats][WARN] scene {scene_id}: re-alignment produced no timed words")
-        except Exception as e:
-            print(f"[rebuild-beats][WARN] scene {scene_id}: WhisperX re-alignment failed ({e})")
-    elif not has_timed_words:
-        print(f"[rebuild-beats] scene {scene_id} has no voiceover to re-align against — will produce a single implicit beat")
-
-    scene = await _regenerate_scene_beats_and_animations(scene)
-    raw_scenes[scene_index] = scene
-
-    _ensure_video_has_icon_animation(raw_scenes, _infer_video_category(raw_scenes))
-
-    timeline_json = build_timeline_from_scenes(raw_scenes)
-    new_version = current_version + 1
-    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
-
-    try:
-        supabase.table("videos").update({
-            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
-            "final_video_url": None, "render_status": "stale_needs_render",
-            "infographics_list": infographics_list, "text_list": text_list,
-        }).eq("id", video_id).execute()
-    except Exception as e:
-        print(f"[rebuild-beats] failed to save video {video_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save rebuilt beats")
-
-    return {
-        "video_id": video_id, "scene_id": scene_id, "realigned_word_timing": realigned,
-        "beats": [{"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end")} for b in scene["beats"]],
-        "animations": scene.get("animations"),
-        "infographics_list": infographics_list, "text_list": text_list,
-        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
-    }
-
 
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/animation")
