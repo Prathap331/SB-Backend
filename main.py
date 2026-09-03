@@ -9193,10 +9193,6 @@ from typing import Any, Optional, Literal
 
 import httpx
 import whisperx
-import torch
-from PIL import Image
-import io as _io
-import mobileclip
 from fastapi import HTTPException
 from pydantic import BaseModel
 
@@ -10761,156 +10757,6 @@ def _dedupe_and_trim(items: list, limit: Optional[int] = None) -> list:
     return deduped
 
 
-# =============================================================================
-# MOBILECLIP RERANKING
-#
-# MobileCLIP-S0 (Apple, CVPR 2024) — chosen over base CLIP/TinyCLIP for this
-# self-hosted reranker because it's purpose-built for cheap CPU inference:
-# ~2.8x smaller and ~4.8x faster than OpenAI ViT-B/16 at similar zero-shot
-# accuracy. Loaded via the `mobileclip` package (NOT transformers — this is
-# a different loading path than the old CLIPModel/CLIPProcessor code), which
-# requires:
-#   pip install git+https://github.com/apple/ml-mobileclip.git
-# and a downloaded checkpoint file (there is no HF model-string shortcut
-# here the way there was for TinyCLIP):
-#   hf download apple/MobileCLIP-S0 mobileclip_s0.pt --local-dir /opt/models
-# then point MOBILECLIP_CHECKPOINT_PATH at the downloaded .pt file.
-# =============================================================================
-
-MOBILECLIP_MODEL_ARCH = os.getenv("MOBILECLIP_MODEL_ARCH", "mobileclip_s0")
-MOBILECLIP_CHECKPOINT_PATH = os.getenv("MOBILECLIP_CHECKPOINT_PATH", "/opt/models/mobileclip_s0.pt")
-MOBILECLIP_DEVICE = os.getenv("MOBILECLIP_DEVICE", "cpu")
-
-MOBILECLIP_RERANK_ENABLED = os.getenv("MOBILECLIP_RERANK_ENABLED", "true").lower() == "true"
-
-MOBILECLIP_MIN_VIDEO_SCORE = float(os.getenv("MOBILECLIP_MIN_VIDEO_SCORE", "0.24"))
-MOBILECLIP_MIN_IMAGE_SCORE = float(os.getenv("MOBILECLIP_MIN_IMAGE_SCORE", "0.22"))
-MOBILECLIP_MEDIA_SWITCH_MARGIN = float(os.getenv("MOBILECLIP_MEDIA_SWITCH_MARGIN", "0.03"))
-
-_mobileclip_model = None
-_mobileclip_preprocess = None
-_mobileclip_tokenizer = None
-
-
-def _get_mobileclip():
-    global _mobileclip_model, _mobileclip_preprocess, _mobileclip_tokenizer
-    if _mobileclip_model is None:
-        print(f"[MobileCLIP] loading '{MOBILECLIP_MODEL_ARCH}' from {MOBILECLIP_CHECKPOINT_PATH} on {MOBILECLIP_DEVICE}")
-        model, _, preprocess = mobileclip.create_model_and_transforms(
-            MOBILECLIP_MODEL_ARCH, pretrained=MOBILECLIP_CHECKPOINT_PATH,
-        )
-        model = model.to(MOBILECLIP_DEVICE).eval()
-        tokenizer = mobileclip.get_tokenizer(MOBILECLIP_MODEL_ARCH)
-        _mobileclip_model, _mobileclip_preprocess, _mobileclip_tokenizer = model, preprocess, tokenizer
-    return _mobileclip_model, _mobileclip_preprocess, _mobileclip_tokenizer
-
-
-def _mobileclip_score_images_sync(query_texts: list[str], images: list) -> dict:
-    model, preprocess, tokenizer = _get_mobileclip()
-    pixel_values = torch.stack([preprocess(img) for _cid, img in images]).to(MOBILECLIP_DEVICE)
-    text_tokens = tokenizer(query_texts).to(MOBILECLIP_DEVICE)
-    with torch.no_grad():
-        image_embeds = model.encode_image(pixel_values)
-        text_embeds = model.encode_text(text_tokens)
-        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
-        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-        sims = image_embeds @ text_embeds.T
-        best_per_image = sims.max(dim=-1).values.tolist()
-        if not isinstance(best_per_image, list):
-            best_per_image = [best_per_image]
-    return {images[i][0]: best_per_image[i] for i in range(len(images))}
-
-
-async def _rerank_images_with_mobileclip(query_texts: list[str], image_candidates: list) -> list:
-    if not MOBILECLIP_RERANK_ENABLED or not image_candidates or not query_texts:
-        return image_candidates
-
-    downloaded = []
-    try:
-        async with httpx.AsyncClient() as client:
-            for cand in image_candidates:
-                url = _resolve_broll_file_url(cand, "image")
-                if not url:
-                    continue
-                try:
-                    resp = await client.get(url, timeout=20.0)
-                    resp.raise_for_status()
-                    img = Image.open(_io.BytesIO(resp.content)).convert("RGB")
-                    downloaded.append((str(cand.get("id")), img, cand))
-                except Exception as e:
-                    print(f"[MobileCLIP] failed to download image {cand.get('id')}: {e}")
-    except Exception as e:
-        print(f"[MobileCLIP] image download pass failed entirely, keeping original order: {e}")
-        return image_candidates
-
-    if not downloaded:
-        return image_candidates
-
-    try:
-        scores = await asyncio.to_thread(_mobileclip_score_images_sync, query_texts, [(cid, img) for cid, img, _c in downloaded])
-    except Exception as e:
-        print(f"[MobileCLIP] scoring failed, keeping original order: {e}")
-        return image_candidates
-
-    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], -1.0), reverse=True)
-    ranked_ids = {cid for cid, _img, _c in ranked}
-    result = []
-    for cid, _img, c in ranked:
-        c["_mobileclip_score"] = scores.get(cid)
-        result.append(c)
-    result += [c for c in image_candidates if str(c.get("id")) not in ranked_ids]
-    return result
-
-
-async def _rerank_videos_with_mobileclip(query_texts: list[str], video_candidates: list) -> list:
-    if not MOBILECLIP_RERANK_ENABLED or not video_candidates or not query_texts:
-        return video_candidates
-
-    downloaded = []
-    try:
-        async with httpx.AsyncClient() as client:
-            for cand in video_candidates:
-                url = cand.get("thumbnail")
-                if not url:
-                    continue
-                try:
-                    resp = await client.get(url, timeout=20.0)
-                    resp.raise_for_status()
-                    img = Image.open(_io.BytesIO(resp.content)).convert("RGB")
-                    downloaded.append((str(cand.get("id")), img, cand))
-                except Exception as e:
-                    print(f"[MobileCLIP] failed to download video thumbnail {cand.get('id')}: {e}")
-    except Exception as e:
-        print(f"[MobileCLIP] video thumbnail download pass failed entirely, keeping original order: {e}")
-        return video_candidates
-
-    if not downloaded:
-        return video_candidates
-
-    try:
-        scores = await asyncio.to_thread(_mobileclip_score_images_sync, query_texts, [(cid, img) for cid, img, _c in downloaded])
-    except Exception as e:
-        print(f"[MobileCLIP] video thumbnail scoring failed, keeping original order: {e}")
-        return video_candidates
-
-    ranked = sorted(downloaded, key=lambda t: scores.get(t[0], -1.0), reverse=True)
-    ranked_ids = {cid for cid, _img, _c in ranked}
-    result = []
-    for cid, _img, c in ranked:
-        c["_mobileclip_score"] = scores.get(cid)
-        result.append(c)
-    result += [c for c in video_candidates if str(c.get("id")) not in ranked_ids]
-    return result
-
-
-def _filter_by_min_mobileclip_score(candidates: list, min_score: float) -> list:
-    if not candidates:
-        return candidates
-    if not any(c.get("_mobileclip_score") is not None for c in candidates):
-        return candidates
-    return [c for c in candidates if c.get("_mobileclip_score") is None or c["_mobileclip_score"] >= min_score]
-
-
 async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     empty_result = {
         "videos": {"total_results": 0, "results": [], "error": None},
@@ -10979,55 +10825,18 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     if dropped_img:
         print(f"[edit-video] {label}: dropped {dropped_img} non-landscape image result(s) at fetch time")
 
-    # Dedupe WITHOUT trimming first — score the full pool, then trim to the
-    # display limit AFTER MobileCLIP reranking + relevance filtering below,
-    # so the top N is genuinely the best match rather than just the first N
-    # fetched.
-    videos_full = _dedupe_and_trim(videos_pool)
-    photos_full = _dedupe_and_trim(images_pool)
-
-    if photos_full:
-        photos_full = await _rerank_images_with_mobileclip(keywords, photos_full)
-        pre_relevance_photo_count = len(photos_full)
-        photos_full = _filter_by_min_mobileclip_score(photos_full, MOBILECLIP_MIN_IMAGE_SCORE)
-        dropped_irrelevant_photos = pre_relevance_photo_count - len(photos_full)
-        if dropped_irrelevant_photos:
-            print(f"[MobileCLIP] {label}: dropped {dropped_irrelevant_photos} image candidate(s) below the relevance floor ({MOBILECLIP_MIN_IMAGE_SCORE})")
-    if videos_full:
-        videos_full = await _rerank_videos_with_mobileclip(keywords, videos_full)
-        pre_relevance_video_count = len(videos_full)
-        videos_full = _filter_by_min_mobileclip_score(videos_full, MOBILECLIP_MIN_VIDEO_SCORE)
-        dropped_irrelevant_videos = pre_relevance_video_count - len(videos_full)
-        if dropped_irrelevant_videos:
-            print(f"[MobileCLIP] {label}: dropped {dropped_irrelevant_videos} video candidate(s) below the relevance floor ({MOBILECLIP_MIN_VIDEO_SCORE})")
-
-    # Trim to the display/storage limit only now, AFTER scoring — the pool
-    # is already sorted best-first by _rerank_*_with_mobileclip.
-    videos = videos_full[:PEXELS_SCENE_RESULT_LIMIT]
-    photos = photos_full[:PEXELS_SCENE_RESULT_LIMIT]
+    # No reranking model — dedupe the per-keyword Pexels results and keep
+    # the top N in whatever order they were returned (keyword order, then
+    # within-keyword result order).
+    videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
+    photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
 
     videos_error = "; ".join(video_errors) if video_errors and not videos else None
     images_error = "; ".join(image_errors) if image_errors and not photos else None
 
-    best_video_score = videos[0].get("_mobileclip_score") if videos else None
-    best_image_score = photos[0].get("_mobileclip_score") if photos else None
-    force_image_fallback = (
-        best_video_score is not None and best_video_score < MOBILECLIP_MIN_VIDEO_SCORE
-        and best_image_score is not None and best_image_score >= MOBILECLIP_MIN_IMAGE_SCORE
-    )
-    if force_image_fallback:
-        print(
-            f"[MobileCLIP] {label}: best video scored {best_video_score:.3f} "
-            f"(below {MOBILECLIP_MIN_VIDEO_SCORE}) — falling back to image "
-            f"(scored {best_image_score:.3f}) instead of an inaccurate video"
-        )
-
     return {
         "videos": {"total_results": len(videos), "results": videos, "error": videos_error},
         "images": {"total_results": len(photos), "results": photos, "error": images_error},
-        "force_image_fallback": force_image_fallback,
-        "best_video_score": best_video_score,
-        "best_image_score": best_image_score,
     }
 
 
@@ -11124,19 +10933,6 @@ def _resolve_beat_broll_selection(beat: dict) -> tuple:
 
     best_video = video_candidates[0] if video_candidates else None
     best_image = image_candidates[0] if image_candidates else None
-    video_score = best_video.get("_mobileclip_score") if best_video else None
-    image_score = best_image.get("_mobileclip_score") if best_image else None
-
-    if video_score is not None and image_score is not None:
-        video_is_weak = video_score < MOBILECLIP_MIN_VIDEO_SCORE
-        image_is_usable = image_score >= MOBILECLIP_MIN_IMAGE_SCORE
-        if video_is_weak and image_is_usable:
-            return best_image, "image"
-
-        if image_score > video_score + MOBILECLIP_MEDIA_SWITCH_MARGIN:
-            return best_image, "image"
-        if video_score > image_score + MOBILECLIP_MEDIA_SWITCH_MARGIN:
-            return best_video, "video"
 
     preferred = beat.get("preferred_media_type")
     if preferred == "image":
@@ -11503,9 +11299,6 @@ async def _fetch_beats_media(beats: list, label_prefix: str) -> None:
     ])
     for b, media in zip(beats, results):
         b["media"] = media
-        if media.get("force_image_fallback") and b.get("preferred_media_type") != "image":
-            print(f"[edit-video] beat {b['beat_id']}: overriding to 'image' (MobileCLIP accuracy gate: video too weak a match)")
-            b["preferred_media_type"] = "image"
 
 
 def _dedupe_beats_media_across_scene(beats: list) -> None:
