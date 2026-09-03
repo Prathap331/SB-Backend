@@ -14679,7 +14679,25 @@ async def _render_scene(
                 if b_start_sec is None or b_end_sec is None:
                     b_start_sec, b_end_sec = start_sec, end_sec
 
-                beat_duration_frames = max(round((b_end_sec - b_start_sec) * fps), 1)
+                # Derive this beat's frame count from the frame boundaries
+                # build_timeline_from_scenes already computed (startFrame/
+                # endFrame), instead of re-deriving from beat_start_sec/
+                # beat_end_sec with an independent round() here. Those
+                # frame boundaries come from one shared cumulative counter
+                # there, so consecutive beats' frames always sum to exactly
+                # the scene's total duration_frames with zero drift.
+                # Re-rounding each beat's own (b_end_sec - b_start_sec)
+                # separately here does NOT carry that guarantee — summed
+                # rounding error let beat clips fall short of the scene's
+                # actual audio length, which showed up as the render
+                # freezing on the last frame while the voiceover kept
+                # playing underneath for the remainder of the scene.
+                track_start_frame = beat_track.get("startFrame")
+                track_end_frame = beat_track.get("endFrame")
+                if track_start_frame is not None and track_end_frame is not None:
+                    beat_duration_frames = max(track_end_frame - track_start_frame, 1)
+                else:
+                    beat_duration_frames = max(round((b_end_sec - b_start_sec) * fps), 1)
 
                 beat_selected = beat_track.get("selected_asset")
                 beat_broll_track = {"selected_asset": None}
@@ -15029,3 +15047,26 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
