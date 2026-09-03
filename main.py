@@ -9178,6 +9178,9 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
 import re
 import os
 import json
@@ -12058,6 +12061,54 @@ async def _rebuild_fragment_beats(scene: dict, local_start: float, local_end: fl
 # Timeline building
 # ---------------------------------------------------------------------------
 
+_PHRASE_MATCH_PUNCT_RE = re.compile(r"[^\w\s]")
+
+
+def _normalize_phrase_word(w: str) -> str:
+    return _PHRASE_MATCH_PUNCT_RE.sub("", w or "").lower().strip()
+
+
+def _find_phrase_start_sec(
+    target_text: Optional[str], timed_words: list, search_start: float, search_end: float,
+) -> Optional[float]:
+    """Finds when `target_text` is actually spoken, by matching it against
+    word-level timestamps within [search_start, search_end] (a beat's own
+    span). Returns the start time of the first matching word, or None if no
+    confident match is found — callers should fall back to the beat's own
+    start in that case. Matching is on normalized (lowercased, punctuation-
+    stripped) words, and only requires the first few words of the phrase to
+    line up consecutively, since target_text can be a light paraphrase of
+    the narration rather than a byte-exact quote (highlight_target_text is
+    verbatim per the Animation Planner prompt, but display_text is not
+    guaranteed to be)."""
+    if not target_text or not timed_words:
+        return None
+    target_words = [_normalize_phrase_word(w) for w in target_text.split()]
+    target_words = [w for w in target_words if w]
+    if not target_words:
+        return None
+
+    window = [
+        w for w in timed_words
+        if "start" in w and "end" in w and w["start"] >= search_start - 0.05 and w["start"] < search_end + 0.05
+    ]
+    window_norm = [_normalize_phrase_word(w.get("word", "")) for w in window]
+    n = len(window_norm)
+    if n == 0:
+        return None
+
+    required_matches = min(len(target_words), 3)
+    for i in range(n):
+        matched = 0
+        for j, target_word in enumerate(target_words):
+            if i + j >= n or window_norm[i + j] != target_word:
+                break
+            matched += 1
+        if matched >= required_matches:
+            return window[i]["start"]
+    return None
+
+
 def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
     tracks = []
     cumulative_frames = 0
@@ -12082,6 +12133,7 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             })
 
         word_segments = scene.get("word_segments") or []
+        timed_words_sec = [w for w in word_segments if "start" in w and "end" in w]
         words = []
         for w in word_segments:
             if "start" not in w or "end" not in w:
@@ -12157,8 +12209,29 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 continue
             b_start_frame, b_end_frame = rng
             anim_span = b_end_frame - b_start_frame if b_end_frame > b_start_frame else animation.get("duration_frames", 90)
+            upper_bound_frame = b_start_frame + max(anim_span, 1)
+
             anim_start_frame = b_start_frame
-            anim_end_frame = min(b_start_frame + animation.get("duration_frames", 90), b_start_frame + max(anim_span, 1))
+            if animation.get("trigger") == "on_keyword":
+                # "on_keyword" means this overlay is supposed to appear when
+                # a specific phrase is actually spoken, not just whenever
+                # its beat happens to start. Find that phrase in the word-
+                # level timestamps and anchor to it — otherwise a beat with
+                # several sentences can show (and finish) an overlay well
+                # before the narration ever reaches the words it's for.
+                target_beat = next((bt for bt in beats if bt.get("beat_id") == beat_id), None)
+                beat_start_sec = target_beat.get("start") if target_beat else None
+                beat_end_sec = target_beat.get("end") if target_beat else None
+                if beat_start_sec is not None and beat_end_sec is not None:
+                    target_text = animation.get("highlight_target_text")
+                    if not target_text and isinstance(animation.get("display_text"), str):
+                        target_text = animation.get("display_text")
+                    matched_sec = _find_phrase_start_sec(target_text, timed_words_sec, beat_start_sec, beat_end_sec)
+                    if matched_sec is not None:
+                        candidate_frame = scene_start_frame + _seconds_to_frames(matched_sec - start_sec, fps)
+                        anim_start_frame = max(b_start_frame, min(candidate_frame, b_end_frame))
+
+            anim_end_frame = min(anim_start_frame + animation.get("duration_frames", 90), upper_bound_frame)
             # Defensive clamp: b_start_frame/b_end_frame are already bounded
             # to [scene_start_frame, scene_end_frame], so this is normally
             # redundant — but never let an animation's computed frames slip
@@ -14956,24 +15029,3 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
