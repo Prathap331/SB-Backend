@@ -9181,6 +9181,47 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import re
 import os
 import json
@@ -12005,13 +12046,16 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             upper_bound_frame = b_start_frame + max(anim_span, 1)
 
             anim_start_frame = b_start_frame
-            if animation.get("trigger") == "on_keyword":
-                # "on_keyword" means this overlay is supposed to appear when
-                # a specific phrase is actually spoken, not just whenever
-                # its beat happens to start. Find that phrase in the word-
-                # level timestamps and anchor to it — otherwise a beat with
-                # several sentences can show (and finish) an overlay well
-                # before the narration ever reaches the words it's for.
+            # Anchor to the actual spoken moment whenever we have a strong
+            # signal to do so: either the Animation Planner marked this
+            # "on_keyword", OR it carries highlight_target_text (a document/
+            # quote highlight is meant to appear roughly when its source is
+            # actually referenced, regardless of what trigger label the
+            # planner happened to assign it — the presence of a verbatim
+            # quoted phrase is itself the strongest signal, stronger than
+            # trusting `trigger` alone).
+            has_target_text = bool(animation.get("highlight_target_text"))
+            if animation.get("trigger") == "on_keyword" or has_target_text:
                 target_beat = next((bt for bt in beats if bt.get("beat_id") == beat_id), None)
                 beat_start_sec = target_beat.get("start") if target_beat else None
                 beat_end_sec = target_beat.get("end") if target_beat else None
@@ -14840,26 +14884,3 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
