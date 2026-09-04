@@ -9191,37 +9191,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -9328,66 +9297,6 @@ def _video_is_landscape(v: dict) -> bool:
 def _image_is_landscape(p: dict) -> bool:
     return _resolve_broll_file_url(p, "image") is not None
 
-
-
-SCRIPT_SCENE_PROMPT = """ 
-You are Storybit's Scene Planner. Classify the entire documentary script once
-and divide its narration into canonical semantic scenes.
-
-RETURN JSON ONLY.
-
-CATEGORY: choose exactly one category from {list(STYLE_PROFILES.keys())}, using
-the entire script and STYLE_PROFILES descriptions. If none clearly fits,
-choose general_documentary.
-
-LANGUAGE: detect script_language from the actual narration as ISO 639-1.
-
-SCENE LENGTH — CRITICAL:
-Normal target = 260–280 spoken words, approximately 2 minutes at 130–140 WPM.
-This is a planning constraint, NOT actual playback timing.
-- Never exceed 280 words in a normal scene.
-- Prefer 260–280 words.
-- Below 260 is allowed only for a genuinely short script, the final/remainder
-  scene, or a strong semantic boundary where merging would damage coherence.
-- Rebalance nearby boundaries when a remainder below 260 can be avoided without
-  exceeding 280.
-- Do not split mechanically at 260; semantic coherence wins within the hard
-  280-word maximum.
-
-SOURCE INTEGRITY:
-Use 0-based character offsets with exclusive end:
-original_script[char_start:char_end] == vo_text.
-Every scene must be contiguous, ordered, non-overlapping, and together cover
-the complete original narration. Never paraphrase, translate, normalize,
-reorder, drop, or duplicate narration.
-
-VISUAL FIELDS:
-visual_intent = concise grounded documentary direction.
-on_screen_text = short viewer-facing text grounded in source, or "".
-animation_preference = avoid | optional | strong. It is NOT a veto.
-scene_animation_density = low | medium | high.
-broll_keywords = 5–6 distinct English retrieval seed phrases, 2–6 words each.
-estimated_duration_seconds is advisory only.
-
-OUTPUT:
-{{
-  "category": "business",
-  "script_language": "en",
-  "scenes": [{{
-    "scene_id": "s1",
-    "source_range": {{"char_start": 0, "char_end": 812,
-                     "word_start": 0, "word_end": 145}},
-    "vo_text": "Exact contiguous source substring.",
-    "visual_intent": "Grounded documentary visual direction.",
-    "on_screen_text": "",
-    "animation_preference": "optional",
-    "scene_animation_density": "medium",
-    "estimated_duration_seconds": 120,
-    "broll_keywords": ["specific subject", "relevant location",
-                       "related activity", "contextual view", "detail view"]
-  }}]
-}}
-"""
 
 
 STYLE_PROFILES = {
@@ -9604,6 +9513,79 @@ STYLE_PROFILES = {
 }
 
 
+SCRIPT_SCENE_PROMPT = f"""
+You are Storybit's Scene Planner. Classify the entire documentary script once
+and divide its narration into canonical semantic scenes.
+
+RETURN JSON ONLY.
+
+CATEGORY: choose exactly one category from {list(STYLE_PROFILES.keys())}, using
+the entire script and the category descriptions below. If none clearly fits,
+choose general_documentary.
+
+Category reference (use this to judge fit, do not invent new categories):
+{ {k: v['description'] for k, v in STYLE_PROFILES.items()} }
+
+LANGUAGE: detect script_language from the actual narration as ISO 639-1.
+
+SCENE LENGTH — CRITICAL:
+Normal target = 260–280 spoken words, approximately 2 minutes at 130–140 WPM.
+This is a planning constraint, NOT actual playback timing.
+- Never exceed 280 words in a normal scene.
+- Prefer 260–280 words.
+- Below 260 is allowed only for a genuinely short script, the final/remainder
+  scene, or a strong semantic boundary where merging would damage coherence.
+- Rebalance nearby boundaries when a remainder below 260 can be avoided without
+  exceeding 280.
+- Do not split mechanically at 260; semantic coherence wins within the hard
+  280-word maximum.
+
+SOURCE INTEGRITY:
+Use 0-based character offsets with exclusive end:
+original_script[char_start:char_end] == vo_text.
+Every scene must be contiguous, ordered, non-overlapping, and together cover
+the complete original narration. Never paraphrase, translate, normalize,
+reorder, drop, or duplicate narration.
+
+VISUAL FIELDS:
+visual_intent = concise grounded documentary direction: name the concrete
+subjects/locations/eras this scene should show, not a mood word. Prefer
+real-world imagery matching the category's footage_style over abstract or
+stock-generic phrasing.
+on_screen_text = short viewer-facing text grounded in source, or "".
+animation_preference = avoid | optional | strong. It is NOT a veto — it is
+input to the Animation Director's own judgment. Use "strong" when the scene
+has a named statistic, a direct quote, a defined list, or a clear thematic
+turn that deserves emphasis; "avoid" only when animation would genuinely
+distract (e.g. a raw emotional beat that should breathe); "optional"
+otherwise.
+scene_animation_density = low | medium | high.
+broll_keywords = 5–6 distinct English retrieval seed phrases, 2–6 words each,
+each targeting a different concrete visual angle on this scene (not 5
+rewordings of the same shot).
+estimated_duration_seconds is advisory only.
+
+OUTPUT:
+{{
+  "category": "business",
+  "script_language": "en",
+  "scenes": [{{
+    "scene_id": "s1",
+    "source_range": {{"char_start": 0, "char_end": 812,
+                     "word_start": 0, "word_end": 145}},
+    "vo_text": "Exact contiguous source substring.",
+    "visual_intent": "Grounded documentary visual direction.",
+    "on_screen_text": "",
+    "animation_preference": "optional",
+    "scene_animation_density": "medium",
+    "estimated_duration_seconds": 120,
+    "broll_keywords": ["specific subject", "relevant location",
+                       "related activity", "contextual view", "detail view"]
+  }}]
+}}
+"""
+
+
 BEAT_KEYWORDS_PROMPT = """
 
 You are Storybit's Beat Director for one canonical scene.
@@ -9613,68 +9595,75 @@ RETURN JSON ONLY.
 INPUT:
 category, style_profile, script_language, scene_id, scene_visual_intent,
 scene_animation_density, scene_on_screen_text, scene_vo_text,
-scene_source_range, previous_scene_last_media_type, and continuity_state.
+previous_scene_last_media_type, known_entities, and known_setting.
 
 Split the scene into variable semantic visual beats. Typical planning target is
 8–20 spoken seconds; it is NOT authoritative timing. Do not split mid-thought
 just to hit a duration target.
 
 SOURCE INTEGRITY:
-Every beat must be an exact contiguous substring of scene_vo_text using
-0-based exclusive character ranges. Beats must be ordered, non-overlapping,
-and cover the entire scene narration exactly.
+Every beat's vo_text must be an exact contiguous substring of scene_vo_text.
+Beats must be ordered, non-overlapping, and together cover the entire scene
+narration exactly — every word appears in exactly one beat, in order.
 
 KEYWORDS:
 Return 5–6 distinct English retrieval phrases per beat, 2–6 words each.
 They must be concrete, photographable, and grounded in the literal narration.
-Never invent names, facts, dates, locations, actions, or subjects.
-For real people use the actual name plus useful context. For fictional
-characters do NOT search the invented name; search setting/archetype/action.
+Never invent names, facts, dates, locations, actions, or subjects. Each
+phrase should target a genuinely different visual angle (wide vs. close,
+subject vs. action vs. setting) — never 5 rewordings of the same shot.
+For real people use the actual name plus useful context (era/role/setting).
+For fictional characters do NOT search the invented name; search the
+setting/archetype/action/mood the beat implies instead.
 
 MEDIA:
 video = motion, process, action, change over time.
 image = static subject, portrait, document, archival frame, data point, quote.
-Variety is a preference, never a quota.
+Variety is a preference, never a quota — do not force alternation if the
+content clearly calls for two videos or two images in a row.
 
 ENTITY CONTINUITY:
-Use stable canonical entity identity from continuity_state. Reuse entity_type;
-do not silently switch real_person and fictional_character. Resolve aliases or
-pronouns only when supported. Recurring entities need not be repeated every
-beat.
+Use stable canonical entity identity from known_entities. Reuse entity_type;
+do not silently switch real_person and fictional_character for a name that
+already appeared. Resolve aliases or pronouns only when clearly supported by
+the text. Recurring entities need not be repeated every beat — only list
+what's new or freshly relevant in THIS beat.
 
 SETTING CONTINUITY:
-Track location and time_period. Inherit unchanged settings; represent explicit
-moves in the narration. Never invent a new setting.
+Track location and time_period via known_setting. Inherit unchanged settings;
+represent explicit moves in the narration. Never invent a new setting the
+text doesn't support.
 
-ANIMATION:
-animation_signal is only a proposal to Step 3. It does not create a quota and
-does not veto Step 3.
+ANIMATION SIGNAL:
+animation_signal is only a proposal for the Animation Director. It does not
+create a quota and does not veto the Director's own judgment. Set
+needs_animation based on whether THIS beat's content would genuinely benefit
+from emphasis (a number, a named thing, a listed set, a turn) — weigh this
+against scene_animation_density.
 
 QUOTED SOURCE:
-source_type = quoted_source only when narration explicitly presents/attributes
-a source or quotation. quoted_excerpt must be an exact substring of vo_text.
+source_type = quoted_source only when narration explicitly presents or
+attributes a source, study, or quotation (e.g. "a report from X found...",
+"as Y argues in Z"). quoted_excerpt must be an exact substring of vo_text.
 source_name_guess must be grounded in vo_text or null.
 
 OUTPUT:
 {
   "beats": [{
     "beat_id": "s1_b1",
-    "source_range": {"char_start": 0, "char_end": 220,
-                     "word_start": 0, "word_end": 41},
     "vo_text": "Exact contiguous source substring.",
-    "visual_intent": "What should be visually communicated.",
+    "visual_intent": "What should be visually communicated in this beat specifically.",
     "estimated_duration_seconds": 18,
     "keywords": ["specific action", "relevant location",
                   "contextual view", "close detail", "related activity"],
     "media_type": "video",
     "entities": [{
-      "entity_id": "e1", "canonical_name": "Example Person",
-      "aliases": [], "entity_type": "real_person"
+      "name": "Example Person", "entity_type": "real_person"
     }],
     "scene_direction": {
       "setting": {"location": "", "time_period": ""},
       "mood": "neutral",
-      "key_action": "What should be shown."
+      "key_action": "What should be shown occurring, not what's being said."
     },
     "animation_signal": {
       "needs_animation": false,
@@ -9688,9 +9677,9 @@ OUTPUT:
     }
   }]
 }
-
 Do not output pixels, frame counts, renderer commands, arbitrary colors, or
-executable rendering instructions.
+executable rendering instructions — that is the Animation Director's job,
+not yours.
 """
 
 
@@ -9785,42 +9774,91 @@ _ICON_GROUP_BY_CATEGORY = {
 }
 
 
+_FALLBACK_ACCENT_COLORS = [
+    "#5B9BD5",  # blue
+    "#E07A5F",  # terracotta
+    "#81B29A",  # sage green
+    "#F2C94C",  # warm yellow — kept, but now just one option among several, not the only one
+    "#9B7EDE",  # violet
+    "#E8A87C",  # amber
+]
+
+
+def _pick_fallback_color(beat_id: Optional[str]) -> str:
+    """Rotates through a small palette instead of one hardcoded hex, keyed
+    on beat_id so the same beat always gets the same color across repeat
+    validation. This exists specifically because every other color_hint
+    default in this file used to be the identical "#F5A623" — the fallback
+    icon, the invalid/missing-color validation default, AND the example in
+    ANIMATION_PLANNER_PROMPT all converged on the same yellow, which is
+    almost certainly why generated videos ended up with everything yellow
+    regardless of what the model actually intended."""
+    idx = sum(ord(c) for c in (beat_id or "")) % len(_FALLBACK_ACCENT_COLORS)
+    return _FALLBACK_ACCENT_COLORS[idx]
+
+
 def _pick_fallback_icon(category: str) -> str:
     group = _ICON_GROUP_BY_CATEGORY.get(category, "general_ui")
     icons = _ICON_LIBRARY_GROUPS.get(group) or _ICON_LIBRARY_GROUPS["general_ui"]
     return icons[0]
 
 
+_FALLBACK_ICON_PLACEMENTS = ["top_right", "top_left", "center_right", "center_left"]
+
+
+def _fallback_icon_geometry(placement: str) -> tuple[dict, dict]:
+    """Corner geometry for the fallback icon, sized larger than the old
+    fixed 160px top-right box felt (still 160px here, but now genuinely
+    varied) — center_left/center_right sit vertically mid-frame, clear of
+    both the top edge and the caption safe zone at the bottom."""
+    size = 160
+    if placement == "top_left":
+        x, y = _SAFE_MARGIN, _SAFE_MARGIN
+    elif placement == "center_left":
+        x, y = _SAFE_MARGIN, CANVAS_HEIGHT // 2 - size // 2
+    elif placement == "center_right":
+        x, y = CANVAS_WIDTH - _SAFE_MARGIN - size, CANVAS_HEIGHT // 2 - size // 2
+    else:  # top_right, and default
+        x, y = CANVAS_WIDTH - _SAFE_MARGIN - size, _SAFE_MARGIN
+    geometry = {"x": x, "y": y, "width": size, "height": size}
+    motion = {
+        "start_xy_px": [x, y - 20],
+        "end_xy_px": [x, y],
+        "motion_style": "pop-in with slight bounce, scale 80% to 100%",
+    }
+    return geometry, motion
+
+
 def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
     """Guaranteed icon_pop_in for a scene that came back from the
     Animation Planner with zero icon-bearing animations. Kept intentionally
     plain — a small pop-in icon, not competing for the same visual weight
-    as a model-authored animation."""
+    as a model-authored animation. Placement rotates across a beat's own
+    index so a video that leans on this fallback more than once doesn't
+    end up with every fallback icon parked in the same corner."""
     icon = _pick_fallback_icon(category)
     key_action = ((beat.get("scene_direction") or {}).get("key_action") or "").strip()
     on_screen_words = key_action.split()
     label = " ".join(on_screen_words[:4]) if on_screen_words else None
     est_seconds = beat.get("estimated_duration_seconds") or 3
     duration_frames = max(30, min(90, int(est_seconds * TIMELINE_FPS * 0.4)))
+    placement = _FALLBACK_ICON_PLACEMENTS[beat.get("beat_index", 0) % len(_FALLBACK_ICON_PLACEMENTS)]
+    geometry_px, motion = _fallback_icon_geometry(placement)
     return {
         "beat_id": beat["beat_id"],
         "animation_type": "icon_pop_in",
-        "placement": "top_right",
-        "geometry_px": {"x": 1696, "y": 64, "width": 160, "height": 160},
-        "motion": {
-            "start_xy_px": [1696, 44],
-            "end_xy_px": [1696, 64],
-            "motion_style": "pop-in with slight bounce, scale 80% to 100%",
-        },
+        "placement": placement,
+        "geometry_px": geometry_px,
+        "motion": motion,
         "duration_frames": duration_frames,
         "content_binding": f"fallback_icon:{icon}",
         "icon_name": icon,
         "icon_layout": None,
         "display_text": label,
-        "color_hint": "#F5A623",
+        "color_hint": _pick_fallback_color(beat.get("beat_id")),
         "highlight_target_text": None,
         "render_prompt": (
-            f"A small '{icon}' icon pops in top-right with a light bounce and holds briefly. "
+            f"A small '{icon}' icon pops in at the {placement.replace('_', ' ')} with a light bounce and holds briefly. "
             "Kept understated so it doesn't compete with the beat's main visual."
         ),
         "trigger": "on_beat",
@@ -9943,23 +9981,14 @@ def _icon_glyph(icon_name: str) -> str:
 
 
 
-ANIMATION_CANVAS_WIDTH = 1920
-ANIMATION_CANVAS_HEIGHT = 1080
-CAPTION_SAFE_ZONE_Y = 918  
-
-PLACEMENT_ANCHORS_PX = {
-    "top_left": (64, 64), "top_center": (960, 64), "top_right": (1856, 64),
-    "center_left": (64, 540), "center": (960, 540), "center_right": (1856, 540),
-    "bottom_left": (64, 854), "bottom_center": (960, 854), "bottom_right": (1856, 854),
-    "full_frame": (0, 0),
-}
-
-
 CANVAS_WIDTH = 1920
 CANVAS_HEIGHT = 1080
+ANIMATION_CANVAS_WIDTH = CANVAS_WIDTH
+ANIMATION_CANVAS_HEIGHT = CANVAS_HEIGHT
 _SAFE_MARGIN = 64
-_CAPTION_BAND_HEIGHT = round(CANVAS_HEIGHT * 0.15)  
+_CAPTION_BAND_HEIGHT = round(CANVAS_HEIGHT * 0.15)
 _CAPTION_BAND_TOP_Y = CANVAS_HEIGHT - _CAPTION_BAND_HEIGHT
+CAPTION_SAFE_ZONE_Y = _CAPTION_BAND_TOP_Y
 
 PLACEMENT_ANCHORS_PX = {
     "top_left": (_SAFE_MARGIN, _SAFE_MARGIN),
@@ -10026,6 +10055,56 @@ branding category), every icon_name value must come from this fixed set —
 nothing outside it will resolve to a real component prop:
 {sorted(_ICON_VOCAB)}
 
+ICON RELEVANCE IS NON-NEGOTIABLE: an icon must visually represent the
+literal subject, action, or concept named in THIS beat's vo_text/
+key_subject/key_action — never a generic decorative choice. Before picking
+an icon, identify the single concrete noun or action the beat is actually
+about, then pick the closest matching icon from the vocabulary for that
+specific thing (e.g. a beat about a court ruling → "gavel" or "scale", not
+"star"; a beat about a discovered fossil → "search" or a science-group
+icon, not "sparkles"; a beat naming a specific dollar figure → "dollar-sign"
+or "trending-up", not "check"). If nothing in the vocabulary is a close
+semantic match for this beat's specific content, prefer a different
+animation_type entirely (text-based) over forcing an irrelevant icon in —
+a well-chosen full_screen_quote_card beats a mismatched icon every time.
+
+Ban on filler icons: "puzzle", "sparkles", "target", "lightbulb", "check",
+and "star" are the most commonly overused icons because they feel like they
+could apply to almost anything ("puzzle" for "piecing together evidence",
+"lightbulb" for any abstract idea). That vagueness is exactly why they are
+usually WRONG — a beat about a specific physical tool, artifact, or bone
+needs an icon of that literal thing's category (see the vocabulary groups),
+not a metaphor icon. Reach for one of these six only when the beat is
+genuinely abstract with no concrete physical referent at all (e.g. "an
+open question remained" → "puzzle" is defensible; "a stone tool found in
+the dirt" → it is not — use a science/tool-adjacent icon or skip the icon
+in favor of a text treatment instead).
+
+Placement must be a deliberate choice, not a default: do not place every
+icon/overlay at "top_center" — or, worse, dead "center" — out of habit.
+"center" in particular puts the overlay directly on top of whatever the
+B-roll's main subject is doing (a machine, a person, the thing the beat is
+actually about), which is the single worst placement available. Neither
+is a safe default — both read as amateurish, especially when one lands
+dead-center over the middle of the shot and visually fights the B-roll's
+own subject. Actually look at what a beat's footage likely shows (a
+close-up subject fills the center; wide shots leave the corners empty) and
+choose the placement that keeps the icon out of the way of where the main
+visual interest will be — corners (top_left, top_right, center_left,
+center_right) read as "overlay annotating the shot" far more often than
+top_center does. Vary placement across the scene's animated beats so
+consecutive overlays don't all cluster in the same spot (this is also
+required by the "Vary treatment across beats" rule below).
+
+Icon animations should look designed, not bare: pair every icon with a
+short, punchy display_text label when the concept benefits from one (most
+do) rather than shipping an icon alone with nothing to anchor its meaning
+— a floating unlabeled glyph reads as an afterthought. Size geometry_px
+generously enough to read as an intentional graphic element (prefer the
+160-220px range for a standalone icon_pop_in, not the tiny end of the
+40px floor) and pick color_hint deliberately per the mood-aware styling
+guidance above rather than defaulting to the same accent color every time.
+
 Mixing icons for richer visuals: you are not limited to one icon per
 animation. icon_name may be either a single string (the common case) or
 an array of 2-4 icon names when a beat's content genuinely benefits from
@@ -10068,17 +10147,30 @@ this scene have animation treatment AT ALL" decision; it overrides
 everything below. Only proceed past this point if requires_animation is
 true.
 
+Icon requirement (applies whenever requires_animation is true): this scene
+MUST include at least one animation whose category is "overlay_graphic" or
+"branding" (i.e. one that carries a non-null icon_name) on some beat — this
+is a floor, not a suggestion, and it holds even for categories whose
+favored_animation_types/avoided_animation_types lean away from icons.
+Choose the beat where an icon is a genuinely strong content match (see ICON
+RELEVANCE above) rather than bolting one onto an arbitrary beat, and prefer
+icon_pop_in, icon_sequence, or arrow_highlight unless the content calls for
+something else in that category. This requirement stacks with, and does
+not replace, whatever other full_screen/overlay_text animations the
+scene's density and content call for elsewhere.
+
 For each beat, decide whether it actually gets an animation. The beat's
 animation_signal is a PROPOSAL from an earlier step, not a final decision —
 you may accept it, reject it (needs_animation was true but you judge it
 unnecessary), or add one it didn't flag, if the scene's overall
 animation_density budget calls for it. As a guide: "low" density scenes
 should end up with animation on roughly one beat, "medium" on a couple,
-"high" on most beats — but use judgment over rigid counts.
+"high" on most beats — but use judgment over rigid counts. The icon
+requirement above still applies regardless of density.
 
 Prefer favored_animation_types for this category and avoid
 avoided_animation_types unless the specific beat content overrides that
-default.
+default — except for the icon requirement above, which always wins.
 
 Vary treatment across beats within the scene — do not give consecutive
 animated beats the same animation_type/placement combination back to back
@@ -10088,6 +10180,26 @@ scene boundary: if this scene's first animated beat would otherwise match
 previous_scene_last_animation's animation_type AND placement exactly,
 change at least one of the two unless the content clearly calls for
 repeating it.
+
+Sync is critical — set `trigger` honestly, it drives real timing: this is
+not decorative metadata, the rendering pipeline uses `trigger` to decide
+WHEN in the beat your animation actually appears.
+- Use "on_keyword" whenever this animation is tied to a specific word or
+  phrase being spoken (a named quote, a statistic, a defined term, the
+  exact moment key_subject is said) — and when you do, display_text (or
+  highlight_target_text for quoted-source treatments) MUST be an exact or
+  near-exact substring of this beat's vo_text, because the renderer
+  locates the animation's start time by matching that text against the
+  actual word-level speech timestamps. A paraphrase that doesn't appear in
+  vo_text cannot be time-matched and will silently fall back to the
+  beat's start — so if you mean "show this exactly when it's said," quote
+  the words as they're actually spoken.
+- Use "on_beat" only for animations that characterize the whole beat
+  (a mood wash, a scene-setting title card) rather than a single moment
+  within it.
+- Never set "on_keyword" on an animation whose display_text is an
+  invented summary rather than words from vo_text — that combination
+  guarantees mistimed playback.
 
 Text sizing: keep display_text short enough to comfortably fit
 geometry_px at a readable size. As a rule of thumb, assume roughly 14-18
@@ -10106,7 +10218,8 @@ real page's layout is unknown to you in advance, do NOT invent pixel
 coordinates for the highlight itself — instead:
 - set highlight_target_text to the quoted_excerpt exactly as given, so a
   downstream text-locating step (OCR/text search over the captured
-  screenshot) can find and highlight it precisely;
+  screenshot, and the same phrase-timing match described above) can find
+  and highlight it precisely and time it correctly;
 - use render_prompt only to describe the highlight STYLE and timing (e.g.
   "yellow marker-style highlight sweeps left to right under the sentence,
   starting 1s after the screenshot appears, holding for the rest of the
@@ -10174,7 +10287,8 @@ Return exactly one JSON object, nothing else — no markdown, no code fences:
       "icon_name": "lightbulb",
       "icon_layout": null,
       "display_text": null,
-      "color_hint": "#F5A623",
+      "color_hint": "#5B9BD5",
+      "background_color_hint": null,
       "highlight_target_text": null,
       "render_prompt": "A lightbulb icon pops in from 80% scale to 100% with a slight bounce, positioned top-right, appearing exactly as the word 'idea' is spoken; icon uses the video's accent color; holds for 1.5s then fades.",
       "render_engine_hint": "remotion"
@@ -10219,10 +10333,24 @@ bullet_list_reveal or icon_sequence when each item needs its own label.
 null for animation types with no on-screen text (e.g. a plain
 ken_burns_pan_zoom with no overlay copy).
 
-color_hint: a hex color string (e.g. "#F5A623"), always required — the
-accent color for this animation, chosen to fit the category's
-footage_style/tone unless the specific beat content calls for something
-else (e.g. a red accent for a warning statistic).
+color_hint: a hex color string (e.g. "#F5A623" for one animation, "#5B9BD5"
+for another), always required — the accent color for this animation,
+chosen to fit the category's footage_style/tone unless the specific beat
+content calls for something else (e.g. a red accent for a warning
+statistic). Do NOT reuse the same hex value across every animation in a
+scene (or across scenes) just because one example value appears in this
+prompt — that value is illustrative, not a default to copy. Vary it
+deliberately per beat the same way you vary placement and animation_type,
+using the mood-aware styling guidance above.
+
+background_color_hint: optional hex color for the PANEL/BOX behind the
+text or icon badge itself — distinct from color_hint, which is the
+accent/icon color, not the panel. null (the default) means "use the
+renderer's own neutral panel color" — only set this when the specific
+beat's mood or category calls for a deliberately tinted panel instead of
+the neutral default (e.g. a warm tint for a triumphant beat). Leave null
+far more often than not; this is an occasional accent, not something to
+set on every animation.
 
 highlight_target_text: the exact quoted_excerpt from the source beat's
 animation_signal when animation_type is "full_screen_document_highlight"
@@ -10246,7 +10374,6 @@ Every field is required for each animation object. Do not omit any field
 (use null where noted above). Choose placement and geometry deliberately
 based on what will read best against this beat's B-roll and on_screen_text
 — a real creative decision, not a formality. Return ONLY the JSON object.
-
 """
 
 
@@ -10311,6 +10438,7 @@ class BeatAnimationUpdate(BaseModel):
     icon_layout: Optional[str] = None
     display_text: Optional[Any] = None
     color_hint: Optional[str] = None
+    background_color_hint: Optional[str] = None
     highlight_target_text: Optional[str] = None
     render_prompt: Optional[str] = None
     render_engine_hint: Optional[str] = None
@@ -10875,13 +11003,19 @@ def _words_in_range(timed_words: list, start: float, end: float) -> str:
 def _validate_entity(e: Any) -> Optional[dict]:
     if not isinstance(e, dict):
         return None
-    name = e.get("name")
+    name = e.get("canonical_name") or e.get("name")
     etype = e.get("entity_type")
     if not isinstance(name, str) or not name.strip():
         return None
     if etype not in ("real_person", "fictional_character", "element"):
         etype = "element"
-    return {"name": name.strip(), "entity_type": etype}
+    result = {"name": name.strip(), "entity_type": etype}
+    aliases = e.get("aliases")
+    if isinstance(aliases, list):
+        clean_aliases = [a.strip() for a in aliases if isinstance(a, str) and a.strip()]
+        if clean_aliases:
+            result["aliases"] = clean_aliases
+    return result
 
 
 def _validate_scene_direction(raw: Any) -> dict:
@@ -10953,6 +11087,10 @@ def _validate_beat(raw: Any, id_prefix: str, index: int) -> dict:
     scene_direction = _validate_scene_direction(raw.get("scene_direction"))
     animation_signal = _validate_animation_signal(raw.get("animation_signal"))
 
+    beat_visual_intent = raw.get("visual_intent")
+    if not isinstance(beat_visual_intent, str):
+        beat_visual_intent = ""
+
     try:
         est = int(raw.get("estimated_duration_seconds"))
         if est <= 0:
@@ -10964,6 +11102,7 @@ def _validate_beat(raw: Any, id_prefix: str, index: int) -> dict:
         "beat_id": f"{id_prefix}_beat{index + 1}",
         "beat_index": index,
         "vo_text": vo_text,
+        "visual_intent": beat_visual_intent,
         "estimated_duration_seconds": est,
         "keywords": keywords,
         "media_type": media_type,
@@ -11156,6 +11295,41 @@ def _dedupe_beats_media_across_scene(beats: list) -> None:
 
 
 
+_NON_CENTER_PLACEMENTS = ["top_right", "top_left", "center_right", "center_left"]
+
+
+def _diversified_placement(beat_id: Optional[str]) -> str:
+    """Deterministic rotation across corner placements, keyed on beat_id so
+    the same animation always resolves to the same placement across repeat
+    validation (e.g. a PATCH re-validating an existing animation), rather
+    than jittering to a different corner each time."""
+    idx = sum(ord(c) for c in (beat_id or "")) % len(_NON_CENTER_PLACEMENTS)
+    return _NON_CENTER_PLACEMENTS[idx]
+
+
+def _is_center_column(geometry_px: dict) -> bool:
+    """True when a box's horizontal center falls near the canvas's own
+    horizontal center — catches "top_center", "center", and "bottom_center"
+    alike (and anything mislabeled but positioned there), since all three
+    put the overlay in the same visually-worst spot: dead center, fighting
+    whatever the B-roll's own subject is doing."""
+    cx = geometry_px["x"] + geometry_px["width"] / 2
+    return abs(cx - ANIMATION_CANVAS_WIDTH / 2) < ANIMATION_CANVAS_WIDTH * 0.15
+
+
+def _corner_geometry_px(placement: str, width: int, height: int) -> dict:
+    margin = 64
+    if placement == "top_left":
+        x, y = margin, margin
+    elif placement == "center_left":
+        x, y = margin, ANIMATION_CANVAS_HEIGHT // 2 - height // 2
+    elif placement == "center_right":
+        x, y = ANIMATION_CANVAS_WIDTH - margin - width, ANIMATION_CANVAS_HEIGHT // 2 - height // 2
+    else:  # top_right, and default
+        x, y = ANIMATION_CANVAS_WIDTH - margin - width, margin
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
 def _validate_geometry_px(raw: Any, category: str) -> dict:
     if category in ("full_screen", "transition"):
         return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
@@ -11220,12 +11394,24 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
 
     placement = raw.get("placement")
     if placement not in _VALID_PLACEMENTS:
-        placement = "full_frame" if category in ("full_screen", "transition") else "top_center"
+        placement = "full_frame" if category in ("full_screen", "transition") else _diversified_placement(beat_id)
     if category in ("overlay_text", "overlay_graphic") and placement in ("bottom_left", "bottom_center", "bottom_right"):
-        placement = "top_center"
+        placement = _diversified_placement(beat_id)
 
     geometry_px = _validate_geometry_px(raw.get("geometry_px"), category)
     motion = _validate_motion(raw.get("motion"), geometry_px)
+
+    # Code-level guarantee against center-column placement for text/icon
+    # overlays — prompt guidance alone proved unreliable in practice (both
+    # "top_center" and dead "center" kept showing up, including one case
+    # landing directly on top of the shot's main subject). This checks the
+    # ACTUAL geometry, not just the placement label, since geometry_px is
+    # what the renderer uses — a model could label something "top_left"
+    # while still handing over center-ish coordinates.
+    if category in ("overlay_text", "overlay_graphic") and _is_center_column(geometry_px):
+        placement = _diversified_placement(beat_id)
+        geometry_px = _corner_geometry_px(placement, geometry_px["width"], geometry_px["height"])
+        motion = _validate_motion(None, geometry_px)
 
     z_index_layer = raw.get("z_index_layer")
     if z_index_layer not in _VALID_Z_LAYERS:
@@ -11242,14 +11428,6 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
     except (TypeError, ValueError):
         duration_frames = 90
 
-    # Clamp to the target beat's own length whenever we know it, so the
-    # animation object we store/return never claims a longer run than the
-    # beat (and therefore the voiceover) can actually support. Without
-    # this, duration_frames could be set to e.g. 900 (30s) on a 3s beat —
-    # build_timeline_from_scenes would still clamp the RENDERED track
-    # correctly, but the animation dict itself (what gets returned by the
-    # API and stored in raw_scenes) would keep claiming 900, which reads
-    # as "going beyond the voiceover" even though playback is fine.
     beat_info = (beats_by_id or {}).get(beat_id)
     if beat_info is not None:
         b_start, b_end = beat_info.get("start"), beat_info.get("end")
@@ -11272,6 +11450,8 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
                 icon_name = cleaned
                 if icon_layout not in _VALID_ICON_LAYOUTS:
                     icon_layout = "sequence" if animation_type == "icon_sequence" else "cluster"
+            elif len(cleaned) == 1:
+                icon_name, icon_layout = cleaned[0], None
             else:
                 icon_name, icon_layout = "sparkles", None
         else:
@@ -11287,11 +11467,24 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
 
     color_hint = raw.get("color_hint")
     if not isinstance(color_hint, str) or not _HEX_COLOR_RE.match(color_hint.strip()):
-        color_hint = "#F5A623"
+        color_hint = _pick_fallback_color(beat_id)
     else:
         color_hint = color_hint.strip()
         if not color_hint.startswith("#"):
             color_hint = f"#{color_hint}"
+
+    # Background/panel color behind the text box or icon badge itself —
+    # distinct from color_hint (the accent/icon color) and distinct from
+    # a scene's own broll background_color (the video background). null
+    # means "let the renderer's own default panel color apply" (theme.panel
+    # on the Remotion side) rather than forcing a specific one.
+    background_color_hint = raw.get("background_color_hint")
+    if isinstance(background_color_hint, str) and _HEX_COLOR_RE.match(background_color_hint.strip()):
+        background_color_hint = background_color_hint.strip()
+        if not background_color_hint.startswith("#"):
+            background_color_hint = f"#{background_color_hint}"
+    else:
+        background_color_hint = None
 
     highlight_target_text = raw.get("highlight_target_text")
     if not isinstance(highlight_target_text, str) or not highlight_target_text.strip():
@@ -11320,6 +11513,7 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
         "icon_layout": icon_layout,
         "display_text": display_text,
         "color_hint": color_hint,
+        "background_color_hint": background_color_hint,
         "highlight_target_text": highlight_target_text,
         "render_prompt": render_prompt,
         "render_engine_hint": render_engine_hint,
@@ -11338,7 +11532,7 @@ async def _run_animation_planner(
         {
             "beat_id": b["beat_id"],
             "vo_text": b["vo_text"],
-            "ICON_LIBRARY_GROUPS": b["estimated_duration_seconds"],
+            "estimated_duration_seconds": b["estimated_duration_seconds"],
             "entities": b["entities"],
             "scene_direction": b["scene_direction"],
             "animation_signal": b["animation_signal"],
@@ -11696,19 +11890,26 @@ def _normalize_phrase_word(w: str) -> str:
     return _PHRASE_MATCH_PUNCT_RE.sub("", w or "").lower().strip()
 
 
-def _find_phrase_start_sec(
+def _find_phrase_span_sec(
     target_text: Optional[str], timed_words: list, search_start: float, search_end: float,
-) -> Optional[float]:
+) -> Optional[tuple]:
     """Finds when `target_text` is actually spoken, by matching it against
     word-level timestamps within [search_start, search_end] (a beat's own
-    span). Returns the start time of the first matching word, or None if no
-    confident match is found — callers should fall back to the beat's own
-    start in that case. Matching is on normalized (lowercased, punctuation-
-    stripped) words, and only requires the first few words of the phrase to
-    line up consecutively, since target_text can be a light paraphrase of
-    the narration rather than a byte-exact quote (highlight_target_text is
-    verbatim per the Animation Planner prompt, but display_text is not
-    guaranteed to be)."""
+    span). Returns (phrase_start_sec, phrase_end_sec) — the start of the
+    first matched word and the end of the last matched word — or None if
+    no confident match is found. Callers use the start to anchor when an
+    overlay appears and the end to make sure it doesn't disappear before
+    the narration finishes saying it.
+
+    Scores every possible alignment offset between target_text and the
+    transcript window, tolerant of a handful of individual word mismatches
+    rather than requiring a perfect run — this matters in practice because
+    WhisperX can mis-transcribe an unusual proper noun (e.g. "Maciej"
+    heard as "Massey") even though the surrounding words transcribe
+    cleanly; a strict-match approach fails on names like that even though
+    the rest of a long phrase lines up perfectly. A match is accepted when
+    either a long enough exact run is found, or enough of the phrase's
+    words match overall (allowing scattered individual misses)."""
     if not target_text or not timed_words:
         return None
     target_words = [_normalize_phrase_word(w) for w in target_text.split()]
@@ -11725,16 +11926,48 @@ def _find_phrase_start_sec(
     if n == 0:
         return None
 
-    required_matches = min(len(target_words), 3)
-    for i in range(n):
-        matched = 0
-        for j, target_word in enumerate(target_words):
-            if i + j >= n or window_norm[i + j] != target_word:
-                break
-            matched += 1
-        if matched >= required_matches:
-            return window[i]["start"]
-    return None
+    n_target = len(target_words)
+    min_run = min(n_target, 3)
+    min_ratio = 0.6 if n_target >= 5 else 1.0  # short phrases still need a near-exact hit
+
+    best_score = None
+    best_offset = None
+    for offset in range(-n_target, n):
+        matches = 0
+        run = 0
+        best_run = 0
+        for t in range(n_target):
+            wi = t + offset
+            if 0 <= wi < n and window_norm[wi] == target_words[t]:
+                matches += 1
+                run += 1
+                best_run = max(best_run, run)
+            else:
+                run = 0
+        if matches == 0:
+            continue
+        ratio = matches / n_target
+        if best_run < min_run and ratio < min_ratio:
+            continue
+        score = (best_run, matches)
+        # Ties keep the LATEST candidate, not the first found. The offset
+        # loop runs earliest-to-latest, so on an exact tie the old ">"
+        # comparison always kept whichever position was found FIRST — a
+        # systematic bias toward the earliest equally-good match. Every
+        # sync complaint so far has been "the overlay shows too early,"
+        # never "too late," which is exactly the signature of that bias.
+        if best_score is None or score >= best_score:
+            best_score = score
+            best_offset = offset
+
+    if best_offset is None:
+        return None
+
+    start_idx = max(0, min(best_offset, n - 1))
+    end_idx = max(0, min(n_target - 1 + best_offset, n - 1))
+    if end_idx < start_idx:
+        end_idx = start_idx
+    return window[start_idx]["start"], window[end_idx]["end"]
 
 
 def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
@@ -11836,33 +12069,59 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             if not rng:
                 continue
             b_start_frame, b_end_frame = rng
-            anim_span = b_end_frame - b_start_frame if b_end_frame > b_start_frame else animation.get("duration_frames", 90)
-            upper_bound_frame = b_start_frame + max(anim_span, 1)
 
             anim_start_frame = b_start_frame
-            # Anchor to the actual spoken moment whenever we have a strong
-            # signal to do so: either the Animation Planner marked this
-            # "on_keyword", OR it carries highlight_target_text (a document/
-            # quote highlight is meant to appear roughly when its source is
-            # actually referenced, regardless of what trigger label the
-            # planner happened to assign it — the presence of a verbatim
-            # quoted phrase is itself the strongest signal, stronger than
-            # trusting `trigger` alone).
-            has_target_text = bool(animation.get("highlight_target_text"))
-            if animation.get("trigger") == "on_keyword" or has_target_text:
-                target_beat = next((bt for bt in beats if bt.get("beat_id") == beat_id), None)
-                beat_start_sec = target_beat.get("start") if target_beat else None
-                beat_end_sec = target_beat.get("end") if target_beat else None
-                if beat_start_sec is not None and beat_end_sec is not None:
-                    target_text = animation.get("highlight_target_text")
-                    if not target_text and isinstance(animation.get("display_text"), str):
-                        target_text = animation.get("display_text")
-                    matched_sec = _find_phrase_start_sec(target_text, timed_words_sec, beat_start_sec, beat_end_sec)
-                    if matched_sec is not None:
-                        candidate_frame = scene_start_frame + _seconds_to_frames(matched_sec - start_sec, fps)
-                        anim_start_frame = max(b_start_frame, min(candidate_frame, b_end_frame))
+            # Anchor to the actual spoken moment whenever there's text we
+            # can locate. Not gated on `trigger` at all: relying on the
+            # Animation Planner to correctly label something "on_keyword"
+            # proved unreliable in practice — plenty of animations with a
+            # clearly quotable display_text still came back "on_beat" (or
+            # some other trigger), which silently skipped anchoring and
+            # left the overlay showing from the start of the whole beat,
+            # well before the narration actually said those words. A
+            # failed phrase match already safely falls back to beat-start
+            # (see _find_phrase_span_sec), so attempting the match
+            # unconditionally can only improve timing, never worsen it.
+            matched_end_frame = None
+            # Search the WHOLE SCENE's words, not just this animation's
+            # nominally-assigned beat. If the Animation Planner attaches an
+            # overlay to beat N but the phrase it's actually showing is
+            # spoken partway into beat N+1 (beats split mid-thought, or the
+            # planner just picked a nearby beat), restricting the search to
+            # beat N's own [start, end] means the real words are never in
+            # the search window at all — the match silently fails and
+            # falls back to beat N's start, showing the overlay early. A
+            # scene-wide search finds it wherever it actually is; the
+            # match is then allowed to resolve outside the nominal beat's
+            # bounds (clamped to the scene, not the beat) specifically so
+            # this misattribution case still ends up synced correctly.
+            target_text = animation.get("highlight_target_text")
+            if not target_text and isinstance(animation.get("display_text"), str):
+                target_text = animation.get("display_text")
+            matched_span = _find_phrase_span_sec(target_text, timed_words_sec, start_sec, end_sec)
+            if matched_span is not None:
+                matched_start_sec, matched_end_sec = matched_span
+                candidate_start_frame = scene_start_frame + _seconds_to_frames(matched_start_sec - start_sec, fps)
+                anim_start_frame = max(scene_start_frame, min(candidate_start_frame, scene_end_frame))
+                candidate_end_frame = scene_start_frame + _seconds_to_frames(matched_end_sec - start_sec, fps)
+                matched_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
 
-            anim_end_frame = min(anim_start_frame + animation.get("duration_frames", 90), upper_bound_frame)
+            # Duration is the LONGER of: what the model asked for
+            # (duration_frames), or how long the matched phrase actually
+            # takes to be spoken (plus a short hold so it doesn't vanish
+            # the instant the last word ends). This is what guarantees a
+            # keyword-anchored overlay never disappears mid-sentence —
+            # previously duration_frames alone decided the end time even
+            # after anchoring the start to the real phrase, so a short
+            # generic duration could still cut the overlay off before the
+            # voice finished saying the exact words it was showing.
+            model_end_frame = min(anim_start_frame + animation.get("duration_frames", 90), scene_end_frame)
+            if matched_end_frame is not None:
+                hold_buffer_frames = round(0.3 * fps)
+                speech_end_frame = min(matched_end_frame + hold_buffer_frames, scene_end_frame)
+                anim_end_frame = max(model_end_frame, speech_end_frame)
+            else:
+                anim_end_frame = model_end_frame
             # Defensive clamp: b_start_frame/b_end_frame are already bounded
             # to [scene_start_frame, scene_end_frame], so this is normally
             # redundant — but never let an animation's computed frames slip
@@ -12099,6 +12358,19 @@ async def edit_video(request: EditVideo):
     if category not in STYLE_PROFILES:
         print(f"[edit-video] model returned unknown category {category!r} — defaulting to general_documentary")
         category = "general_documentary"
+
+    # New Scene Planner schema returns animation_preference (avoid/optional/
+    # strong) instead of the old boolean requires_animation. Every other
+    # part of the pipeline (Animation Planner hard gate, icon guarantee,
+    # response slimming, etc.) still reads scene["requires_animation"], so
+    # derive it here rather than touching every call site: "avoid" means no
+    # animation for the scene, "optional"/"strong" both mean the Animation
+    # Planner is allowed to add animation (it already decides per-beat how
+    # much, via scene_animation_density). A scene that still returns the
+    # old field directly is respected as-is.
+    for _scene in scenes:
+        if isinstance(_scene, dict) and "requires_animation" not in _scene:
+            _scene["requires_animation"] = _scene.get("animation_preference") != "avoid"
 
     # No scene-count cap: the Scene Planner prompt already governs scene
     # count via the 2-minute-per-scene rule (SCRIPT_SCENE_PROMPT explicitly
@@ -12922,6 +13194,7 @@ class BrollInsertGapUpdate(BaseModel):
     start: float
     end: float
     motion_type: Optional[str] = None
+    scene_id: Optional[str] = None
 
 @app.patch("/timeline/{video_id}/broll")
 async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
@@ -13026,6 +13299,17 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
 
 @app.post("/timeline/{video_id}/broll/insert")
 async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
+    """Two modes, chosen by whether `scene_id` is provided:
+
+    - scene_id given: inserts the asset INTO that scene's own beat
+      timeline (start/end are scene-local seconds). This is what most
+      callers want — "put this clip at this point in this scene."
+    - scene_id omitted: old behavior — creates a brand new, voiceover-less
+      standalone scene and extends the whole video's total duration
+      (start/end are absolute video-timeline seconds). Use this only when
+      you actually want to lengthen the video with a new silent B-roll
+      segment, not to place something inside existing narration.
+    """
     if update.source not in ("video", "image"):
         raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
     if update.start < 0:
@@ -13065,6 +13349,54 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
 
     current_version = row.data.get("timeline_version", 1)
     fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
+
+    # Scene-scoped insert: put this asset INTO an existing scene's own beat
+    # timeline (splitting whichever beat currently occupies [start, end]),
+    # instead of the old behavior below of always creating a brand new,
+    # voiceover-less standalone scene and extending the whole video's
+    # duration. This is what callers usually mean by "insert broll into
+    # this scene" — start/end here are scene-LOCAL seconds, matching the
+    # convention used by update_scene_broll's start/end.
+    if update.scene_id:
+        scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == update.scene_id), None)
+        if scene_index is None:
+            raise HTTPException(status_code=404, detail=f"Scene {update.scene_id} not found")
+
+        scene = dict(raw_scenes[scene_index])
+        scene_start = scene.get("start") or 0.0
+        scene_end = scene.get("end") or 0.0
+        if update.start < scene_start - 1e-3 or update.end > scene_end + 1e-3:
+            raise HTTPException(
+                status_code=422,
+                detail=f"[{update.start}, {update.end}] must fall inside scene {update.scene_id}'s own bounds [{scene_start}, {scene_end}]",
+            )
+
+        scene["beats"] = _carve_scene_beats_for_absolute_range(
+            scene, update.start, update.end, override, id_prefix=update.scene_id,
+        )
+        raw_scenes[scene_index] = scene
+
+        timeline_json = build_timeline_from_scenes(raw_scenes)
+        new_version = current_version + 1
+        broll_list = _compute_broll_list(timeline_json)
+        infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+        try:
+            supabase.table("videos").update({
+                "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+                "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+                "infographics_list": infographics_list, "text_list": text_list,
+            }).eq("id", video_id).execute()
+        except Exception as e:
+            print(f"[insert-broll-gap] failed to save video {video_id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to insert B-roll into scene")
+
+        return {
+            "video_id": video_id, "scene_id": update.scene_id, "start": update.start, "end": update.end,
+            "selected_asset": override, "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
+            "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+        }
 
     boundaries, cumulative = [], 0.0
     for i, s in enumerate(raw_scenes):
@@ -13944,6 +14276,17 @@ def _font_size_for_geometry(geo: dict, text: str) -> int:
     height_based = int(geo["height"] / max(len(lines), 1) * 0.7) if geo["height"] else width_based
     return max(18, min(width_based, height_based, 120))
 
+def _ffmpeg_box_color(background_color_hint: Optional[str], alpha: float, default: str = "black") -> str:
+    """Converts an animation's background_color_hint (hex, or None) into
+    an FFmpeg drawtext boxcolor value. Falls back to the same translucent
+    black every box used before this field existed."""
+    if background_color_hint:
+        h = background_color_hint.strip().lstrip("#")
+        if len(h) == 6:
+            return f"0x{h}@{alpha}"
+    return f"{default}@{alpha}"
+
+
 def _build_icon_overlay_drawtext(
     animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
 ) -> Optional[str]:
@@ -13983,7 +14326,7 @@ def _build_icon_overlay_drawtext(
         cy = geo["y"] + geo["height"] / 2
         filters.append(
             f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
-            f"box=1:boxcolor=black@0.5:boxborderw=14:"
+            f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.5)}:boxborderw=14:"
             f"x={cx:.1f}-text_w/2:y={cy:.1f}-text_h/2:alpha='{alpha_expr}'"
         )
     else:
@@ -14005,7 +14348,7 @@ def _build_icon_overlay_drawtext(
                 )
                 filters.append(
                     f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
-                    f"box=1:boxcolor=black@0.5:boxborderw=14:"
+                    f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.5)}:boxborderw=14:"
                     f"x={x0:.1f}-text_w/2:y={y0:.1f}-text_h/2:alpha='{seg_alpha}'"
                 )
         else:
@@ -14017,7 +14360,7 @@ def _build_icon_overlay_drawtext(
                 cx = geo["x"] + spacing * (i + 0.5)
                 filters.append(
                     f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
-                    f"box=1:boxcolor=black@0.5:boxborderw=10:"
+                    f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.5)}:boxborderw=10:"
                     f"x={cx:.1f}-text_w/2:y={y0:.1f}-text_h/2:alpha='{alpha_expr}'"
                 )
         if label:
@@ -14027,7 +14370,7 @@ def _build_icon_overlay_drawtext(
             ly = geo["y"] + geo["height"] * 0.82
             filters.append(
                 f"drawtext=text='{safe_label}':fontcolor=white:fontsize={label_font_size}:"
-                f"box=1:boxcolor=black@0.5:boxborderw=10:"
+                f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.5)}:boxborderw=10:"
                 f"x={lx:.1f}-text_w/2:y={ly:.1f}-text_h/2:alpha='{alpha_expr}'"
             )
 
@@ -14070,7 +14413,7 @@ def _build_beat_animation_drawtext(
 
     return (
         f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
-        f"box=1:boxcolor=black@0.55:boxborderw=16:line_spacing=8:"
+        f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.55)}:boxborderw=16:line_spacing=8:"
         f"x={x}:y={y}:alpha='{alpha_expr}'"
     )
 
@@ -14085,7 +14428,13 @@ def _build_remotion_props(animation_type: str, animation: dict, width: int, heig
     carries. Sending the generic shape to those meant they were either
     rendering with their defaultProps (ignoring your beat's actual text)
     or failing zod validation outright. This maps animation_type to the
-    right prop shape per composition.
+    right prop shape per composition. IconSequenceOverlay and IconPopIn
+    are the two exceptions that DO also get colorHint/geometryPx passed
+    through (on top of their icons/label fields) — without those, the
+    component has no way to know where the backend wants it placed or
+    what accent color to use, and silently falls back to a hardcoded
+    position, which was the actual root cause of icons always landing in
+    the same spot regardless of what geometry the backend computed.
 
     Every OTHER composition (everything in compositions/Extra.tsx) shares
     one generic schema (baseAnimSchema) and accepts the raw shape
@@ -14118,15 +14467,26 @@ def _build_remotion_props(animation_type: str, animation: dict, width: int, heig
         return {"title": "", "items": items[:6] or ["", ""]}
 
     if animation_type == "icon_sequence":
-        return {"icons": icons or ["sparkles"], "label": text}
+        return {
+            "icons": icons or ["sparkles"], "label": text,
+            "colorHint": animation.get("color_hint"),
+            "backgroundColorHint": animation.get("background_color_hint"),
+            "geometryPx": _scale_geometry_px(animation.get("geometry_px") or {}, width, height),
+        }
 
     if animation_type == "icon_pop_in":
-        return {"icons": (icons[:1] or ["sparkles"]), "label": text}
+        return {
+            "icons": (icons[:1] or ["sparkles"]), "label": text,
+            "colorHint": animation.get("color_hint"),
+            "backgroundColorHint": animation.get("background_color_hint"),
+            "geometryPx": _scale_geometry_px(animation.get("geometry_px") or {}, width, height),
+        }
 
     # Everything else (compositions/Extra.tsx) — generic shape.
     return {
         "displayText": animation.get("display_text"),
         "colorHint": animation.get("color_hint"),
+        "backgroundColorHint": animation.get("background_color_hint"),
         "geometryPx": _scale_geometry_px(animation.get("geometry_px") or {}, width, height),
         "iconName": animation.get("icon_name"),
         "iconLayout": animation.get("icon_layout"),
@@ -14655,7 +15015,7 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     try:
         row = (
             supabase.table("videos")
-            .select("timeline_json, raw_scenes, final_video_url")
+            .select("raw_scenes, final_video_url")
             .eq("id", video_id)
             .single()
             .execute()
@@ -14670,13 +15030,53 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     if row.data.get("final_video_url") and not request.force:
         return {"final_video_url": row.data["final_video_url"]}
 
-    timeline = row.data.get("timeline_json") or {}
     scenes = row.data.get("raw_scenes") or []
     if not scenes:
         raise HTTPException(status_code=400, detail="No scenes to render for this video")
 
+    # Always rebuild the timeline fresh from raw_scenes rather than trusting
+    # a stored timeline_json snapshot. The stored column reflects whatever
+    # build_timeline_from_scenes computed the LAST time this video's scenes
+    # were saved — for a video created before a sync/placement/duration fix
+    # landed, that snapshot keeps silently baking the old bug into every
+    # re-render, no matter how many times the fix itself gets deployed.
+    # This was the actual reason "the same fix, redeployed, didn't help":
+    # the fix was correct, but /render never re-ran it.
+    timeline = build_timeline_from_scenes(scenes)
+    try:
+        infographics_list, text_list = _compute_infographics_and_text_lists(scenes, timeline)
+        broll_list = _compute_broll_list(timeline)
+        supabase.table("videos").update({
+            "timeline_json": timeline, "raw_scenes": scenes,
+            "infographics_list": infographics_list, "text_list": text_list, "broll_list": broll_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[render] failed to persist freshly rebuilt timeline for {video_id} (rendering with it anyway): {e}")
+
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
