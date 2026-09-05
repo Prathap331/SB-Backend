@@ -4011,6 +4011,7 @@ async def get_context_with_timeout(
 
 
 SCRIPT_SYSTEM_PROMPT = """
+
 # YOUTUBE DOCUMENTARY SCRIPT GENERATION AGENT
 
 ## ROLE
@@ -4050,6 +4051,25 @@ Use retrieved material as **raw material, not as text to summarize**. Select onl
 Do not force every retrieved chunk into the script. Prefer concrete, specific, story-worthy details over broad background.
 
 Use recent web/news material when relevant. For time-sensitive information, retain the appropriate date and context rather than presenting it as timeless fact.
+
+## OPENING + OVERALL VIDEO PROMISE
+
+At the very beginning of the script, after establishing the initial engaging hook, naturally give the viewer a **brief, engaging overview of what the video will explore overall**.
+
+This overview should feel like a friend telling you, “Here’s what we’re about to uncover,” rather than a formal introduction or agenda.
+
+* Briefly orient the viewer to the video's overall subject, journey, question, or discovery.
+* Make the viewer understand what they are going to learn, discover, or experience by staying until the end.
+* Keep it conversational, warm, natural, and curiosity-driven.
+* Connect it directly to the Hook so it feels like part of the story rather than a separate introduction.
+* Do not turn it into a list of sections or a detailed roadmap.
+* Do not reveal the final answer, major reveal, or full conclusion.
+* Do not use generic phrases such as “In this video, we will discuss…” unless naturally rephrased.
+* Do not sacrifice the strength or immediacy of the Hook merely to provide the overview.
+
+The opening should therefore accomplish two things quickly:
+
+**Hook the viewer → naturally orient them to the journey ahead.**
 
 ## HOOK
 
@@ -4165,6 +4185,8 @@ Before returning the answer, silently verify:
 * each segment uses information according to its LLM Brief
 * Engagement Craft is reflected in execution
 * Hook is genuinely a hook, not an introduction
+* opening naturally gives viewers a brief overview of what the video will explore
+* overview does not spoil the major reveal or conclusion
 * narrative remains coherent and progressively engaging
 * no unsupported factual claims or fabricated quotations
 * script contains exactly **Target Duration × 130 words**
@@ -4210,7 +4232,7 @@ The example exists only to demonstrate the expected **field names, nesting, and 
 
 The detailed requirements above are the authoritative specification. Generate every value dynamically from the actual input and generated script.
 
-json
+```json id="rpj990"
 {
   "script": "Complete documentary narration in continuous paragraphs.",
   "metrics": {
@@ -4229,6 +4251,7 @@ json
     ]
   }
 }
+```
 
 """
 
