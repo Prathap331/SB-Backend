@@ -4161,26 +4161,6 @@ Requirements:
 """
 
 
-def _build_script_context(db_results: list[dict], new_articles: list[dict]) -> str:
-    parts = []
-
-    if db_results:
-        parts.append(f"=== KNOWLEDGE BASE EXCERPTS (dense similarity >= {DB_SIMILARITY_THRESHOLD}) ===")
-        for i, row in enumerate(db_results, start=1):
-            content = row.get("content", "")
-            dense_score = row.get("dense_score")
-            parts.append(f"[KB-{i}] (similarity={dense_score}) {content}")
-
-    if new_articles:
-        parts.append(f"\n=== RECENT NEWS / WEB (similarity >= {WEB_CONTENT_SIMILARITY_THRESHOLD}) ===")
-        for i, article in enumerate(new_articles, start=1):
-            snippet = article.get("snippet", "")
-            url = article.get("url", "")
-            similarity = article.get("similarity")
-            parts.append(f"[NEWS-{i}] (similarity={similarity}) {snippet} (source: {url})")
-
-    return "\n\n".join(parts) if parts else "No high-confidence source material available."
-
 
 def _segments_brief(segments: list[dict]) -> str:
     if not segments:
@@ -9191,6 +9171,37 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import re
 import os
 import json
@@ -9803,23 +9814,14 @@ def _pick_fallback_icon(category: str) -> str:
     return icons[0]
 
 
-_FALLBACK_ICON_PLACEMENTS = ["top_right", "top_left", "center_right", "center_left"]
-
-
-def _fallback_icon_geometry(placement: str) -> tuple[dict, dict]:
-    """Corner geometry for the fallback icon, sized larger than the old
-    fixed 160px top-right box felt (still 160px here, but now genuinely
-    varied) — center_left/center_right sit vertically mid-frame, clear of
-    both the top edge and the caption safe zone at the bottom."""
+def _fallback_icon_geometry() -> tuple[dict, dict]:
+    """Centered geometry for the fallback icon — icons and text overlays
+    are always centered on the frame per product direction, not placed in
+    a corner. Vertically centered but kept clear of the caption band at
+    the bottom by construction (icon is small relative to the frame)."""
     size = 160
-    if placement == "top_left":
-        x, y = _SAFE_MARGIN, _SAFE_MARGIN
-    elif placement == "center_left":
-        x, y = _SAFE_MARGIN, CANVAS_HEIGHT // 2 - size // 2
-    elif placement == "center_right":
-        x, y = CANVAS_WIDTH - _SAFE_MARGIN - size, CANVAS_HEIGHT // 2 - size // 2
-    else:  # top_right, and default
-        x, y = CANVAS_WIDTH - _SAFE_MARGIN - size, _SAFE_MARGIN
+    x = (CANVAS_WIDTH - size) // 2
+    y = (CANVAS_HEIGHT - size) // 2
     geometry = {"x": x, "y": y, "width": size, "height": size}
     motion = {
         "start_xy_px": [x, y - 20],
@@ -9842,12 +9844,11 @@ def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
     label = " ".join(on_screen_words[:4]) if on_screen_words else None
     est_seconds = beat.get("estimated_duration_seconds") or 3
     duration_frames = max(30, min(90, int(est_seconds * TIMELINE_FPS * 0.4)))
-    placement = _FALLBACK_ICON_PLACEMENTS[beat.get("beat_index", 0) % len(_FALLBACK_ICON_PLACEMENTS)]
-    geometry_px, motion = _fallback_icon_geometry(placement)
+    geometry_px, motion = _fallback_icon_geometry()
     return {
         "beat_id": beat["beat_id"],
         "animation_type": "icon_pop_in",
-        "placement": placement,
+        "placement": "center",
         "geometry_px": geometry_px,
         "motion": motion,
         "duration_frames": duration_frames,
@@ -9858,7 +9859,7 @@ def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
         "color_hint": _pick_fallback_color(beat.get("beat_id")),
         "highlight_target_text": None,
         "render_prompt": (
-            f"A small '{icon}' icon pops in at the {placement.replace('_', ' ')} with a light bounce and holds briefly. "
+            f"A small '{icon}' icon pops in at the center with a light bounce and holds briefly. "
             "Kept understated so it doesn't compete with the beat's main visual."
         ),
         "trigger": "on_beat",
@@ -9985,7 +9986,7 @@ CANVAS_WIDTH = 1920
 CANVAS_HEIGHT = 1080
 ANIMATION_CANVAS_WIDTH = CANVAS_WIDTH
 ANIMATION_CANVAS_HEIGHT = CANVAS_HEIGHT
-_SAFE_MARGIN = 64
+_SAFE_MARGIN = 72
 _CAPTION_BAND_HEIGHT = round(CANVAS_HEIGHT * 0.15)
 _CAPTION_BAND_TOP_Y = CANVAS_HEIGHT - _CAPTION_BAND_HEIGHT
 CAPTION_SAFE_ZONE_Y = _CAPTION_BAND_TOP_Y
@@ -10018,12 +10019,42 @@ You are given, as JSON:
   scene_animation_density.
 - beats: the full array of this scene's beats from the Beat Director, each
   with beat_id, vo_text, estimated_duration_seconds, entities,
-  scene_direction (setting, mood, key_action), and animation_signal
+  scene_direction (setting, mood, key_action), animation_signal
   (needs_animation, intent, suggested_category, key_subject, source_type,
-  quoted_excerpt, source_name_guess, key_subject_entity_type).
+  quoted_excerpt, source_name_guess, key_subject_entity_type), AND words —
+  the REAL word-level timestamps for this beat from the actual recorded
+  voiceover: [{{"word": "one", "start": 10.02, "end": 10.31}}, ...], in
+  scene-local seconds. This is ground truth, not an estimate — use it.
 - previous_scene_last_animation: null (first scene only), or
   {{"animation_type": ..., "placement": ..., "category": ...}} for the last
   animated beat of the immediately preceding scene.
+
+TIMING — read this before anything else: you now have the exact second
+each word is actually spoken, so timing an animation to the narration is a
+lookup, not a guess. For every animation you output, set anchor_start_sec
+and anchor_end_sec (both REQUIRED, in the same scene-local seconds as
+words) by finding the specific word(s) in this beat's words array that the
+animation is FOR, and reading their real start/end directly:
+- If the animation illustrates a specific phrase, quote, statistic, or
+  named thing (most animations), find that phrase's words in the words
+  array and set anchor_start_sec to the FIRST matching word's start,
+  anchor_end_sec to the LAST matching word's end. Do not estimate or
+  round — copy the numbers straight from words.
+- If the animation is a whole-beat treatment (a mood wash, a scene-setting
+  title card with no single anchor phrase), set anchor_start_sec to the
+  first word's start and anchor_end_sec to the last word's end — i.e. the
+  beat's full span.
+- highlight_target_text/display_text should still be the actual words
+  you're anchoring to (see the quoted-source and display_text guidance
+  below) — anchor_start_sec/anchor_end_sec is the authoritative timing
+  Storybit will use directly; getting the anchored TEXT right is what
+  makes your anchor_start_sec/anchor_end_sec correct in the first place.
+- Sanity-check your own output before returning it: anchor_start_sec must
+  fall within this beat's own words range, and anchor_end_sec must be >=
+  anchor_start_sec. If you cannot find the relevant words in the words
+  array (e.g. this beat's words don't actually contain what you want to
+  show), that is a signal you have the wrong beat_id — reconsider which
+  beat this animation actually belongs to rather than guessing a time.
 
 Language rule: display_text must be written in script_language — it is
 on-screen text tied to spoken narration, so it must match what the viewer
@@ -10080,21 +10111,13 @@ open question remained" → "puzzle" is defensible; "a stone tool found in
 the dirt" → it is not — use a science/tool-adjacent icon or skip the icon
 in favor of a text treatment instead).
 
-Placement must be a deliberate choice, not a default: do not place every
-icon/overlay at "top_center" — or, worse, dead "center" — out of habit.
-"center" in particular puts the overlay directly on top of whatever the
-B-roll's main subject is doing (a machine, a person, the thing the beat is
-actually about), which is the single worst placement available. Neither
-is a safe default — both read as amateurish, especially when one lands
-dead-center over the middle of the shot and visually fights the B-roll's
-own subject. Actually look at what a beat's footage likely shows (a
-close-up subject fills the center; wide shots leave the corners empty) and
-choose the placement that keeps the icon out of the way of where the main
-visual interest will be — corners (top_left, top_right, center_left,
-center_right) read as "overlay annotating the shot" far more often than
-top_center does. Vary placement across the scene's animated beats so
-consecutive overlays don't all cluster in the same spot (this is also
-required by the "Vary treatment across beats" rule below).
+Placement is handled automatically — every icon and text overlay is always
+centered on the frame by the renderer, regardless of what geometry_px you
+provide for it. You do not need to choose or vary placement; just provide
+reasonable width/height for the content (the x/y position is discarded
+and replaced with true center every time). Focus your creative judgment on
+which beats deserve an animation, what animation_type and content fit
+best, and sizing — not on where it sits on screen.
 
 Icon animations should look designed, not bare: pair every icon with a
 short, punchy display_text label when the concept benefits from one (most
@@ -10119,6 +10142,20 @@ When icon_name is an array, set icon_layout to one of "sequence" (icons
 appear one after another, cascading), "cluster" (icons appear together at
 once, grouped), or "pair" (exactly two icons side by side representing a
 relationship). icon_layout is null when icon_name is a single string.
+
+CONSISTENCY CHECK — required before you finalize any icon animation: if
+render_prompt, content_binding, or display_text describes TWO things
+being compared, contrasted, or juxtaposed (words like "versus", "vs",
+"or", "either/or", a slash as in "cut mark / hyena bite") — icon_name
+MUST actually be a 2-item array with icon_layout: "pair", representing
+BOTH sides of that comparison. Describing a pair in render_prompt while
+sending a single icon_name is a real defect: what actually renders is one
+unrelated-looking icon next to comparison text, which reads as random
+rather than analytical. If the vocabulary has no icon for one side of the
+comparison (e.g. no literal "hyena"), pick the closest available icon for
+EACH side rather than dropping to a single icon — a generic "dog" paired
+with a tool-adjacent icon for "cut mark" still reads as a comparison; a
+lone "dog" next to "cut mark / hyena bite" text does not.
 
 Mood-aware styling: each beat carries a scene_direction.mood from the Beat
 Director (e.g. "tense", "triumphant", "solemn", "playful"). Let it inform
@@ -10181,25 +10218,31 @@ previous_scene_last_animation's animation_type AND placement exactly,
 change at least one of the two unless the content clearly calls for
 repeating it.
 
-Sync is critical — set `trigger` honestly, it drives real timing: this is
-not decorative metadata, the rendering pipeline uses `trigger` to decide
-WHEN in the beat your animation actually appears.
-- Use "on_keyword" whenever this animation is tied to a specific word or
+Space animations out in TIME, not just in type/placement: within your
+animation_density budget, prefer distributing animated beats across the
+scene rather than clustering several back-to-back with plain beats only
+at the very end (or vice versa). A "medium" density scene with 6 beats
+reads better as animation on beats 1, 3, 5 than on beats 1, 2, 3 — the
+viewer needs a few seconds of plain footage between emphasis moments to
+actually register each one, and clustering makes the video feel busy in
+one stretch and empty in another rather than evenly paced throughout.
+
+`trigger` still describes the CHARACTER of the timing (for logging/
+downstream context), but actual sync now comes from anchor_start_sec/
+anchor_end_sec above, not from trigger or from Storybit guessing at your
+text afterward:
+- Use "on_keyword" when this animation is tied to a specific word or
   phrase being spoken (a named quote, a statistic, a defined term, the
-  exact moment key_subject is said) — and when you do, display_text (or
-  highlight_target_text for quoted-source treatments) MUST be an exact or
-  near-exact substring of this beat's vo_text, because the renderer
-  locates the animation's start time by matching that text against the
-  actual word-level speech timestamps. A paraphrase that doesn't appear in
-  vo_text cannot be time-matched and will silently fall back to the
-  beat's start — so if you mean "show this exactly when it's said," quote
-  the words as they're actually spoken.
-- Use "on_beat" only for animations that characterize the whole beat
-  (a mood wash, a scene-setting title card) rather than a single moment
-  within it.
-- Never set "on_keyword" on an animation whose display_text is an
-  invented summary rather than words from vo_text — that combination
-  guarantees mistimed playback.
+  exact moment key_subject is said) — and set anchor_start_sec/
+  anchor_end_sec to that phrase's real words[] timestamps per the TIMING
+  section above.
+- Use "on_beat" for animations that characterize the whole beat (a mood
+  wash, a scene-setting title card) rather than a single moment within
+  it — anchor_start_sec/anchor_end_sec still required, spanning the
+  beat's full words range in that case.
+- Whichever trigger you choose, anchor_start_sec/anchor_end_sec must
+  reflect where you're actually placing it — don't let trigger and the
+  anchor timing disagree with each other.
 
 Text sizing: keep display_text short enough to comfortably fit
 geometry_px at a readable size. As a rule of thumb, assume roughly 14-18
@@ -10252,16 +10295,11 @@ CHARACTER (category: "branding")
 MOTION_EFFECT (category: "transition")
 - ken_burns_pan_zoom, parallax_layering, shake_impact, speed_ramp_indicator
 
-Placement values: top_left, top_center, top_right, center_left, center,
-center_right, bottom_left, bottom_center, bottom_right, full_frame
-
-IMPORTANT — caption safe zone: word-by-word captions are always burned in
-along the very bottom edge of the frame (lowest ~15% of canvas). For any
-overlay_text or overlay_graphic animation_type, do NOT choose bottom_left,
-bottom_center, or bottom_right. Prefer top_left/top_center/top_right,
-center_left/center/center_right instead. Bottom placements remain fine only
-for full_screen or transition category animation_types, which own the
-whole frame anyway.
+Placement values: for full_screen/transition, always "full_frame". For
+overlay_text/overlay_graphic, the placement field and any x/y you set in
+geometry_px are informational only — the renderer always centers these on
+the frame automatically, clear of the caption band at the bottom by
+construction. Just set placement to "center" for these two categories.
 
 Output Schema
 
@@ -10282,6 +10320,8 @@ Return exactly one JSON object, nothing else — no markdown, no code fences:
       }},
       "z_index_layer": "foreground",
       "trigger": "on_keyword",
+      "anchor_start_sec": 14.86,
+      "anchor_end_sec": 15.34,
       "duration_frames": 45,
       "content_binding": "icon:lightbulb",
       "icon_name": "lightbulb",
@@ -10300,6 +10340,12 @@ Field Guidelines
 
 beat_id: must match a beat_id from the input beats array. Only include
 beats that actually receive an animation — omit beats with no animation.
+
+anchor_start_sec / anchor_end_sec: REQUIRED for every animation. Copied
+directly from this beat's words array (see the TIMING section above) —
+not estimated, not derived from estimated_duration_seconds. This is what
+Storybit uses to actually position the animation on the timeline; getting
+this right is the single most important thing in your output.
 
 geometry_px: {{x, y, width, height}} in real pixels on the
 {CANVAS_WIDTH}x{CANVAS_HEIGHT} canvas — the element's full rendered
@@ -10439,6 +10485,7 @@ class BeatAnimationUpdate(BaseModel):
     display_text: Optional[Any] = None
     color_hint: Optional[str] = None
     background_color_hint: Optional[str] = None
+    font_size: Optional[int] = None
     highlight_target_text: Optional[str] = None
     render_prompt: Optional[str] = None
     render_engine_hint: Optional[str] = None
@@ -10482,6 +10529,30 @@ def _validate_hex_color(value: Optional[str], field_name: str) -> None:
         )
 
 
+def _log_token_usage(step_label: str, res: Any) -> None:
+    """Explicit input/output token logging for every LLM call in the
+    /edit-video pipeline, independent of whatever _record_token_usage
+    itself does (that function may or may not already persist this —
+    this is a plain, always-on log line so token counts are visible per
+    call without depending on that). Reads the standard OpenAI response
+    usage fields; degrades gracefully (logs a note, doesn't raise) if a
+    response shape doesn't have them."""
+    try:
+        usage = getattr(res, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        total_tokens = getattr(usage, "total_tokens", None) if usage else None
+        if prompt_tokens is None and completion_tokens is None:
+            print(f"[tokens] {step_label}: no usage data on response")
+            return
+        print(
+            f"[tokens] {step_label}: input={prompt_tokens} output={completion_tokens} "
+            f"total={total_tokens if total_tokens is not None else (prompt_tokens or 0) + (completion_tokens or 0)}"
+        )
+    except Exception as e:
+        print(f"[tokens] {step_label}: failed to read usage ({e})")
+
+
 WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "small")
 WHISPERX_DEVICE = os.getenv("WHISPERX_DEVICE", "cpu")
 WHISPERX_COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "int8")
@@ -10502,8 +10573,8 @@ BROLL_KEYWORDS_MAX = int(os.getenv("BROLL_KEYWORDS_MAX", "6"))
 BROLL_KEYWORDS_MIN = int(os.getenv("BROLL_KEYWORDS_MIN", "5"))
 
 TIMELINE_FPS = int(os.getenv("TIMELINE_FPS", "30"))
-TIMELINE_WIDTH = int(os.getenv("TIMELINE_WIDTH", "1080"))
-TIMELINE_HEIGHT = int(os.getenv("TIMELINE_HEIGHT", "1920"))
+TIMELINE_WIDTH = int(os.getenv("TIMELINE_WIDTH", "1920"))
+TIMELINE_HEIGHT = int(os.getenv("TIMELINE_HEIGHT", "1080"))
 
 DEFAULT_CAPTION_STYLE = {
     "vertical_position": "bottom",
@@ -11145,6 +11216,7 @@ async def _run_beat_director(
             )
         )
         _record_token_usage("edit video - beat director", res)
+        _log_token_usage("Beat Director", res)
 
         content = (res.choices[0].message.content or "").strip()
         if content.startswith("```"):
@@ -11295,71 +11367,102 @@ def _dedupe_beats_media_across_scene(beats: list) -> None:
 
 
 
-_NON_CENTER_PLACEMENTS = ["top_right", "top_left", "center_right", "center_left"]
+def _content_aware_max_box_size(display_text: Any) -> tuple:
+    """Caps how big a text overlay box can be relative to what it's
+    actually showing — sized for a small, ~20-25px understated callout
+    (not a headline), so a short phrase doesn't get stretched into an
+    oversized box with a lot of empty space around it. This is a
+    ceiling, not a target: a smaller box that already fits the text is
+    left alone. ~13px of width per character at a 20-25px reading size,
+    plus fixed padding; height scales with line count at that same
+    small size."""
+    text = _display_text_to_string(display_text) if isinstance(display_text, (str, list)) else ""
+    if not text:
+        return (400, 110)
+    lines = [l for l in text.split("\n") if l.strip()] or [text]
+    longest_line = max((len(l) for l in lines), default=0)
+    num_lines = max(len(lines), 1)
+    max_width = min(700, max(220, longest_line * 13 + 100))
+    max_height = min(260, max(80, num_lines * 46 + 50))
+    return max_width, max_height
 
 
-def _diversified_placement(beat_id: Optional[str]) -> str:
-    """Deterministic rotation across corner placements, keyed on beat_id so
-    the same animation always resolves to the same placement across repeat
-    validation (e.g. a PATCH re-validating an existing animation), rather
-    than jittering to a different corner each time."""
-    idx = sum(ord(c) for c in (beat_id or "")) % len(_NON_CENTER_PLACEMENTS)
-    return _NON_CENTER_PLACEMENTS[idx]
-
-
-def _is_center_column(geometry_px: dict) -> bool:
-    """True when a box's horizontal center falls near the canvas's own
-    horizontal center — catches "top_center", "center", and "bottom_center"
-    alike (and anything mislabeled but positioned there), since all three
-    put the overlay in the same visually-worst spot: dead center, fighting
-    whatever the B-roll's own subject is doing."""
-    cx = geometry_px["x"] + geometry_px["width"] / 2
-    return abs(cx - ANIMATION_CANVAS_WIDTH / 2) < ANIMATION_CANVAS_WIDTH * 0.15
-
-
-def _corner_geometry_px(placement: str, width: int, height: int) -> dict:
-    margin = 64
-    if placement == "top_left":
-        x, y = margin, margin
-    elif placement == "center_left":
-        x, y = margin, ANIMATION_CANVAS_HEIGHT // 2 - height // 2
-    elif placement == "center_right":
-        x, y = ANIMATION_CANVAS_WIDTH - margin - width, ANIMATION_CANVAS_HEIGHT // 2 - height // 2
-    else:  # top_right, and default
-        x, y = ANIMATION_CANVAS_WIDTH - margin - width, margin
-    return {"x": x, "y": y, "width": width, "height": height}
-
-
-def _validate_geometry_px(raw: Any, category: str) -> dict:
+def _validate_geometry_px(
+    raw: Any, category: str, allow_manual_placement: bool = False, display_text: Any = None,
+) -> dict:
     if category in ("full_screen", "transition"):
         return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
 
-    default = {"x": 700, "y": 64, "width": 520, "height": 160}
+    default = {"width": 520, "height": 160}
     if not isinstance(raw, dict):
-        geo = dict(default)
+        geo = {"x": 0, "y": 0, **default}
     else:
         try:
             geo = {
-                "x": int(raw.get("x", default["x"])),
-                "y": int(raw.get("y", default["y"])),
+                "x": int(raw.get("x", 0)) if allow_manual_placement else 0,
+                "y": int(raw.get("y", 0)) if allow_manual_placement else 0,
                 "width": int(raw.get("width", default["width"])),
                 "height": int(raw.get("height", default["height"])),
             }
         except (TypeError, ValueError):
-            geo = dict(default)
+            geo = {"x": 0, "y": 0, **default}
 
-    geo["width"] = max(40, min(geo["width"], ANIMATION_CANVAS_WIDTH))
-    geo["height"] = max(40, min(geo["height"], ANIMATION_CANVAS_HEIGHT))
-    geo["x"] = max(0, min(geo["x"], ANIMATION_CANVAS_WIDTH - geo["width"]))
-    geo["y"] = max(0, min(geo["y"], ANIMATION_CANVAS_HEIGHT - geo["height"]))
+    max_width = max(40, ANIMATION_CANVAS_WIDTH - 2 * _SAFE_MARGIN)
+    max_height = max(40, ANIMATION_CANVAS_HEIGHT - 2 * _SAFE_MARGIN)
+    if category == "overlay_text" and display_text is not None:
+        # Tighten the ceiling further to what this specific text actually
+        # needs, instead of only capping against the canvas-wide maximum
+        # (which is generous enough to let a 3-word phrase get a
+        # near-half-screen box). Never used for overlay_graphic — an
+        # icon's badge size is a deliberate visual choice independent of
+        # any label text next to it.
+        content_max_w, content_max_h = _content_aware_max_box_size(display_text)
+        max_width = min(max_width, content_max_w)
+        max_height = min(max_height, content_max_h)
+    geo["width"] = max(40, min(geo["width"], max_width))
+    geo["height"] = max(40, min(geo["height"], max_height))
 
-    if category in ("overlay_text", "overlay_graphic"):
-        if geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
-            if geo["height"] < CAPTION_SAFE_ZONE_Y:
+    if allow_manual_placement and isinstance(raw, dict) and ("x" in raw or "y" in raw):
+        # A human explicitly set a position via a PATCH edit — that's a
+        # deliberate decision, not something to silently override. Still
+        # enforce the same minimum-margin/caption-safe-zone safety rails
+        # as everything else, just don't force it back to dead center.
+        geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
+        geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
+        if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
+            if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
                 geo["y"] = CAPTION_SAFE_ZONE_Y - geo["height"]
             else:
-                geo["height"] = CAPTION_SAFE_ZONE_Y - 4
-                geo["y"] = 4
+                geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
+                geo["y"] = _SAFE_MARGIN
+        return geo
+
+    # Icons and text overlays are always centered on the frame — this is a
+    # deliberate product decision (not a fallback default): whatever
+    # placement/x/y the model or an older stored animation provides is
+    # discarded entirely, the same way full_screen/transition above always
+    # get the full frame regardless of input. Corner placement was tried
+    # earlier and reversed on explicit direction — center is now the only
+    # placement for these two categories, UNLESS allow_manual_placement is
+    # set (only true for direct human PATCH edits — see
+    # update_beat_animation), in which case the block above already
+    # returned an explicit, human-chosen position.
+    geo["x"] = (ANIMATION_CANVAS_WIDTH - geo["width"]) // 2
+
+    if category in ("overlay_text", "overlay_graphic"):
+        # Vertically centered on the frame, but never low enough to reach
+        # the caption band at the bottom — bias upward if a tall box would
+        # otherwise overlap it.
+        centered_y = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
+        if centered_y + geo["height"] > CAPTION_SAFE_ZONE_Y:
+            if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
+                centered_y = CAPTION_SAFE_ZONE_Y - geo["height"]
+            else:
+                geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
+                centered_y = _SAFE_MARGIN
+        geo["y"] = centered_y
+    else:
+        geo["y"] = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
 
     return geo
 
@@ -11381,7 +11484,9 @@ def _validate_motion(raw: Any, geometry: dict) -> dict:
     return motion
 
 
-def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict] = None) -> Optional[dict]:
+def _validate_beat_animation(
+    raw: Any, beat_ids: set, beats_by_id: Optional[dict] = None, allow_manual_placement: bool = False,
+) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
     beat_id = raw.get("beat_id")
@@ -11393,25 +11498,25 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
     category = _ANIMATION_TYPE_TO_CATEGORY[animation_type]
 
     placement = raw.get("placement")
-    if placement not in _VALID_PLACEMENTS:
-        placement = "full_frame" if category in ("full_screen", "transition") else _diversified_placement(beat_id)
-    if category in ("overlay_text", "overlay_graphic") and placement in ("bottom_left", "bottom_center", "bottom_right"):
-        placement = _diversified_placement(beat_id)
+    if category in ("full_screen", "transition"):
+        placement = "full_frame"
+    elif category in ("overlay_text", "overlay_graphic") and not allow_manual_placement:
+        # Icons and text overlays are always centered — see
+        # _validate_geometry_px, which forces the actual geometry to
+        # center regardless of what's given. Keep the placement LABEL
+        # consistent with that so nothing downstream reads a stale
+        # corner name against center coordinates. Manual PATCH edits
+        # (allow_manual_placement=True) keep whatever placement label the
+        # human sent instead — validated below like everything else.
+        placement = "center"
+    elif placement not in _VALID_PLACEMENTS:
+        placement = "top_left" if allow_manual_placement else "top_center"
 
-    geometry_px = _validate_geometry_px(raw.get("geometry_px"), category)
+    geometry_px = _validate_geometry_px(
+        raw.get("geometry_px"), category, allow_manual_placement=allow_manual_placement,
+        display_text=raw.get("display_text"),
+    )
     motion = _validate_motion(raw.get("motion"), geometry_px)
-
-    # Code-level guarantee against center-column placement for text/icon
-    # overlays — prompt guidance alone proved unreliable in practice (both
-    # "top_center" and dead "center" kept showing up, including one case
-    # landing directly on top of the shot's main subject). This checks the
-    # ACTUAL geometry, not just the placement label, since geometry_px is
-    # what the renderer uses — a model could label something "top_left"
-    # while still handing over center-ish coordinates.
-    if category in ("overlay_text", "overlay_graphic") and _is_center_column(geometry_px):
-        placement = _diversified_placement(beat_id)
-        geometry_px = _corner_geometry_px(placement, geometry_px["width"], geometry_px["height"])
-        motion = _validate_motion(None, geometry_px)
 
     z_index_layer = raw.get("z_index_layer")
     if z_index_layer not in _VALID_Z_LAYERS:
@@ -11459,6 +11564,29 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
     else:
         icon_name, icon_layout = None, None
 
+    # Diagnostic only (not an auto-fix — inventing a plausible second icon
+    # from text alone is too unreliable to do safely in code): flag when a
+    # single icon_name is paired with render_prompt/display_text language
+    # that describes a two-sided comparison. What renders in that case is
+    # one icon next to comparison text with no visual link between them —
+    # exactly the "odd, random-looking icon" pattern. The real fix is the
+    # prompt's own CONSISTENCY CHECK instruction; this just makes it
+    # visible in logs when the model doesn't follow it.
+    if isinstance(icon_name, str) and icon_name:
+        comparison_source = " ".join(
+            str(x) for x in (raw.get("render_prompt"), raw.get("display_text"), raw.get("content_binding"))
+            if isinstance(x, str)
+        ).lower()
+        comparison_markers = (" versus ", " vs ", " vs. ", "/", " either ")
+        if any(m in comparison_source for m in comparison_markers):
+            print(
+                f"[edit-video] beat {beat_id}: animation_type={animation_type!r} has a single "
+                f"icon_name ({icon_name!r}) but its own render_prompt/display_text reads like a "
+                f"two-sided comparison — this will render as one icon next to comparison text "
+                f"with nothing visually linking them. Should likely have been icon_name=[a, b] "
+                f"with icon_layout='pair'."
+            )
+
     display_text = raw.get("display_text")
     if display_text is not None and not isinstance(display_text, (str, list)):
         display_text = None
@@ -11486,9 +11614,45 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
     else:
         background_color_hint = None
 
+    # Font size for the overlay's own text (distinct from
+    # SceneStyleUpdate.font_size, which controls burned-in word-by-word
+    # captions, not this). null means "let the renderer size it itself"
+    # (auto-fit to the box, or the Remotion component's own default) —
+    # only set when a specific size is actually wanted, e.g. via a manual
+    # PATCH edit. Clamped to a sane range; this field existed in the
+    # schema before but was never actually read anywhere downstream.
+    font_size = raw.get("font_size")
+    try:
+        font_size = int(font_size) if font_size is not None else None
+        if font_size is not None and not (10 <= font_size <= 200):
+            font_size = None
+    except (TypeError, ValueError):
+        font_size = None
+
     highlight_target_text = raw.get("highlight_target_text")
     if not isinstance(highlight_target_text, str) or not highlight_target_text.strip():
         highlight_target_text = None
+
+    # anchor_start_sec/anchor_end_sec: the Animation Planner's own computed
+    # timing, read directly off the real word-level timestamps it was
+    # given for this beat — authoritative when present. build_timeline_
+    # from_scenes prefers these over its own after-the-fact phrase
+    # matching; they're optional here (not every caller of
+    # _validate_beat_animation runs through the Animation Planner, e.g.
+    # the guaranteed-icon fallback), so an absent/invalid value just means
+    # "fall back to the heuristic matcher," not a validation failure.
+    anchor_start_sec = raw.get("anchor_start_sec")
+    anchor_end_sec = raw.get("anchor_end_sec")
+    try:
+        anchor_start_sec = float(anchor_start_sec) if anchor_start_sec is not None else None
+    except (TypeError, ValueError):
+        anchor_start_sec = None
+    try:
+        anchor_end_sec = float(anchor_end_sec) if anchor_end_sec is not None else None
+    except (TypeError, ValueError):
+        anchor_end_sec = None
+    if anchor_start_sec is not None and anchor_end_sec is not None and anchor_end_sec < anchor_start_sec:
+        anchor_start_sec, anchor_end_sec = None, None
 
     render_prompt = raw.get("render_prompt")
     if not isinstance(render_prompt, str):
@@ -11514,7 +11678,10 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
         "display_text": display_text,
         "color_hint": color_hint,
         "background_color_hint": background_color_hint,
+        "font_size": font_size,
         "highlight_target_text": highlight_target_text,
+        "anchor_start_sec": anchor_start_sec,
+        "anchor_end_sec": anchor_end_sec,
         "render_prompt": render_prompt,
         "render_engine_hint": render_engine_hint,
     }
@@ -11523,10 +11690,32 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
 async def _run_animation_planner(
     *, scene_id: str, scene_visual_intent: str, scene_on_screen_text: str, requires_animation: bool,
     scene_animation_density: str, category: str, style_profile: dict, script_language: str,
-    beats: list, previous_scene_last_animation: Optional[dict],
+    beats: list, previous_scene_last_animation: Optional[dict], timed_words: Optional[list] = None,
 ) -> list[dict]:
     if not requires_animation:
         return []
+
+    # Word-level timestamps for each beat's own span, sliced from the
+    # scene's real WhisperX alignment (timed_words). Giving the model the
+    # ACTUAL time each word is spoken — not just the narration text — lets
+    # it compute exact anchor_start_sec/anchor_end_sec itself by reading
+    # real ground truth, instead of Storybit trying to reverse-engineer
+    # timing afterward by fuzzy-matching display_text against the
+    # transcript. That heuristic approach kept finding new edge cases
+    # (wrong beat, list vs string display_text, tie-breaking bias); having
+    # the model do the matching with the real data in front of it removes
+    # the whole class of guesswork.
+    def _beat_words(b: dict) -> list:
+        if not timed_words:
+            return []
+        b_start, b_end = b.get("start"), b.get("end")
+        if b_start is None or b_end is None:
+            return []
+        return [
+            {"word": w.get("word", ""), "start": round(w["start"], 2), "end": round(w["end"], 2)}
+            for w in timed_words
+            if "start" in w and "end" in w and w["start"] >= b_start - 0.05 and w["start"] < b_end + 0.05
+        ]
 
     beats_context = [
         {
@@ -11536,6 +11725,7 @@ async def _run_animation_planner(
             "entities": b["entities"],
             "scene_direction": b["scene_direction"],
             "animation_signal": b["animation_signal"],
+            "words": _beat_words(b),
         }
         for b in beats
     ]
@@ -11565,6 +11755,7 @@ async def _run_animation_planner(
             )
         )
         _record_token_usage("edit video - animation plan", res)
+        _log_token_usage("Animation Planner", res)
 
         content = (res.choices[0].message.content or "").strip()
         if content.startswith("```"):
@@ -11671,6 +11862,7 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
             scene_animation_density=scene_animation_density, category=category,
             style_profile=style_profile, script_language=script_language,
             beats=beats, previous_scene_last_animation=previous_animation_in,
+            timed_words=timed_words,
         )
 
         scene_out["beats"] = beats
@@ -11820,6 +12012,7 @@ async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
         scene_animation_density=scene_animation_density, category=ctx["category"],
         style_profile=ctx["style_profile"], script_language=ctx["script_language"],
         beats=beats, previous_scene_last_animation=previous_animation,
+        timed_words=timed_words,
     )
 
     scene["beats"] = beats
@@ -11892,6 +12085,7 @@ def _normalize_phrase_word(w: str) -> str:
 
 def _find_phrase_span_sec(
     target_text: Optional[str], timed_words: list, search_start: float, search_end: float,
+    hint_start_sec: Optional[float] = None,
 ) -> Optional[tuple]:
     """Finds when `target_text` is actually spoken, by matching it against
     word-level timestamps within [search_start, search_end] (a beat's own
@@ -11909,7 +12103,20 @@ def _find_phrase_span_sec(
     cleanly; a strict-match approach fails on names like that even though
     the rest of a long phrase lines up perfectly. A match is accepted when
     either a long enough exact run is found, or enough of the phrase's
-    words match overall (allowing scattered individual misses)."""
+    words match overall (allowing scattered individual misses).
+
+    hint_start_sec, when given (the Animation Planner's own anchor_start_
+    sec), disambiguates between multiple qualifying candidates by picking
+    whichever is CLOSEST to it, rather than always the single highest-
+    scoring one in isolation. This matters for a real failure mode: a
+    scene can genuinely say the same distinctive words more than once (a
+    callback, a recap, a repeated key phrase) — searching the whole scene
+    with no hint at all can and did match a coincidentally-similar-scoring
+    occurrence far from the true one (observed: a 77-second jump to a
+    completely wrong position). The model's own anchor is usually roughly
+    right even when not pixel-perfect, so it's a strong signal for WHICH
+    occurrence is the correct one, even when it can't be trusted as the
+    exact final number on its own."""
     if not target_text or not timed_words:
         return None
     target_words = [_normalize_phrase_word(w) for w in target_text.split()]
@@ -11930,8 +12137,8 @@ def _find_phrase_span_sec(
     min_run = min(n_target, 3)
     min_ratio = 0.6 if n_target >= 5 else 1.0  # short phrases still need a near-exact hit
 
+    candidates = []  # every qualifying (score, offset) pair, not just the best
     best_score = None
-    best_offset = None
     for offset in range(-n_target, n):
         matches = 0
         run = 0
@@ -11950,18 +12157,36 @@ def _find_phrase_span_sec(
         if best_run < min_run and ratio < min_ratio:
             continue
         score = (best_run, matches)
-        # Ties keep the LATEST candidate, not the first found. The offset
-        # loop runs earliest-to-latest, so on an exact tie the old ">"
-        # comparison always kept whichever position was found FIRST — a
-        # systematic bias toward the earliest equally-good match. Every
-        # sync complaint so far has been "the overlay shows too early,"
-        # never "too late," which is exactly the signature of that bias.
+        candidates.append((score, offset))
         if best_score is None or score >= best_score:
             best_score = score
-            best_offset = offset
 
-    if best_offset is None:
+    if not candidates:
         return None
+
+    def _offset_to_start_sec(offset: int) -> float:
+        idx = max(0, min(offset, n - 1))
+        return window[idx]["start"]
+
+    if hint_start_sec is not None:
+        # Among candidates that are at least reasonably strong (within one
+        # matched-word of the single best score — not just "qualified at
+        # all", so a barely-passing coincidental match elsewhere can't
+        # outrank a strong true match just for being closer to the hint by
+        # chance), pick whichever is closest in time to the model's own
+        # anchor.
+        strong_candidates = [c for c in candidates if c[0][1] >= best_score[1] - 1]
+        best_offset = min(strong_candidates, key=lambda c: abs(_offset_to_start_sec(c[1]) - hint_start_sec))[1]
+    else:
+        # No hint available — same tie-break as before: ties keep the
+        # LATEST candidate, since every sync complaint prior to this one
+        # was "shows too early", never "too late".
+        best_offset = None
+        best_kept_score = None
+        for score, offset in candidates:
+            if best_kept_score is None or score >= best_kept_score:
+                best_kept_score = score
+                best_offset = offset
 
     start_idx = max(0, min(best_offset, n - 1))
     end_idx = max(0, min(n_target - 1 + best_offset, n - 1))
@@ -12063,6 +12288,7 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
 
             tracks.append(broll_track)
 
+        scene_animation_tracks = []
         for animation in (scene.get("animations") or []):
             beat_id = animation.get("beat_id")
             rng = beat_frame_ranges.get(beat_id)
@@ -12071,57 +12297,124 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             b_start_frame, b_end_frame = rng
 
             anim_start_frame = b_start_frame
-            # Anchor to the actual spoken moment whenever there's text we
-            # can locate. Not gated on `trigger` at all: relying on the
-            # Animation Planner to correctly label something "on_keyword"
-            # proved unreliable in practice — plenty of animations with a
-            # clearly quotable display_text still came back "on_beat" (or
-            # some other trigger), which silently skipped anchoring and
-            # left the overlay showing from the start of the whole beat,
-            # well before the narration actually said those words. A
-            # failed phrase match already safely falls back to beat-start
-            # (see _find_phrase_span_sec), so attempting the match
-            # unconditionally can only improve timing, never worsen it.
             matched_end_frame = None
-            # Search the WHOLE SCENE's words, not just this animation's
-            # nominally-assigned beat. If the Animation Planner attaches an
-            # overlay to beat N but the phrase it's actually showing is
-            # spoken partway into beat N+1 (beats split mid-thought, or the
-            # planner just picked a nearby beat), restricting the search to
-            # beat N's own [start, end] means the real words are never in
-            # the search window at all — the match silently fails and
-            # falls back to beat N's start, showing the overlay early. A
-            # scene-wide search finds it wherever it actually is; the
-            # match is then allowed to resolve outside the nominal beat's
-            # bounds (clamped to the scene, not the beat) specifically so
-            # this misattribution case still ends up synced correctly.
+
+            # Compute the deterministic heuristic match FIRST, always —
+            # regardless of whether the model also provided its own
+            # anchor. This is what lets us catch a hallucinated
+            # anchor_start_sec: the model was given real word timestamps
+            # and told to read from them, but nothing forces it to
+            # actually do that — it can just default anchor_start_sec to
+            # the beat's own start out of habit while still passing schema
+            # validation. Without a cross-check, that wrong number would
+            # silently override what the heuristic matcher (grounded in
+            # the same real transcript) would have gotten right.
             target_text = animation.get("highlight_target_text")
-            if not target_text and isinstance(animation.get("display_text"), str):
-                target_text = animation.get("display_text")
-            matched_span = _find_phrase_span_sec(target_text, timed_words_sec, start_sec, end_sec)
-            if matched_span is not None:
-                matched_start_sec, matched_end_sec = matched_span
+            if not target_text:
+                # display_text can legally be a list (multi-line
+                # overlays), not just a string.
+                candidate_text = _display_text_to_string(animation.get("display_text"))
+                if candidate_text:
+                    target_text = candidate_text
+
+            model_anchor_start = animation.get("anchor_start_sec")
+            model_anchor_end = animation.get("anchor_end_sec")
+
+            # Pass the model's own anchor as a disambiguation hint — see
+            # _find_phrase_span_sec's docstring. Without this, a phrase
+            # that's genuinely spoken more than once in a long scene (a
+            # callback, a recap) could match the wrong occurrence even
+            # though it scores fine in isolation; the model's anchor,
+            # even when not itself precise, is usually close enough to
+            # the TRUE occurrence to pick the right one of several.
+            heuristic_span = _find_phrase_span_sec(
+                target_text, timed_words_sec, start_sec, end_sec, hint_start_sec=model_anchor_start,
+            )
+
+            # Heuristic-first: the deterministic transcript matcher has
+            # proven reliable in every verified case; the model's own
+            # anchor_start_sec has repeatedly turned out wrong (defaulted
+            # to the beat's start rather than actually read from the
+            # words it was given) even when it landed within a small-
+            # seeming margin of the truth — a "small" 2s disagreement is
+            # still very visibly wrong to a viewer. So the priority is now
+            # inverted from a pure tolerance check: use the heuristic
+            # whenever it finds ANY match at all, and fall back to the
+            # model's anchor only when the heuristic finds nothing to
+            # match against (e.g. a paraphrased display_text with no
+            # verbatim words in the transcript).
+            use_model_anchor = model_anchor_start is not None and heuristic_span is None
+            if model_anchor_start is not None and heuristic_span is not None:
+                heuristic_start_sec = heuristic_span[0]
+                if abs(model_anchor_start - heuristic_start_sec) > 0.5:
+                    print(
+                        f"[edit-video] scene {scene_id} beat {beat_id}: Animation Planner's "
+                        f"anchor_start_sec ({model_anchor_start:.2f}s) disagrees with the "
+                        f"heuristic transcript match ({heuristic_start_sec:.2f}s) — using the "
+                        f"heuristic match (deterministic, grounded in the real transcript, "
+                        f"and has proven more reliable than trusting the model's own anchor)"
+                    )
+
+            if use_model_anchor:
+                candidate_start_frame = scene_start_frame + _seconds_to_frames(model_anchor_start - start_sec, fps)
+                anim_start_frame = max(scene_start_frame, min(candidate_start_frame, scene_end_frame))
+            elif heuristic_span is not None:
+                matched_start_sec, _ = heuristic_span
                 candidate_start_frame = scene_start_frame + _seconds_to_frames(matched_start_sec - start_sec, fps)
                 anim_start_frame = max(scene_start_frame, min(candidate_start_frame, scene_end_frame))
-                candidate_end_frame = scene_start_frame + _seconds_to_frames(matched_end_sec - start_sec, fps)
-                matched_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
 
-            # Duration is the LONGER of: what the model asked for
-            # (duration_frames), or how long the matched phrase actually
-            # takes to be spoken (plus a short hold so it doesn't vanish
-            # the instant the last word ends). This is what guarantees a
-            # keyword-anchored overlay never disappears mid-sentence —
-            # previously duration_frames alone decided the end time even
-            # after anchoring the start to the real phrase, so a short
-            # generic duration could still cut the overlay off before the
-            # voice finished saying the exact words it was showing.
+            # End time. The heuristic-matched end (when we have one) is
+            # the TRUSTED baseline — it's deterministic, grounded in the
+            # real transcript, and by construction lands right at the end
+            # of the actual matched phrase. We extend past that baseline
+            # to accommodate a model-provided anchor_end_sec or
+            # duration_frames that wants extra hold time, but only by a
+            # bounded, reasonable margin — not by an unlimited amount.
+            #
+            # This cap is the fix for a real regression: the previous
+            # version took the unconditional max() of every end candidate,
+            # including the model's own anchor_end_sec/duration_frames
+            # with no sanity check against the heuristic at all. When the
+            # model hallucinated a wildly-too-long end (e.g. defaulting to
+            # something like its own beat's full remaining length), that
+            # unbounded max() would win outright — and because the
+            # cross-beat spillover fix now faithfully renders an animation
+            # across as many beats as its computed end requires, the
+            # result was an overlay lingering for 10+ seconds past when
+            # the phrase actually finished, silently overlapping whatever
+            # came next. Bounding the extension keeps the original intent
+            # (never cut off before the voice finishes) without also
+            # allowing an unverified number to run away unbounded.
             model_end_frame = min(anim_start_frame + animation.get("duration_frames", 90), scene_end_frame)
-            if matched_end_frame is not None:
-                hold_buffer_frames = round(0.3 * fps)
-                speech_end_frame = min(matched_end_frame + hold_buffer_frames, scene_end_frame)
-                anim_end_frame = max(model_end_frame, speech_end_frame)
+            if heuristic_span is not None:
+                _, heuristic_end_sec = heuristic_span
+                candidate_end_frame = scene_start_frame + _seconds_to_frames(heuristic_end_sec - start_sec, fps)
+                heuristic_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
+                # Deliberate hold after the phrase finishes being spoken —
+                # this is what makes the overlay actually "stay" once the
+                # voice moves on, rather than disappearing the instant the
+                # last word ends. 0.3s is barely perceptible as a hold; 0.8s
+                # gives a viewer a real beat to keep reading before it goes.
+                hold_buffer_frames = round(0.8 * fps)
+                speech_end_frame = min(heuristic_end_frame + hold_buffer_frames, scene_end_frame)
+
+                max_reasonable_extra_frames = round(3.0 * fps)
+                max_end_frame = min(speech_end_frame + max_reasonable_extra_frames, scene_end_frame)
+
+                candidate_ends = [speech_end_frame, model_end_frame]
+                if use_model_anchor and model_anchor_end is not None:
+                    candidate_end_frame = scene_start_frame + _seconds_to_frames(model_anchor_end - start_sec, fps)
+                    candidate_ends.append(max(anim_start_frame, min(candidate_end_frame, scene_end_frame)))
+
+                anim_end_frame = max(speech_end_frame, min(max(candidate_ends), max_end_frame))
             else:
+                # No heuristic to sanity-check against — fall back to
+                # trusting the model/duration_frames, same as before.
                 anim_end_frame = model_end_frame
+                if use_model_anchor and model_anchor_end is not None:
+                    candidate_end_frame = scene_start_frame + _seconds_to_frames(model_anchor_end - start_sec, fps)
+                    model_anchor_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
+                    anim_end_frame = max(anim_end_frame, model_anchor_end_frame)
             # Defensive clamp: b_start_frame/b_end_frame are already bounded
             # to [scene_start_frame, scene_end_frame], so this is normally
             # redundant — but never let an animation's computed frames slip
@@ -12129,12 +12422,28 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             anim_start_frame = max(scene_start_frame, min(anim_start_frame, scene_end_frame))
             anim_end_frame = max(anim_start_frame, min(anim_end_frame, scene_end_frame))
 
-            tracks.append({
+            # Re-validate geometry_px against the CURRENT margin rules on
+            # every render, rather than trusting whatever was stored at
+            # the moment this animation was first created. Without this,
+            # geometry safety is frozen forever at creation time — an
+            # animation created before the margin-enforcement fix existed
+            # (or before any future geometry rule change) would stay
+            # unsafe across every subsequent re-render, no matter how
+            # correct the current validation logic or the Remotion
+            # component itself is. This mirrors the same self-healing
+            # approach already applied to sync/timing in this function —
+            # geometry deserves the same guarantee.
+            safe_geometry_px = _validate_geometry_px(
+                animation.get("geometry_px"), animation.get("category"),
+                display_text=animation.get("display_text"),
+            )
+
+            scene_animation_tracks.append({
                 "track_id": f"anim_{scene_id}_{beat_id}",
                 "scene_id": scene_id, "beat_id": beat_id, "type": "animation",
                 "layer": animation.get("z_index_layer", "foreground"),
                 "animation_type": animation.get("animation_type"), "category": animation.get("category"),
-                "placement": animation.get("placement"), "geometry_px": animation.get("geometry_px"),
+                "placement": animation.get("placement"), "geometry_px": safe_geometry_px,
                 "motion": animation.get("motion"), "icon_name": animation.get("icon_name"),
                 "icon_layout": animation.get("icon_layout"), "display_text": animation.get("display_text"),
                 "color_hint": animation.get("color_hint"), "highlight_target_text": animation.get("highlight_target_text"),
@@ -12147,6 +12456,31 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "asset_url": None,
                 "render_engine_hint": animation.get("render_engine_hint"),
             })
+
+        # De-conflict: two DIFFERENT animations in the same scene must
+        # never be visibly on screen at the same time. Each animation's
+        # start/end was computed independently above (from its own
+        # anchor/heuristic match), with nothing cross-checking it against
+        # any OTHER animation in the scene — so two overlays with
+        # genuinely overlapping anchor windows (e.g. one ends at 183.6s,
+        # the next starts at 182.2s) would both get composited over the
+        # same frames simultaneously. This was always a latent risk, but
+        # became a guaranteed visual collision once every overlay_text/
+        # overlay_graphic animation started rendering at the same
+        # (center) position — two overlapping-in-time animations now
+        # occupy the exact same screen space, producing garbled double
+        # text. Sort by start and trim the EARLIER animation's end back
+        # to the LATER one's start wherever they overlap, so consecutive
+        # animations are always sequential, never simultaneous.
+        scene_animation_tracks.sort(key=lambda t: t["startFrame"])
+        for i in range(len(scene_animation_tracks) - 1):
+            cur = scene_animation_tracks[i]
+            nxt = scene_animation_tracks[i + 1]
+            if cur["endFrame"] > nxt["startFrame"]:
+                cur["endFrame"] = max(cur["startFrame"], nxt["startFrame"])
+                cur["end_sec"] = cur["endFrame"] / fps
+                cur["duration_frames"] = cur["endFrame"] - cur["startFrame"]
+        tracks.extend(scene_animation_tracks)
 
         cumulative_frames = scene_end_frame
 
@@ -12326,6 +12660,7 @@ async def edit_video(request: EditVideo):
             )
         )
         _record_token_usage("edit video", res)
+        _log_token_usage("Scene Planner", res)
 
         content = (res.choices[0].message.content or "").strip()
         if content.startswith("```"):
@@ -12905,7 +13240,16 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
     else:
         merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
 
-    validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id)
+    # A human explicitly setting placement/geometry_px via this endpoint
+    # is a deliberate decision and should be respected, unlike the
+    # Animation Planner's own output which always gets force-centered.
+    # Scoped to only fire when THIS PATCH actually touches one of those
+    # two fields, so an unrelated edit (e.g. just color_hint) on an
+    # existing manually-placed animation doesn't accidentally re-center it,
+    # and a PATCH that never mentions placement doesn't unexpectedly
+    # opt an animation out of auto-centering either.
+    allow_manual_placement = "placement" in provided or "geometry_px" in provided
+    validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id, allow_manual_placement=allow_manual_placement)
     if not validated:
         raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
     if isinstance(merged_raw.get("id"), int):
@@ -14046,7 +14390,19 @@ async def render_infographic_via_remotion(
     """Renders one animation as a transparent ProRes4444 clip via Remotion.
     `composition_id` is the animation_type (e.g. "icon_pop_in",
     "full_screen_quote_card") — the Remotion project is expected to expose
-    one composition per animation_type in ANIMATION_TAXONOMY."""
+    one composition per animation_type in ANIMATION_TAXONOMY.
+
+    Always verifies the ACTUAL rendered clip length against the requested
+    duration_frames afterward and pads if short — this doesn't depend on
+    successfully parsing Remotion's exact error text to detect a
+    truncation (that regex match was a best-effort guess at Remotion's
+    error format that was never confirmed against real output, so relying
+    on it alone to trigger padding was fragile: if the message didn't
+    match, or Remotion truncated silently without erroring at all — e.g.
+    a composition with its own internal duration cap that simply clips
+    rather than throwing — the overlay would render shorter than intended
+    with no padding applied and no error logged either). Probing the real
+    output file's frame count is unconditional and catches every case."""
     if not REMOTION_PROJECT_DIR:
         print(
             f"[render] REMOTION_PROJECT_DIR not configured — skipping "
@@ -14070,29 +14426,79 @@ async def render_infographic_via_remotion(
         ]
         return cmd
 
+    rendered = False
     async with _remotion_semaphore:
         try:
             await _run(_build_cmd(f"0-{duration_frames - 1}"), cwd=REMOTION_PROJECT_DIR)
+            rendered = True
         except RuntimeError as e:
             msg = str(e)
             m = re.search(
                 r"durationInFrames.*?evaluated to be (\d+).*?not inbetween 0-(\d+)",
                 msg, re.IGNORECASE | re.DOTALL,
             )
-            if not m:
-                print(f"[render] Remotion render failed for '{composition_id}': {e}")
-                return None
+            max_frame = int(m.group(2)) if m else None
+            if max_frame is None:
+                # Couldn't parse a specific bound from the error — try a
+                # single generic retry with no --frames constraint at all
+                # (let the composition use its own default length) rather
+                # than giving up outright. If this also fails, there's
+                # nothing more to try.
+                print(f"[render] '{composition_id}' render failed and error format wasn't recognized ({e}) — retrying with the composition's own default duration")
+                try:
+                    await _run(_build_cmd(None), cwd=REMOTION_PROJECT_DIR)
+                    rendered = True
+                except Exception as e2:
+                    print(f"[render] '{composition_id}': fallback retry also failed: {e2}")
+                    return None
+            else:
+                print(f"[render] '{composition_id}' has a fixed durationInFrames — retrying within its native bounds (0-{max_frame})")
+                try:
+                    await _run(_build_cmd(f"0-{max_frame}"), cwd=REMOTION_PROJECT_DIR)
+                    rendered = True
+                except Exception as e2:
+                    print(f"[render] '{composition_id}': retry also failed: {e2}")
+                    return None
 
-            max_frame = int(m.group(2))
+    if not rendered:
+        return None
+
+    # Unconditional check: does the actual rendered file have as many
+    # frames as requested? If not — for ANY reason, error-message-parsed
+    # or not — freeze-pad its last frame out to duration_frames so the
+    # overlay stays visible for its full intended duration rather than
+    # vanishing early (the render pipeline composites this clip starting
+    # at frame 0 of wherever it's placed, so a short clip directly means
+    # early disappearance, independent of how correct the upstream
+    # anchor_start_sec/anchor_end_sec computation was).
+    try:
+        actual_seconds = await _probe_duration_seconds(out_path)
+        actual_frames = max(1, round(actual_seconds * fps))
+    except Exception as e:
+        print(f"[render] '{composition_id}': couldn't verify rendered clip length ({e}) — using it as-is")
+        return out_path
+
+    if actual_frames < duration_frames:
+        padded_path = os.path.join(tmp_dir, f"anim_padded_{uuid.uuid4().hex}.mov")
+        pad_cmd = [
+            FFMPEG_BIN, "-y", "-i", out_path,
+            "-vf", f"tpad=stop_mode=clone:stop={duration_frames - actual_frames}",
+            "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
+            padded_path,
+        ]
+        try:
+            await _run(pad_cmd)
             print(
-                f"[render] '{composition_id}' has a fixed durationInFrames "
-                f"— retrying within its native bounds (0-{max_frame})"
+                f"[render] '{composition_id}': rendered clip was {actual_frames}/{duration_frames} "
+                f"frames — padded by freezing its final frame so it stays visible for the "
+                f"full intended duration instead of vanishing early"
             )
-            try:
-                await _run(_build_cmd(f"0-{max_frame}"), cwd=REMOTION_PROJECT_DIR)
-            except Exception as e2:
-                print(f"[render] retry also failed for '{composition_id}': {e2}")
-                return None
+            return padded_path
+        except Exception as e3:
+            print(
+                f"[render] '{composition_id}': failed to pad truncated clip, "
+                f"leaving it short at {actual_frames}/{duration_frames} frames: {e3}"
+            )
 
     return out_path
 
@@ -14266,15 +14672,17 @@ def _display_text_to_string(display_text: Any) -> str:
 
 
 def _font_size_for_geometry(geo: dict, text: str) -> int:
-    """Loose implementation of the Animation Planner's own sizing rule of
-    thumb (~14-18 chars per 100px of box width) — solves for a font size
-    that keeps the longest line inside the (already-scaled) box."""
+    """Solves for a font size that keeps the longest line inside the
+    (already-scaled) box, clamped to a fixed 20-25px range for this
+    style of small, understated callout — not a general-purpose sizer
+    that scales up for big boxes; this family of overlay is meant to
+    read as a quiet annotation, not a headline."""
     lines = text.split("\n") or [text]
     longest = max((len(l) for l in lines), default=1) or 1
     chars_per_100px = 16
-    width_based = max(int((geo["width"] / max(longest, 1)) * (100 / chars_per_100px) * 0.6), 18)
+    width_based = int((geo["width"] / max(longest, 1)) * (100 / chars_per_100px) * 0.6)
     height_based = int(geo["height"] / max(len(lines), 1) * 0.7) if geo["height"] else width_based
-    return max(18, min(width_based, height_based, 120))
+    return max(20, min(width_based, height_based, 25))
 
 def _ffmpeg_box_color(background_color_hint: Optional[str], alpha: float, default: str = "black") -> str:
     """Converts an animation's background_color_hint (hex, or None) into
@@ -14289,10 +14697,14 @@ def _ffmpeg_box_color(background_color_hint: Optional[str], alpha: float, defaul
 
 def _build_icon_overlay_drawtext(
     animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
+    offset_seconds: float = 0.0,
 ) -> Optional[str]:
     """FFmpeg fallback for overlay_graphic/branding animations — draws the
     icon's emoji glyph (+ optional label) at geometry_px, with fade in/out
-    and support for single / sequence / cluster / pair icon_layout."""
+    and support for single / sequence / cluster / pair icon_layout.
+    offset_seconds shifts every timing expression so the animation only
+    becomes visible that many seconds into the clip it's drawn onto — see
+    the offset_seconds note on _apply_beat_animation for why this exists."""
     icon_name = animation.get("icon_name")
     icons: list[str] = []
     if isinstance(icon_name, str) and icon_name:
@@ -14309,9 +14721,11 @@ def _build_icon_overlay_drawtext(
     duration_seconds = max(clip_duration_frames / fps, 0.2)
     fade_in = min(0.35, duration_seconds / 4)
     fade_out = min(0.35, duration_seconds / 4)
+    o = offset_seconds
     alpha_expr = (
-        f"if(lt(t,{fade_in}),t/{fade_in},"
-        f"if(gt(t,{duration_seconds - fade_out}),({duration_seconds}-t)/{fade_out},1))"
+        f"if(lt(t,{o}),0,"
+        f"if(lt(t,{o + fade_in}),(t-{o})/{fade_in},"
+        f"if(gt(t,{o + duration_seconds - fade_out}),({o + duration_seconds}-t)/{fade_out},1)))"
     )
 
     icon_font_size = max(28, min(int(geo["height"] * 0.55), 140))
@@ -14338,8 +14752,8 @@ def _build_icon_overlay_drawtext(
             for i, icon in enumerate(icons[:n]):
                 glyph = _icon_glyph(icon)
                 safe_text = _escape_drawtext(glyph)
-                seg_start = i * slice_seconds
-                seg_end = duration_seconds if i == n - 1 else (i + 1) * slice_seconds
+                seg_start = o + i * slice_seconds
+                seg_end = o + (duration_seconds if i == n - 1 else (i + 1) * slice_seconds)
                 local_fade_in = min(0.2, slice_seconds / 4)
                 seg_alpha = (
                     f"if(lt(t,{seg_start}),0,"
@@ -14380,6 +14794,7 @@ def _build_icon_overlay_drawtext(
     
 def _build_beat_animation_drawtext(
     animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
+    offset_seconds: float = 0.0,
 ) -> Optional[str]:
     """
     FFmpeg fallback for animation categories that are pure text —
@@ -14387,6 +14802,9 @@ def _build_beat_animation_drawtext(
     or `highlight_target_text` with nothing to actually screenshot.
     `overlay_graphic` / `pip` / `branding` (icons, PiP frames, avatars)
     have no honest FFmpeg equivalent — callers should not route those here.
+    offset_seconds shifts the fade timing so the text only becomes visible
+    that many seconds into the clip it's drawn onto — see the
+    offset_seconds note on _apply_beat_animation for why this exists.
     """
     text = _display_text_to_string(animation.get("display_text"))
     if not text and animation.get("highlight_target_text"):
@@ -14397,14 +14815,16 @@ def _build_beat_animation_drawtext(
         return None
 
     geo = _scale_geometry_px(animation.get("geometry_px") or {}, out_width, out_height)
-    font_size = _font_size_for_geometry(geo, text)
+    font_size = animation.get("font_size") or _font_size_for_geometry(geo, text)
 
     duration_seconds = max(clip_duration_frames / fps, 0.2)
     fade_in = min(0.4, duration_seconds / 4)
     fade_out = min(0.4, duration_seconds / 4)
+    o = offset_seconds
     alpha_expr = (
-        f"if(lt(t,{fade_in}),t/{fade_in},"
-        f"if(gt(t,{duration_seconds - fade_out}),({duration_seconds}-t)/{fade_out},1))"
+        f"if(lt(t,{o}),0,"
+        f"if(lt(t,{o + fade_in}),(t-{o})/{fade_in},"
+        f"if(gt(t,{o + duration_seconds - fade_out}),({o + duration_seconds}-t)/{fade_out},1)))"
     )
 
     safe_text = _escape_drawtext(text)
@@ -14487,6 +14907,7 @@ def _build_remotion_props(animation_type: str, animation: dict, width: int, heig
         "displayText": animation.get("display_text"),
         "colorHint": animation.get("color_hint"),
         "backgroundColorHint": animation.get("background_color_hint"),
+        "fontSize": animation.get("font_size"),
         "geometryPx": _scale_geometry_px(animation.get("geometry_px") or {}, width, height),
         "iconName": animation.get("icon_name"),
         "iconLayout": animation.get("icon_layout"),
@@ -14497,16 +14918,35 @@ def _build_remotion_props(animation_type: str, animation: dict, width: int, heig
 
 async def _apply_beat_animation(
     beat_clip_path: str, animation: dict, width: int, height: int, fps: int, tmp_dir: str,
+    offset_seconds: float = 0.0,
 ) -> str:
     """
     Applies ONE animation (a timeline "animation" track dict, already
     scoped to a single beat) onto that beat's own clip. Returns the
     animated clip path, or the original `beat_clip_path` unchanged if
     nothing could be rendered for it.
+
+    offset_seconds is how far INTO the beat's own clip the animation
+    should actually start appearing — computed by the caller as
+    (animation's own timeline startFrame - the beat's own timeline
+    startFrame) / fps. This is not optional cosmetic polish: every
+    animation's real anchor_start_sec/anchor_end_sec (or heuristic-matched
+    timing) was being computed correctly upstream in build_timeline_from_
+    scenes, but this function used to always composite the overlay
+    starting at frame 0 of whatever beat clip it was attached to —
+    silently discarding that timing and showing every animation from the
+    moment its beat's B-roll began, regardless of when it was actually
+    supposed to appear. For a beat several seconds long with an animation
+    anchored partway through it (the normal case for anything anchored to
+    a specific phrase), this made the animation show early by exactly the
+    gap between the beat's start and the animation's real anchor — which
+    is precisely the sync bug that kept reproducing no matter how
+    accurate the upstream timing computation became.
     """
     category = animation.get("category")
     animation_type = animation.get("animation_type")
     duration_frames = animation.get("duration_frames") or fps * 2
+    offset_seconds = max(0.0, offset_seconds)
 
     # A separate async Remotion pipeline may already have pre-rendered
     # this animation and populated `asset_url` on the timeline track —
@@ -14545,10 +14985,16 @@ async def _apply_beat_animation(
 
     if overlay_clip:
         composited = os.path.join(tmp_dir, f"anim_composited_{uuid.uuid4().hex}.mp4")
+        # -itsoffset on the overlay INPUT shifts its presentation
+        # timestamps forward by offset_seconds, so it has no frames to
+        # show until that point in the merged timeline — before then,
+        # overlay just passes the base beat clip through unchanged. This
+        # is what actually delays the animation to its real anchor time
+        # instead of always starting at the beat's own frame 0.
         cmd = [
             FFMPEG_BIN, "-y",
             "-i", beat_clip_path,
-            "-i", overlay_clip,
+            "-itsoffset", f"{offset_seconds:.3f}", "-i", overlay_clip,
             "-filter_complex", "[1:v]format=yuva420p[fg];[0:v][fg]overlay=0:0:eof_action=pass:format=auto",
             "-r", str(fps),
             *FFMPEG_X264_FLAGS,
@@ -14565,7 +15011,7 @@ async def _apply_beat_animation(
         category == "full_screen" and (animation.get("display_text") or animation.get("highlight_target_text"))
     )
     if text_eligible:
-        drawtext = _build_beat_animation_drawtext(animation, width, height, duration_frames, fps)
+        drawtext = _build_beat_animation_drawtext(animation, width, height, duration_frames, fps, offset_seconds)
         if drawtext:
             out_path = os.path.join(tmp_dir, f"anim_text_{uuid.uuid4().hex}.mp4")
             try:
@@ -14582,7 +15028,7 @@ async def _apply_beat_animation(
     # "return beat_clip_path" below with no FFmpeg rendering at all.
     icon_eligible = category in ("overlay_graphic", "branding")
     if icon_eligible:
-        icon_drawtext = _build_icon_overlay_drawtext(animation, width, height, duration_frames, fps)
+        icon_drawtext = _build_icon_overlay_drawtext(animation, width, height, duration_frames, fps, offset_seconds)
         if icon_drawtext:
             out_path = os.path.join(tmp_dir, f"anim_icon_{uuid.uuid4().hex}.mp4")
             try:
@@ -14707,13 +15153,47 @@ async def _render_scene(
                     motion_type=beat_motion_type,
                 )
 
-                # NEW: apply THIS beat's own animation (if any) onto its
-                # own clip before concatenation — this is what actually
-                # lets a scene carry more than one animated moment.
-                this_beat_animation = beat_animations.get(beat_track.get("beat_id"))
-                if this_beat_animation:
+                # Apply every animation whose frame range overlaps THIS
+                # beat's frame range — not just the one nominally attached
+                # to this beat_id. A long quote/animation can legitimately
+                # extend past its own beat's boundary into the next beat
+                # (build_timeline_from_scenes only clamps its end to the
+                # SCENE's boundary, deliberately, so a long quote isn't cut
+                # short just because it outlasts one beat) — but this
+                # render loop used to only ever look up the ONE animation
+                # nominally attached to the current beat_id. Any portion of
+                # an animation's real duration that spilled into a LATER
+                # beat was silently dropped the moment that beat's own clip
+                # ended, no matter what the timeline said the true end
+                # should be — this is what let a quote's overlay vanish
+                # mid-sentence even though its computed anchor_end_sec was
+                # correct. Each overlapping animation gets composited with
+                # its own LOCAL offset/duration clipped to what actually
+                # fits in this one beat's clip; sequential animations that
+                # both touch this beat both get applied, in order.
+                relevant_animations = []
+                for anim in beat_animations.values():
+                    a_start_frame = anim.get("startFrame")
+                    a_end_frame = anim.get("endFrame")
+                    if a_start_frame is None or a_end_frame is None:
+                        continue
+                    if a_end_frame <= track_start_frame or a_start_frame >= track_end_frame:
+                        continue  # no overlap with this beat at all
+                    relevant_animations.append((a_start_frame, anim))
+                relevant_animations.sort(key=lambda pair: pair[0])
+
+                for a_start_frame, anim in relevant_animations:
+                    a_end_frame = anim.get("endFrame")
+                    local_start_frame = max(0, a_start_frame - track_start_frame)
+                    local_end_frame = min(beat_duration_frames, a_end_frame - track_start_frame)
+                    if local_end_frame <= local_start_frame:
+                        continue
+                    offset_seconds = local_start_frame / fps
+                    local_anim = dict(anim)
+                    local_anim["duration_frames"] = local_end_frame - local_start_frame
                     beat_clip = await _apply_beat_animation(
-                        beat_clip, this_beat_animation, width, height, fps, beat_tmp_dir,
+                        beat_clip, local_anim, width, height, fps, beat_tmp_dir,
+                        offset_seconds=offset_seconds,
                     )
 
                 beat_clip_paths.append(beat_clip)
@@ -15034,14 +15514,6 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     if not scenes:
         raise HTTPException(status_code=400, detail="No scenes to render for this video")
 
-    # Always rebuild the timeline fresh from raw_scenes rather than trusting
-    # a stored timeline_json snapshot. The stored column reflects whatever
-    # build_timeline_from_scenes computed the LAST time this video's scenes
-    # were saved — for a video created before a sync/placement/duration fix
-    # landed, that snapshot keeps silently baking the old bug into every
-    # re-render, no matter how many times the fix itself gets deployed.
-    # This was the actual reason "the same fix, redeployed, didn't help":
-    # the fix was correct, but /render never re-ran it.
     timeline = build_timeline_from_scenes(scenes)
     try:
         infographics_list, text_list = _compute_infographics_and_text_lists(scenes, timeline)
@@ -15056,27 +15528,3 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
