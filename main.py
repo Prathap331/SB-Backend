@@ -4161,6 +4161,26 @@ Requirements:
 """
 
 
+def _build_script_context(db_results: list[dict], new_articles: list[dict]) -> str:
+    parts = []
+
+    if db_results:
+        parts.append(f"=== KNOWLEDGE BASE EXCERPTS (dense similarity >= {DB_SIMILARITY_THRESHOLD}) ===")
+        for i, row in enumerate(db_results, start=1):
+            content = row.get("content", "")
+            dense_score = row.get("dense_score")
+            parts.append(f"[KB-{i}] (similarity={dense_score}) {content}")
+
+    if new_articles:
+        parts.append(f"\n=== RECENT NEWS / WEB (similarity >= {WEB_CONTENT_SIMILARITY_THRESHOLD}) ===")
+        for i, article in enumerate(new_articles, start=1):
+            snippet = article.get("snippet", "")
+            url = article.get("url", "")
+            similarity = article.get("similarity")
+            parts.append(f"[NEWS-{i}] (similarity={similarity}) {snippet} (source: {url})")
+
+    return "\n\n".join(parts) if parts else "No high-confidence source material available."
+
 
 def _segments_brief(segments: list[dict]) -> str:
     if not segments:
@@ -9171,37 +9191,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -10446,6 +10435,8 @@ _VALID_CAPTION_ANIMATION_TYPES = {
 
 class SceneStyleUpdate(BaseModel):
     font_size: Optional[int] = None
+    font_family: Optional[str] = None
+    words_per_line: Optional[int] = None
     text_color: Optional[str] = None
     outline_color: Optional[str] = None
     animation_type: Optional[str] = None
@@ -10580,6 +10571,19 @@ DEFAULT_CAPTION_STYLE = {
     "vertical_position": "bottom",
     "margin_bottom_percent": 3,
 }
+
+# How many words are grouped into one burned-in caption line at a time.
+# Bumped up from the previous default of 4 for a longer, more readable
+# chunk per line — still perfectly in sync with the voice, since each
+# line's on/off timing is still taken directly from the real start/end of
+# its first/last word (see _build_ass_from_words) regardless of how many
+# words are grouped together; this only changes how much text shows at
+# once, not when it appears.
+CAPTION_WORDS_PER_LINE = int(os.getenv("CAPTION_WORDS_PER_LINE", "7"))
+
+# Default burned-in caption font. Can still be overridden per scene via
+# caption_style.font_family (see SceneStyleUpdate / update_scene_style).
+DEFAULT_CAPTION_FONT = os.getenv("DEFAULT_CAPTION_FONT", "Roboto")
 
 TTS_MAX_CHARS_PER_CALL = int(os.getenv("TTS_MAX_CHARS_PER_CALL", "900"))
 TTS_AUDIO_BUCKET = os.getenv("TTS_AUDIO_BUCKET", "generated-audio")
@@ -11679,6 +11683,16 @@ def _validate_beat_animation(
         "color_hint": color_hint,
         "background_color_hint": background_color_hint,
         "font_size": font_size,
+        # Sticky once set: True either because THIS validation call was
+        # explicitly told it's a manual PATCH, or because the animation
+        # was already manually placed by an earlier PATCH and this call
+        # is just touching some other unrelated field. Without the OR,
+        # a later edit that doesn't mention placement/geometry_px (e.g.
+        # only changing color_hint) would reset this back to False,
+        # silently opting the animation back into auto-centering on the
+        # next render even though nothing about its position was
+        # supposed to change.
+        "manually_placed": bool(allow_manual_placement or (isinstance(raw, dict) and raw.get("manually_placed"))),
         "highlight_target_text": highlight_target_text,
         "anchor_start_sec": anchor_start_sec,
         "anchor_end_sec": anchor_end_sec,
@@ -12433,8 +12447,19 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             # component itself is. This mirrors the same self-healing
             # approach already applied to sync/timing in this function —
             # geometry deserves the same guarantee.
+            #
+            # allow_manual_placement is read from the animation's own
+            # stored "manually_placed" flag — set once, sticky, whenever a
+            # human PATCHed a specific placement/geometry_px (see
+            # _validate_beat_animation). Without this, a manually-placed
+            # animation would get silently force-centered back by THIS
+            # re-validation on the very next render, since this pass has
+            # no other way to distinguish "a human chose this position on
+            # purpose" from "the LLM generated this and it needs the
+            # normal safety/auto-center treatment".
             safe_geometry_px = _validate_geometry_px(
                 animation.get("geometry_px"), animation.get("category"),
+                allow_manual_placement=bool(animation.get("manually_placed")),
                 display_text=animation.get("display_text"),
             )
 
@@ -12879,7 +12904,8 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     _validate_hex_color(update.background_color, "background_color")
 
     if (
-        update.font_size is None and update.text_color is None and update.outline_color is None
+        update.font_size is None and update.font_family is None and update.words_per_line is None
+        and update.text_color is None and update.outline_color is None
         and update.animation_type is None and update.background_color is None and update.vertical_position is None
         and update.margin_bottom_percent is None and update.horizontal_position is None and update.margin_horizontal_percent is None
     ):
@@ -12904,7 +12930,8 @@ async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpd
     scene = dict(raw_scenes[scene_index])
 
     style_fields = {
-        "font_size": update.font_size, "text_color": update.text_color, "outline_color": update.outline_color,
+        "font_size": update.font_size, "font_family": update.font_family, "words_per_line": update.words_per_line,
+        "text_color": update.text_color, "outline_color": update.outline_color,
         "animation_type": update.animation_type, "vertical_position": update.vertical_position,
         "margin_bottom_percent": update.margin_bottom_percent, "horizontal_position": update.horizontal_position,
         "margin_horizontal_percent": update.margin_horizontal_percent,
@@ -13239,6 +13266,22 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
         merged_raw = {"beat_id": beat_id, **provided}
     else:
         merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
+        # If this PATCH moves the animation (geometry_px and/or placement)
+        # WITHOUT also providing a new motion, drop the old stored motion
+        # rather than silently carrying it forward. _validate_motion
+        # defaults start_xy_px/end_xy_px to the geometry's own x/y, but
+        # only when raw.motion doesn't already have them set — otherwise
+        # it trusts whatever's already there. Left alone, a position-only
+        # PATCH would update geometry_px correctly while motion still
+        # pointed at the OLD coordinates — and if the Remotion component
+        # uses motion.start_xy_px/end_xy_px for its actual entrance
+        # animation (common for a "slide in" or "cascade" effect), the
+        # element visually stays at the old spot despite geometry_px
+        # being right, which is exactly indistinguishable from "the PATCH
+        # didn't work" even though the backend update succeeded.
+        if ("geometry_px" in provided or "placement" in provided) and "motion" not in provided:
+            old_motion_style = (animations[anim_idx].get("motion") or {}).get("motion_style")
+            merged_raw["motion"] = {"motion_style": old_motion_style} if old_motion_style else None
 
     # A human explicitly setting placement/geometry_px via this endpoint
     # is a deliberate decision and should be respected, unlike the
@@ -14517,6 +14560,7 @@ def _build_ass_from_words(
 ) -> str:
     style = style or {}
     font_size = style.get("font_size") or 72
+    font_family = style.get("font_family") or DEFAULT_CAPTION_FONT
     primary_color = _hex_to_ass_color(style.get("text_color") or "#FFFFFF", alpha_hex="00")
     outline_color = _hex_to_ass_color(style.get("outline_color") or "#000000", alpha_hex="00")
     animation_type = style.get("animation_type") or "kinetic_caption"
@@ -14556,7 +14600,7 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV
-Style: Caption,Arial Black,{font_size},{primary_color},{outline_color},&H80000000,1,4,0,{alignment},{margin_l},{margin_r},{margin_v}
+Style: Caption,{font_family},{font_size},{primary_color},{outline_color},&H80000000,1,4,0,{alignment},{margin_l},{margin_r},{margin_v}
 
 [Events]
 Format: Layer, Start, End, Style, Text
@@ -14575,7 +14619,7 @@ Format: Layer, Start, End, Style, Text
 
     lines = []
     chunk: list[dict] = []
-    CHUNK_SIZE = 4
+    CHUNK_SIZE = style.get("words_per_line") or CAPTION_WORDS_PER_LINE
     for w in words:
         chunk.append(w)
         if len(chunk) >= CHUNK_SIZE:
@@ -15514,6 +15558,14 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     if not scenes:
         raise HTTPException(status_code=400, detail="No scenes to render for this video")
 
+    # Always rebuild the timeline fresh from raw_scenes rather than trusting
+    # a stored timeline_json snapshot. The stored column reflects whatever
+    # build_timeline_from_scenes computed the LAST time this video's scenes
+    # were saved — for a video created before a sync/placement/duration fix
+    # landed, that snapshot keeps silently baking the old bug into every
+    # re-render, no matter how many times the fix itself gets deployed.
+    # This was the actual reason "the same fix, redeployed, didn't help":
+    # the fix was correct, but /render never re-ran it.
     timeline = build_timeline_from_scenes(scenes)
     try:
         infographics_list, text_list = _compute_infographics_and_text_lists(scenes, timeline)
@@ -15528,3 +15580,32 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
