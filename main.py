@@ -9191,6 +9191,9 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
 import re
 import os
 import json
@@ -10579,7 +10582,7 @@ DEFAULT_CAPTION_STYLE = {
 # its first/last word (see _build_ass_from_words) regardless of how many
 # words are grouped together; this only changes how much text shows at
 # once, not when it appears.
-CAPTION_WORDS_PER_LINE = int(os.getenv("CAPTION_WORDS_PER_LINE", "7"))
+CAPTION_WORDS_PER_LINE = int(os.getenv("CAPTION_WORDS_PER_LINE", "10"))
 
 # Default burned-in caption font. Can still be overridden per scene via
 # caption_style.font_family (see SceneStyleUpdate / update_scene_style).
@@ -13265,6 +13268,30 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
             raise HTTPException(status_code=422, detail="animation_type is required to create a new animation on this beat")
         merged_raw = {"beat_id": beat_id, **provided}
     else:
+        # A partial geometry_px (e.g. just {"width": 240, "height": 240}
+        # to resize an icon without moving it) used to silently replace
+        # the WHOLE geometry_px dict on merge below — losing x/y entirely
+        # and snapping the animation to (0, 0). Merge with the existing
+        # geometry first so an unspecified field is preserved rather than
+        # dropped. When only width/height changed and x/y weren't given,
+        # recompute x/y so the box's CENTER stays put — this is what
+        # makes a resize-only PATCH actually behave like "make this
+        # bigger/smaller in place" instead of shifting the box's visual
+        # position just because its top-left anchor didn't move while its
+        # size did.
+        if "geometry_px" in provided:
+            existing_geo = animations[anim_idx].get("geometry_px") or {}
+            new_geo_partial = provided["geometry_px"] or {}
+            merged_geo = {**existing_geo, **new_geo_partial}
+            size_changed = "width" in new_geo_partial or "height" in new_geo_partial
+            position_given = "x" in new_geo_partial or "y" in new_geo_partial
+            if size_changed and not position_given and existing_geo:
+                old_cx = existing_geo.get("x", 0) + existing_geo.get("width", 0) / 2
+                old_cy = existing_geo.get("y", 0) + existing_geo.get("height", 0) / 2
+                merged_geo["x"] = round(old_cx - merged_geo.get("width", 0) / 2)
+                merged_geo["y"] = round(old_cy - merged_geo.get("height", 0) / 2)
+            provided = {**provided, "geometry_px": merged_geo}
+
         merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
         # If this PATCH moves the animation (geometry_px and/or placement)
         # WITHOUT also providing a new motion, drop the old stored motion
@@ -15412,13 +15439,6 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
 
     width, height = resolution["width"], resolution["height"]
 
-    # timeline_tracks_by_scene: scene_id -> [broll tracks] (one per beat).
-    # caption_tracks_by_scene: scene_id -> single caption_word track.
-    # animation_tracks_by_scene_beat: scene_id -> {beat_id: animation
-    #   track} — NOT a single track per scene, since a scene can have
-    #   several animated beats (see module docstring, point 1). There is
-    #   no "infographic" track type any more — the timeline only ever
-    #   emits "audio" / "caption_word" / "broll" / "animation".
     timeline_tracks_by_scene = {}
     caption_tracks_by_scene = {}
     animation_tracks_by_scene_beat = {}
@@ -15558,14 +15578,6 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     if not scenes:
         raise HTTPException(status_code=400, detail="No scenes to render for this video")
 
-    # Always rebuild the timeline fresh from raw_scenes rather than trusting
-    # a stored timeline_json snapshot. The stored column reflects whatever
-    # build_timeline_from_scenes computed the LAST time this video's scenes
-    # were saved — for a video created before a sync/placement/duration fix
-    # landed, that snapshot keeps silently baking the old bug into every
-    # re-render, no matter how many times the fix itself gets deployed.
-    # This was the actual reason "the same fix, redeployed, didn't help":
-    # the fix was correct, but /render never re-ran it.
     timeline = build_timeline_from_scenes(scenes)
     try:
         infographics_list, text_list = _compute_infographics_and_text_lists(scenes, timeline)
@@ -15580,32 +15592,3 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
 
     return {"final_video_url": final_video_url}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
