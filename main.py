@@ -13283,13 +13283,17 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
             existing_geo = animations[anim_idx].get("geometry_px") or {}
             new_geo_partial = provided["geometry_px"] or {}
             merged_geo = {**existing_geo, **new_geo_partial}
-            size_changed = "width" in new_geo_partial or "height" in new_geo_partial
-            position_given = "x" in new_geo_partial or "y" in new_geo_partial
-            if size_changed and not position_given and existing_geo:
-                old_cx = existing_geo.get("x", 0) + existing_geo.get("width", 0) / 2
-                old_cy = existing_geo.get("y", 0) + existing_geo.get("height", 0) / 2
-                merged_geo["x"] = round(old_cx - merged_geo.get("width", 0) / 2)
-                merged_geo["y"] = round(old_cy - merged_geo.get("height", 0) / 2)
+            # x/y are simply left untouched when a PATCH only sends
+            # width/height — the existing top-left corner from
+            # {**existing_geo, **new_geo_partial} above already does
+            # this, since new_geo_partial has no "x"/"y" keys to
+            # override them with. (An earlier version of this resized
+            # around the box's CENTER instead, which meant a big size
+            # change shifted x/y as a side-effect — correct geometry,
+            # but it read as "the icon moved" rather than "it resized",
+            # so anchoring to the unchanged corner instead is simpler
+            # and matches what "just make it bigger/smaller" actually
+            # means to a caller who isn't also repositioning it.)
             provided = {**provided, "geometry_px": merged_geo}
 
         merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
@@ -15439,6 +15443,13 @@ async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientati
 
     width, height = resolution["width"], resolution["height"]
 
+    # timeline_tracks_by_scene: scene_id -> [broll tracks] (one per beat).
+    # caption_tracks_by_scene: scene_id -> single caption_word track.
+    # animation_tracks_by_scene_beat: scene_id -> {beat_id: animation
+    #   track} — NOT a single track per scene, since a scene can have
+    #   several animated beats (see module docstring, point 1). There is
+    #   no "infographic" track type any more — the timeline only ever
+    #   emits "audio" / "caption_word" / "broll" / "animation".
     timeline_tracks_by_scene = {}
     caption_tracks_by_scene = {}
     animation_tracks_by_scene_beat = {}
@@ -15578,6 +15589,14 @@ async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoR
     if not scenes:
         raise HTTPException(status_code=400, detail="No scenes to render for this video")
 
+    # Always rebuild the timeline fresh from raw_scenes rather than trusting
+    # a stored timeline_json snapshot. The stored column reflects whatever
+    # build_timeline_from_scenes computed the LAST time this video's scenes
+    # were saved — for a video created before a sync/placement/duration fix
+    # landed, that snapshot keeps silently baking the old bug into every
+    # re-render, no matter how many times the fix itself gets deployed.
+    # This was the actual reason "the same fix, redeployed, didn't help":
+    # the fix was correct, but /render never re-ran it.
     timeline = build_timeline_from_scenes(scenes)
     try:
         infographics_list, text_list = _compute_infographics_and_text_lists(scenes, timeline)
