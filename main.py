@@ -9194,6 +9194,66 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import re
 import os
 import json
@@ -9202,8 +9262,8 @@ import uuid
 import shutil
 import tempfile
 import asyncio
+import datetime
 from typing import Any, Optional, Literal
-
 import httpx
 import whisperx
 from fastapi import HTTPException
@@ -9221,13 +9281,16 @@ def _looks_like_playable_media_url(url: Optional[str]) -> bool:
     return False
 
 
-def _is_landscape_dimensions(width, height) -> bool:
-    try:
-        w = float(width)
-        h = float(height)
-    except (TypeError, ValueError):
-        return False
-    return w > 0 and h > 0 and w >= h * 1.2
+def _display_text_to_string(display_text: Any) -> str:
+    if isinstance(display_text, list):
+        return "\n".join(str(d) for d in display_text if d)
+    if isinstance(display_text, str):
+        return display_text
+    return ""
+
+
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
 
 
 def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) -> Optional[str]:
@@ -9739,10 +9802,6 @@ _ICON_LIBRARY_GROUPS = {
 }
 _ICON_VOCAB = {icon for group in _ICON_LIBRARY_GROUPS.values() for icon in group}
 
-# Maps each STYLE_PROFILES category to the icon-library group most likely
-# to fit its content, so the guaranteed-icon fallback below (see
-# _pick_fallback_icon) reaches for something topical instead of always
-# defaulting to "sparkles".
 _ICON_GROUP_BY_CATEGORY = {
     "anthropology": "history_religion_anthropology_culture",
     "biography": "emotion_people",
@@ -9788,14 +9847,7 @@ _FALLBACK_ACCENT_COLORS = [
 
 
 def _pick_fallback_color(beat_id: Optional[str]) -> str:
-    """Rotates through a small palette instead of one hardcoded hex, keyed
-    on beat_id so the same beat always gets the same color across repeat
-    validation. This exists specifically because every other color_hint
-    default in this file used to be the identical "#F5A623" — the fallback
-    icon, the invalid/missing-color validation default, AND the example in
-    ANIMATION_PLANNER_PROMPT all converged on the same yellow, which is
-    almost certainly why generated videos ended up with everything yellow
-    regardless of what the model actually intended."""
+
     idx = sum(ord(c) for c in (beat_id or "")) % len(_FALLBACK_ACCENT_COLORS)
     return _FALLBACK_ACCENT_COLORS[idx]
 
@@ -9807,10 +9859,7 @@ def _pick_fallback_icon(category: str) -> str:
 
 
 def _fallback_icon_geometry() -> tuple[dict, dict]:
-    """Centered geometry for the fallback icon — icons and text overlays
-    are always centered on the frame per product direction, not placed in
-    a corner. Vertically centered but kept clear of the caption band at
-    the bottom by construction (icon is small relative to the frame)."""
+
     size = 160
     x = (CANVAS_WIDTH - size) // 2
     y = (CANVAS_HEIGHT - size) // 2
@@ -9824,12 +9873,6 @@ def _fallback_icon_geometry() -> tuple[dict, dict]:
 
 
 def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
-    """Guaranteed icon_pop_in for a scene that came back from the
-    Animation Planner with zero icon-bearing animations. Kept intentionally
-    plain — a small pop-in icon, not competing for the same visual weight
-    as a model-authored animation. Placement rotates across a beat's own
-    index so a video that leans on this fallback more than once doesn't
-    end up with every fallback icon parked in the same corner."""
     icon = _pick_fallback_icon(category)
     key_action = ((beat.get("scene_direction") or {}).get("key_action") or "").strip()
     on_screen_words = key_action.split()
@@ -9860,11 +9903,7 @@ def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
 
 
 def _infer_video_category(scenes: list) -> str:
-    """Best-effort category lookup from whatever scenes already carry —
-    used by the video-level icon guarantee below when it needs to pick a
-    fallback icon but isn't running inside the main /edit-video request
-    (e.g. a single-scene rebuild/trim endpoint) where `category` isn't
-    already in scope."""
+    
     for s in scenes:
         ctx = s.get("_beat_director_context")
         if ctx and ctx.get("category"):
@@ -9884,7 +9923,7 @@ def _ensure_video_has_icon_animation(scenes: list, category: str) -> None:
     for scene in scenes:
         for anim in (scene.get("animations") or []):
             if anim.get("category") in ("overlay_graphic", "branding"):
-                return  # video already has at least one icon — nothing to do
+                return  
 
     for scene in scenes:
         beats = scene.get("beats") or []
@@ -10495,22 +10534,33 @@ class SceneBrollSelectUpdate(BaseModel):
     adjust_next_beat: bool = True
 
 
-def _hex_to_ass_color(hex_color: str, alpha_hex: str = "00") -> str:
-    h = (hex_color or "").strip().lstrip("#")
-    if len(h) != 6:
-        h = "FFFFFF"
-    r, g, b = h[0:2], h[2:4], h[4:6]
-    return f"&H{alpha_hex}{b}{g}{r}"
-
-
-def _normalize_ffmpeg_color(hex_color: str) -> str:
-    h = (hex_color or "").strip().lstrip("#")
-    if len(h) != 6:
-        h = "111827"
-    return f"0x{h}"
-
 
 _HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
+RUN_SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("RUN_SUBPROCESS_TIMEOUT_SECONDS", "300"))
+
+async def _run(cmd: list[str], cwd: Optional[str] = None, timeout: Optional[float] = None) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout or RUN_SUBPROCESS_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(
+            f"Command timed out after {timeout or RUN_SUBPROCESS_TIMEOUT_SECONDS}s "
+            f"and was killed: {' '.join(cmd)}"
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
+            f"--- stderr ---\n{stderr.decode(errors='replace')[-4000:]}"
+        )
 
 
 def _validate_hex_color(value: Optional[str], field_name: str) -> None:
@@ -10524,13 +10574,7 @@ def _validate_hex_color(value: Optional[str], field_name: str) -> None:
 
 
 def _log_token_usage(step_label: str, res: Any) -> None:
-    """Explicit input/output token logging for every LLM call in the
-    /edit-video pipeline, independent of whatever _record_token_usage
-    itself does (that function may or may not already persist this —
-    this is a plain, always-on log line so token counts are visible per
-    call without depending on that). Reads the standard OpenAI response
-    usage fields; degrades gracefully (logs a note, doesn't raise) if a
-    response shape doesn't have them."""
+   
     try:
         usage = getattr(res, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
@@ -10575,17 +10619,9 @@ DEFAULT_CAPTION_STYLE = {
     "margin_bottom_percent": 3,
 }
 
-# How many words are grouped into one burned-in caption line at a time.
-# Bumped up from the previous default of 4 for a longer, more readable
-# chunk per line — still perfectly in sync with the voice, since each
-# line's on/off timing is still taken directly from the real start/end of
-# its first/last word (see _build_ass_from_words) regardless of how many
-# words are grouped together; this only changes how much text shows at
-# once, not when it appears.
+
 CAPTION_WORDS_PER_LINE = int(os.getenv("CAPTION_WORDS_PER_LINE", "10"))
 
-# Default burned-in caption font. Can still be overridden per scene via
-# caption_style.font_family (see SceneStyleUpdate / update_scene_style).
 DEFAULT_CAPTION_FONT = os.getenv("DEFAULT_CAPTION_FONT", "Roboto")
 
 TTS_MAX_CHARS_PER_CALL = int(os.getenv("TTS_MAX_CHARS_PER_CALL", "900"))
@@ -11325,18 +11361,7 @@ def _align_beats_to_timed_words(beats: list, timed_words: list) -> None:
         b["start"] = prev_end
         b["end"] = max(next_start, prev_end + 0.5)
 
-    # Close every gap between consecutive beats so they form a perfectly
-    # contiguous partition of the scene — not even a millisecond of dead
-    # space. WhisperX leaves small natural silences between a beat's last
-    # word and the next beat's first word; left alone, that stretch has no
-    # broll/animation covering it, and gaps like this compound: instead of
-    # showing as a pause where it belongs, the render pipeline concatenates
-    # beat clips back-to-back and pads the SHORTFALL as a single frozen
-    # hold at the very end of the scene — so broll silently drifts earlier
-    # than the voice for the rest of the scene. Extending each beat's end
-    # to meet the next beat's start (rather than shrinking the next beat's
-    # start) keeps every beat's audio-derived start_sec anchored to the
-    # word that actually begins it.
+  
     for i in range(len(beats) - 1):
         cur_end = beats[i].get("end")
         next_start = beats[i + 1].get("start")
@@ -11375,14 +11400,7 @@ def _dedupe_beats_media_across_scene(beats: list) -> None:
 
 
 def _content_aware_max_box_size(display_text: Any) -> tuple:
-    """Caps how big a text overlay box can be relative to what it's
-    actually showing — sized for a small, ~20-25px understated callout
-    (not a headline), so a short phrase doesn't get stretched into an
-    oversized box with a lot of empty space around it. This is a
-    ceiling, not a target: a smaller box that already fits the text is
-    left alone. ~13px of width per character at a 20-25px reading size,
-    plus fixed padding; height scales with line count at that same
-    small size."""
+   
     text = _display_text_to_string(display_text) if isinstance(display_text, (str, list)) else ""
     if not text:
         return (400, 110)
@@ -11417,12 +11435,7 @@ def _validate_geometry_px(
     max_width = max(40, ANIMATION_CANVAS_WIDTH - 2 * _SAFE_MARGIN)
     max_height = max(40, ANIMATION_CANVAS_HEIGHT - 2 * _SAFE_MARGIN)
     if category == "overlay_text" and display_text is not None:
-        # Tighten the ceiling further to what this specific text actually
-        # needs, instead of only capping against the canvas-wide maximum
-        # (which is generous enough to let a 3-word phrase get a
-        # near-half-screen box). Never used for overlay_graphic — an
-        # icon's badge size is a deliberate visual choice independent of
-        # any label text next to it.
+       
         content_max_w, content_max_h = _content_aware_max_box_size(display_text)
         max_width = min(max_width, content_max_w)
         max_height = min(max_height, content_max_h)
@@ -11430,10 +11443,7 @@ def _validate_geometry_px(
     geo["height"] = max(40, min(geo["height"], max_height))
 
     if allow_manual_placement and isinstance(raw, dict) and ("x" in raw or "y" in raw):
-        # A human explicitly set a position via a PATCH edit — that's a
-        # deliberate decision, not something to silently override. Still
-        # enforce the same minimum-margin/caption-safe-zone safety rails
-        # as everything else, just don't force it back to dead center.
+        
         geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
         geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
         if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
@@ -11444,22 +11454,9 @@ def _validate_geometry_px(
                 geo["y"] = _SAFE_MARGIN
         return geo
 
-    # Icons and text overlays are always centered on the frame — this is a
-    # deliberate product decision (not a fallback default): whatever
-    # placement/x/y the model or an older stored animation provides is
-    # discarded entirely, the same way full_screen/transition above always
-    # get the full frame regardless of input. Corner placement was tried
-    # earlier and reversed on explicit direction — center is now the only
-    # placement for these two categories, UNLESS allow_manual_placement is
-    # set (only true for direct human PATCH edits — see
-    # update_beat_animation), in which case the block above already
-    # returned an explicit, human-chosen position.
     geo["x"] = (ANIMATION_CANVAS_WIDTH - geo["width"]) // 2
 
     if category in ("overlay_text", "overlay_graphic"):
-        # Vertically centered on the frame, but never low enough to reach
-        # the caption band at the bottom — bias upward if a tall box would
-        # otherwise overlap it.
         centered_y = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
         if centered_y + geo["height"] > CAPTION_SAFE_ZONE_Y:
             if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
@@ -11508,13 +11505,6 @@ def _validate_beat_animation(
     if category in ("full_screen", "transition"):
         placement = "full_frame"
     elif category in ("overlay_text", "overlay_graphic") and not allow_manual_placement:
-        # Icons and text overlays are always centered — see
-        # _validate_geometry_px, which forces the actual geometry to
-        # center regardless of what's given. Keep the placement LABEL
-        # consistent with that so nothing downstream reads a stale
-        # corner name against center coordinates. Manual PATCH edits
-        # (allow_manual_placement=True) keep whatever placement label the
-        # human sent instead — validated below like everything else.
         placement = "center"
     elif placement not in _VALID_PLACEMENTS:
         placement = "top_left" if allow_manual_placement else "top_center"
@@ -11571,14 +11561,6 @@ def _validate_beat_animation(
     else:
         icon_name, icon_layout = None, None
 
-    # Diagnostic only (not an auto-fix — inventing a plausible second icon
-    # from text alone is too unreliable to do safely in code): flag when a
-    # single icon_name is paired with render_prompt/display_text language
-    # that describes a two-sided comparison. What renders in that case is
-    # one icon next to comparison text with no visual link between them —
-    # exactly the "odd, random-looking icon" pattern. The real fix is the
-    # prompt's own CONSISTENCY CHECK instruction; this just makes it
-    # visible in logs when the model doesn't follow it.
     if isinstance(icon_name, str) and icon_name:
         comparison_source = " ".join(
             str(x) for x in (raw.get("render_prompt"), raw.get("display_text"), raw.get("content_binding"))
@@ -11608,11 +11590,6 @@ def _validate_beat_animation(
         if not color_hint.startswith("#"):
             color_hint = f"#{color_hint}"
 
-    # Background/panel color behind the text box or icon badge itself —
-    # distinct from color_hint (the accent/icon color) and distinct from
-    # a scene's own broll background_color (the video background). null
-    # means "let the renderer's own default panel color apply" (theme.panel
-    # on the Remotion side) rather than forcing a specific one.
     background_color_hint = raw.get("background_color_hint")
     if isinstance(background_color_hint, str) and _HEX_COLOR_RE.match(background_color_hint.strip()):
         background_color_hint = background_color_hint.strip()
@@ -11621,13 +11598,6 @@ def _validate_beat_animation(
     else:
         background_color_hint = None
 
-    # Font size for the overlay's own text (distinct from
-    # SceneStyleUpdate.font_size, which controls burned-in word-by-word
-    # captions, not this). null means "let the renderer size it itself"
-    # (auto-fit to the box, or the Remotion component's own default) —
-    # only set when a specific size is actually wanted, e.g. via a manual
-    # PATCH edit. Clamped to a sane range; this field existed in the
-    # schema before but was never actually read anywhere downstream.
     font_size = raw.get("font_size")
     try:
         font_size = int(font_size) if font_size is not None else None
@@ -11640,14 +11610,6 @@ def _validate_beat_animation(
     if not isinstance(highlight_target_text, str) or not highlight_target_text.strip():
         highlight_target_text = None
 
-    # anchor_start_sec/anchor_end_sec: the Animation Planner's own computed
-    # timing, read directly off the real word-level timestamps it was
-    # given for this beat — authoritative when present. build_timeline_
-    # from_scenes prefers these over its own after-the-fact phrase
-    # matching; they're optional here (not every caller of
-    # _validate_beat_animation runs through the Animation Planner, e.g.
-    # the guaranteed-icon fallback), so an absent/invalid value just means
-    # "fall back to the heuristic matcher," not a validation failure.
     anchor_start_sec = raw.get("anchor_start_sec")
     anchor_end_sec = raw.get("anchor_end_sec")
     try:
@@ -11686,15 +11648,6 @@ def _validate_beat_animation(
         "color_hint": color_hint,
         "background_color_hint": background_color_hint,
         "font_size": font_size,
-        # Sticky once set: True either because THIS validation call was
-        # explicitly told it's a manual PATCH, or because the animation
-        # was already manually placed by an earlier PATCH and this call
-        # is just touching some other unrelated field. Without the OR,
-        # a later edit that doesn't mention placement/geometry_px (e.g.
-        # only changing color_hint) would reset this back to False,
-        # silently opting the animation back into auto-centering on the
-        # next render even though nothing about its position was
-        # supposed to change.
         "manually_placed": bool(allow_manual_placement or (isinstance(raw, dict) and raw.get("manually_placed"))),
         "highlight_target_text": highlight_target_text,
         "anchor_start_sec": anchor_start_sec,
@@ -11712,16 +11665,6 @@ async def _run_animation_planner(
     if not requires_animation:
         return []
 
-    # Word-level timestamps for each beat's own span, sliced from the
-    # scene's real WhisperX alignment (timed_words). Giving the model the
-    # ACTUAL time each word is spoken — not just the narration text — lets
-    # it compute exact anchor_start_sec/anchor_end_sec itself by reading
-    # real ground truth, instead of Storybit trying to reverse-engineer
-    # timing afterward by fuzzy-matching display_text against the
-    # transcript. That heuristic approach kept finding new edge cases
-    # (wrong beat, list vs string display_text, tie-breaking bias); having
-    # the model do the matching with the real data in front of it removes
-    # the whole class of guesswork.
     def _beat_words(b: dict) -> list:
         if not timed_words:
             return []
@@ -11797,12 +11740,7 @@ async def _run_animation_planner(
             validated.append(v)
             seen_beat_ids.add(v["beat_id"])
 
-    # Guaranteed icon floor: the prompt asks for at least one icon-bearing
-    # animation per scene, but model output isn't guaranteed to comply —
-    # enforce it here rather than trusting the LLM alone. Prefer an
-    # unanimated beat so we don't clobber something the model chose;
-    # fall back to overwriting the first beat's animation only if every
-    # beat already has one.
+
     has_icon = any(v["category"] in ("overlay_graphic", "branding") for v in validated)
     if not has_icon and beats:
         target_beat = next((b for b in beats if b["beat_id"] not in seen_beat_ids), None)
@@ -11827,7 +11765,6 @@ async def _get_or_create_tagged_text(scene: dict, scene_id, user_id: str, vo_tex
     tags_request = AddScriptTagsRequest(userId=user_id, script=vo_text)
     tags_result = await add_script_tags(tags_request)
     return tags_result["tagged_script"]
-
 
 
 async def _process_scene(scene: dict, request: EditVideo, category: str, script_language: str, video_ctx: dict, is_first_scene: bool = False) -> dict:
@@ -11886,7 +11823,6 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         scene_out["media"] = _aggregate_beats_media(beats)
         scene_out["animations"] = animations
 
-        # Advance video-level continuity for the NEXT scene.
         for b in beats:
             for e in b["entities"]:
                 if not any(existing["name"].lower() == e["name"].lower() for existing in video_ctx["known_entities"]):
@@ -11988,9 +11924,6 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
 
 
 async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
-    """Used by the scene trim endpoint: re-runs the Beat Director +
-    Animation Planner for a single scene using the continuity context that
-    was captured when the scene was first processed."""
     ctx = scene.get("_beat_director_context") or {
         "category": "general_documentary",
         "style_profile": STYLE_PROFILES["general_documentary"],
@@ -12039,9 +11972,6 @@ async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
 
 
 async def _rebuild_fragment_beats(scene: dict, local_start: float, local_end: float, id_prefix: str) -> list:
-    """Re-runs the Beat Director scoped to a single sub-range of a scene's
-    narration (used by split/insert). The Director still decides how many
-    beats the fragment needs — usually one, but not necessarily."""
     ctx = scene.get("_beat_director_context") or {
         "category": "general_documentary",
         "style_profile": STYLE_PROFILES["general_documentary"],
@@ -12089,9 +12019,6 @@ async def _rebuild_fragment_beats(scene: dict, local_start: float, local_end: fl
     return beats
 
 
-# ---------------------------------------------------------------------------
-# Timeline building
-# ---------------------------------------------------------------------------
 
 _PHRASE_MATCH_PUNCT_RE = re.compile(r"[^\w\s]")
 
@@ -12104,36 +12031,6 @@ def _find_phrase_span_sec(
     target_text: Optional[str], timed_words: list, search_start: float, search_end: float,
     hint_start_sec: Optional[float] = None,
 ) -> Optional[tuple]:
-    """Finds when `target_text` is actually spoken, by matching it against
-    word-level timestamps within [search_start, search_end] (a beat's own
-    span). Returns (phrase_start_sec, phrase_end_sec) — the start of the
-    first matched word and the end of the last matched word — or None if
-    no confident match is found. Callers use the start to anchor when an
-    overlay appears and the end to make sure it doesn't disappear before
-    the narration finishes saying it.
-
-    Scores every possible alignment offset between target_text and the
-    transcript window, tolerant of a handful of individual word mismatches
-    rather than requiring a perfect run — this matters in practice because
-    WhisperX can mis-transcribe an unusual proper noun (e.g. "Maciej"
-    heard as "Massey") even though the surrounding words transcribe
-    cleanly; a strict-match approach fails on names like that even though
-    the rest of a long phrase lines up perfectly. A match is accepted when
-    either a long enough exact run is found, or enough of the phrase's
-    words match overall (allowing scattered individual misses).
-
-    hint_start_sec, when given (the Animation Planner's own anchor_start_
-    sec), disambiguates between multiple qualifying candidates by picking
-    whichever is CLOSEST to it, rather than always the single highest-
-    scoring one in isolation. This matters for a real failure mode: a
-    scene can genuinely say the same distinctive words more than once (a
-    callback, a recap, a repeated key phrase) — searching the whole scene
-    with no hint at all can and did match a coincidentally-similar-scoring
-    occurrence far from the true one (observed: a 77-second jump to a
-    completely wrong position). The model's own anchor is usually roughly
-    right even when not pixel-perfect, so it's a strong signal for WHICH
-    occurrence is the correct one, even when it can't be trusted as the
-    exact final number on its own."""
     if not target_text or not timed_words:
         return None
     target_words = [_normalize_phrase_word(w) for w in target_text.split()]
@@ -12152,9 +12049,9 @@ def _find_phrase_span_sec(
 
     n_target = len(target_words)
     min_run = min(n_target, 3)
-    min_ratio = 0.6 if n_target >= 5 else 1.0  # short phrases still need a near-exact hit
+    min_ratio = 0.6 if n_target >= 5 else 1.0  
 
-    candidates = []  # every qualifying (score, offset) pair, not just the best
+    candidates = []  
     best_score = None
     for offset in range(-n_target, n):
         matches = 0
@@ -12186,18 +12083,9 @@ def _find_phrase_span_sec(
         return window[idx]["start"]
 
     if hint_start_sec is not None:
-        # Among candidates that are at least reasonably strong (within one
-        # matched-word of the single best score — not just "qualified at
-        # all", so a barely-passing coincidental match elsewhere can't
-        # outrank a strong true match just for being closer to the hint by
-        # chance), pick whichever is closest in time to the model's own
-        # anchor.
         strong_candidates = [c for c in candidates if c[0][1] >= best_score[1] - 1]
         best_offset = min(strong_candidates, key=lambda c: abs(_offset_to_start_sec(c[1]) - hint_start_sec))[1]
     else:
-        # No hint available — same tie-break as before: ties keep the
-        # LATEST candidate, since every sync complaint prior to this one
-        # was "shows too early", never "too late".
         best_offset = None
         best_kept_score = None
         for score, offset in candidates:
@@ -12243,9 +12131,6 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 continue
             w_start_frame = scene_start_frame + _seconds_to_frames(w["start"] - start_sec, fps)
             w_end_frame = scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps)
-            # Defensive clamp: WhisperX timestamps can round to a frame or
-            # two past the scene's own computed end — never let a caption
-            # word render past the scene/voiceover boundary.
             w_start_frame = max(scene_start_frame, min(w_start_frame, scene_end_frame))
             w_end_frame = max(w_start_frame, min(w_end_frame, scene_end_frame))
             words.append({"word": w.get("word", ""), "startFrame": w_start_frame, "endFrame": w_end_frame})
@@ -12316,20 +12201,8 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             anim_start_frame = b_start_frame
             matched_end_frame = None
 
-            # Compute the deterministic heuristic match FIRST, always —
-            # regardless of whether the model also provided its own
-            # anchor. This is what lets us catch a hallucinated
-            # anchor_start_sec: the model was given real word timestamps
-            # and told to read from them, but nothing forces it to
-            # actually do that — it can just default anchor_start_sec to
-            # the beat's own start out of habit while still passing schema
-            # validation. Without a cross-check, that wrong number would
-            # silently override what the heuristic matcher (grounded in
-            # the same real transcript) would have gotten right.
             target_text = animation.get("highlight_target_text")
             if not target_text:
-                # display_text can legally be a list (multi-line
-                # overlays), not just a string.
                 candidate_text = _display_text_to_string(animation.get("display_text"))
                 if candidate_text:
                     target_text = candidate_text
@@ -12337,29 +12210,10 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             model_anchor_start = animation.get("anchor_start_sec")
             model_anchor_end = animation.get("anchor_end_sec")
 
-            # Pass the model's own anchor as a disambiguation hint — see
-            # _find_phrase_span_sec's docstring. Without this, a phrase
-            # that's genuinely spoken more than once in a long scene (a
-            # callback, a recap) could match the wrong occurrence even
-            # though it scores fine in isolation; the model's anchor,
-            # even when not itself precise, is usually close enough to
-            # the TRUE occurrence to pick the right one of several.
             heuristic_span = _find_phrase_span_sec(
                 target_text, timed_words_sec, start_sec, end_sec, hint_start_sec=model_anchor_start,
             )
 
-            # Heuristic-first: the deterministic transcript matcher has
-            # proven reliable in every verified case; the model's own
-            # anchor_start_sec has repeatedly turned out wrong (defaulted
-            # to the beat's start rather than actually read from the
-            # words it was given) even when it landed within a small-
-            # seeming margin of the truth — a "small" 2s disagreement is
-            # still very visibly wrong to a viewer. So the priority is now
-            # inverted from a pure tolerance check: use the heuristic
-            # whenever it finds ANY match at all, and fall back to the
-            # model's anchor only when the heuristic finds nothing to
-            # match against (e.g. a paraphrased display_text with no
-            # verbatim words in the transcript).
             use_model_anchor = model_anchor_start is not None and heuristic_span is None
             if model_anchor_start is not None and heuristic_span is not None:
                 heuristic_start_sec = heuristic_span[0]
@@ -12380,38 +12234,11 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 candidate_start_frame = scene_start_frame + _seconds_to_frames(matched_start_sec - start_sec, fps)
                 anim_start_frame = max(scene_start_frame, min(candidate_start_frame, scene_end_frame))
 
-            # End time. The heuristic-matched end (when we have one) is
-            # the TRUSTED baseline — it's deterministic, grounded in the
-            # real transcript, and by construction lands right at the end
-            # of the actual matched phrase. We extend past that baseline
-            # to accommodate a model-provided anchor_end_sec or
-            # duration_frames that wants extra hold time, but only by a
-            # bounded, reasonable margin — not by an unlimited amount.
-            #
-            # This cap is the fix for a real regression: the previous
-            # version took the unconditional max() of every end candidate,
-            # including the model's own anchor_end_sec/duration_frames
-            # with no sanity check against the heuristic at all. When the
-            # model hallucinated a wildly-too-long end (e.g. defaulting to
-            # something like its own beat's full remaining length), that
-            # unbounded max() would win outright — and because the
-            # cross-beat spillover fix now faithfully renders an animation
-            # across as many beats as its computed end requires, the
-            # result was an overlay lingering for 10+ seconds past when
-            # the phrase actually finished, silently overlapping whatever
-            # came next. Bounding the extension keeps the original intent
-            # (never cut off before the voice finishes) without also
-            # allowing an unverified number to run away unbounded.
             model_end_frame = min(anim_start_frame + animation.get("duration_frames", 90), scene_end_frame)
             if heuristic_span is not None:
                 _, heuristic_end_sec = heuristic_span
                 candidate_end_frame = scene_start_frame + _seconds_to_frames(heuristic_end_sec - start_sec, fps)
                 heuristic_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
-                # Deliberate hold after the phrase finishes being spoken —
-                # this is what makes the overlay actually "stay" once the
-                # voice moves on, rather than disappearing the instant the
-                # last word ends. 0.3s is barely perceptible as a hold; 0.8s
-                # gives a viewer a real beat to keep reading before it goes.
                 hold_buffer_frames = round(0.8 * fps)
                 speech_end_frame = min(heuristic_end_frame + hold_buffer_frames, scene_end_frame)
 
@@ -12425,41 +12252,15 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
 
                 anim_end_frame = max(speech_end_frame, min(max(candidate_ends), max_end_frame))
             else:
-                # No heuristic to sanity-check against — fall back to
-                # trusting the model/duration_frames, same as before.
                 anim_end_frame = model_end_frame
                 if use_model_anchor and model_anchor_end is not None:
                     candidate_end_frame = scene_start_frame + _seconds_to_frames(model_anchor_end - start_sec, fps)
                     model_anchor_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
                     anim_end_frame = max(anim_end_frame, model_anchor_end_frame)
-            # Defensive clamp: b_start_frame/b_end_frame are already bounded
-            # to [scene_start_frame, scene_end_frame], so this is normally
-            # redundant — but never let an animation's computed frames slip
-            # past the scene/voiceover boundary regardless of how it got here.
+          
             anim_start_frame = max(scene_start_frame, min(anim_start_frame, scene_end_frame))
             anim_end_frame = max(anim_start_frame, min(anim_end_frame, scene_end_frame))
 
-            # Re-validate geometry_px against the CURRENT margin rules on
-            # every render, rather than trusting whatever was stored at
-            # the moment this animation was first created. Without this,
-            # geometry safety is frozen forever at creation time — an
-            # animation created before the margin-enforcement fix existed
-            # (or before any future geometry rule change) would stay
-            # unsafe across every subsequent re-render, no matter how
-            # correct the current validation logic or the Remotion
-            # component itself is. This mirrors the same self-healing
-            # approach already applied to sync/timing in this function —
-            # geometry deserves the same guarantee.
-            #
-            # allow_manual_placement is read from the animation's own
-            # stored "manually_placed" flag — set once, sticky, whenever a
-            # human PATCHed a specific placement/geometry_px (see
-            # _validate_beat_animation). Without this, a manually-placed
-            # animation would get silently force-centered back by THIS
-            # re-validation on the very next render, since this pass has
-            # no other way to distinguish "a human chose this position on
-            # purpose" from "the LLM generated this and it needs the
-            # normal safety/auto-center treatment".
             safe_geometry_px = _validate_geometry_px(
                 animation.get("geometry_px"), animation.get("category"),
                 allow_manual_placement=bool(animation.get("manually_placed")),
@@ -12485,21 +12286,6 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "render_engine_hint": animation.get("render_engine_hint"),
             })
 
-        # De-conflict: two DIFFERENT animations in the same scene must
-        # never be visibly on screen at the same time. Each animation's
-        # start/end was computed independently above (from its own
-        # anchor/heuristic match), with nothing cross-checking it against
-        # any OTHER animation in the scene — so two overlays with
-        # genuinely overlapping anchor windows (e.g. one ends at 183.6s,
-        # the next starts at 182.2s) would both get composited over the
-        # same frames simultaneously. This was always a latent risk, but
-        # became a guaranteed visual collision once every overlay_text/
-        # overlay_graphic animation started rendering at the same
-        # (center) position — two overlapping-in-time animations now
-        # occupy the exact same screen space, producing garbled double
-        # text. Sort by start and trim the EARLIER animation's end back
-        # to the LATER one's start wherever they overlap, so consecutive
-        # animations are always sequential, never simultaneous.
         scene_animation_tracks.sort(key=lambda t: t["startFrame"])
         for i in range(len(scene_animation_tracks) - 1):
             cur = scene_animation_tracks[i]
@@ -12600,9 +12386,6 @@ def _compute_broll_list(timeline: dict) -> list:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Response slimming
-# ---------------------------------------------------------------------------
 
 def _slim_beat_for_response(beat: dict, broll_track: Optional[dict] = None) -> dict:
     default_asset, default_source = _resolve_beat_broll_selection(beat)
@@ -12676,6 +12459,32 @@ def _slim_timeline_for_response(timeline: dict) -> dict:
 
 @app.post("/edit-video")
 async def edit_video(request: EditVideo):
+
+    EDIT_VIDEO_BASE_CREDITS = 50
+    try:
+        profile_res = supabase.table('user_profiles') \
+            .select('id, credit_batches') \
+            .eq('id', request.userId) \
+            .maybe_single() \
+            .execute()
+
+        if not profile_res.data:
+            raise HTTPException(status_code=404, detail="user profile not found")
+
+        batches = profile_res.data.get('credit_batches') or []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        active_batches = _expire_stale_batches(batches, now)
+        available = _sum_batches(active_batches)
+
+        if available < EDIT_VIDEO_BASE_CREDITS:
+            raise HTTPException(status_code=402, detail="credits not sufficient")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("error checking credits for /edit-video:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
     try:
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
@@ -12722,22 +12531,10 @@ async def edit_video(request: EditVideo):
         print(f"[edit-video] model returned unknown category {category!r} — defaulting to general_documentary")
         category = "general_documentary"
 
-    # New Scene Planner schema returns animation_preference (avoid/optional/
-    # strong) instead of the old boolean requires_animation. Every other
-    # part of the pipeline (Animation Planner hard gate, icon guarantee,
-    # response slimming, etc.) still reads scene["requires_animation"], so
-    # derive it here rather than touching every call site: "avoid" means no
-    # animation for the scene, "optional"/"strong" both mean the Animation
-    # Planner is allowed to add animation (it already decides per-beat how
-    # much, via scene_animation_density). A scene that still returns the
-    # old field directly is respected as-is.
     for _scene in scenes:
         if isinstance(_scene, dict) and "requires_animation" not in _scene:
             _scene["requires_animation"] = _scene.get("animation_preference") != "avoid"
 
-    # No scene-count cap: the Scene Planner prompt already governs scene
-    # count via the 2-minute-per-scene rule (SCRIPT_SCENE_PROMPT explicitly
-    # states there is no upper bound), so whatever it returns is used as-is.
     print(f"[edit-video] scene planner produced {len(scenes)} scene(s)")
 
     video_ctx = {
@@ -12751,9 +12548,6 @@ async def edit_video(request: EditVideo):
         )
         scenes_with_voice_and_timestamps.append(scene_result)
 
-    # Video-wide guarantee: at least one icon animation must exist
-    # somewhere in this video, regardless of which/how many scenes the
-    # Animation Planner (and its own per-scene fallback) actually animated.
     _ensure_video_has_icon_animation(scenes_with_voice_and_timestamps, category)
 
     failed_scenes = [s["scene_id"] for s in scenes_with_voice_and_timestamps if s.get("error")]
@@ -12787,13 +12581,53 @@ async def edit_video(request: EditVideo):
         print(f"[edit-video] failed to persist video row: {e}")
         raise HTTPException(status_code=500, detail="Failed to save video")
 
+    EDIT_VIDEO_BASE_CREDITS = 50
+    EDIT_VIDEO_CREDITS_PER_MINUTE = 5
+    duration_minutes = (timeline_json.get("total_frames", 0) / max(timeline_json.get("fps", 1), 1)) / 60
+    credit_cost = EDIT_VIDEO_BASE_CREDITS + round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
+
+    credit_result = {"cost": credit_cost, "deducted": False, "remaining_credits": None}
+    try:
+        profile_res = supabase.table('user_profiles') \
+            .select('id, credit_batches') \
+            .eq('id', request.userId) \
+            .maybe_single() \
+            .execute()
+
+        if not profile_res.data:
+            print(f"[edit-video] credit deduction skipped for {request.userId}: user profile not found")
+        else:
+            batches = profile_res.data.get('credit_batches') or []
+            now = datetime.datetime.now(datetime.timezone.utc)
+            active_batches = _expire_stale_batches(batches, now)
+
+            updated_batches, deducted = _deduct_from_batches(active_batches, credit_cost)
+            new_total = _sum_batches(updated_batches)
+
+            supabase.table('user_profiles').update({
+                'credit_batches': updated_batches,
+                'credits_remaining': new_total,
+            }).eq('id', request.userId).execute()
+
+            credit_result["deducted"] = deducted > 0
+            credit_result["remaining_credits"] = new_total
+            if deducted == 0:
+                print(f"[edit-video] user {request.userId}: insufficient credits for cost {credit_cost} (video {video_id} was still generated and saved)")
+            elif deducted < credit_cost:
+                print(f"[edit-video] user {request.userId}: only {deducted}/{credit_cost} credits available, partial deduction applied")
+
+    except Exception as e:
+        print(f"[edit-video] credit deduction failed for {request.userId} (video {video_id} was still generated and saved): {e}")
+
     return {
         "video_id": video_id, "category": category, "script_language": script_language,
         "timeline": _slim_timeline_for_response(timeline_json),
         "scenes": [_slim_scene_for_response(s, timeline_json) for s in scenes_with_voice_and_timestamps],
         "scene_timings": scene_timings, "failed_scene_ids": failed_scenes,
         "infographics_list": infographics, "text_list": text_overlays, "broll_list": broll_list,
+        "credits": credit_result,
     }
+
 
 
 @app.patch("/timeline/{video_id}")
@@ -12898,8 +12732,6 @@ async def patch_timeline(video_id: str, patch: TrackPatch):
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/style")
 async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpdate):
-    """Pure burned-in-caption styling. Overlay/infographic text is edited
-    via PATCH .../beat/{beat_id}/animation instead — see BeatAnimationUpdate."""
     if update.animation_type is not None and update.animation_type not in _VALID_CAPTION_ANIMATION_TYPES:
         raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_CAPTION_ANIMATION_TYPES)}")
     _validate_hex_color(update.text_color, "text_color")
@@ -13227,9 +13059,6 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/animation")
 async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, update: BeatAnimationUpdate):
-    """Create or edit the animation attached to a specific beat. Replaces
-    the old scene-level `update_scene_infographic` endpoint, since a scene
-    can now carry many beat-owned animations rather than one."""
     provided = {k: v for k, v in update.dict().items() if v is not None}
     if not provided:
         raise HTTPException(status_code=422, detail="Provide at least one field to update")
@@ -13268,69 +13097,22 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
             raise HTTPException(status_code=422, detail="animation_type is required to create a new animation on this beat")
         merged_raw = {"beat_id": beat_id, **provided}
     else:
-        # A partial geometry_px (e.g. just {"width": 240, "height": 240}
-        # to resize an icon without moving it) used to silently replace
-        # the WHOLE geometry_px dict on merge below — losing x/y entirely
-        # and snapping the animation to (0, 0). Merge with the existing
-        # geometry first so an unspecified field is preserved rather than
-        # dropped. When only width/height changed and x/y weren't given,
-        # recompute x/y so the box's CENTER stays put — this is what
-        # makes a resize-only PATCH actually behave like "make this
-        # bigger/smaller in place" instead of shifting the box's visual
-        # position just because its top-left anchor didn't move while its
-        # size did.
         if "geometry_px" in provided:
             existing_geo = animations[anim_idx].get("geometry_px") or {}
             new_geo_partial = provided["geometry_px"] or {}
             merged_geo = {**existing_geo, **new_geo_partial}
-            # x/y are simply left untouched when a PATCH only sends
-            # width/height — the existing top-left corner from
-            # {**existing_geo, **new_geo_partial} above already does
-            # this, since new_geo_partial has no "x"/"y" keys to
-            # override them with. (An earlier version of this resized
-            # around the box's CENTER instead, which meant a big size
-            # change shifted x/y as a side-effect — correct geometry,
-            # but it read as "the icon moved" rather than "it resized",
-            # so anchoring to the unchanged corner instead is simpler
-            # and matches what "just make it bigger/smaller" actually
-            # means to a caller who isn't also repositioning it.)
             provided = {**provided, "geometry_px": merged_geo}
 
         merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
-        # If this PATCH moves the animation (geometry_px and/or placement)
-        # WITHOUT also providing a new motion, drop the old stored motion
-        # rather than silently carrying it forward. _validate_motion
-        # defaults start_xy_px/end_xy_px to the geometry's own x/y, but
-        # only when raw.motion doesn't already have them set — otherwise
-        # it trusts whatever's already there. Left alone, a position-only
-        # PATCH would update geometry_px correctly while motion still
-        # pointed at the OLD coordinates — and if the Remotion component
-        # uses motion.start_xy_px/end_xy_px for its actual entrance
-        # animation (common for a "slide in" or "cascade" effect), the
-        # element visually stays at the old spot despite geometry_px
-        # being right, which is exactly indistinguishable from "the PATCH
-        # didn't work" even though the backend update succeeded.
         if ("geometry_px" in provided or "placement" in provided) and "motion" not in provided:
             old_motion_style = (animations[anim_idx].get("motion") or {}).get("motion_style")
             merged_raw["motion"] = {"motion_style": old_motion_style} if old_motion_style else None
 
-    # A human explicitly setting placement/geometry_px via this endpoint
-    # is a deliberate decision and should be respected, unlike the
-    # Animation Planner's own output which always gets force-centered.
-    # Scoped to only fire when THIS PATCH actually touches one of those
-    # two fields, so an unrelated edit (e.g. just color_hint) on an
-    # existing manually-placed animation doesn't accidentally re-center it,
-    # and a PATCH that never mentions placement doesn't unexpectedly
-    # opt an animation out of auto-centering either.
     allow_manual_placement = "placement" in provided or "geometry_px" in provided
     validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id, allow_manual_placement=allow_manual_placement)
     if not validated:
         raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
     if isinstance(merged_raw.get("id"), int):
-        # Editing an existing animation — keep its id stable rather than
-        # letting _assign_animation_ids (called inside
-        # _compute_infographics_and_text_lists below) treat this as a new
-        # entry and hand it a fresh one.
         validated["id"] = merged_raw["id"]
 
     if anim_idx is None:
@@ -13364,13 +13146,6 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
 
 @app.delete("/timeline/{video_id}/overlay/{overlay_id}")
 async def delete_animation_by_id(video_id: str, overlay_id: int):
-    """
-    Same delete as DELETE .../beat/{beat_id}/animation, but located
-    purely by the overlay's stable integer id — this is the "easy
-    deletion" path for BOTH text overlays and infographics: a client
-    holding just the `id` from text_list or infographics_list can delete
-    directly, without also tracking which scene/beat it came from.
-    """
     try:
         row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
     except Exception as e:
@@ -13717,17 +13492,6 @@ async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
 
 @app.post("/timeline/{video_id}/broll/insert")
 async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
-    """Two modes, chosen by whether `scene_id` is provided:
-
-    - scene_id given: inserts the asset INTO that scene's own beat
-      timeline (start/end are scene-local seconds). This is what most
-      callers want — "put this clip at this point in this scene."
-    - scene_id omitted: old behavior — creates a brand new, voiceover-less
-      standalone scene and extends the whole video's total duration
-      (start/end are absolute video-timeline seconds). Use this only when
-      you actually want to lengthen the video with a new silent B-roll
-      segment, not to place something inside existing narration.
-    """
     if update.source not in ("video", "image"):
         raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
     if update.start < 0:
@@ -13768,13 +13532,6 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
     current_version = row.data.get("timeline_version", 1)
     fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
 
-    # Scene-scoped insert: put this asset INTO an existing scene's own beat
-    # timeline (splitting whichever beat currently occupies [start, end]),
-    # instead of the old behavior below of always creating a brand new,
-    # voiceover-less standalone scene and extending the whole video's
-    # duration. This is what callers usually mean by "insert broll into
-    # this scene" — start/end here are scene-LOCAL seconds, matching the
-    # convention used by update_scene_broll's start/end.
     if update.scene_id:
         scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == update.scene_id), None)
         if scene_index is None:
@@ -13892,9 +13649,7 @@ async def delete_scene_content(
     content_type: Literal["video", "image"],
     beat_id: Optional[str] = None,
 ):
-    """Broll-only. For deleting a text overlay or infographic, use
-    DELETE /timeline/{video_id}/overlay/{overlay_id} instead — id-only,
-    no payload, no need to know which scene/beat it lives on."""
+
     if beat_id is None:
         raise HTTPException(status_code=422, detail="beat_id is required — content is now beat-owned, not scene-owned")
 
@@ -13950,1664 +13705,3 @@ async def delete_scene_content(
         "infographics_list": infographics_list, "text_list": text_list, "broll_list": broll_list,
         "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-from fastapi import HTTPException
-
-
-RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
-FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
-
-REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR", "")
-
-RENDER_CONCURRENCY = int(os.getenv("RENDER_CONCURRENCY", str(max(os.cpu_count() or 2, 2))))
-
-FFMPEG_X264_PRESET = os.getenv("FFMPEG_X264_PRESET", "veryfast")
-FFMPEG_X264_CRF = os.getenv("FFMPEG_X264_CRF", "23")
-FFMPEG_X264_FLAGS = [
-    "-c:v", "libx264",
-    "-preset", FFMPEG_X264_PRESET,
-    "-crf", FFMPEG_X264_CRF,
-    "-pix_fmt", "yuv420p",
-    "-threads", "0",
-]
-
-SILENT_AUDIO_SAMPLE_RATE = int(os.getenv("SILENT_AUDIO_SAMPLE_RATE", "48000"))
-SILENT_AUDIO_CHANNEL_LAYOUT = os.getenv("SILENT_AUDIO_CHANNEL_LAYOUT", "stereo")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RENDER_OUTPUT_DIR = os.environ.get("RENDER_OUTPUT_DIR", os.path.join(BASE_DIR, "rendered_videos"))
-os.makedirs(RENDER_OUTPUT_DIR, exist_ok=True)
-
-LANDSCAPE_RESOLUTION = {"width": 1920, "height": 1080}
-PORTRAIT_RESOLUTION = {"width": 1080, "height": 1920}
-
-SUPABASE_RENDERED_VIDEOS_BUCKET = os.getenv("SUPABASE_RENDERED_VIDEOS_BUCKET", "rendered-videos")
-
-_REMOTION_COMPOSITION_BY_ANIMATION_TYPE = {
-    # full_screen
-    "full_screen_title_card": "TitleCard",
-    "full_screen_quote_card": "QuoteCard",
-    "full_screen_data_viz": "DataVizFullScreen",
-    "full_screen_broll": "FullScreenBroll",  # no-op by design — see compositions.tsx
-    "full_screen_transition": "FullScreenTransitionFx",
-    "full_screen_color_wash": "FullScreenColorWash",
-    "full_screen_document_highlight": "FullScreenDocumentHighlight",  # degraded, no real screenshot yet
-    # overlay_text
-    "stat_counter_overlay": "StatCounterOverlay",
-    "bullet_list_reveal": "BulletListReveal",
-    "lower_third": "LowerThird",
-    "kinetic_caption": "KineticCaption",
-    "callout_textbox": "CalloutTextbox",
-    # overlay_graphic
-    "icon_sequence": "IconSequenceOverlay",
-    "icon_pop_in": "IconPopIn",
-    "logo_watermark": "LogoWatermark",
-    "emoji_reaction": "EmojiReaction",
-    "arrow_highlight": "ArrowHighlight",
-    "badge_sticker": "BadgeSticker",
-    # pip — chrome/frame only, no second video source in the schema yet
-    "pip_video": "PipVideoFrame",
-    "split_screen": "SplitScreenDivider",
-    "multi_panel_grid": "MultiPanelGrid",
-    # branding — icon placeholder only, no avatar/mascot asset in the schema yet
-    "avatar_overlay": "AvatarOverlayPlaceholder",
-    "mascot_animation": "MascotAnimationPlaceholder",
-    # transition — accents/no-ops only; true shake/speed/parallax need an
-    # FFmpeg pass on the beat clip itself, not a Remotion overlay (see
-    # compositions.tsx for why)
-    "ken_burns_pan_zoom": "KenBurnsNoOp",
-    "parallax_layering": "ParallaxAccent",
-    "shake_impact": "ShakeImpactFlash",
-    "speed_ramp_indicator": "SpeedRampIndicator",
-}
-
-# Concurrent scene renders can each spawn their own `npx remotion render`
-# (and therefore its own headless Chrome instance). Uncapped, that's a
-# plausible source of the "Was not able to close puppeteer page /
-# No target found for targetId" warnings under RENDER_CONCURRENCY > a
-# couple — that error was cosmetic (it fired during cleanup of an
-# already-failed render), but capping concurrent Remotion invocations
-# is worth doing regardless of the composition-id fix below.
-REMOTION_MAX_CONCURRENT = int(os.getenv("REMOTION_MAX_CONCURRENT", "2"))
-_remotion_semaphore = asyncio.Semaphore(REMOTION_MAX_CONCURRENT)
-
-
-# =============================================================================
-# IMAGE MOTION EFFECTS  (unchanged — already per-beat via `motion_type` on
-# each beat's broll timeline track, resolved by `_resolve_beat_motion_type`
-# upstream. Nothing here changes with the animations refactor.)
-# =============================================================================
-
-def _ease_expr(duration_frames: int) -> str:
-    d = max(duration_frames - 1, 1)
-    return f"(1-cos(PI*min(on/{d},1)))/2"
-
-
-def _build_image_motion_filter(
-    motion_type: str, duration_frames: int, fps: int, width: int, height: int,
-) -> str:
-    ease = _ease_expr(duration_frames)
-    zoom_base = 1.2
-    zoom_amount = 0.3
-
-    if motion_type == "zoom_in":
-        z_expr = f"1+{zoom_amount}*({ease})"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
-    elif motion_type == "zoom_out":
-        z_expr = f"{1 + zoom_amount}-{zoom_amount}*({ease})"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
-    elif motion_type == "pan_left":
-        z_expr = f"{zoom_base}"
-        x_expr = f"({ease})*(iw-iw/zoom)"
-        y_expr = "ih/2-(ih/zoom/2)"
-    elif motion_type == "pan_right":
-        z_expr = f"{zoom_base}"
-        x_expr = f"(1-({ease}))*(iw-iw/zoom)"
-        y_expr = "ih/2-(ih/zoom/2)"
-    elif motion_type == "tilt_up":
-        z_expr = f"{zoom_base}"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = f"(1-({ease}))*(ih-ih/zoom)"
-    elif motion_type == "tilt_down":
-        z_expr = f"{zoom_base}"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = f"({ease})*(ih-ih/zoom)"
-    else:
-        print(f"[render] unrecognized motion_type {motion_type!r} — using a subtle default zoom")
-        z_expr = f"1+0.05*({ease})"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
-
-    return (
-        f"scale=8000:-1,"
-        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
-        f"d={duration_frames}:s={width}x{height}:fps={fps}"
-    )
-
-
-def _upload_rendered_video_to_supabase(local_path: str, video_id: str, filename: Optional[str] = None) -> str:
-    if filename is None:
-        filename = f"final_{uuid.uuid4().hex}.mp4"
-    dest_path = f"{video_id}/{filename}"
-
-    with open(local_path, "rb") as f:
-        file_bytes = f.read()
-
-    supabase.storage.from_(SUPABASE_RENDERED_VIDEOS_BUCKET).upload(
-        path=dest_path,
-        file=file_bytes,
-        file_options={"content-type": "video/mp4", "upsert": "true"},
-    )
-
-    return supabase.storage.from_(SUPABASE_RENDERED_VIDEOS_BUCKET).get_public_url(dest_path)
-
-
-class RenderVideoRequest(BaseModel):
-    force: bool = False
-    orientation: Literal["landscape", "portrait"] = "landscape"
-
-
-RUN_SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("RUN_SUBPROCESS_TIMEOUT_SECONDS", "300"))
-
-
-async def _run(cmd: list[str], cwd: Optional[str] = None, timeout: Optional[float] = None) -> None:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=cwd,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout or RUN_SUBPROCESS_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError(
-            f"Command timed out after {timeout or RUN_SUBPROCESS_TIMEOUT_SECONDS}s "
-            f"and was killed: {' '.join(cmd)}"
-        )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
-            f"--- stderr ---\n{stderr.decode(errors='replace')[-4000:]}"
-        )
-
-
-async def _probe_duration_seconds(path: str) -> float:
-    cmd = [
-        FFPROBE_BIN, "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffprobe failed on {path}: {stderr.decode(errors='replace')}")
-    try:
-        return float(stdout.decode().strip())
-    except ValueError:
-        raise RuntimeError(f"ffprobe returned unparsable duration for {path}: {stdout!r}")
-
-
-async def _probe_video_dimensions(path: str) -> Optional[tuple[int, int]]:
-    cmd = [
-        FFPROBE_BIN, "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
-        "-of", "json",
-        path,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        print(f"[render] ffprobe dimension check failed on {path}: {stderr.decode(errors='replace')[-500:]}")
-        return None
-
-    try:
-        data = json.loads(stdout.decode())
-        streams = data.get("streams") or []
-        if not streams:
-            return None
-        stream = streams[0]
-
-        width = int(stream.get("width", 0) or 0)
-        height = int(stream.get("height", 0) or 0)
-        if width <= 0 or height <= 0:
-            return None
-
-        rotation = 0
-        tags_rotate = (stream.get("tags") or {}).get("rotate")
-        if tags_rotate is not None:
-            try:
-                rotation = int(float(tags_rotate))
-            except (TypeError, ValueError):
-                rotation = 0
-
-        for sd in (stream.get("side_data_list") or []):
-            if "rotation" in sd:
-                try:
-                    rotation = int(float(sd["rotation"]))
-                except (TypeError, ValueError):
-                    pass
-
-        rotation = abs(rotation) % 360
-        if rotation in (90, 270):
-            width, height = height, width
-
-        return width, height
-    except (ValueError, KeyError, IndexError, json.JSONDecodeError):
-        return None
-
-
-async def _download(url: str, dest: str, client: httpx.AsyncClient) -> str:
-    resp = await client.get(url, follow_redirects=True, timeout=60.0)
-    resp.raise_for_status()
-    with open(dest, "wb") as f:
-        f.write(resp.content)
-    return dest
-
-
-async def _make_color_fallback(
-    duration_frames: int, fps: int, width: int, height: int, tmp_dir: str,
-    color: str = "0x111827",
-) -> str:
-    out_path = os.path.join(tmp_dir, "broll_fallback.mp4")
-    seconds = duration_frames / fps
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-f", "lavfi",
-        "-i", f"color=c={color}:s={width}x{height}:d={seconds:.3f}:r={fps}",
-        *FFMPEG_X264_FLAGS,
-        out_path,
-    ]
-    await _run(cmd)
-    return out_path
-
-
-async def _make_blurpad_fallback(
-    local_src: str, source_kind: str, duration_frames: int, fps: int,
-    width: int, height: int, tmp_dir: str,
-) -> Optional[str]:
-    target_seconds = duration_frames / fps
-    out_path = os.path.join(tmp_dir, "broll_blurpad.mp4")
-
-    filter_complex = (
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},gblur=sigma=30,eq=brightness=-0.05[bg];"
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={fps}[outv]"
-    )
-
-    if source_kind == "image":
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-loop", "1", "-i", local_src,
-            "-t", f"{target_seconds:.3f}",
-            "-filter_complex", filter_complex,
-            "-map", "[outv]", "-an",
-            *FFMPEG_X264_FLAGS,
-            out_path,
-        ]
-        try:
-            await _run(cmd)
-            return out_path
-        except Exception as e:
-            print(f"[render] blur-pad image composite failed: {e}")
-            return None
-
-    try:
-        source_seconds = await _probe_duration_seconds(local_src)
-    except Exception:
-        source_seconds = target_seconds
-
-    if source_seconds >= target_seconds:
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-i", local_src,
-            "-t", f"{target_seconds:.3f}",
-            "-filter_complex", filter_complex,
-            "-map", "[outv]", "-an",
-            *FFMPEG_X264_FLAGS,
-            out_path,
-        ]
-    else:
-        loops_needed = int(target_seconds // max(source_seconds, 0.1)) + 1
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-stream_loop", str(loops_needed),
-            "-i", local_src,
-            "-t", f"{target_seconds:.3f}",
-            "-filter_complex", filter_complex,
-            "-map", "[outv]", "-an",
-            *FFMPEG_X264_FLAGS,
-            out_path,
-        ]
-
-    try:
-        await _run(cmd)
-        return out_path
-    except Exception as e:
-        print(f"[render] blur-pad video composite failed: {e}")
-        return None
-
-
-async def _prepare_broll_clip(
-    broll_track: dict, scene_duration_frames: int, fps: int, width: int, height: int,
-    tmp_dir: str, client: httpx.AsyncClient,
-    background_color_override: Optional[str] = None,
-    motion_type: Optional[str] = None,
-) -> str:
-    if background_color_override:
-        return await _make_color_fallback(
-            scene_duration_frames, fps, width, height, tmp_dir,
-            color=_normalize_ffmpeg_color(background_color_override),
-        )
-
-    selected = broll_track.get("selected_asset")
-
-    if not selected:
-        print("[render] no b-roll asset selected for this beat — using color fallback")
-        return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
-    source = selected.get("source", "video")
-    landscape_url = _resolve_broll_file_url(selected, source)
-
-    if landscape_url:
-        target_seconds = scene_duration_frames / fps
-        ext = ".mp4" if source == "video" else ".jpg"
-        local_src = os.path.join(tmp_dir, f"broll_src{ext}")
-
-        try:
-            await _download(landscape_url, local_src, client)
-        except Exception as e:
-            print(f"[render] broll download failed ({landscape_url}): {e} — trying blur-pad fallback")
-            landscape_url = None
-
-        if landscape_url:
-            if source == "video":
-                dims = await _probe_video_dimensions(local_src)
-                if dims is not None and not _is_landscape_dimensions(dims[0], dims[1]):
-                    print(
-                        f"[render] downloaded broll video DISPLAYS as portrait/square "
-                        f"(effective {dims[0]}x{dims[1]} after rotation) despite metadata "
-                        f"claiming landscape — using blur-pad composite instead of stretching it"
-                    )
-                    blurpad = await _make_blurpad_fallback(
-                        local_src, "video", scene_duration_frames, fps, width, height, tmp_dir
-                    )
-                    if blurpad:
-                        return blurpad
-                    return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
-            out_path = os.path.join(tmp_dir, "broll_fit.mp4")
-
-            if source == "image":
-                resolved_motion = motion_type if motion_type in _VALID_MOTION_TYPES else _DEFAULT_MOTION_TYPE
-                motion_filter = _build_image_motion_filter(
-                    resolved_motion, duration_frames=scene_duration_frames,
-                    fps=fps, width=width, height=height,
-                )
-                cmd = [
-                    FFMPEG_BIN, "-y",
-                    "-loop", "1", "-i", local_src,
-                    "-t", f"{target_seconds:.3f}",
-                    "-vf", motion_filter,
-                    "-an",
-                    *FFMPEG_X264_FLAGS,
-                    out_path,
-                ]
-                await _run(cmd)
-                return out_path
-
-            scale_crop = (
-                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},setsar=1,fps={fps}"
-            )
-
-            source_seconds = await _probe_duration_seconds(local_src)
-            if source_seconds >= target_seconds:
-                cmd = [
-                    FFMPEG_BIN, "-y",
-                    "-i", local_src,
-                    "-t", f"{target_seconds:.3f}",
-                    "-vf", scale_crop, "-an",
-                    *FFMPEG_X264_FLAGS,
-                    out_path,
-                ]
-            else:
-                loops_needed = int(target_seconds // source_seconds) + 1
-                cmd = [
-                    FFMPEG_BIN, "-y",
-                    "-stream_loop", str(loops_needed),
-                    "-i", local_src,
-                    "-t", f"{target_seconds:.3f}",
-                    "-vf", scale_crop, "-an",
-                    *FFMPEG_X264_FLAGS,
-                    out_path,
-                ]
-            await _run(cmd)
-            return out_path
-
-    any_url = _resolve_broll_file_url_any_orientation(selected, source)
-    if not any_url:
-        print(
-            f"[render] no downloadable file at all for asset "
-            f"{selected.get('asset_id') or selected.get('id')} — using color fallback"
-        )
-        return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
-    ext = ".mp4" if source == "video" else ".jpg"
-    local_src = os.path.join(tmp_dir, f"broll_anyorient{ext}")
-    try:
-        await _download(any_url, local_src, client)
-    except Exception as e:
-        print(f"[render] any-orientation broll download failed ({any_url}): {e} — using color fallback")
-        return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
-    blurpad = await _make_blurpad_fallback(local_src, source, scene_duration_frames, fps, width, height, tmp_dir)
-    if blurpad:
-        return blurpad
-
-    print("[render] blur-pad composite failed — using color fallback as last resort")
-    return await _make_color_fallback(scene_duration_frames, fps, width, height, tmp_dir)
-
-
-async def _make_silent_audio(duration_frames: int, fps: int, tmp_dir: str) -> str:
-    out_path = os.path.join(tmp_dir, "silence.aac")
-    seconds = max(duration_frames / fps, 1 / fps)
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-f", "lavfi",
-        "-i", f"anullsrc=channel_layout={SILENT_AUDIO_CHANNEL_LAYOUT}:sample_rate={SILENT_AUDIO_SAMPLE_RATE}",
-        "-t", f"{seconds:.3f}",
-        "-c:a", "aac",
-        out_path,
-    ]
-    await _run(cmd)
-    return out_path
-
-
-async def render_infographic_via_remotion(
-    composition_id: str, props: dict, duration_frames: int, fps: int,
-    width: int, height: int, tmp_dir: str,
-) -> Optional[str]:
-    """Renders one animation as a transparent ProRes4444 clip via Remotion.
-    `composition_id` is the animation_type (e.g. "icon_pop_in",
-    "full_screen_quote_card") — the Remotion project is expected to expose
-    one composition per animation_type in ANIMATION_TAXONOMY.
-
-    Always verifies the ACTUAL rendered clip length against the requested
-    duration_frames afterward and pads if short — this doesn't depend on
-    successfully parsing Remotion's exact error text to detect a
-    truncation (that regex match was a best-effort guess at Remotion's
-    error format that was never confirmed against real output, so relying
-    on it alone to trigger padding was fragile: if the message didn't
-    match, or Remotion truncated silently without erroring at all — e.g.
-    a composition with its own internal duration cap that simply clips
-    rather than throwing — the overlay would render shorter than intended
-    with no padding applied and no error logged either). Probing the real
-    output file's frame count is unconditional and catches every case."""
-    if not REMOTION_PROJECT_DIR:
-        print(
-            f"[render] REMOTION_PROJECT_DIR not configured — skipping "
-            f"animation '{composition_id}'. Set up a Remotion project and "
-            f"point REMOTION_PROJECT_DIR at it to enable overlays."
-        )
-        return None
-
-    out_path = os.path.join(tmp_dir, f"anim_{uuid.uuid4().hex}.mov")
-    props_path = os.path.join(tmp_dir, f"props_{uuid.uuid4().hex}.json")
-    with open(props_path, "w") as f:
-        json.dump(props, f)
-
-    def _build_cmd(frame_range: Optional[str]) -> list[str]:
-        cmd = ["npx", "remotion", "render", composition_id, out_path, f"--props={props_path}"]
-        if frame_range:
-            cmd.append(f"--frames={frame_range}")
-        cmd += [
-            f"--fps={fps}", f"--width={width}", f"--height={height}",
-            "--codec=prores", "--prores-profile=4444", "--pixel-format=yuva444p10le",
-        ]
-        return cmd
-
-    rendered = False
-    async with _remotion_semaphore:
-        try:
-            await _run(_build_cmd(f"0-{duration_frames - 1}"), cwd=REMOTION_PROJECT_DIR)
-            rendered = True
-        except RuntimeError as e:
-            msg = str(e)
-            m = re.search(
-                r"durationInFrames.*?evaluated to be (\d+).*?not inbetween 0-(\d+)",
-                msg, re.IGNORECASE | re.DOTALL,
-            )
-            max_frame = int(m.group(2)) if m else None
-            if max_frame is None:
-                # Couldn't parse a specific bound from the error — try a
-                # single generic retry with no --frames constraint at all
-                # (let the composition use its own default length) rather
-                # than giving up outright. If this also fails, there's
-                # nothing more to try.
-                print(f"[render] '{composition_id}' render failed and error format wasn't recognized ({e}) — retrying with the composition's own default duration")
-                try:
-                    await _run(_build_cmd(None), cwd=REMOTION_PROJECT_DIR)
-                    rendered = True
-                except Exception as e2:
-                    print(f"[render] '{composition_id}': fallback retry also failed: {e2}")
-                    return None
-            else:
-                print(f"[render] '{composition_id}' has a fixed durationInFrames — retrying within its native bounds (0-{max_frame})")
-                try:
-                    await _run(_build_cmd(f"0-{max_frame}"), cwd=REMOTION_PROJECT_DIR)
-                    rendered = True
-                except Exception as e2:
-                    print(f"[render] '{composition_id}': retry also failed: {e2}")
-                    return None
-
-    if not rendered:
-        return None
-
-    # Unconditional check: does the actual rendered file have as many
-    # frames as requested? If not — for ANY reason, error-message-parsed
-    # or not — freeze-pad its last frame out to duration_frames so the
-    # overlay stays visible for its full intended duration rather than
-    # vanishing early (the render pipeline composites this clip starting
-    # at frame 0 of wherever it's placed, so a short clip directly means
-    # early disappearance, independent of how correct the upstream
-    # anchor_start_sec/anchor_end_sec computation was).
-    try:
-        actual_seconds = await _probe_duration_seconds(out_path)
-        actual_frames = max(1, round(actual_seconds * fps))
-    except Exception as e:
-        print(f"[render] '{composition_id}': couldn't verify rendered clip length ({e}) — using it as-is")
-        return out_path
-
-    if actual_frames < duration_frames:
-        padded_path = os.path.join(tmp_dir, f"anim_padded_{uuid.uuid4().hex}.mov")
-        pad_cmd = [
-            FFMPEG_BIN, "-y", "-i", out_path,
-            "-vf", f"tpad=stop_mode=clone:stop={duration_frames - actual_frames}",
-            "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
-            padded_path,
-        ]
-        try:
-            await _run(pad_cmd)
-            print(
-                f"[render] '{composition_id}': rendered clip was {actual_frames}/{duration_frames} "
-                f"frames — padded by freezing its final frame so it stays visible for the "
-                f"full intended duration instead of vanishing early"
-            )
-            return padded_path
-        except Exception as e3:
-            print(
-                f"[render] '{composition_id}': failed to pad truncated clip, "
-                f"leaving it short at {actual_frames}/{duration_frames} frames: {e3}"
-            )
-
-    return out_path
-
-
-def _frames_to_ass_time(frame: int, fps: int) -> str:
-    total_seconds = frame / fps
-    h = int(total_seconds // 3600)
-    m = int((total_seconds % 3600) // 60)
-    s = total_seconds % 60
-    return f"{h:d}:{m:02d}:{s:05.2f}"
-
-
-def _build_ass_from_words(
-    words: list[dict], scene_start_frame: int, fps: int, width: int, height: int,
-    style: Optional[dict] = None,
-) -> str:
-    style = style or {}
-    font_size = style.get("font_size") or 72
-    font_family = style.get("font_family") or DEFAULT_CAPTION_FONT
-    primary_color = _hex_to_ass_color(style.get("text_color") or "#FFFFFF", alpha_hex="00")
-    outline_color = _hex_to_ass_color(style.get("outline_color") or "#000000", alpha_hex="00")
-    animation_type = style.get("animation_type") or "kinetic_caption"
-
-    vertical_position = (style.get("vertical_position") or "bottom").lower()
-    horizontal_position = (style.get("horizontal_position") or "center").lower()
-    try:
-        margin_v_percent = float(style.get("margin_bottom_percent", 3))
-    except (TypeError, ValueError):
-        margin_v_percent = 3.0
-    try:
-        margin_h_percent = float(style.get("margin_horizontal_percent", 0))
-    except (TypeError, ValueError):
-        margin_h_percent = 0.0
-
-    _ALIGNMENT_GRID = {
-        ("top", "left"): 7, ("top", "center"): 8, ("top", "right"): 9,
-        ("middle", "left"): 4, ("middle", "center"): 5, ("middle", "right"): 6,
-        ("bottom", "left"): 1, ("bottom", "center"): 2, ("bottom", "right"): 3,
-    }
-    alignment = _ALIGNMENT_GRID.get((vertical_position, horizontal_position), 2)
-
-    margin_v = 0 if vertical_position == "middle" else max(round(height * margin_v_percent / 100), 0)
-    default_side_margin = 60
-    margin_h = (
-        default_side_margin if margin_h_percent <= 0
-        else max(round(width * margin_h_percent / 100), 0)
-    )
-    margin_l = margin_h
-    margin_r = margin_h
-
-    header = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {width}
-PlayResY: {height}
-WrapStyle: 0
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV
-Style: Caption,{font_family},{font_size},{primary_color},{outline_color},&H80000000,1,4,0,{alignment},{margin_l},{margin_r},{margin_v}
-
-[Events]
-Format: Layer, Start, End, Style, Text
-"""
-    if animation_type == "static_line" and words:
-        start_frame = words[0]["startFrame"] - scene_start_frame
-        end_frame = words[-1]["endFrame"] - scene_start_frame
-        text = " ".join(w["word"] for w in words)
-        if start_frame < 0:
-            start_frame = 0
-        if end_frame > start_frame:
-            start_ts = _frames_to_ass_time(start_frame, fps)
-            end_ts = _frames_to_ass_time(end_frame, fps)
-            return header + f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}\n"
-        return header
-
-    lines = []
-    chunk: list[dict] = []
-    CHUNK_SIZE = style.get("words_per_line") or CAPTION_WORDS_PER_LINE
-    for w in words:
-        chunk.append(w)
-        if len(chunk) >= CHUNK_SIZE:
-            lines.append(chunk)
-            chunk = []
-    if chunk:
-        lines.append(chunk)
-
-    events = []
-    for line_words in lines:
-        start_frame = line_words[0]["startFrame"] - scene_start_frame
-        end_frame = line_words[-1]["endFrame"] - scene_start_frame
-        if start_frame < 0 or end_frame <= start_frame:
-            continue
-        text = " ".join(w["word"] for w in line_words)
-        start_ts = _frames_to_ass_time(start_frame, fps)
-        end_ts = _frames_to_ass_time(end_frame, fps)
-        events.append(f"Dialogue: 0,{start_ts},{end_ts},Caption,{text}")
-
-    return header + "\n".join(events) + "\n"
-
-
-async def _burn_captions(
-    input_path: str, words: list[dict], scene_start_frame: int, fps: int,
-    width: int, height: int, tmp_dir: str, style: Optional[dict] = None,
-) -> str:
-    if not words:
-        return input_path
-
-    ass_content = _build_ass_from_words(words, scene_start_frame, fps, width, height, style=style)
-    ass_path = os.path.join(tmp_dir, "captions.ass")
-    with open(ass_path, "w") as f:
-        f.write(ass_content)
-
-    out_path = os.path.join(tmp_dir, "with_captions.mp4")
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-i", input_path,
-        "-vf", "ass=captions.ass",
-        *FFMPEG_X264_FLAGS,
-        "-c:a", "copy",
-        out_path,
-    ]
-    await _run(cmd, cwd=tmp_dir)
-    return out_path
-
-
-def _escape_drawtext(text: str) -> str:
-    if not text:
-        return ""
-    return (
-        text.replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\u2019")
-        .replace("%", "\\%")
-        .replace("\n", "\\n")
-    )
-
-
-# =============================================================================
-# BEAT ANIMATION RENDERING  (rewritten for the new per-beat animations
-# schema — see the module docstring at the top of this file for the full
-# rationale.)
-# =============================================================================
-
-def _scale_geometry_px(geometry_px: dict, out_width: int, out_height: int) -> dict:
-    """
-    geometry_px is always expressed on a fixed 1920x1080 (16:9) canvas
-    (ANIMATION_CANVAS_WIDTH/HEIGHT, from the edit-video module). Scales
-    uniformly by width (contain-fit) and centers vertically when the
-    actual output is a different aspect ratio (e.g. 1080x1920 portrait) —
-    this keeps proportions correct instead of stretching text/icons.
-    """
-    geometry_px = geometry_px or {"x": 0, "y": 0, "width": 200, "height": 100}
-    scale = out_width / ANIMATION_CANVAS_WIDTH
-    scaled_canvas_height = ANIMATION_CANVAS_HEIGHT * scale
-    y_offset = (out_height - scaled_canvas_height) / 2
-
-    return {
-        "x": geometry_px.get("x", 0) * scale,
-        "y": geometry_px.get("y", 0) * scale + y_offset,
-        "width": geometry_px.get("width", 0) * scale,
-        "height": geometry_px.get("height", 0) * scale,
-        "scale": scale,
-    }
-
-
-def _display_text_to_string(display_text: Any) -> str:
-    if isinstance(display_text, list):
-        return "\n".join(str(d) for d in display_text if d)
-    if isinstance(display_text, str):
-        return display_text
-    return ""
-
-
-def _font_size_for_geometry(geo: dict, text: str) -> int:
-    """Solves for a font size that keeps the longest line inside the
-    (already-scaled) box, clamped to a fixed 20-25px range for this
-    style of small, understated callout — not a general-purpose sizer
-    that scales up for big boxes; this family of overlay is meant to
-    read as a quiet annotation, not a headline."""
-    lines = text.split("\n") or [text]
-    longest = max((len(l) for l in lines), default=1) or 1
-    chars_per_100px = 16
-    width_based = int((geo["width"] / max(longest, 1)) * (100 / chars_per_100px) * 0.6)
-    height_based = int(geo["height"] / max(len(lines), 1) * 0.7) if geo["height"] else width_based
-    return max(20, min(width_based, height_based, 25))
-
-def _ffmpeg_box_color(background_color_hint: Optional[str], alpha: float, default: str = "black") -> str:
-    """Converts an animation's background_color_hint (hex, or None) into
-    an FFmpeg drawtext boxcolor value. Falls back to the same translucent
-    black every box used before this field existed."""
-    if background_color_hint:
-        h = background_color_hint.strip().lstrip("#")
-        if len(h) == 6:
-            return f"0x{h}@{alpha}"
-    return f"{default}@{alpha}"
-
-
-def _build_icon_overlay_drawtext(
-    animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
-    offset_seconds: float = 0.0,
-) -> Optional[str]:
-    """FFmpeg fallback for overlay_graphic/branding animations — draws the
-    icon's emoji glyph (+ optional label) at geometry_px, with fade in/out
-    and support for single / sequence / cluster / pair icon_layout.
-    offset_seconds shifts every timing expression so the animation only
-    becomes visible that many seconds into the clip it's drawn onto — see
-    the offset_seconds note on _apply_beat_animation for why this exists."""
-    icon_name = animation.get("icon_name")
-    icons: list[str] = []
-    if isinstance(icon_name, str) and icon_name:
-        icons = [icon_name]
-    elif isinstance(icon_name, list):
-        icons = [i for i in icon_name if isinstance(i, str) and i]
-
-    label = _display_text_to_string(animation.get("display_text"))
-    if not icons and not label:
-        return None
-
-    geo = _scale_geometry_px(animation.get("geometry_px") or {}, out_width, out_height)
-
-    duration_seconds = max(clip_duration_frames / fps, 0.2)
-    fade_in = min(0.35, duration_seconds / 4)
-    fade_out = min(0.35, duration_seconds / 4)
-    o = offset_seconds
-    alpha_expr = (
-        f"if(lt(t,{o}),0,"
-        f"if(lt(t,{o + fade_in}),(t-{o})/{fade_in},"
-        f"if(gt(t,{o + duration_seconds - fade_out}),({o + duration_seconds}-t)/{fade_out},1)))"
-    )
-
-    icon_font_size = max(28, min(int(geo["height"] * 0.55), 140))
-    layout = animation.get("icon_layout")
-    filters = []
-
-    if len(icons) <= 1:
-        glyph = _icon_glyph(icons[0]) if icons else ""
-        text = f"{glyph}  {label}".strip() if (glyph and label) else (glyph or label)
-        safe_text = _escape_drawtext(text)
-        cx = geo["x"] + geo["width"] / 2
-        cy = geo["y"] + geo["height"] / 2
-        filters.append(
-            f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
-            f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.5)}:boxborderw=14:"
-            f"x={cx:.1f}-text_w/2:y={cy:.1f}-text_h/2:alpha='{alpha_expr}'"
-        )
-    else:
-        n = min(len(icons), 4)
-        if layout == "sequence":
-            slice_seconds = duration_seconds / n
-            x0 = geo["x"] + geo["width"] / 2
-            y0 = geo["y"] + geo["height"] / 2
-            for i, icon in enumerate(icons[:n]):
-                glyph = _icon_glyph(icon)
-                safe_text = _escape_drawtext(glyph)
-                seg_start = o + i * slice_seconds
-                seg_end = o + (duration_seconds if i == n - 1 else (i + 1) * slice_seconds)
-                local_fade_in = min(0.2, slice_seconds / 4)
-                seg_alpha = (
-                    f"if(lt(t,{seg_start}),0,"
-                    f"if(lt(t,{seg_start + local_fade_in}),(t-{seg_start})/{local_fade_in},"
-                    f"if(lt(t,{seg_end}),1,0)))"
-                )
-                filters.append(
-                    f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
-                    f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.5)}:boxborderw=14:"
-                    f"x={x0:.1f}-text_w/2:y={y0:.1f}-text_h/2:alpha='{seg_alpha}'"
-                )
-        else:
-            spacing = geo["width"] / n
-            y0 = geo["y"] + geo["height"] / 2
-            for i, icon in enumerate(icons[:n]):
-                glyph = _icon_glyph(icon)
-                safe_text = _escape_drawtext(glyph)
-                cx = geo["x"] + spacing * (i + 0.5)
-                filters.append(
-                    f"drawtext=text='{safe_text}':fontcolor=white:fontsize={icon_font_size}:"
-                    f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.5)}:boxborderw=10:"
-                    f"x={cx:.1f}-text_w/2:y={y0:.1f}-text_h/2:alpha='{alpha_expr}'"
-                )
-        if label:
-            safe_label = _escape_drawtext(label)
-            label_font_size = max(20, min(int(geo["height"] * 0.28), 56))
-            lx = geo["x"] + geo["width"] / 2
-            ly = geo["y"] + geo["height"] * 0.82
-            filters.append(
-                f"drawtext=text='{safe_label}':fontcolor=white:fontsize={label_font_size}:"
-                f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.5)}:boxborderw=10:"
-                f"x={lx:.1f}-text_w/2:y={ly:.1f}-text_h/2:alpha='{alpha_expr}'"
-            )
-
-    return ",".join(filters)
-
-
-    
-def _build_beat_animation_drawtext(
-    animation: dict, out_width: int, out_height: int, clip_duration_frames: int, fps: int,
-    offset_seconds: float = 0.0,
-) -> Optional[str]:
-    """
-    FFmpeg fallback for animation categories that are pure text —
-    `overlay_text`, and `full_screen` animations that carry `display_text`
-    or `highlight_target_text` with nothing to actually screenshot.
-    `overlay_graphic` / `pip` / `branding` (icons, PiP frames, avatars)
-    have no honest FFmpeg equivalent — callers should not route those here.
-    offset_seconds shifts the fade timing so the text only becomes visible
-    that many seconds into the clip it's drawn onto — see the
-    offset_seconds note on _apply_beat_animation for why this exists.
-    """
-    text = _display_text_to_string(animation.get("display_text"))
-    if not text and animation.get("highlight_target_text"):
-        # No real screenshot asset to composite — degrade to showing the
-        # quoted text itself rather than dropping the beat's emphasis.
-        text = animation["highlight_target_text"]
-    if not text:
-        return None
-
-    geo = _scale_geometry_px(animation.get("geometry_px") or {}, out_width, out_height)
-    font_size = animation.get("font_size") or _font_size_for_geometry(geo, text)
-
-    duration_seconds = max(clip_duration_frames / fps, 0.2)
-    fade_in = min(0.4, duration_seconds / 4)
-    fade_out = min(0.4, duration_seconds / 4)
-    o = offset_seconds
-    alpha_expr = (
-        f"if(lt(t,{o}),0,"
-        f"if(lt(t,{o + fade_in}),(t-{o})/{fade_in},"
-        f"if(gt(t,{o + duration_seconds - fade_out}),({o + duration_seconds}-t)/{fade_out},1)))"
-    )
-
-    safe_text = _escape_drawtext(text)
-    x = f"{geo['x']:.1f}"
-    y = f"{geo['y']:.1f}"
-
-    return (
-        f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
-        f"box=1:boxcolor={_ffmpeg_box_color(animation.get('background_color_hint'), 0.55)}:boxborderw=16:line_spacing=8:"
-        f"x={x}:y={y}:alpha='{alpha_expr}'"
-    )
-
-
-def _build_remotion_props(animation_type: str, animation: dict, width: int, height: int) -> dict:
-    """
-    Your first 7 compositions (TitleCard, QuoteCard, DataVizFullScreen,
-    StatCounterOverlay, BulletListReveal, IconSequenceOverlay, IconPopIn)
-    each expect their OWN specific field names (title/subtitle,
-    quote/attribution, label/caption, value/label, items, icons) — not
-    the generic displayText/iconName/colorHint shape the animation track
-    carries. Sending the generic shape to those meant they were either
-    rendering with their defaultProps (ignoring your beat's actual text)
-    or failing zod validation outright. This maps animation_type to the
-    right prop shape per composition. IconSequenceOverlay and IconPopIn
-    are the two exceptions that DO also get colorHint/geometryPx passed
-    through (on top of their icons/label fields) — without those, the
-    component has no way to know where the backend wants it placed or
-    what accent color to use, and silently falls back to a hardcoded
-    position, which was the actual root cause of icons always landing in
-    the same spot regardless of what geometry the backend computed.
-
-    Every OTHER composition (everything in compositions/Extra.tsx) shares
-    one generic schema (baseAnimSchema) and accepts the raw shape
-    directly, so those fall through to the generic branch unchanged.
-    """
-    text = _display_text_to_string(animation.get("display_text"))
-    lines = [l for l in text.split("\n") if l.strip()] if text else []
-
-    icons = animation.get("icon_name")
-    if isinstance(icons, str):
-        icons = [icons]
-    elif not isinstance(icons, list):
-        icons = []
-
-    if animation_type == "full_screen_title_card":
-        return {"title": lines[0] if lines else text, "subtitle": lines[1] if len(lines) > 1 else ""}
-
-    if animation_type == "full_screen_quote_card":
-        quote = lines[0] if lines else (animation.get("highlight_target_text") or text)
-        return {"quote": quote, "attribution": lines[1] if len(lines) > 1 else ""}
-
-    if animation_type == "full_screen_data_viz":
-        return {"label": lines[0] if lines else text, "caption": lines[1] if len(lines) > 1 else ""}
-
-    if animation_type == "stat_counter_overlay":
-        return {"value": lines[0] if lines else text, "label": lines[1] if len(lines) > 1 else ""}
-
-    if animation_type == "bullet_list_reveal":
-        items = lines if lines else ([text] if text else ["", ""])
-        return {"title": "", "items": items[:6] or ["", ""]}
-
-    if animation_type == "icon_sequence":
-        return {
-            "icons": icons or ["sparkles"], "label": text,
-            "colorHint": animation.get("color_hint"),
-            "backgroundColorHint": animation.get("background_color_hint"),
-            "geometryPx": _scale_geometry_px(animation.get("geometry_px") or {}, width, height),
-        }
-
-    if animation_type == "icon_pop_in":
-        return {
-            "icons": (icons[:1] or ["sparkles"]), "label": text,
-            "colorHint": animation.get("color_hint"),
-            "backgroundColorHint": animation.get("background_color_hint"),
-            "geometryPx": _scale_geometry_px(animation.get("geometry_px") or {}, width, height),
-        }
-
-    # Everything else (compositions/Extra.tsx) — generic shape.
-    return {
-        "displayText": animation.get("display_text"),
-        "colorHint": animation.get("color_hint"),
-        "backgroundColorHint": animation.get("background_color_hint"),
-        "fontSize": animation.get("font_size"),
-        "geometryPx": _scale_geometry_px(animation.get("geometry_px") or {}, width, height),
-        "iconName": animation.get("icon_name"),
-        "iconLayout": animation.get("icon_layout"),
-        "highlightTargetText": animation.get("highlight_target_text"),
-        "motion": animation.get("motion"),
-    }
-
-
-async def _apply_beat_animation(
-    beat_clip_path: str, animation: dict, width: int, height: int, fps: int, tmp_dir: str,
-    offset_seconds: float = 0.0,
-) -> str:
-    """
-    Applies ONE animation (a timeline "animation" track dict, already
-    scoped to a single beat) onto that beat's own clip. Returns the
-    animated clip path, or the original `beat_clip_path` unchanged if
-    nothing could be rendered for it.
-
-    offset_seconds is how far INTO the beat's own clip the animation
-    should actually start appearing — computed by the caller as
-    (animation's own timeline startFrame - the beat's own timeline
-    startFrame) / fps. This is not optional cosmetic polish: every
-    animation's real anchor_start_sec/anchor_end_sec (or heuristic-matched
-    timing) was being computed correctly upstream in build_timeline_from_
-    scenes, but this function used to always composite the overlay
-    starting at frame 0 of whatever beat clip it was attached to —
-    silently discarding that timing and showing every animation from the
-    moment its beat's B-roll began, regardless of when it was actually
-    supposed to appear. For a beat several seconds long with an animation
-    anchored partway through it (the normal case for anything anchored to
-    a specific phrase), this made the animation show early by exactly the
-    gap between the beat's start and the animation's real anchor — which
-    is precisely the sync bug that kept reproducing no matter how
-    accurate the upstream timing computation became.
-    """
-    category = animation.get("category")
-    animation_type = animation.get("animation_type")
-    duration_frames = animation.get("duration_frames") or fps * 2
-    offset_seconds = max(0.0, offset_seconds)
-
-    # A separate async Remotion pipeline may already have pre-rendered
-    # this animation and populated `asset_url` on the timeline track —
-    # use it directly instead of invoking Remotion synchronously again.
-    asset_url = animation.get("asset_url")
-    overlay_clip = None
-
-    if asset_url:
-        try:
-            ext = ".mov" if asset_url.lower().endswith((".mov", ".mp4")) else ".png"
-            local_asset = os.path.join(tmp_dir, f"preRendered_{uuid.uuid4().hex}{ext}")
-            async with httpx.AsyncClient() as client:
-                await _download(asset_url, local_asset, client)
-            overlay_clip = local_asset
-        except Exception as e:
-            print(f"[render] failed to fetch pre-rendered asset for '{animation_type}': {e} — falling back")
-
-    composition_id = _REMOTION_COMPOSITION_BY_ANIMATION_TYPE.get(animation_type)
-
-    if overlay_clip is None and animation.get("render_engine_hint") == "remotion" and REMOTION_PROJECT_DIR:
-        if composition_id:
-            props = _build_remotion_props(animation_type, animation, width, height)
-            overlay_clip = await render_infographic_via_remotion(
-                composition_id=composition_id, props=props,
-                duration_frames=duration_frames, fps=fps, width=width, height=height, tmp_dir=tmp_dir,
-            )
-        else:
-            # No composition built for this animation_type yet — don't
-            # even spawn `npx remotion render`, it can only fail. Fall
-            # straight through to the text/skip logic below.
-            print(
-                f"[render] no Remotion composition mapped for animation_type "
-                f"'{animation_type}' yet (see _REMOTION_COMPOSITION_BY_ANIMATION_TYPE) "
-                f"— trying the FFmpeg text fallback instead"
-            )
-
-    if overlay_clip:
-        composited = os.path.join(tmp_dir, f"anim_composited_{uuid.uuid4().hex}.mp4")
-        # -itsoffset on the overlay INPUT shifts its presentation
-        # timestamps forward by offset_seconds, so it has no frames to
-        # show until that point in the merged timeline — before then,
-        # overlay just passes the base beat clip through unchanged. This
-        # is what actually delays the animation to its real anchor time
-        # instead of always starting at the beat's own frame 0.
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-i", beat_clip_path,
-            "-itsoffset", f"{offset_seconds:.3f}", "-i", overlay_clip,
-            "-filter_complex", "[1:v]format=yuva420p[fg];[0:v][fg]overlay=0:0:eof_action=pass:format=auto",
-            "-r", str(fps),
-            *FFMPEG_X264_FLAGS,
-            "-an",
-            composited,
-        ]
-        try:
-            await _run(cmd)
-            return composited
-        except Exception as e:
-            print(f"[render] compositing rendered animation '{animation_type}' failed: {e} — falling back")
-
-    text_eligible = category == "overlay_text" or (
-        category == "full_screen" and (animation.get("display_text") or animation.get("highlight_target_text"))
-    )
-    if text_eligible:
-        drawtext = _build_beat_animation_drawtext(animation, width, height, duration_frames, fps, offset_seconds)
-        if drawtext:
-            out_path = os.path.join(tmp_dir, f"anim_text_{uuid.uuid4().hex}.mp4")
-            try:
-                await _run([
-                    FFMPEG_BIN, "-y", "-i", beat_clip_path, "-vf", drawtext,
-                    *FFMPEG_X264_FLAGS, "-an", out_path,
-                ])
-                return out_path
-            except Exception as e:
-                print(f"[render] FFmpeg text-overlay fallback for '{animation_type}' failed: {e}")
-        return beat_clip_path
-
-    # --- ICON FIX: overlay_graphic/branding used to just fall through to
-    # "return beat_clip_path" below with no FFmpeg rendering at all.
-    icon_eligible = category in ("overlay_graphic", "branding")
-    if icon_eligible:
-        icon_drawtext = _build_icon_overlay_drawtext(animation, width, height, duration_frames, fps, offset_seconds)
-        if icon_drawtext:
-            out_path = os.path.join(tmp_dir, f"anim_icon_{uuid.uuid4().hex}.mp4")
-            try:
-                await _run([
-                    FFMPEG_BIN, "-y", "-i", beat_clip_path, "-vf", icon_drawtext,
-                    *FFMPEG_X264_FLAGS, "-an", out_path,
-                ])
-                return out_path
-            except Exception as e:
-                print(f"[render] FFmpeg icon-overlay fallback for '{animation_type}' failed: {e}")
-        else:
-            print(f"[render] icon animation '{animation_type}' had no icon_name/display_text to draw — skipping")
-        return beat_clip_path
-
-    print(
-        f"[render] animation '{animation_type}' (category={category}) needs Remotion "
-        f"(pip/transition content has no FFmpeg equivalent) and none "
-        f"was available — this beat renders without it"
-    )
-    return beat_clip_path
-
-async def _lock_clip_to_frame_count(
-    input_path: str, duration_frames: int, fps: int, width: int, height: int, tmp_dir: str,
-) -> str:
-    out_path = os.path.join(tmp_dir, "locked.mp4")
-    cmd = [
-        FFMPEG_BIN, "-y",
-        "-i", input_path,
-        "-vf", f"fps={fps},tpad=stop_mode=clone:stop=100",
-        "-frames:v", str(duration_frames),
-        *FFMPEG_X264_FLAGS,
-        "-an",
-        out_path,
-    ]
-    await _run(cmd)
-    return out_path
-
-
-async def _render_scene(
-    scene: dict, fps: int, width: int, height: int, work_root: str,
-    client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
-    timeline_tracks_by_scene: Optional[dict] = None,
-    caption_tracks_by_scene: Optional[dict] = None,
-    animation_tracks_by_scene_beat: Optional[dict] = None,
-) -> str:
-    """
-    `animation_tracks_by_scene_beat` is {scene_id: {beat_id: track}} — a
-    scene can carry several animated beats, so this MUST be keyed by both
-    scene and beat, not scene alone (see module docstring, point 1).
-    """
-    async with semaphore:
-        scene_id = scene.get("scene_id", uuid.uuid4().hex)
-        tmp_dir = os.path.join(work_root, f"scene_{scene_id}")
-        os.makedirs(tmp_dir, exist_ok=True)
-
-        trim = scene.get("trim") or {}
-        start_sec = scene.get("start")
-        if start_sec is None:
-            start_sec = trim.get("start", 0.0)
-
-        end_sec = scene.get("end")
-        if end_sec is None:
-            end_sec = trim.get("end", 0.0)
-
-        if (start_sec in (None, 0.0)) or (end_sec in (None, 0.0)):
-            word_segments = scene.get("word_segments") or []
-            timed = [w for w in word_segments if "start" in w and "end" in w]
-            if timed:
-                if start_sec in (None,):
-                    start_sec = timed[0]["start"]
-                if end_sec in (None, 0.0):
-                    end_sec = timed[-1]["end"]
-
-        duration_frames = max(round((end_sec - start_sec) * fps), fps)
-        target_seconds = duration_frames / fps
-
-        scene_beat_tracks = (timeline_tracks_by_scene or {}).get(scene_id) or []
-        beat_animations = (animation_tracks_by_scene_beat or {}).get(scene_id) or {}
-
-        if scene_beat_tracks:
-            beat_clip_paths = []
-            for i, beat_track in enumerate(scene_beat_tracks):
-                b_start_sec = beat_track.get("beat_start_sec")
-                b_end_sec = beat_track.get("beat_end_sec")
-                if b_start_sec is None or b_end_sec is None:
-                    b_start_sec, b_end_sec = start_sec, end_sec
-
-                # Derive this beat's frame count from the frame boundaries
-                # build_timeline_from_scenes already computed (startFrame/
-                # endFrame), instead of re-deriving from beat_start_sec/
-                # beat_end_sec with an independent round() here. Those
-                # frame boundaries come from one shared cumulative counter
-                # there, so consecutive beats' frames always sum to exactly
-                # the scene's total duration_frames with zero drift.
-                # Re-rounding each beat's own (b_end_sec - b_start_sec)
-                # separately here does NOT carry that guarantee — summed
-                # rounding error let beat clips fall short of the scene's
-                # actual audio length, which showed up as the render
-                # freezing on the last frame while the voiceover kept
-                # playing underneath for the remainder of the scene.
-                track_start_frame = beat_track.get("startFrame")
-                track_end_frame = beat_track.get("endFrame")
-                if track_start_frame is not None and track_end_frame is not None:
-                    beat_duration_frames = max(track_end_frame - track_start_frame, 1)
-                else:
-                    beat_duration_frames = max(round((b_end_sec - b_start_sec) * fps), 1)
-
-                beat_selected = beat_track.get("selected_asset")
-                beat_broll_track = {"selected_asset": None}
-                if beat_selected:
-                    beat_broll_track = {"selected_asset": dict(beat_selected)}
-
-                beat_bg_override = beat_track.get("background_color") or scene.get("background_color")
-                beat_motion_type = beat_track.get("motion_type")
-
-                beat_tmp_dir = os.path.join(tmp_dir, f"beat_{i}")
-                os.makedirs(beat_tmp_dir, exist_ok=True)
-
-                beat_clip = await _prepare_broll_clip(
-                    beat_broll_track, beat_duration_frames, fps, width, height, beat_tmp_dir, client,
-                    background_color_override=beat_bg_override,
-                    motion_type=beat_motion_type,
-                )
-
-                # Apply every animation whose frame range overlaps THIS
-                # beat's frame range — not just the one nominally attached
-                # to this beat_id. A long quote/animation can legitimately
-                # extend past its own beat's boundary into the next beat
-                # (build_timeline_from_scenes only clamps its end to the
-                # SCENE's boundary, deliberately, so a long quote isn't cut
-                # short just because it outlasts one beat) — but this
-                # render loop used to only ever look up the ONE animation
-                # nominally attached to the current beat_id. Any portion of
-                # an animation's real duration that spilled into a LATER
-                # beat was silently dropped the moment that beat's own clip
-                # ended, no matter what the timeline said the true end
-                # should be — this is what let a quote's overlay vanish
-                # mid-sentence even though its computed anchor_end_sec was
-                # correct. Each overlapping animation gets composited with
-                # its own LOCAL offset/duration clipped to what actually
-                # fits in this one beat's clip; sequential animations that
-                # both touch this beat both get applied, in order.
-                relevant_animations = []
-                for anim in beat_animations.values():
-                    a_start_frame = anim.get("startFrame")
-                    a_end_frame = anim.get("endFrame")
-                    if a_start_frame is None or a_end_frame is None:
-                        continue
-                    if a_end_frame <= track_start_frame or a_start_frame >= track_end_frame:
-                        continue  # no overlap with this beat at all
-                    relevant_animations.append((a_start_frame, anim))
-                relevant_animations.sort(key=lambda pair: pair[0])
-
-                for a_start_frame, anim in relevant_animations:
-                    a_end_frame = anim.get("endFrame")
-                    local_start_frame = max(0, a_start_frame - track_start_frame)
-                    local_end_frame = min(beat_duration_frames, a_end_frame - track_start_frame)
-                    if local_end_frame <= local_start_frame:
-                        continue
-                    offset_seconds = local_start_frame / fps
-                    local_anim = dict(anim)
-                    local_anim["duration_frames"] = local_end_frame - local_start_frame
-                    beat_clip = await _apply_beat_animation(
-                        beat_clip, local_anim, width, height, fps, beat_tmp_dir,
-                        offset_seconds=offset_seconds,
-                    )
-
-                beat_clip_paths.append(beat_clip)
-
-            if len(beat_clip_paths) == 1:
-                base_clip = beat_clip_paths[0]
-            else:
-                base_clip = await _concat_scenes(beat_clip_paths, tmp_dir, fps=fps)
-
-            base_clip = await _lock_clip_to_frame_count(base_clip, duration_frames, fps, width, height, tmp_dir)
-        else:
-            # Legacy fallback: no beat tracks at all for this scene (older
-            # timeline_json predating the beats refactor). No beat-level
-            # animation to apply here since there's no beat to key it by.
-            selected, source = None, None
-            media = scene.get("media") or {}
-            video_candidates = (media.get("videos") or {}).get("results") or []
-            image_candidates = (media.get("images") or {}).get("results") or []
-            if video_candidates:
-                selected, source = dict(video_candidates[0]), "video"
-            elif image_candidates:
-                selected, source = dict(image_candidates[0]), "image"
-
-            broll_track = {"selected_asset": None}
-            if selected:
-                broll_track = {"selected_asset": {**selected, "source": source}}
-
-            background_color_override = scene.get("background_color")
-
-            base_clip = await _prepare_broll_clip(
-                broll_track, duration_frames, fps, width, height, tmp_dir, client,
-                background_color_override=background_color_override,
-                motion_type=None,
-            )
-
-        current = base_clip
-
-        timeline_caption = (caption_tracks_by_scene or {}).get(scene_id)
-        caption_style = (timeline_caption or {}).get("style") or scene.get("caption_style")
-
-        words = scene.get("word_segments") or []
-        words = [
-            w for w in words
-            if "start" in w and "end" in w
-            and w["start"] >= start_sec and w["end"] <= end_sec
-        ]
-        frame_words = [
-            {
-                "word": w.get("word", ""),
-                "startFrame": max(round((w["start"] - start_sec) * fps), 0),
-                "endFrame": max(round((w["end"] - start_sec) * fps), 0),
-            }
-            for w in words
-        ]
-        current = await _burn_captions(
-            current, frame_words, 0, fps, width, height, tmp_dir, style=caption_style
-        )
-
-        voiceover = scene.get("voiceover")
-        final_scene_path = os.path.join(work_root, f"scene_{scene_id}_final.mp4")
-
-        if voiceover and voiceover.get("url"):
-            audio_path_raw = os.path.join(tmp_dir, "audio_raw.mp3")
-            await _download(voiceover["url"], audio_path_raw, client)
-
-            audio_path = os.path.join(tmp_dir, "audio_trimmed.m4a")
-            trim_cmd = [
-                FFMPEG_BIN, "-y",
-                "-i", audio_path_raw,
-                "-ss", f"{start_sec:.3f}",
-                "-to", f"{end_sec:.3f}",
-                "-c:a", "aac",
-                audio_path,
-            ]
-            await _run(trim_cmd)
-        else:
-            print(f"[render] scene {scene_id} has no voiceover ({scene.get('error')}) — muxing silent audio instead")
-            audio_path = await _make_silent_audio(duration_frames, fps, tmp_dir)
-
-        locked_audio_path = os.path.join(tmp_dir, "audio_locked.m4a")
-        lock_cmd = [
-            FFMPEG_BIN, "-y",
-            "-i", audio_path,
-            "-af", f"apad=whole_dur={target_seconds:.3f}",
-            "-t", f"{target_seconds:.3f}",
-            "-c:a", "aac",
-            locked_audio_path,
-        ]
-        await _run(lock_cmd)
-
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-i", current,
-            "-i", locked_audio_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-frames:v", str(duration_frames),
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-shortest",
-            final_scene_path,
-        ]
-        try:
-            await _run(cmd)
-        except Exception as e:
-            print(f"[render] stream-copy mux failed for scene {scene_id}, falling back to re-encode: {e}")
-            cmd = [
-                FFMPEG_BIN, "-y",
-                "-i", current,
-                "-i", locked_audio_path,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-r", str(fps),
-                "-vsync", "cfr",
-                "-frames:v", str(duration_frames),
-                *FFMPEG_X264_FLAGS,
-                "-c:a", "aac",
-                "-shortest",
-                final_scene_path,
-            ]
-            await _run(cmd)
-
-        return final_scene_path
-
-
-async def _concat_scenes(scene_paths: list[str], work_root: str, fps: int = TIMELINE_FPS) -> str:
-    list_path = os.path.join(work_root, "concat_list.txt")
-    with open(list_path, "w") as f:
-        for p in scene_paths:
-            f.write(f"file '{p}'\n")
-
-    out_path = os.path.join(work_root, "final_output.mp4")
-
-    cmd = [FFMPEG_BIN, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path]
-    try:
-        await _run(cmd)
-    except Exception as e:
-        print(f"[render] concat stream-copy failed, falling back to re-encode: {e}")
-        cmd = [
-            FFMPEG_BIN, "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", list_path,
-            "-r", str(fps),
-            "-vsync", "cfr",
-            *FFMPEG_X264_FLAGS,
-            "-c:a", "aac",
-            out_path,
-        ]
-        await _run(cmd)
-
-    return out_path
-
-
-async def _run_render_job(video_id: str, timeline: dict, scenes: list, orientation: str) -> Optional[str]:
-    no_voice_scene_ids = [
-        s.get("scene_id") for s in scenes
-        if not (s.get("voiceover") and s.get("voiceover", {}).get("url"))
-    ]
-    if no_voice_scene_ids:
-        print(f"[render] video {video_id}: scenes with NO voiceover (will render silent): {no_voice_scene_ids}")
-
-    fps = timeline.get("fps", 30)
-    resolution = PORTRAIT_RESOLUTION if orientation == "portrait" else LANDSCAPE_RESOLUTION
-
-    stored_resolution = timeline.get("resolution")
-    if stored_resolution and (
-        stored_resolution.get("width") != resolution["width"]
-        or stored_resolution.get("height") != resolution["height"]
-    ):
-        print(
-            f"[render] video {video_id}: overriding stored timeline resolution "
-            f"{stored_resolution} -> {resolution} to match requested orientation='{orientation}'"
-        )
-
-    width, height = resolution["width"], resolution["height"]
-
-    # timeline_tracks_by_scene: scene_id -> [broll tracks] (one per beat).
-    # caption_tracks_by_scene: scene_id -> single caption_word track.
-    # animation_tracks_by_scene_beat: scene_id -> {beat_id: animation
-    #   track} — NOT a single track per scene, since a scene can have
-    #   several animated beats (see module docstring, point 1). There is
-    #   no "infographic" track type any more — the timeline only ever
-    #   emits "audio" / "caption_word" / "broll" / "animation".
-    timeline_tracks_by_scene = {}
-    caption_tracks_by_scene = {}
-    animation_tracks_by_scene_beat = {}
-    for track in timeline.get("tracks", []):
-        if track.get("type") == "broll" and track.get("scene_id"):
-            timeline_tracks_by_scene.setdefault(track["scene_id"], []).append(track)
-        elif track.get("type") == "caption_word" and track.get("scene_id"):
-            caption_tracks_by_scene[track["scene_id"]] = track
-        elif track.get("type") == "animation" and track.get("scene_id"):
-            animation_tracks_by_scene_beat.setdefault(track["scene_id"], {})[track.get("beat_id")] = track
-
-    for beat_tracks in timeline_tracks_by_scene.values():
-        beat_tracks.sort(key=lambda t: t.get("startFrame", 0))
-
-    try:
-        supabase.table("videos").update({"render_status": "rendering"}).eq("id", video_id).execute()
-    except Exception as e:
-        print(f"[render] failed to set render_status=rendering for {video_id}: {e}")
-
-    work_root = os.path.join(RENDER_TMP_ROOT, video_id)
-    os.makedirs(work_root, exist_ok=True)
-    semaphore = asyncio.Semaphore(RENDER_CONCURRENCY)
-
-    try:
-        async with httpx.AsyncClient() as client:
-            async def _render_one(scene: dict):
-                scene_id = scene.get("scene_id")
-                try:
-                    path = await _render_scene(
-                        scene, fps, width, height, work_root, client, semaphore,
-                        timeline_tracks_by_scene=timeline_tracks_by_scene,
-                        caption_tracks_by_scene=caption_tracks_by_scene,
-                        animation_tracks_by_scene_beat=animation_tracks_by_scene_beat,
-                    )
-                    return scene_id, path, None
-                except Exception as e:
-                    print(f"[render] scene {scene_id} failed: {e}")
-                    return scene_id, None, scene_id
-
-            results = await asyncio.gather(*(_render_one(scene) for scene in scenes))
-
-            scene_paths_by_id = {sid: path for sid, path, _ in results if path}
-            failed_scenes = [sid for _, path, sid in results if path is None]
-            scene_paths = [
-                scene_paths_by_id[s.get("scene_id")]
-                for s in scenes
-                if s.get("scene_id") in scene_paths_by_id
-            ]
-
-            if not scene_paths:
-                print(f"[render] video {video_id}: all scenes failed to render")
-                try:
-                    supabase.table("videos").update({
-                        "render_status": "failed", "failed_render_scene_ids": failed_scenes,
-                    }).eq("id", video_id).execute()
-                except Exception as e:
-                    print(f"[render] failed to persist all-scenes-failed status for {video_id}: {e}")
-                raise HTTPException(status_code=500, detail="All scenes failed to render")
-
-            final_path = await _concat_scenes(scene_paths, work_root, fps=fps)
-
-        try:
-            final_duration = await _probe_duration_seconds(final_path)
-            print(f"[render] video {video_id}: final output duration = {final_duration:.3f}s")
-        except Exception as e:
-            print(f"[render] could not probe final output duration: {e}")
-
-        try:
-            public_url = _upload_rendered_video_to_supabase(final_path, video_id)
-            render_status = "completed" if not failed_scenes else "completed_with_errors"
-        except Exception as e:
-            print(f"[render] video {video_id}: Supabase upload failed: {e}")
-            video_output_dir = os.path.join(RENDER_OUTPUT_DIR, video_id)
-            os.makedirs(video_output_dir, exist_ok=True)
-            dest_path = os.path.join(video_output_dir, "final.mp4")
-            shutil.copy2(final_path, dest_path)
-            public_url = None
-            render_status = "completed_upload_failed"
-
-        try:
-            supabase.table("videos").update({
-                "final_video_url": public_url,
-                "render_status": render_status,
-                "failed_render_scene_ids": failed_scenes,
-            }).eq("id", video_id).execute()
-        except Exception as e:
-            print(f"[render] failed to persist final status for {video_id}: {e}")
-
-        print(
-            f"[render] video {video_id}: done, status={render_status}, "
-            f"failed_scenes={failed_scenes}, no_voiceover_scenes={no_voice_scene_ids}"
-        )
-
-        if public_url is None:
-            raise HTTPException(status_code=500, detail="Render completed but upload to storage failed")
-
-        return public_url
-
-    except HTTPException:
-        try:
-            supabase.table("videos").update({"render_status": "failed"}).eq("id", video_id).execute()
-        except Exception:
-            pass
-        raise
-    except Exception as e:
-        print(f"[render] render failed for {video_id}: {e}")
-        try:
-            supabase.table("videos").update({"render_status": "failed"}).eq("id", video_id).execute()
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"Render failed: {e}")
-    finally:
-        shutil.rmtree(work_root, ignore_errors=True)
-
-
-@app.post("/render/{video_id}")
-async def render_video(video_id: str, request: RenderVideoRequest = RenderVideoRequest()):
-    try:
-        row = (
-            supabase.table("videos")
-            .select("raw_scenes, final_video_url")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
-    except Exception as e:
-        print(f"[render] failed to fetch video {video_id}: {e}")
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if not row.data:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    if row.data.get("final_video_url") and not request.force:
-        return {"final_video_url": row.data["final_video_url"]}
-
-    scenes = row.data.get("raw_scenes") or []
-    if not scenes:
-        raise HTTPException(status_code=400, detail="No scenes to render for this video")
-
-    # Always rebuild the timeline fresh from raw_scenes rather than trusting
-    # a stored timeline_json snapshot. The stored column reflects whatever
-    # build_timeline_from_scenes computed the LAST time this video's scenes
-    # were saved — for a video created before a sync/placement/duration fix
-    # landed, that snapshot keeps silently baking the old bug into every
-    # re-render, no matter how many times the fix itself gets deployed.
-    # This was the actual reason "the same fix, redeployed, didn't help":
-    # the fix was correct, but /render never re-ran it.
-    timeline = build_timeline_from_scenes(scenes)
-    try:
-        infographics_list, text_list = _compute_infographics_and_text_lists(scenes, timeline)
-        broll_list = _compute_broll_list(timeline)
-        supabase.table("videos").update({
-            "timeline_json": timeline, "raw_scenes": scenes,
-            "infographics_list": infographics_list, "text_list": text_list, "broll_list": broll_list,
-        }).eq("id", video_id).execute()
-    except Exception as e:
-        print(f"[render] failed to persist freshly rebuilt timeline for {video_id} (rendering with it anyway): {e}")
-
-    final_video_url = await _run_render_job(video_id, timeline, scenes, request.orientation)
-
-    return {"final_video_url": final_video_url}
