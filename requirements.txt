@@ -40,3 +40,4 @@ SQLAlchemy
 yt-dlp
 tiktoken
 deep_translator
+qdrant-client
