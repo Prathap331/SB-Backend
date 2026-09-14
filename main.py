@@ -12841,42 +12841,6 @@ def _split_oversized_scene(scene: dict, original_script: str) -> list:
 
 @app.post("/edit-video")
 async def edit_video(request: EditVideo):
-    # Credit GATE — checked before any expensive work (LLM calls, TTS,
-    # WhisperX) starts, so a user with no credits never triggers a full
-    # generation for free. This is a READ-ONLY check against the fixed
-    # base cost only (not the duration-based portion) — the video's real
-    # duration, and therefore its true final cost, isn't known until
-    # generation finishes (see the deduction logic near the end of this
-    # function), so there's no way to gate on the exact final number
-    # upfront. Requiring at least the base covers the common "zero/near-
-    # zero credits" case this is actually meant to prevent; the full
-    # 50 + duration-based cost still gets deducted for real after
-    # generation succeeds.
-    EDIT_VIDEO_BASE_CREDITS = 50
-    try:
-        profile_res = supabase.table('user_profiles') \
-            .select('id, credit_batches') \
-            .eq('id', request.userId) \
-            .maybe_single() \
-            .execute()
-
-        if not profile_res.data:
-            raise HTTPException(status_code=404, detail="user profile not found")
-
-        batches = profile_res.data.get('credit_batches') or []
-        now = datetime.datetime.now(datetime.timezone.utc)
-        active_batches = _expire_stale_batches(batches, now)
-        available = _sum_batches(active_batches)
-
-        if available < EDIT_VIDEO_BASE_CREDITS:
-            raise HTTPException(status_code=402, detail="credits not sufficient")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("error checking credits for /edit-video:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
     try:
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
@@ -12923,29 +12887,12 @@ async def edit_video(request: EditVideo):
         print(f"[edit-video] model returned unknown category {category!r} — defaulting to general_documentary")
         category = "general_documentary"
 
-    # New Scene Planner schema returns animation_preference (avoid/optional/
-    # strong) instead of the old boolean requires_animation. Every other
-    # part of the pipeline (Animation Planner hard gate, icon guarantee,
-    # response slimming, etc.) still reads scene["requires_animation"], so
-    # derive it here rather than touching every call site: "avoid" means no
-    # animation for the scene, "optional"/"strong" both mean the Animation
-    # Planner is allowed to add animation (it already decides per-beat how
-    # much, via scene_animation_density). A scene that still returns the
-    # old field directly is respected as-is.
     for _scene in scenes:
         if isinstance(_scene, dict) and "requires_animation" not in _scene:
             _scene["requires_animation"] = _scene.get("animation_preference") != "avoid"
 
-    # No scene-count cap: the Scene Planner prompt already governs scene
-    # count via the 2-minute-per-scene rule (SCRIPT_SCENE_PROMPT explicitly
-    # states there is no upper bound) — but that's prompt-only, so it's
-    # enforced for real just below rather than trusted blindly.
     print(f"[edit-video] scene planner produced {len(scenes)} scene(s)")
 
-    # Enforce the 260-280 word/scene target in code: split any scene that
-    # came back drastically oversized instead of leaving it as one giant
-    # scene. See _split_oversized_scene's own docstring for why this
-    # can't be left to prompt wording alone.
     total_script_words = len(request.script.split())
     split_scenes: list = []
     for _scene in scenes:
@@ -12970,9 +12917,6 @@ async def edit_video(request: EditVideo):
         )
         scenes_with_voice_and_timestamps.append(scene_result)
 
-    # Video-wide guarantee: at least one icon animation must exist
-    # somewhere in this video, regardless of which/how many scenes the
-    # Animation Planner (and its own per-scene fallback) actually animated.
     _ensure_video_has_icon_animation(scenes_with_voice_and_timestamps, category)
 
     failed_scenes = [s["scene_id"] for s in scenes_with_voice_and_timestamps if s.get("error")]
@@ -13007,20 +12951,17 @@ async def edit_video(request: EditVideo):
         raise HTTPException(status_code=500, detail="Failed to save video")
 
     # Credit deduction — happens ONLY here, after generation has fully
-    # succeeded, per your instruction. Cost = a fixed 50 credits, plus 5
-    # credits per minute of the video's actual generated duration (known
-    # only now, from timeline_json — this is exactly why the deduction
-    # can't happen any earlier). A failure here is deliberately NOT fatal
-    # to the request: the video already exists and the generation cost
-    # was already spent, so a credit-system hiccup shouldn't make a
-    # successful generation look like it failed to the caller. It's
-    # logged, and the response reports whatever the outcome was.
-    EDIT_VIDEO_BASE_CREDITS = 50
-    EDIT_VIDEO_CREDITS_PER_MINUTE = 5
+    # succeeded. Cost = 11 credits per minute of the video's actual
+    # generated duration (known only now, from timeline_json). No base
+    # fee, and no partial deduction: if the user doesn't have enough
+    # credits to cover the full cost, nothing is deducted and the
+    # response reports "no credits" — the video itself was still
+    # generated and saved regardless.
+    EDIT_VIDEO_CREDITS_PER_MINUTE = 11
     duration_minutes = (timeline_json.get("total_frames", 0) / max(timeline_json.get("fps", 1), 1)) / 60
-    credit_cost = EDIT_VIDEO_BASE_CREDITS + round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
+    credit_cost = round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
 
-    credit_result = {"cost": credit_cost, "deducted": False, "remaining_credits": None}
+    credit_result = {"cost": credit_cost, "deducted": False, "remaining_credits": None, "status": None}
     try:
         profile_res = supabase.table('user_profiles') \
             .select('id, credit_batches') \
@@ -13030,28 +12971,33 @@ async def edit_video(request: EditVideo):
 
         if not profile_res.data:
             print(f"[edit-video] credit deduction skipped for {request.userId}: user profile not found")
+            credit_result["status"] = "no credits"
         else:
             batches = profile_res.data.get('credit_batches') or []
             now = datetime.datetime.now(datetime.timezone.utc)
             active_batches = _expire_stale_batches(batches, now)
+            available = _sum_batches(active_batches)
 
-            updated_batches, deducted = _deduct_from_batches(active_batches, credit_cost)
-            new_total = _sum_batches(updated_batches)
+            if available < credit_cost:
+                print(f"[edit-video] user {request.userId}: insufficient credits for cost {credit_cost} (has {available}) — video {video_id} was still generated and saved")
+                credit_result["status"] = "no credits"
+                credit_result["remaining_credits"] = available
+            else:
+                updated_batches, deducted = _deduct_from_batches(active_batches, credit_cost)
+                new_total = _sum_batches(updated_batches)
 
-            supabase.table('user_profiles').update({
-                'credit_batches': updated_batches,
-                'credits_remaining': new_total,
-            }).eq('id', request.userId).execute()
+                supabase.table('user_profiles').update({
+                    'credit_batches': updated_batches,
+                    'credits_remaining': new_total,
+                }).eq('id', request.userId).execute()
 
-            credit_result["deducted"] = deducted > 0
-            credit_result["remaining_credits"] = new_total
-            if deducted == 0:
-                print(f"[edit-video] user {request.userId}: insufficient credits for cost {credit_cost} (video {video_id} was still generated and saved)")
-            elif deducted < credit_cost:
-                print(f"[edit-video] user {request.userId}: only {deducted}/{credit_cost} credits available, partial deduction applied")
+                credit_result["deducted"] = True
+                credit_result["remaining_credits"] = new_total
+                credit_result["status"] = "deducted"
 
     except Exception as e:
         print(f"[edit-video] credit deduction failed for {request.userId} (video {video_id} was still generated and saved): {e}")
+        credit_result["status"] = "error"
 
     return {
         "video_id": video_id, "category": category, "script_language": script_language,
@@ -13061,7 +13007,6 @@ async def edit_video(request: EditVideo):
         "infographics_list": infographics, "text_list": text_overlays, "broll_list": broll_list,
         "credits": credit_result,
     }
-
 
 
 @app.patch("/timeline/{video_id}")
@@ -14222,6 +14167,37 @@ async def delete_scene_content(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from fastapi import HTTPException
 
 
@@ -14287,7 +14263,6 @@ async def _run(cmd: list[str], cwd: Optional[str] = None, timeout: Optional[floa
             f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
             f"--- stderr ---\n{stderr.decode(errors='replace')[-4000:]}"
         )
-
 
 
 
