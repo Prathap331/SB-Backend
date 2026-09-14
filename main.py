@@ -110,8 +110,8 @@ app = FastAPI(lifespan=lifespan)
 
 origins = [
     "http://localhost:3000",
-    "https://www.storio.tech",
-    "https://storio.tech",
+    "https://www.testing.storio.tech",
+    "https://testing.storio.tech",
 ]
 
 app.add_middleware(
@@ -179,6 +179,7 @@ async def token(form_data: OAuth2PasswordRequestForm = Depends()):
 async def refresh_token(request: RefreshTokenRequest):
     return await refresh_access_token(request.refresh_token)
 
+
 @app.post("/analyze")
 async def analyze(request: PromptRequest):
     try:
@@ -226,9 +227,6 @@ async def eci(request: PromptRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
-
-
-
 
 
 
@@ -1271,7 +1269,7 @@ WORDS_PER_MINUTE = 140
 
 BOOKS_TABLE_NAME = "english_books"
 THUMBNAILS_BUCKET = "generated-thumbnails"
-FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "6"))  
+FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "6"))   # was 15
 
 def to_pgvector(embedding) -> str:
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
@@ -2459,7 +2457,7 @@ async def build_shared_web_pool(
     keywords: list[str],
     scraped_urls: set,
     per_keyword_results: int = PER_KEYWORD_SCRAPE_COUNT,
-    overall_timeout: float = 120.0,   # NEW — hard cap for the whole pool-build stage
+    overall_timeout: float = 20.0,   # NEW — hard cap for the whole pool-build stage
 ) -> list[dict]:
     model = _get_st_model()
 
@@ -2748,7 +2746,7 @@ async def _generate_search_keywords_for_script(
         )
         return cached_keywords
 
-    segments_block = _segments_brief(template.get("segments") or [], brief_field="hyde_brief")
+    segments_block = _segments_brief(template.get("segments") or [])
 
     prompt = SCRIPT_KEYWORD_GEN_PROMPT_TEMPLATE.format(
         title=title,
@@ -3162,8 +3160,7 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
         try:
             table_name = await select_table_for_topic(topic)
         except Exception as exc:
-            print(f"[MAIN] table selection failed, defaulting to {TABLES[0]}: {exc}")
-            table_name = TABLES[0]
+            print(f"[MAIN] table selection failed, defaulting to")
 
         similar_task = asyncio.create_task(get_similar_saved_ideas(topic, combined_hyde_doc))
 
@@ -3600,11 +3597,12 @@ def _strip_json_fences(raw: str) -> str:
 
 
 RRF_K = 60  
+
 SCRIPT_RAG_POOL_PER_DOC = 40
 SCRIPT_TOP_K_PER_DOC = 2       
 
-DENSE_SCORE_THRESHOLD = 0.3
-SPARSE_SCORE_THRESHOLD = 0.2
+DENSE_SCORE_THRESHOLD = 0.30
+SPARSE_SCORE_THRESHOLD = 0.20
 
 async def get_context_from_db_segment(
     hyde_document: str,
@@ -3760,7 +3758,7 @@ async def get_context_from_db_segment_with_timeout(
     hyde_document: str,
     keywords: list[str],
     table_name: str,
-    timeout: float = 60.0,
+    timeout: float = 20.0,
     dense_k: int = SCRIPT_RAG_POOL_PER_DOC,   # was 10
     sparse_k: int = SCRIPT_RAG_POOL_PER_DOC,  # was 10
 ) -> list[dict]:
@@ -3789,51 +3787,19 @@ async def generate_hyde_docs_for_script(
     segments: list[dict],
 ) -> list[dict]:
     """
-    Returns a list of {"hyde_document": str, "keywords": list[str],
-    "segment_index": int, "segment_name": str, "hyde_brief": str,
-    "llm_brief": str} — one entry per template segment, in order.
-
-    Only `segment_name` and `hyde_brief` are pulled from each segment to
-    build the HyDE generation prompt (llm_brief / engagement_craft are never
-    shown to the HyDE generator — they are for the final script-writing LLM
-    only). segment_name / hyde_brief / llm_brief are carried through onto
-    the returned entry (not invented by the model) so downstream retrieval
-    can tag each chunk with the segment it was retrieved for.
+    Returns a list of {"hyde_document": str, "keywords": list[str]} — one
+    entry per template segment, in order.
     """
     segment_briefs = "\n".join(
-        f"- {seg.get('segment_name', 'segment')} ({seg.get('percentage', 0)}%): {seg.get('hyde_brief', '')}"
+        f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}%): {seg.get('brief', '')}"
         for seg in segments
     )
 
     fallback_text = f"{title}\n\n{description}".strip()
-    fallback_docs = lambda: [
-        {
-            "hyde_document": fallback_text,
-            "keywords": [],
-            "segment_index": idx,
-            "segment_name": seg.get("segment_name", f"segment_{idx}"),
-            "hyde_brief": seg.get("hyde_brief", ""),
-            "llm_brief": seg.get("llm_brief", ""),
-        }
-        for idx, seg in enumerate(segments, start=1)
-    ] or [{
-        "hyde_document": fallback_text,
-        "keywords": [],
-        "segment_index": 1,
-        "segment_name": "segment_1",
-        "hyde_brief": "",
-        "llm_brief": "",
-    }]
+    fallback_docs = lambda: [{"hyde_document": fallback_text, "keywords": []} for _ in segments]
 
     if not segments:
-        return [{
-            "hyde_document": fallback_text,
-            "keywords": [],
-            "segment_index": 1,
-            "segment_name": "segment_1",
-            "hyde_brief": "",
-            "llm_brief": "",
-        }]
+        return [{"hyde_document": fallback_text, "keywords": []}]
 
     template_title = template.get('title')
     template_about = template.get('about')
@@ -3943,7 +3909,7 @@ OUTPUT — valid JSON only, no markdown fences, no preamble, no trailing text:
             return fallback_docs()
 
         docs = []
-        for i, entry in enumerate(raw_docs):
+        for entry in raw_docs:
             if not isinstance(entry, dict):
                 continue
             text_value = (entry.get("hyde_document") or "").strip()
@@ -3951,22 +3917,8 @@ OUTPUT — valid JSON only, no markdown fences, no preamble, no trailing text:
             if not isinstance(raw_keywords, list):
                 raw_keywords = []
             kw_clean = [str(k).strip() for k in raw_keywords if str(k).strip()]
-            if not text_value:
-                continue
-
-            # Positional match to the original template segment — segment
-            # metadata (segment_name / hyde_brief / llm_brief) always comes
-            # from the input `segments` list, never from what the model
-            # returned, so it can be trusted for chunk provenance tagging.
-            seg_meta = segments[i] if i < len(segments) else {}
-            docs.append({
-                "hyde_document": text_value,
-                "keywords": kw_clean,
-                "segment_index": i + 1,
-                "segment_name": seg_meta.get("segment_name") or entry.get("segment") or f"segment_{i + 1}",
-                "hyde_brief": seg_meta.get("hyde_brief", ""),
-                "llm_brief": seg_meta.get("llm_brief", ""),
-            })
+            if text_value:
+                docs.append({"hyde_document": text_value, "keywords": kw_clean})
 
         if len(docs) != len(segments):
             print(
@@ -4008,233 +3960,176 @@ async def get_context_with_timeout(
         print("[DB] task still running after timeout, proceeding without it for now.")
         return []
 
-
-
 SCRIPT_SYSTEM_PROMPT = """
-
-# YOUTUBE DOCUMENTARY SCRIPT GENERATION AGENT
-
 ## ROLE
 
-You are a production-grade YouTube Documentary Script Generation Agent.
+You are a professional YouTube documentary script writer for long-form educational videos.
 
-Turn the supplied idea, template, retrieved knowledge, and recent web/news material into a highly engaging documentary narration for a broad audience. The result must feel researched but human, cinematic but conversational, educational without sounding like an article, and structured for strong audience retention.
+Transform the supplied source material into a compelling, narration-ready documentary script that is factually accurate, engaging, and optimized for human voice-over. Never invent information beyond the supplied sources.
+
+---
 
 ## INPUT
 
 You will receive:
 
-* **Idea Title**
-* **Idea Description**
-* **Target Duration (minutes)**
-* **Script Template:** title, cluster, purpose, and ordered segments
-* **Retrieved Knowledge Chunks with sources:** Book name, author, published year
-* **Recent Web/News Chunks with source details:** including the web article link
+* Idea Title
+* Idea Description
+* Target Duration (minutes)
+* Script Template (title, cluster, purpose, ordered segments)
+* Retrieved Knowledge Chunks with sources (Book name, author, published year)
+* Recent Web/News Chunks with source details (with link of web article)
 
-Treat the supplied template and retrieved material as the primary source of truth. Never invent facts, sources, quotations, dates, numbers, events, or claims.
 
-## INSTRUCTION HIERARCHY
+All retrieved chunks have already passed semantic relevance filtering and should be treated as the trusted knowledge base.
 
-Apply all layers together:
+---
 
-1. **Template Structure** = WHAT happens and WHEN.
-2. **LLM Brief / Retrieval Directive** = WHICH source information belongs in each segment.
-3. **Engagement Craft** = HOW that information should work inside the segment.
-4. **Global Storytelling Rules below** = HOW the complete script should sound and flow.
+## OBJECTIVE
 
-Never replace the template with generic storytelling rules. Never ignore a segment's LLM Brief or retrieval purpose.
+Produce one complete documentary narration that:
 
-## SOURCE → STORY
+* internally follows the supplied template in the exact order
+* fulfills every template segment's purpose
+* flows naturally as one continuous story
+* remains engaging from beginning to end
+* sounds conversational when spoken aloud
+* is informative, emotionally engaging, and easy to understand
+* stays completely grounded in the supplied sources
 
-Use retrieved material as **raw material, not as text to summarize**. Select only information that serves the current segment. Preserve important names, dates, numbers, places, evidence, and causal relationships accurately.
+The audience should never notice the underlying template structure.
 
-Do not force every retrieved chunk into the script. Prefer concrete, specific, story-worthy details over broad background.
+---
 
-Use recent web/news material when relevant. For time-sensitive information, retain the appropriate date and context rather than presenting it as timeless fact.
+## SCRIPT REQUIREMENTS
 
-## OPENING + OVERALL VIDEO PROMISE
+### Template
 
-At the very beginning of the script, after establishing the initial engaging hook, naturally give the viewer a **brief, engaging overview of what the video will explore overall**.
+Internally follow every template segment.
 
-This overview should feel like a friend telling you, “Here’s what we’re about to uncover,” rather than a formal introduction or agenda.
+Do not skip, merge, reorder, or invent segments.
 
-* Briefly orient the viewer to the video's overall subject, journey, question, or discovery.
-* Make the viewer understand what they are going to learn, discover, or experience by staying until the end.
-* Keep it conversational, warm, natural, and curiosity-driven.
-* Connect it directly to the Hook so it feels like part of the story rather than a separate introduction.
-* Do not turn it into a list of sections or a detailed roadmap.
-* Do not reveal the final answer, major reveal, or full conclusion.
-* Do not use generic phrases such as “In this video, we will discuss…” unless naturally rephrased.
-* Do not sacrifice the strength or immediacy of the Hook merely to provide the overview.
+The final narration must not expose segment boundaries, template details, runtime percentages, or metadata.
 
-The opening should therefore accomplish two things quickly:
+Distribute the narration approximately according to each segment's runtime percentage.
 
-**Hook the viewer → naturally orient them to the journey ahead.**
+### Word Count
 
-## HOOK
-
-Open immediately with the strongest supported incident, fact, contradiction, image, result, or human moment available for the template.
-
-The Hook must function as a **YouTube hook, not a topic introduction**.
-
-* No “today we're going to…”
-* No generic greetings.
-* No broad textbook definitions.
-* No empty scene-setting.
-* Put a concrete detail in the opening lines.
-* Create immediate curiosity, tension, contradiction, uncertainty, or a held-back promise.
-* Make the audience want the next sentence.
-* Follow the template's Hook LLM Brief and Engagement Craft precisely.
-
-A natural audience-facing line is allowed later if it does not weaken the opening.
-
-## CONTINUOUS ENGAGEMENT
-
-Every segment must earn its place.
-
-Create forward motion through causation, contrast, escalation, unanswered questions, expectations, consequences, and revelations.
-
-Prefer **“but,” “therefore,” and “because”** logic over disconnected “and then” accumulation.
-
-Plant details that can pay off later. Use Breadcrumbs, Backpacks, open questions, or other Engagement Craft techniques when the template calls for them.
-
-Do not manufacture suspense when the evidence does not support it.
-
-## STORY + EXPLANATION
-
-Teach through story whenever possible.
-
-Prefer:
-**concrete example → context → meaning**
-
-rather than:
-**background → explanation → facts**
-
-Explain difficult ideas in plain language. Use intuitive analogies, comparisons, or hypothetical examples when useful, without distorting the evidence.
-
-Avoid list-like narration unless the selected template explicitly requires a list, ranking, checklist, timeline, or similar structure.
-
-## HUMAN VOICE
-
-Write like an intelligent human narrator speaking naturally to a real audience:
-
-* conversational, confident, curious, vivid, and natural
-* varied sentence length and rhythm
-* occasional short sentences for emphasis
-* concrete verbs and sensory detail where supported
-* natural transitions
-* no corporate, academic, robotic, or Wikipedia-like phrasing
-* no repetitive “this is important because…” constructions
-* no excessive rhetorical questions
-* no filler, padding, or ornamental language
-
-Do not fabricate dialogue or inner thoughts.
-
-Any quotation must be supported by the retrieved material. Do not present wording as an exact quotation unless the source supports it.
-
-## PACING + TEMPLATE
-
-Use the template's ordered segments and proportions as the narrative architecture.
-
-Segment proportions guide **pacing only** and must NOT appear as labels in the final script.
-
-Maintain natural transitions between segments so the story feels continuous rather than stitched together.
-
-Do not over-explain merely to satisfy a segment percentage.
-
-### HARD WORD-COUNT REQUIREMENT
-
-The final script must contain exactly:
+The final script length **must equal:**
 
 **Target Duration × 130 words**
 
-This is a hard production requirement, not an estimate.
+Maintain approximately **±3%** of the calculated target.
 
-Internally revise, compress, or expand the narration until the required word count is reached while preserving factual accuracy, narrative quality, pacing, and template structure.
+### Factual Integrity
 
-## ENDING + CTA
+Use only supported information from the supplied source material.
 
-Complete the narrative before asking for engagement.
+Never invent facts, statistics, quotations, dates, events, research findings, financial figures, historical claims, or scientific conclusions.
 
-The ending must pay off the Hook's question, promise, image, contradiction, or tension through the template's final synthesis/close.
+When multiple sources discuss the same subject, synthesize them into one coherent explanation.
 
-When the template contains a CTA:
+Whenever an important fact, statistic, study, report, policy, discovery, historical conclusion, or expert opinion is presented, naturally attribute it within the narration.
 
-* make it feel earned and connected to the story
-* explicitly invite viewers to share their **thoughts, interpretation, opinion, experience, or feedback in the comments**
-* use a specific question when appropriate
-* callback to a concrete earlier detail when the template calls for it
+Examples:
 
-Do not end with a generic “like and subscribe” unless the supplied template specifically requires it.
+* According to the World Health Organization...
+* Research published in Nature suggests...
+* NASA reports...
+* A World Bank study found...
 
-## FACTUAL INTEGRITY
+Blend attribution seamlessly into the script without citations, hyperlinks, footnotes, or reference sections.
 
-Never invent unsupported information to improve drama or word count.
+---
 
-Do not merge separate facts into a false causal relationship.
+## NARRATION GUIDELINES
 
-Clearly distinguish documented fact from interpretation, hypothesis, prediction, or uncertainty.
+Write for **viewer retention**, not just information delivery.
 
-When sources disagree, preserve the relevant uncertainty rather than silently choosing a convenient version.
+The narration should feel like a professionally produced documentary.
 
-## FINAL INTERNAL QA
+Throughout the script, naturally apply:
 
-Before returning the answer, silently verify:
+* a compelling opening hook
+* periodic re-hooks before attention declines
+* curiosity gaps
+* setup and payoff
+* callbacks to earlier ideas
+* foreshadowing where appropriate
+* escalating insights
+* emotional progression suited to the topic
+* smooth transitions between ideas
 
-* template order and segment purposes are respected
-* each segment uses information according to its LLM Brief
-* Engagement Craft is reflected in execution
-* Hook is genuinely a hook, not an introduction
-* opening naturally gives viewers a brief overview of what the video will explore
-* overview does not spoil the major reveal or conclusion
-* narrative remains coherent and progressively engaging
-* no unsupported factual claims or fabricated quotations
-* script contains exactly **Target Duration × 130 words**
-* CTA explicitly invites comments/feedback when applicable
-* all metrics are calculated from the actual generated script
-* JSON is valid
-* nothing appears outside the JSON object
+These techniques should feel invisible, varied, and never repetitive.
+
+Never sacrifice factual accuracy for dramatic effect.
+
+Write using:
+
+* conversational narration
+* cinematic documentary storytelling
+* natural human rhythm
+* varied sentence lengths
+* vivid but factual language
+* logical progression
+
+Structure the script into natural paragraphs.
+
+Where appropriate, naturally include relevant quotations, proverbs, sayings, analogies, or comparisons only if they genuinely strengthen the narration.
+
+The final narration must be a continuous paragraph-based documentary with no headings, visible sections, markdown, template information, or segment names.
+
+---
 
 ## SCRIPT ANALYTICS
 
-Return these metrics:
+After generating the script, evaluate it.
 
-* **Every numeric value must be at least 1.**
-* `videoLengthMinutes`: copy **Target Duration exactly**.
-* `wordCount`: total words in the generated script.
-* `emotionalDepth` (1–10): emotional engagement, storytelling quality, tension, vivid imagery, and human resonance.
-* `generalExamples`: illustrative examples, analogies, comparisons, or hypothetical scenarios that are **NOT historical examples**.
-* `proverbs_count`: proverbs, sayings, quotations, aphorisms, and memorable quotes.
-* `historicalExamples`: historical events, figures, discoveries, civilizations, companies, or eras.
-* `researchFacts`: distinct research-backed facts, reports, studies, surveys, or statistics.
+Every numeric value must be **at least 1**.
+
+Generate:
+
+* **videoLengthMinutes**: Copy the Target Duration (minutes) exactly as provided in the input.
+* **wordCount**: Total number of words in the generated script.
+* **emotionalDepth** (1–10): Emotional engagement, storytelling quality, tension, vivid imagery, and human resonance.
+* **generalExamples**: Number of illustrative examples, analogies, comparisons, or hypothetical scenarios that are not historical examples.
+* **proverbs_count**: Number of proverbs, sayings, quotations, aphorisms, or memorable quotes used.
+* **historicalExamples**: Number of historical events, figures, discoveries, civilizations, companies, or eras referenced.
+* **researchFacts**: Number of distinct research-backed facts, reports, studies, surveys, or statistics referenced.
+
+---
 
 ## CONTENT CLASSIFICATION
 
-Return:
+Classify the completed script.
 
-* `category`: one primary category, **1–3 words**.
-* `subcategories`: up to five concise subcategories, **1–3 words each**.
-* Do not repeat the category inside subcategories.
+Generate:
+
+* **category** — one primary category (1–3 words)
+* **subcategories** — up to five concise subcategories (1–3 words each)
+
+Examples:
+
+* Business → Marketing, Finance, Strategy
+* Technology → Artificial Intelligence, Robotics
+* History → Ancient History, Empires
+* Science → Physics, Biology
+* Psychology → Human Behavior, Cognitive Bias
+
+Choose the category and subcategories that best represent the completed script.
+
+Do not repeat the category within the subcategories.
+
+---
 
 ## OUTPUT
 
 Return **only valid JSON**.
 
-**IMPORTANT — JSON EXAMPLE STATUS:**
-
-The JSON example below is a **STRUCTURE/SCHEMA EXAMPLE ONLY**.
-
-It is **NOT a perfect, fixed, or authoritative set of values, wording, counts, or classifications**.
-
-Do **not** copy its sample numbers, text, counts, category, or subcategories.
-
-The example exists only to demonstrate the expected **field names, nesting, and data types**.
-
-The detailed requirements above are the authoritative specification. Generate every value dynamically from the actual input and generated script.
-
-```json id="rpj990"
+```json
 {
   "script": "Complete documentary narration in continuous paragraphs.",
+
   "metrics": {
     "videoLengthMinutes": 10,
     "wordCount": 1300,
@@ -4244,6 +4139,7 @@ The detailed requirements above are the authoritative specification. Generate ev
     "historicalExamples": 1,
     "researchFacts": 1
   },
+
   "classification": {
     "category": "string",
     "subcategories": [
@@ -4253,17 +4149,47 @@ The detailed requirements above are the authoritative specification. Generate ev
 }
 ```
 
+Requirements:
+
+* The `script` must begin immediately with the narration and end naturally.
+* Use only continuous paragraphs.
+* Do not include headings, markdown, segment names, template details, notes, or explanations.
+* Ensure the JSON is syntactically valid.
+* Return nothing except the JSON object.
+
+
 """
 
 
+def _build_script_context(db_results: list[dict], new_articles: list[dict]) -> str:
+    parts = []
 
-def _segments_brief(segments: list[dict], brief_field: str = "hyde_brief") -> str:
+    if db_results:
+        parts.append(f"=== KNOWLEDGE BASE EXCERPTS (dense similarity >= {DB_SIMILARITY_THRESHOLD}) ===")
+        for i, row in enumerate(db_results, start=1):
+            content = row.get("content", "")
+            dense_score = row.get("dense_score")
+            parts.append(f"[KB-{i}] (similarity={dense_score}) {content}")
+
+    if new_articles:
+        parts.append(f"\n=== RECENT NEWS / WEB (similarity >= {WEB_CONTENT_SIMILARITY_THRESHOLD}) ===")
+        for i, article in enumerate(new_articles, start=1):
+            snippet = article.get("snippet", "")
+            url = article.get("url", "")
+            similarity = article.get("similarity")
+            parts.append(f"[NEWS-{i}] (similarity={similarity}) {snippet} (source: {url})")
+
+    return "\n\n".join(parts) if parts else "No high-confidence source material available."
+
+
+def _segments_brief(segments: list[dict]) -> str:
     if not segments:
         return "No template segments available — write a natural documentary-style structure."
     return "\n".join(
-        f"- {seg.get('segment_name', 'segment')} ({seg.get('percentage', 0)}% of runtime): {seg.get(brief_field, '')}"
+        f"- {seg.get('name', 'segment')} ({seg.get('percentage', 0)}% of runtime): {seg.get('brief', '')}"
         for seg in segments
     )
+
 
 
 
@@ -4314,14 +4240,7 @@ async def _build_script_context_json(
             "content": row.get("content", ""),
             "similarity": row.get("dense_score"),
             "md5": md5,
-            "book": book_map.get(md5),
-            # Chunk provenance: which template segment this chunk was
-            # retrieved for. Deliberately carries llm_brief (writing
-            # guidance for the script LLM), never hyde_brief (retrieval-only,
-            # not meant for the script-writing pass).
-            "segment_id": row.get("segment_id"),
-            "segment_name": row.get("segment_name"),
-            "segment_brief": row.get("llm_brief"),
+            "book": book_map.get(md5),  
         })
 
     web_chunks = []
@@ -4330,9 +4249,6 @@ async def _build_script_context_json(
             "snippet": article.get("snippet", ""),
             "similarity": article.get("similarity"),
             "url": article.get("url", ""),
-            "segment_id": article.get("segment_id"),
-            "segment_name": article.get("segment_name"),
-            "segment_brief": article.get("llm_brief"),
         })
 
     payload = {
@@ -4354,9 +4270,7 @@ async def generate_script_from_context(
     target_word_count: int,
 ) -> dict:
     context_block, _context_payload = await _build_script_context_json(db_results, new_articles)
-    segments_block = _segments_brief(selected_template.get("segments") or [], brief_field="llm_brief")
-
-    print( "script_segments" + segments_block)
+    segments_block = _segments_brief(selected_template.get("segments") or [])
 
     user_prompt = f"""
 Video Title: "{request.title}"
@@ -4367,18 +4281,14 @@ Target Word Count: approximately {target_word_count} words
 Template: "{selected_template.get('title')}" (cluster: {selected_template.get('cluster')})
 Template Purpose: {selected_template.get('about')}
 
-Segments (write the script in this exact order — each entry's guidance is
-that segment's llm_brief):
+Segments (write the script in this exact order):
 {segments_block}
 
 Source Material (JSON — each knowledge_base_chunks entry may include a "book"
 object with title/author/year; each web_chunks entry includes its source
-"url". Every chunk also carries "segment_name" and "segment_brief" showing
-which template segment it was retrieved for — use that chunk's facts in the
-matching part of the narration, guided by that segment's brief. Attribute
-facts to their sources naturally in the narration, e.g. "According to
-[author]'s [title]..." or "As reported by [domain]..."; never attribute to a
-chunk whose "book" is null or whose "url" is empty):
+"url". Attribute facts to these sources naturally in the narration, e.g.
+"According to [author]'s [title]..." or "As reported by [domain]..."; never
+attribute to a chunk whose "book" is null or whose "url" is empty):
 {context_block}
 """
 
@@ -5517,27 +5427,6 @@ def pick_topk_with_backfill(
     return picked
 
 
-def _tag_chunks_with_segment(chunks: list[dict], seg_info: dict) -> None:
-    """
-    Stamps chunk provenance in place: which HyDE document / template segment
-    this chunk was retrieved for. Both hyde_brief and llm_brief are carried
-    on the chunk at this stage (retrieval-time), so downstream code can
-    choose which one to expose to which consumer:
-      - hyde_brief -> retrieval-only, never sent to the script-writing LLM
-      - llm_brief  -> the one actually sent to the script-writing LLM
-    Works identically for RAG DB chunks and web-scraped chunks.
-    """
-    segment_id = seg_info.get("segment_index")
-    segment_name = seg_info.get("segment_name")
-    hyde_brief = seg_info.get("hyde_brief")
-    llm_brief = seg_info.get("llm_brief")
-    for chunk in chunks:
-        chunk["segment_id"] = segment_id
-        chunk["segment_name"] = segment_name
-        chunk["hyde_brief"] = hyde_brief
-        chunk["llm_brief"] = llm_brief
-
-
 
 
 
@@ -5643,6 +5532,12 @@ async def _generate_script_impl(request: "ScriptRequest"):
         kw = seg.get("keywords") or []
         print(f"  [HYDE-{i}] ({_count_tokens(doc_preview)} tok, {len(kw)} kw) \"{doc_preview}\"")
 
+    # =========================================================================
+    # STAGE 2 (RAG retrieval) and STAGE 3 (web search) both only depend on
+    # Stage 1's hyde_documents — not on each other — so they now run
+    # concurrently instead of sequentially. All retrieval math/thresholds/
+    # RRF fusion logic inside each is byte-for-byte unchanged.
+    # =========================================================================
     script_rag_target = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC
     script_web_source_target = len(hyde_documents) * SCRIPT_TOP_K_PER_DOC
 
@@ -5695,6 +5590,9 @@ async def _generate_script_impl(request: "ScriptRequest"):
             script_search_keywords = await _generate_search_keywords_for_script(
                 request.title, request.description, selected_template, request.time
             )
+            print(f"[STAGE 3] {len(script_search_keywords)} search keyword(s) generated:")
+            for i, kw in enumerate(script_search_keywords, start=1):
+                print(f"    [KW-{i}] {kw}")
         except Exception as exc:
             print(f"[STAGE 3] keyword generation failed: {exc}")
             script_search_keywords = [f"{request.title} latest news today", f"{request.title} 2026 update"]
@@ -5702,14 +5600,21 @@ async def _generate_script_impl(request: "ScriptRequest"):
         shared_pool: list[dict] = []
         try:
             shared_pool = await build_shared_web_pool(script_search_keywords, scraped_urls)
+            print(f"[STAGE 3] shared web pool built: {len(shared_pool)} article(s) fetched/chunked/embedded")
         except Exception as exc:
             print(f"[STAGE 3] shared web pool build failed: {exc}")
+            import traceback
+            traceback.print_exc()
             shared_pool = []
 
         articles: list[dict] = []
-        seen_urls_final: set = set()
         try:
             model = _get_st_model()
+            seen_urls_final: set = set()
+
+            # Batch all segment HyDE embeddings in a single encode() call
+            # instead of one call per segment — same vectors, far fewer
+            # sequential model invocations on CPU.
             hyde_texts = [seg.get("hyde_document", "") for seg in hyde_documents]
             try:
                 hyde_embeddings_batch = await _run_encode(
@@ -5720,68 +5625,47 @@ async def _generate_script_impl(request: "ScriptRequest"):
                 hyde_embeddings_batch = None
 
             for doc_idx, seg in enumerate(hyde_documents, start=1):
-                hyde_embedding = (
-                    hyde_embeddings_batch[doc_idx - 1] if hyde_embeddings_batch is not None
-                    else await _run_encode(
-                        lambda d=seg.get("hyde_document", ""): model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
+                if hyde_embeddings_batch is not None:
+                    hyde_embedding = hyde_embeddings_batch[doc_idx - 1]
+                else:
+                    doc = seg.get("hyde_document", "")
+                    hyde_embedding = await _run_encode(
+                        lambda d=doc: model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
                     )
-                )
+
                 top_for_doc = rank_pool_for_hyde_doc(
-                    shared_pool, hyde_embedding, WEB_CONTENT_SIMILARITY_THRESHOLD, SCRIPT_TOP_K_PER_DOC,
-                    exclude_urls=seen_urls_final,
+                    shared_pool, hyde_embedding, WEB_CONTENT_SIMILARITY_THRESHOLD, SCRIPT_TOP_K_PER_DOC
                 )
-                _tag_chunks_with_segment(top_for_doc, seg)
+                newly_added = 0
                 for article in top_for_doc:
                     url = article.get("url")
                     if url and url not in seen_urls_final:
                         seen_urls_final.add(url)
                         articles.append(article)
+                        newly_added += 1
+                print(
+                    f"[STAGE 3 | SEGMENT #{doc_idx}] matched {newly_added} new source(s) from the "
+                    f"pool of {len(shared_pool)} (running unique total: {len(seen_urls_final)})"
+                )
 
-            print(f"[STAGE 3] direct matching done: {_unique_url_count(articles)}/{script_web_source_target} unique source(s)")
-
-            # --- NEW: backfill, mirrors /generate-ideas ---
-            if _unique_url_count(articles) < script_web_source_target:
-                print(f"[STAGE 3] backfilling — only {_unique_url_count(articles)}/{script_web_source_target}, widening search")
-                generic_queries = [
-                    request.title, f"{request.title} history", f"{request.title} overview",
-                    f"{request.title} explained", f"{request.title} background",
-                    f"{request.title} facts", f"{request.title} details", f"{request.title} analysis",
-                ]
-                try:
-                    extra_pool = await build_shared_web_pool(generic_queries, scraped_urls)
-                    combined_pool = shared_pool + extra_pool
-                    for seg in hyde_documents:
-                        if _unique_url_count(articles) >= script_web_source_target:
-                            break
-                        doc = seg.get("hyde_document", "")
-                        hyde_embedding = await _run_encode(
-                            lambda d=doc: model.encode(d, normalize_embeddings=True, convert_to_numpy=True)
-                        )
-                        backfilled = rank_pool_for_hyde_doc(
-                            combined_pool, hyde_embedding, _MIN_ACCEPTABLE_SIMILARITY,
-                            SCRIPT_TOP_K_PER_DOC, exclude_urls=seen_urls_final,
-                        )
-                        _tag_chunks_with_segment(backfilled, seg)
-                        for article in backfilled:
-                            if _unique_url_count(articles) >= script_web_source_target:
-                                break
-                            url = article.get("url")
-                            if url and url not in seen_urls_final:
-                                seen_urls_final.add(url)
-                                articles.append(article)
-                    print(f"[STAGE 3] backfill done — now {_unique_url_count(articles)}/{script_web_source_target}")
-                except Exception as exc:
-                    print(f"[STAGE 3] backfill failed: {exc}")
+            unique_source_count = _unique_url_count(articles)
+            print(f"[STAGE 3] direct matching done: {unique_source_count}/{script_web_source_target} unique source(s)")
 
             articles.sort(key=lambda a: a.get("similarity", 0.0), reverse=True)
             articles = articles[:script_web_source_target]
+            print(
+                f"[STAGE 3] {_unique_url_count(articles)}/{script_web_source_target} "
+                f"unique semantically relevant web source(s) available (no backfill)."
+            )
         except Exception as exc:
             print(f"[STAGE 3] FAILED — web content matching raised: {exc}")
             import traceback
             traceback.print_exc()
 
         print(f"[STAGE 3] done in {time.time() - stage3_start:.2f}s — final unique source count: {_unique_url_count(articles)}/{script_web_source_target}")
-        return articles  
+        for i, a in enumerate(articles, start=1):
+            print(f"    [SRC-{i}] sim={a.get('similarity'):.4f} {a.get('url')}")
+        return articles
 
     (table_name, db_results_per_doc), new_articles = await asyncio.gather(
         _run_stage2(), _run_stage3()
@@ -5817,7 +5701,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         top_for_doc = pick_topk_with_backfill(
             doc_results, SCRIPT_TOP_K_PER_DOC, globally_claimed_md5s
         )
-        _tag_chunks_with_segment(top_for_doc, hyde_documents[doc_idx - 1])
         db_results.extend(top_for_doc)
 
         picked_ids = {item.get("chunk_id") for item in top_for_doc}
@@ -6017,52 +5900,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -7048,7 +6885,6 @@ async def _translate_script_impl(request: "TranslateScriptRequest"):
 
 
 import os
-import asyncio
 import requests
 from typing import Optional
 
@@ -7515,7 +7351,6 @@ import time
 import json
 import datetime
 import random
-import re
 import string
 import uuid as uuid_lib
 
@@ -8426,29 +8261,6 @@ async def razorpay_webhook(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 from fastapi import UploadFile, File, Form
 
 AUDIO_BUCKET = "user-audio"
@@ -8655,37 +8467,6 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import math
 
 FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
@@ -8693,16 +8474,24 @@ FISH_AUDIO_TTS_URL = "https://api.fish.audio/v1/tts"
 
 import httpx
 import base64
-from fish_audio_sdk import Session, TTSRequest
+from fish_audio_sdk import Session, TTSRequest, Prosody  # FIX (voice too fast): added Prosody import
 
 fish_session = Session(FISH_AUDIO_API_KEY)
 
 GENERATED_AUDIO_BUCKET = "generated-audio"
 
+# FIX (voice too fast): _run_fish_tts_sync below never set any prosody/speed
+# option, so Fish Audio used its own default speed of 1.0 (normal) — nothing
+# was ever making it fast, nothing was ever slowing it down either. This is
+# the global default speed applied whenever a request doesn't specify its
+# own `speed`. Range 0.5-2.0, lower = slower. Kept as an env var so it can be
+# tuned without a redeploy.
+TTS_SPEECH_SPEED = float(os.getenv("TTS_SPEECH_SPEED", "0.95"))
+
 # ---- Credit pricing for voice generation ----
 # 1 minute of generated audio = 5 credits.
 #
-# NOTE: despite the field name, `durationSeconds` sent by the client is
+# NOTE: despite the field name, `durationMinutes` sent by the client is
 # actually a whole number of MINUTES (1, 2, 3, ...), not seconds. We deduct
 # credits directly as minutes * VOICE_CREDITS_PER_MINUTE — no /60 conversion.
 VOICE_CREDITS_PER_MINUTE = 5
@@ -8726,7 +8515,11 @@ class GenerateSpeechRequest(BaseModel):
     script: str
     voice: str
     langCode: str = "en"
-    durationSeconds: int = 0  # NOTE: actually whole MINUTES from the client, not seconds
+    durationMinutes: int = 0
+    speed: float | None = None  # FIX (voice too fast): 0.5-2.0, lower = slower; None = use TTS_SPEECH_SPEED
+    volume: float | None = None  # Fish Audio prosody.volume — dB adjustment, roughly -20..20; None = Fish Audio's own default (0)
+    loudnessNormalization: bool | None = None  # Fish Audio prosody.normalize_loudness; None = Fish Audio's own default
+    textNormalization: bool | None = None  # Fish Audio top-level "normalize"; None = Fish Audio's own default (true)
 
 
 async def _download_bytes(url: str) -> bytes:
@@ -8746,25 +8539,38 @@ def _create_fish_model_sync(ref_audio_bytes: bytes, title: str) -> str:
     return model.id
 
 
-def _run_fish_tts_sync(script: str, reference_id: str) -> bytes:
+def _run_fish_tts_sync(
+    script: str,
+    reference_id: str,
+    speed: float = TTS_SPEECH_SPEED,
+    volume: float | None = None,
+    loudness_normalization: bool | None = None,
+    text_normalization: bool | None = None,
+) -> bytes:
+    prosody_kwargs = {"speed": speed}
+    if volume is not None:
+        prosody_kwargs["volume"] = volume
+    if loudness_normalization is not None:
+        prosody_kwargs["normalize_loudness"] = loudness_normalization
+
     tts_request = TTSRequest(
         text=script,
         reference_id=reference_id,
-        temperature=0.5,              
-        top_p=0.7,                    
-        repetition_penalty=1.2,     
-        chunk_length=300,           
-        latency="normal",             
-        normalize=True,              
-        format="mp3",             
-        mp3_bitrate=192,               
-        condition_on_previous_chunks=True,  
+        temperature=0.5,
+        top_p=0.7,
+        repetition_penalty=1.2,
+        chunk_length=300,
+        latency="normal",
+        normalize=text_normalization if text_normalization is not None else True,
+        format="mp3",
+        mp3_bitrate=192,
+        condition_on_previous_chunks=True,
+        prosody=Prosody(**prosody_kwargs),
     )
     audio_chunks = []
     for chunk in fish_session.tts(tts_request):
         audio_chunks.append(chunk)
     return b"".join(audio_chunks)
-
 
 def _credits_for_voice_minutes(duration_minutes: float) -> int:
     if duration_minutes <= 0:
@@ -8800,6 +8606,7 @@ async def generate_speech(body: GenerateSpeechRequest):
     script = body.script
     voice = body.voice.strip() if body.voice else ""
     lang_code = (body.langCode or "en").strip()
+    speed = body.speed if body.speed is not None else TTS_SPEECH_SPEED
 
     await require_valid_user(userId)
 
@@ -8861,7 +8668,10 @@ async def generate_speech(body: GenerateSpeechRequest):
         reference_id = voice
 
     try:
-        audio_bytes = await asyncio.to_thread(_run_fish_tts_sync, script, reference_id)
+        audio_bytes = await asyncio.to_thread(_run_fish_tts_sync, script, reference_id,speed,body.volume,
+            body.loudnessNormalization,
+            body.textNormalization,
+)
     except Exception as e:
         print(f"[TTS] Fish Audio TTS failed: {e}")
         import traceback
@@ -8899,7 +8709,7 @@ async def generate_speech(body: GenerateSpeechRequest):
         raise HTTPException(status_code=500, detail="Generated audio saved but failed to create URL")
 
     try:
-        duration_minutes = body.durationSeconds or 0
+        duration_minutes = body.durationMinutes or 0
         await _deduct_voice_credits(userId, duration_minutes)
     except Exception as e:
         print(f"[TTS] credit deduction failed for user {userId}: {e}")
@@ -8911,40 +8721,11 @@ async def generate_speech(body: GenerateSpeechRequest):
         "userId": userId,
         "voice": voice,
         "langCode": lang_code,
+        "speed": speed,
         "reference_id": reference_id,
         "storage_path": storage_path,
         "url": public_url,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -9396,121 +9177,3314 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-class EditVideo(BaseModel):
-    userId : str
-    script:str
 
 
 
-SCRIPT_SCENE_PROMPT = f""" 
-System Prompt
 
-You are Storybit's Scene Planner, an AI that converts documentary-style narration into a structured scene manifest for an automated video editing pipeline.
 
-Your output is consumed directly by backend services, so it must be valid JSON only with no markdown, explanations, comments, or code fences.
 
-Objective
 
-Transform a narration script into a sequence of visually coherent scenes while preserving the original narration exactly.
 
-The output must contain no timestamps. Timing will be generated later from voiceover alignment.
 
-Scene Segmentation Rules
 
-Split whenever the spoken idea or visual changes.
 
-Most scenes should contain 1 sentence or a closely related pair of short sentences.
 
-Keep scene lengths balanced; avoid overly long scenes.
 
-Preserve the narration verbatim inside vo_text.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import re
+import os
+import json
+import math
+import uuid
+import shutil
+import tempfile
+import asyncio
+import datetime
+from typing import Any, Optional, Literal
+import httpx
+import whisperx
+from fastapi import HTTPException
+from pydantic import BaseModel
+
+
+
+def _looks_like_playable_media_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    if "videos.pexels.com" in url or "images.pexels.com" in url:
+        return True
+    if re.search(r"\.(mp4|mov|webm|jpg|jpeg|png|webp)(\?|$)", url, re.IGNORECASE):
+        return True
+    return False
+
+
+def _display_text_to_string(display_text: Any) -> str:
+    if isinstance(display_text, list):
+        return "\n".join(str(d) for d in display_text if d)
+    if isinstance(display_text, str):
+        return display_text
+    return ""
+
+
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
+
+
+def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) -> Optional[str]:
+    if not candidate:
+        return None
+
+    if source == "image":
+        src = candidate.get("src") or {}
+        for key in ("original", "large2x", "large", "portrait", "landscape", "medium", "small", "tiny"):
+            url = src.get(key)
+            if url:
+                return url
+        return None
+
+    if source == "video":
+        video_files = candidate.get("video_files") or []
+        if not video_files:
+            return None
+
+        def _area(f: dict) -> int:
+            w = f.get("width") or 0
+            h = f.get("height") or 0
+            return w * h
+
+        labeled_hd = [f for f in video_files if (f.get("quality") or "").lower() in ("hd", "uhd")]
+        if labeled_hd:
+            best = max(labeled_hd, key=_area)
+            if best.get("link"):
+                return best["link"]
+
+        candidates_with_links = [f for f in video_files if f.get("link")]
+        if not candidates_with_links:
+            return None
+        best = max(candidates_with_links, key=_area)
+        return best["link"]
+
+    return None
+
+
+def _resolve_broll_file_url_any_orientation(candidate: dict, source: str) -> Optional[str]:
+    if not candidate:
+        return None
+
+    existing = candidate.get("file_url")
+    if _looks_like_playable_media_url(existing):
+        return existing
+
+    if source == "video":
+        if candidate.get("video_url") and _looks_like_playable_media_url(candidate["video_url"]):
+            return candidate["video_url"]
+        video_files = candidate.get("video_files") or []
+        if video_files:
+            for vf in video_files:
+                if vf.get("quality") == "hd" and vf.get("file_type") == "video/mp4":
+                    return vf.get("link")
+            return video_files[0].get("link")
+        return candidate.get("url") if _looks_like_playable_media_url(candidate.get("url")) else None
+
+    src = candidate.get("src") or {}
+    for key in ("large2x", "large", "original", "medium"):
+        if src.get(key):
+            return src[key]
+    return candidate.get("url") if _looks_like_playable_media_url(candidate.get("url")) else None
+
+
+def _video_is_landscape(v: dict) -> bool:
+    return _resolve_broll_file_url(v, "video") is not None
+
+
+def _image_is_landscape(p: dict) -> bool:
+    return _resolve_broll_file_url(p, "image") is not None
+
+
+
+STYLE_PROFILES = {
+  "anthropology": {
+    "description": "Human societies, cultures, evolution, ethnography.",
+    "footage_style": "Communities, ceremonies, artifacts, archaeological sites, cultural practices across regions/eras.",
+    "animation_density": "low",
+    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third", "callout_textbox"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+  },
+  "biography": {
+    "description": "A specific person's life story.",
+    "footage_style": "Portraits, era-appropriate settings, places tied to the person's life.",
+    "animation_density": "low",
+    "favored_animation_types": ["lower_third", "full_screen_quote_card", "ken_burns_pan_zoom"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+  },
+  "business": {
+    "description": "Companies, corporate strategy, case studies, industry.",
+    "footage_style": "Offices, meetings, product shots, people working, cities.",
+    "animation_density": "high",
+    "favored_animation_types": ["stat_counter_overlay", "icon_sequence", "bullet_list_reveal", "full_screen_data_viz", "callout_textbox"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "economics": {
+    "description": "Markets, macro/micro economics, trade, policy.",
+    "footage_style": "Markets, factories, trade, currency, charts/screens.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "stat_counter_overlay", "icon_sequence", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+  },
+  "entrepreneurship": {
+    "description": "Startups, founders, building and scaling businesses.",
+    "footage_style": "Startup offices, founders working, product launches, pitching.",
+    "animation_density": "high",
+    "favored_animation_types": ["icon_pop_in", "stat_counter_overlay", "bullet_list_reveal", "callout_textbox"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "finance": {
+    "description": "Personal finance, investing, markets, money management.",
+    "footage_style": "Stock tickers, banks, currency, people managing money.",
+    "animation_density": "high",
+    "favored_animation_types": ["stat_counter_overlay", "full_screen_data_viz", "icon_sequence", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "health": {
+    "description": "Medicine, wellness, fitness, nutrition.",
+    "footage_style": "Clinical settings, exercise, food, doctors/patients, wellness scenes.",
+    "animation_density": "medium",
+    "favored_animation_types": ["stat_counter_overlay", "icon_pop_in", "bullet_list_reveal", "full_screen_data_viz"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "knowledge": {
+    "description": "General facts, trivia, 'did you know' style content spanning any subject.",
+    "footage_style": "Broad real-world imagery matched directly to whichever fact is being discussed.",
+    "animation_density": "medium",
+    "favored_animation_types": ["stat_counter_overlay", "icon_pop_in", "bullet_list_reveal", "callout_textbox"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "law": {
+    "description": "Legal systems, court cases, legislation.",
+    "footage_style": "Courtrooms, legal documents, government/court buildings.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_document_highlight", "lower_third", "callout_textbox", "bullet_list_reveal"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+  },
+  "personal_development": {
+    "description": "Habits, growth frameworks, productivity, self-improvement systems.",
+    "footage_style": "Everyday life, people building routines, journaling, incremental progress.",
+    "animation_density": "medium",
+    "favored_animation_types": ["bullet_list_reveal", "icon_pop_in", "callout_textbox", "stat_counter_overlay"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "philosophy": {
+    "description": "Abstract ideas, ethics, philosophers, thought experiments.",
+    "footage_style": "Contemplative real-world imagery, historical settings, symbolic everyday scenes.",
+    "animation_density": "low",
+    "favored_animation_types": ["full_screen_quote_card", "lower_third", "ken_burns_pan_zoom"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation", "icon_sequence"],
+  },
+  "politics": {
+    "description": "Political systems, elections, government, policy.",
+    "footage_style": "Government buildings, rallies, officials, maps.",
+    "animation_density": "medium",
+    "favored_animation_types": ["lower_third", "full_screen_data_viz", "callout_textbox", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+  },
+  "psychology": {
+    "description": "Mind, behavior, cognitive concepts, mental processes (behavioral framing).",
+    "footage_style": "People and everyday behavior/interactions, relatable real-world scenes.",
+    "animation_density": "medium",
+    "favored_animation_types": ["icon_pop_in", "callout_textbox", "bullet_list_reveal", "full_screen_data_viz"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "self_help": {
+    "description": "Direct, prescriptive advice and how-to guidance for personal problems.",
+    "footage_style": "Relatable everyday life, people applying advice/techniques.",
+    "animation_density": "medium",
+    "favored_animation_types": ["bullet_list_reveal", "callout_textbox", "icon_pop_in"],
+    "avoided_animation_types": ["full_screen_data_viz", "mascot_animation"],
+  },
+  "sociology": {
+    "description": "Social structures, group behavior, societal trends.",
+    "footage_style": "Communities, social settings, crowds, institutions.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_data_viz", "stat_counter_overlay", "lower_third", "callout_textbox"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "history": {
+    "description": "Historical events and periods, any era.",
+    "footage_style": "Archival-style or era-appropriate imagery, artifacts, maps, timelines — matched to whichever era the specific script covers.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third", "full_screen_data_viz"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+  },
+  "religion": {
+    "description": "Religious traditions, theology, practices.",
+    "footage_style": "Religious sites, symbols, ceremonies, texts.",
+    "animation_density": "low",
+    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation", "emoji_reaction"],
+  },
+  "travel": {
+    "description": "Destinations, travel guides, culture of places.",
+    "footage_style": "Landmarks, landscapes, street scenes, local life.",
+    "animation_density": "low",
+    "favored_animation_types": ["lower_third", "ken_burns_pan_zoom", "callout_textbox"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+  },
+  "geography": {
+    "description": "Physical geography, countries, natural formations, maps.",
+    "footage_style": "Landscapes, maps, satellite-style views, natural formations.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_data_viz", "lower_third", "arrow_highlight", "ken_burns_pan_zoom"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "astronomy": {
+    "description": "Space, planets, cosmology.",
+    "footage_style": "Space imagery, telescopes, night sky, planetary/scale visuals.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "technology": {
+    "description": "Tech products, engineering, innovation, computing.",
+    "footage_style": "Devices, labs, close-ups of tech, digital interfaces.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "sports": {
+    "description": "Sports history, athletes, competitions, stats.",
+    "footage_style": "Sports action, athletes, stadiums, equipment.",
+    "animation_density": "high",
+    "favored_animation_types": ["stat_counter_overlay", "lower_third", "full_screen_data_viz", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "communication": {
+    "description": "Language, media, rhetoric, interpersonal/mass communication.",
+    "footage_style": "People talking, media/broadcast settings, writing, signals.",
+    "animation_density": "medium",
+    "favored_animation_types": ["icon_pop_in", "callout_textbox", "bullet_list_reveal", "lower_third"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "science": {
+    "description": "General science: physics, chemistry, biology, experimentation.",
+    "footage_style": "Labs, experiments, natural phenomena, close-ups of mechanisms.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "neuroscience": {
+    "description": "Brain, nervous system, cognitive science (research/clinical framing).",
+    "footage_style": "Brain/medical imagery, labs, research settings.",
+    "animation_density": "high",
+    "favored_animation_types": ["full_screen_data_viz", "icon_pop_in", "stat_counter_overlay", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "film_theatre": {
+    "description": "Film and theatre history, analysis, industry.",
+    "footage_style": "Theatres, film sets, performances, era-appropriate cinema imagery.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_quote_card", "lower_third", "callout_textbox", "ken_burns_pan_zoom"],
+    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+  },
+  "social_science": {
+    "description": "Social science research and theory (methodology/research framing).",
+    "footage_style": "Research settings, communities, data-adjacent real-world imagery.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_data_viz", "callout_textbox", "lower_third", "bullet_list_reveal"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "criminology": {
+    "description": "Study of crime, criminal behavior, and the justice system.",
+    "footage_style": "Evidence-style imagery, courtrooms, investigation settings, documents.",
+    "animation_density": "medium",
+    "favored_animation_types": ["full_screen_document_highlight", "lower_third", "callout_textbox", "arrow_highlight"],
+    "avoided_animation_types": ["mascot_animation", "emoji_reaction", "icon_sequence"],
+  },
+  "cultural_studies": {
+    "description": "Culture, identity, media/cultural analysis.",
+    "footage_style": "Cultural settings, communities, symbols, everyday life across cultures.",
+    "animation_density": "medium",
+    "favored_animation_types": ["lower_third", "callout_textbox", "full_screen_quote_card", "bullet_list_reveal"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+  "general_documentary": {
+    "description": "Fallback for scripts that don't clearly fit another category.",
+    "footage_style": "Real-world footage matched directly to narration subjects.",
+    "animation_density": "low",
+    "favored_animation_types": ["lower_third", "ken_burns_pan_zoom", "full_screen_quote_card"],
+    "avoided_animation_types": ["mascot_animation"],
+  },
+}
+
+
+SCRIPT_SCENE_PROMPT = f"""
+You are Storybit's Scene Planner. Classify the entire documentary script once
+and divide its narration into canonical semantic scenes.
+
+RETURN JSON ONLY.
+
+CATEGORY: choose exactly one category from {list(STYLE_PROFILES.keys())}, using
+the entire script and the category descriptions below. If none clearly fits,
+choose general_documentary.
+
+Category reference (use this to judge fit, do not invent new categories):
+{ {k: v['description'] for k, v in STYLE_PROFILES.items()} }
+
+LANGUAGE: detect script_language from the actual narration as ISO 639-1.
+
+SCENE LENGTH — CRITICAL:
+Normal target = 260–280 spoken words, approximately 2 minutes at 130–140 WPM.
+This is a planning constraint, NOT actual playback timing.
+- Never exceed 280 words in a normal scene.
+- Prefer 260–280 words.
+- Below 260 is allowed only for a genuinely short script, the final/remainder
+  scene, or a strong semantic boundary where merging would damage coherence.
+- Rebalance nearby boundaries when a remainder below 260 can be avoided without
+  exceeding 280.
+- Do not split mechanically at 260; semantic coherence wins within the hard
+  280-word maximum.
+
+SOURCE INTEGRITY:
+Use 0-based character offsets with exclusive end:
+original_script[char_start:char_end] == vo_text.
+Every scene must be contiguous, ordered, non-overlapping, and together cover
+the complete original narration. Never paraphrase, translate, normalize,
+reorder, drop, or duplicate narration.
+
+VISUAL FIELDS:
+visual_intent = concise grounded documentary direction: name the concrete
+subjects/locations/eras this scene should show, not a mood word. Prefer
+real-world imagery matching the category's footage_style over abstract or
+stock-generic phrasing.
+on_screen_text = short viewer-facing text grounded in source, or "".
+animation_preference = avoid | optional | strong. It is NOT a veto — it is
+input to the Animation Director's own judgment. Use "strong" when the scene
+has a named statistic, a direct quote, a defined list, or a clear thematic
+turn that deserves emphasis; "avoid" only when animation would genuinely
+distract (e.g. a raw emotional beat that should breathe); "optional"
+otherwise.
+scene_animation_density = low | medium | high.
+broll_keywords = 5–6 distinct English retrieval seed phrases, 2–6 words each,
+each targeting a different concrete visual angle on this scene (not 5
+rewordings of the same shot).
+estimated_duration_seconds is advisory only.
+
+OUTPUT:
+{{
+  "category": "business",
+  "script_language": "en",
+  "scenes": [{{
+    "scene_id": "s1",
+    "source_range": {{"char_start": 0, "char_end": 812,
+                     "word_start": 0, "word_end": 145}},
+    "vo_text": "Exact contiguous source substring.",
+    "visual_intent": "Grounded documentary visual direction.",
+    "on_screen_text": "",
+    "animation_preference": "optional",
+    "scene_animation_density": "medium",
+    "estimated_duration_seconds": 120,
+    "broll_keywords": ["specific subject", "relevant location",
+                       "related activity", "contextual view", "detail view"]
+  }}]
+}}
+"""
+
+
+BEAT_KEYWORDS_PROMPT = """
+
+You are Storybit's Beat Director for one canonical scene.
+
+RETURN JSON ONLY.
+
+INPUT:
+category, style_profile, script_language, scene_id, scene_visual_intent,
+scene_animation_density, scene_on_screen_text, scene_vo_text,
+previous_scene_last_media_type, known_entities, and known_setting.
+
+Split the scene into variable semantic visual beats. Typical planning target is
+8–20 spoken seconds; it is NOT authoritative timing. Do not split mid-thought
+just to hit a duration target.
+
+SOURCE INTEGRITY:
+Every beat's vo_text must be an exact contiguous substring of scene_vo_text.
+Beats must be ordered, non-overlapping, and together cover the entire scene
+narration exactly — every word appears in exactly one beat, in order.
+
+KEYWORDS:
+Return 5–6 distinct English retrieval phrases per beat, 2–6 words each.
+They must be concrete, photographable, and grounded in the literal narration.
+Never invent names, facts, dates, locations, actions, or subjects. Each
+phrase should target a genuinely different visual angle (wide vs. close,
+subject vs. action vs. setting) — never 5 rewordings of the same shot.
+For real people use the actual name plus useful context (era/role/setting).
+For fictional characters do NOT search the invented name; search the
+setting/archetype/action/mood the beat implies instead.
+
+MEDIA:
+video = motion, process, action, change over time.
+image = static subject, portrait, document, archival frame, data point, quote.
+Variety is a preference, never a quota — do not force alternation if the
+content clearly calls for two videos or two images in a row.
+
+ENTITY CONTINUITY:
+Use stable canonical entity identity from known_entities. Reuse entity_type;
+do not silently switch real_person and fictional_character for a name that
+already appeared. Resolve aliases or pronouns only when clearly supported by
+the text. Recurring entities need not be repeated every beat — only list
+what's new or freshly relevant in THIS beat.
+
+SETTING CONTINUITY:
+Track location and time_period via known_setting. Inherit unchanged settings;
+represent explicit moves in the narration. Never invent a new setting the
+text doesn't support.
+
+ANIMATION SIGNAL:
+animation_signal is only a proposal for the Animation Director. It does not
+create a quota and does not veto the Director's own judgment. Set
+needs_animation based on whether THIS beat's content would genuinely benefit
+from emphasis (a number, a named thing, a listed set, a turn) — weigh this
+against scene_animation_density.
+
+QUOTED SOURCE:
+source_type = quoted_source only when narration explicitly presents or
+attributes a source, study, or quotation (e.g. "a report from X found...",
+"as Y argues in Z"). quoted_excerpt must be an exact substring of vo_text.
+source_name_guess must be grounded in vo_text or null.
+
+OUTPUT:
+{
+  "beats": [{
+    "beat_id": "s1_b1",
+    "vo_text": "Exact contiguous source substring.",
+    "visual_intent": "What should be visually communicated in this beat specifically.",
+    "estimated_duration_seconds": 18,
+    "keywords": ["specific action", "relevant location",
+                  "contextual view", "close detail", "related activity"],
+    "media_type": "video",
+    "entities": [{
+      "name": "Example Person", "entity_type": "real_person"
+    }],
+    "scene_direction": {
+      "setting": {"location": "", "time_period": ""},
+      "mood": "neutral",
+      "key_action": "What should be shown occurring, not what's being said."
+    },
+    "animation_signal": {
+      "needs_animation": false,
+      "intent": "",
+      "suggested_category": null,
+      "key_subject": "",
+      "source_type": "narrative",
+      "quoted_excerpt": null,
+      "source_name_guess": null,
+      "key_subject_entity_type": null
+    }
+  }]
+}
+Do not output pixels, frame counts, renderer commands, arbitrary colors, or
+executable rendering instructions — that is the Animation Director's job,
+not yours.
+"""
+
+
+ANIMATION_TAXONOMY = {
+  "full_screen": [
+    "full_screen_broll", "full_screen_title_card", "full_screen_data_viz",
+    "full_screen_transition", "full_screen_color_wash", "full_screen_quote_card",
+    "full_screen_document_highlight",
+  ],
+  "overlay_text": [
+    "lower_third", "kinetic_caption", "bullet_list_reveal", "callout_textbox",
+    "stat_counter_overlay",
+  ],
+  "overlay_graphic": [
+    "icon_pop_in", "icon_sequence", "logo_watermark", "emoji_reaction",
+    "arrow_highlight", "badge_sticker",
+  ],
+  "pip": ["pip_video", "split_screen", "multi_panel_grid"],
+  "branding": ["avatar_overlay", "mascot_animation"],
+  "transition": ["ken_burns_pan_zoom", "parallax_layering", "shake_impact", "speed_ramp_indicator"],
+}
+
+_ANIMATION_TYPE_TO_CATEGORY = {
+    anim_type: category
+    for category, anim_types in ANIMATION_TAXONOMY.items()
+    for anim_type in anim_types
+}
+_VALID_ANIMATION_TYPES = set(_ANIMATION_TYPE_TO_CATEGORY.keys())
+_VALID_PLACEMENTS = {
+    "top_left", "top_center", "top_right",
+    "center_left", "center", "center_right",
+    "bottom_left", "bottom_center", "bottom_right",
+    "full_frame",
+}
+_VALID_Z_LAYERS = {"background", "midground", "foreground"}
+_VALID_TRIGGERS = {"time_offset", "on_keyword", "on_beat", "scene_start"}
+_VALID_RENDER_HINTS = {"remotion", "ffmpeg"}
+_VALID_ICON_LAYOUTS = {"sequence", "cluster", "pair"}
+
+_ICON_LIBRARY_GROUPS = {
+    "general_ui": ["arrow-right", "bell", "calendar", "camera", "check", "clock", "infinity", "lightbulb", "puzzle", "quote", "search", "sparkles", "target", "timer", "x"],
+    "emotion_people": ["crown", "handshake", "heart", "heart-handshake", "user", "users", "users-round"],
+    "business_finance_economics": ["banknote", "bar-chart", "briefcase", "building", "building-2", "chart-column", "chart-line", "coins", "credit-card", "dollar-sign", "factory", "line-chart", "pie-chart", "piggy-bank", "receipt", "trending-down", "trending-up", "wallet"],
+    "law_criminology": ["archive", "file-text", "fingerprint-pattern", "folder", "gavel", "key", "lock", "scale", "shield"],
+    "science_technology_neuroscience": ["atom", "battery", "brain", "brain-circuit", "code", "cpu", "database", "dna", "flask-conical", "gauge", "laptop", "microscope", "network", "server", "smartphone", "terminal", "wifi", "zap"],
+    "astronomy_geography": ["compass", "globe", "map", "map-pin", "map-pinned", "moon", "moon-star", "mountain", "orbit", "rocket", "satellite", "snowflake", "star", "sun", "telescope", "thermometer", "waves", "wind"],
+    "health": ["activity", "cross", "leaf", "pill", "sprout", "stethoscope"],
+    "history_religion_anthropology_culture": ["castle", "church", "flag", "landmark", "scroll", "sword", "vote"],
+    "travel_sports": ["anchor", "award", "bus", "car", "dumbbell", "luggage", "medal", "plane", "ribbon", "ship", "train", "trophy", "umbrella"],
+    "communication_film_media": ["clapperboard", "drama", "film", "message-circle", "mic", "newspaper", "podcast", "radio", "rss", "theater", "tv"],
+    "knowledge_education": ["book", "graduation-cap", "library", "pen", "pencil"],
+    "nature_misc": ["bird", "bug", "cat", "coffee", "dog", "fish", "flame", "music", "paintbrush", "palette", "pizza", "shirt", "tent", "utensils"],
+    "alerts": ["alert-triangle", "megaphone"],
+}
+_ICON_VOCAB = {icon for group in _ICON_LIBRARY_GROUPS.values() for icon in group}
+
+_ICON_GROUP_BY_CATEGORY = {
+    "anthropology": "history_religion_anthropology_culture",
+    "biography": "emotion_people",
+    "business": "business_finance_economics",
+    "economics": "business_finance_economics",
+    "entrepreneurship": "business_finance_economics",
+    "finance": "business_finance_economics",
+    "health": "health",
+    "knowledge": "general_ui",
+    "law": "law_criminology",
+    "personal_development": "general_ui",
+    "philosophy": "general_ui",
+    "politics": "history_religion_anthropology_culture",
+    "psychology": "emotion_people",
+    "self_help": "general_ui",
+    "sociology": "emotion_people",
+    "history": "history_religion_anthropology_culture",
+    "religion": "history_religion_anthropology_culture",
+    "travel": "travel_sports",
+    "geography": "astronomy_geography",
+    "astronomy": "astronomy_geography",
+    "technology": "science_technology_neuroscience",
+    "sports": "travel_sports",
+    "communication": "communication_film_media",
+    "science": "science_technology_neuroscience",
+    "neuroscience": "science_technology_neuroscience",
+    "film_theatre": "communication_film_media",
+    "social_science": "emotion_people",
+    "criminology": "law_criminology",
+    "cultural_studies": "history_religion_anthropology_culture",
+    "general_documentary": "general_ui",
+}
+
+
+_FALLBACK_ACCENT_COLORS = [
+    "#5B9BD5",  # blue
+    "#E07A5F",  # terracotta
+    "#81B29A",  # sage green
+    "#F2C94C",  # warm yellow — kept, but now just one option among several, not the only one
+    "#9B7EDE",  # violet
+    "#E8A87C",  # amber
+]
+
+
+def _pick_fallback_color(beat_id: Optional[str]) -> str:
+
+    idx = sum(ord(c) for c in (beat_id or "")) % len(_FALLBACK_ACCENT_COLORS)
+    return _FALLBACK_ACCENT_COLORS[idx]
+
+
+def _pick_fallback_icon(category: str) -> str:
+    group = _ICON_GROUP_BY_CATEGORY.get(category, "general_ui")
+    icons = _ICON_LIBRARY_GROUPS.get(group) or _ICON_LIBRARY_GROUPS["general_ui"]
+    return icons[0]
+
+
+def _fallback_icon_geometry() -> tuple[dict, dict]:
+
+    size = 160
+    x = (CANVAS_WIDTH - size) // 2
+    y = (CANVAS_HEIGHT - size) // 2
+    geometry = {"x": x, "y": y, "width": size, "height": size}
+    motion = {
+        "start_xy_px": [x, y - 20],
+        "end_xy_px": [x, y],
+        "motion_style": "pop-in with slight bounce, scale 80% to 100%",
+    }
+    return geometry, motion
+
+
+def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
+    icon = _pick_fallback_icon(category)
+    key_action = ((beat.get("scene_direction") or {}).get("key_action") or "").strip()
+    on_screen_words = key_action.split()
+    label = " ".join(on_screen_words[:4]) if on_screen_words else None
+    est_seconds = beat.get("estimated_duration_seconds") or 3
+    duration_frames = max(30, min(90, int(est_seconds * TIMELINE_FPS * 0.4)))
+    geometry_px, motion = _fallback_icon_geometry()
+    return {
+        "beat_id": beat["beat_id"],
+        "animation_type": "icon_pop_in",
+        "placement": "center",
+        "geometry_px": geometry_px,
+        "motion": motion,
+        "duration_frames": duration_frames,
+        "content_binding": f"fallback_icon:{icon}",
+        "icon_name": icon,
+        "icon_layout": None,
+        "display_text": label,
+        "color_hint": _pick_fallback_color(beat.get("beat_id")),
+        "highlight_target_text": None,
+        "render_prompt": (
+            f"A small '{icon}' icon pops in at the center with a light bounce and holds briefly. "
+            "Kept understated so it doesn't compete with the beat's main visual."
+        ),
+        "trigger": "on_beat",
+        "render_engine_hint": "remotion",
+    }
+
+
+def _infer_video_category(scenes: list) -> str:
+    
+    for s in scenes:
+        ctx = s.get("_beat_director_context")
+        if ctx and ctx.get("category"):
+            return ctx["category"]
+    return "general_documentary"
+
+
+def _ensure_video_has_icon_animation(scenes: list, category: str) -> None:
+    """Final, video-wide safety net: guarantees at least one icon-bearing
+    animation (category "overlay_graphic" or "branding") exists SOMEWHERE
+    across the whole video, regardless of any individual scene's
+    requires_animation gate or how many animations the Animation Planner
+    (plus its own per-scene fallback) happened to produce. Call this once,
+    after all scenes for a video have been finalized, right before the
+    timeline is built. Mutates `scenes` in place.
+    """
+    for scene in scenes:
+        for anim in (scene.get("animations") or []):
+            if anim.get("category") in ("overlay_graphic", "branding"):
+                return  
+
+    for scene in scenes:
+        beats = scene.get("beats") or []
+        if not beats:
+            continue
+
+        animated_beat_ids = {a.get("beat_id") for a in (scene.get("animations") or [])}
+        target_beat = next((b for b in beats if b["beat_id"] not in animated_beat_ids), None)
+        replacing = target_beat is None
+        if target_beat is None:
+            target_beat = beats[0]
+
+        beat_ids = {b["beat_id"] for b in beats}
+        beats_by_id = {b["beat_id"]: b for b in beats}
+        fallback_raw = _build_fallback_icon_animation(target_beat, category)
+        fallback_validated = _validate_beat_animation(fallback_raw, beat_ids, beats_by_id)
+        if not fallback_validated:
+            continue
+
+        animations = list(scene.get("animations") or [])
+        if replacing:
+            animations = [a for a in animations if a.get("beat_id") != target_beat["beat_id"]]
+        animations.append(fallback_validated)
+        scene["animations"] = animations
+        # requires_animation only gates the Animation Planner call itself —
+        # by the time this runs that call is already done, but keep the
+        # flag consistent for anything downstream that inspects it.
+        scene["requires_animation"] = True
+
+        print(
+            f"[edit-video] no icon animation anywhere in this video — injected a "
+            f"guaranteed icon_pop_in on scene {scene.get('scene_id')} beat {target_beat['beat_id']}"
+        )
+        return
+
+    print("[edit-video][WARN] video-wide icon guarantee found no beat in any scene to attach an icon to")
+
+# icon_name -> emoji glyph, used by the FFmpeg fallback renderer below when
+# Remotion isn't available. Every key must exist in _ICON_VOCAB.
+_ICON_EMOJI_FALLBACK = {
+    "arrow-right": "\u27a1", "bell": "\U0001f514", "calendar": "\U0001f4c5", "camera": "\U0001f4f7",
+    "check": "\u2705", "clock": "\U0001f550", "infinity": "\u267e", "lightbulb": "\U0001f4a1",
+    "puzzle": "\U0001f9e9", "quote": "\U0001f4ac", "search": "\U0001f50d", "sparkles": "\u2728",
+    "target": "\U0001f3af", "timer": "\u23f2", "x": "\u274c",
+    "crown": "\U0001f451", "handshake": "\U0001f91d", "heart": "\u2764", "heart-handshake": "\U0001f491",
+    "user": "\U0001f464", "users": "\U0001f465", "users-round": "\U0001f465",
+    "banknote": "\U0001f4b5", "bar-chart": "\U0001f4ca", "briefcase": "\U0001f4bc", "building": "\U0001f3e2",
+    "building-2": "\U0001f3ec", "chart-column": "\U0001f4ca", "chart-line": "\U0001f4c8", "coins": "\U0001fa99",
+    "credit-card": "\U0001f4b3", "dollar-sign": "\U0001f4b2", "factory": "\U0001f3ed", "line-chart": "\U0001f4c8",
+    "pie-chart": "\U0001f4c8", "piggy-bank": "\U0001f437", "receipt": "\U0001f9fe", "trending-down": "\U0001f4c9",
+    "trending-up": "\U0001f4c8", "wallet": "\U0001f45b",
+    "archive": "\U0001f5c4", "file-text": "\U0001f4c4", "fingerprint-pattern": "\U0001faf2", "folder": "\U0001f4c1",
+    "gavel": "\U0001f528", "key": "\U0001f511", "lock": "\U0001f512", "scale": "\u2696", "shield": "\U0001f6e1",
+    "atom": "\u269b", "battery": "\U0001f50b", "brain": "\U0001f9e0", "brain-circuit": "\U0001f9e0",
+    "code": "\U0001f4bb", "cpu": "\U0001f5a5", "database": "\U0001f5c3", "dna": "\U0001f9ec",
+    "flask-conical": "\U0001f9ea", "gauge": "\U0001f4dd", "laptop": "\U0001f4bb", "microscope": "\U0001f52c",
+    "network": "\U0001f310", "server": "\U0001f5a5", "smartphone": "\U0001f4f1", "terminal": "\u2328",
+    "wifi": "\U0001f4f6", "zap": "\u26a1",
+    "compass": "\U0001f9ed", "globe": "\U0001f30d", "map": "\U0001f5fa", "map-pin": "\U0001f4cd",
+    "map-pinned": "\U0001f4cd", "moon": "\U0001f319", "moon-star": "\U0001f319", "mountain": "\u26f0",
+    "orbit": "\U0001fa90", "rocket": "\U0001f680", "satellite": "\U0001f6f0", "snowflake": "\u2744",
+    "star": "\u2b50", "sun": "\u2600", "telescope": "\U0001f52d", "thermometer": "\U0001f321",
+    "waves": "\U0001f30a", "wind": "\U0001f4a8",
+    "activity": "\U0001f4c9", "cross": "\u271d", "leaf": "\U0001f343", "pill": "\U0001f48a",
+    "sprout": "\U0001f331", "stethoscope": "\U0001fa7a",
+    "castle": "\U0001f3f0", "church": "\u26ea", "flag": "\U0001f6a9", "landmark": "\U0001f3db",
+    "scroll": "\U0001f4dc", "sword": "\u2694", "vote": "\U0001f5f3",
+    "anchor": "\u2693", "award": "\U0001f3c5", "bus": "\U0001f68c", "car": "\U0001f697", "dumbbell": "\U0001f3cb",
+    "luggage": "\U0001f9f3", "medal": "\U0001f3c5", "plane": "\u2708", "ribbon": "\U0001f397",
+    "ship": "\U0001f6a2", "train": "\U0001f686", "trophy": "\U0001f3c6", "umbrella": "\u2602",
+    "clapperboard": "\U0001f3ac", "drama": "\U0001f3ad", "film": "\U0001f39e", "message-circle": "\U0001f4ac",
+    "mic": "\U0001f3a4", "newspaper": "\U0001f4f0", "podcast": "\U0001f399", "radio": "\U0001f4fb",
+    "rss": "\U0001f4e1", "theater": "\U0001f3ad", "tv": "\U0001f4fa",
+    "book": "\U0001f4d6", "graduation-cap": "\U0001f393", "library": "\U0001f4da", "pen": "\U0001f58a",
+    "pencil": "\u270f",
+    "bird": "\U0001f426", "bug": "\U0001f41b", "cat": "\U0001f431", "coffee": "\u2615", "dog": "\U0001f436",
+    "fish": "\U0001f41f", "flame": "\U0001f525", "music": "\U0001f3b5", "paintbrush": "\U0001f58c",
+    "palette": "\U0001f3a8", "pizza": "\U0001f355", "shirt": "\U0001f455", "tent": "\u26fa",
+    "utensils": "\U0001f374",
+    "alert-triangle": "\u26a0", "megaphone": "\U0001f4e2",
+}
+_DEFAULT_ICON_EMOJI = "\u2b50"
+
+
+def _icon_glyph(icon_name: str) -> str:
+    return _ICON_EMOJI_FALLBACK.get(icon_name, _DEFAULT_ICON_EMOJI)
+
+
+
+CANVAS_WIDTH = 1920
+CANVAS_HEIGHT = 1080
+ANIMATION_CANVAS_WIDTH = CANVAS_WIDTH
+ANIMATION_CANVAS_HEIGHT = CANVAS_HEIGHT
+_SAFE_MARGIN = 72
+_CAPTION_BAND_HEIGHT = round(CANVAS_HEIGHT * 0.15)
+_CAPTION_BAND_TOP_Y = CANVAS_HEIGHT - _CAPTION_BAND_HEIGHT
+CAPTION_SAFE_ZONE_Y = _CAPTION_BAND_TOP_Y
+
+PLACEMENT_ANCHORS_PX = {
+    "top_left": (_SAFE_MARGIN, _SAFE_MARGIN),
+    "top_center": (CANVAS_WIDTH // 2, _SAFE_MARGIN),
+    "top_right": (CANVAS_WIDTH - _SAFE_MARGIN, _SAFE_MARGIN),
+    "center_left": (_SAFE_MARGIN, CANVAS_HEIGHT // 2),
+    "center": (CANVAS_WIDTH // 2, CANVAS_HEIGHT // 2),
+    "center_right": (CANVAS_WIDTH - _SAFE_MARGIN, CANVAS_HEIGHT // 2),
+    "bottom_left": (_SAFE_MARGIN, _CAPTION_BAND_TOP_Y - _SAFE_MARGIN),
+    "bottom_center": (CANVAS_WIDTH // 2, _CAPTION_BAND_TOP_Y - _SAFE_MARGIN),
+    "bottom_right": (CANVAS_WIDTH - _SAFE_MARGIN, _CAPTION_BAND_TOP_Y - _SAFE_MARGIN),
+    "full_frame": (0, 0),
+}
+
+ANIMATION_PLANNER_PROMPT = f"""
+You are Storybit's Animation Director — the creative director of this
+video, and the FINAL authority on animation decisions for this scene. The
+rendering pipeline (hybrid Remotion + FFmpeg) draws exactly what you return
+here — there is no other layout logic downstream.
+
+You are given, as JSON:
+- category, style_profile (footage_style, animation_density baseline,
+  favored_animation_types, avoided_animation_types).
+- script_language: ISO 639-1 code of the narration's language (fixed for
+  the whole video).
+- scene_id, scene_visual_intent, scene_on_screen_text, requires_animation,
+  scene_animation_density.
+- beats: the full array of this scene's beats from the Beat Director, each
+  with beat_id, vo_text, estimated_duration_seconds, entities,
+  scene_direction (setting, mood, key_action), animation_signal
+  (needs_animation, intent, suggested_category, key_subject, source_type,
+  quoted_excerpt, source_name_guess, key_subject_entity_type), AND words —
+  the REAL word-level timestamps for this beat from the actual recorded
+  voiceover: [{{"word": "one", "start": 10.02, "end": 10.31}}, ...], in
+  scene-local seconds. This is ground truth, not an estimate — use it.
+- previous_scene_last_animation: null (first scene only), or
+  {{"animation_type": ..., "placement": ..., "category": ...}} for the last
+  animated beat of the immediately preceding scene.
+
+TIMING — read this before anything else: you now have the exact second
+each word is actually spoken, so timing an animation to the narration is a
+lookup, not a guess. For every animation you output, set anchor_start_sec
+and anchor_end_sec (both REQUIRED, in the same scene-local seconds as
+words) by finding the specific word(s) in this beat's words array that the
+animation is FOR, and reading their real start/end directly:
+- If the animation illustrates a specific phrase, quote, statistic, or
+  named thing (most animations), find that phrase's words in the words
+  array and set anchor_start_sec to the FIRST matching word's start,
+  anchor_end_sec to the LAST matching word's end. Do not estimate or
+  round — copy the numbers straight from words.
+- If the animation is a whole-beat treatment (a mood wash, a scene-setting
+  title card with no single anchor phrase), set anchor_start_sec to the
+  first word's start and anchor_end_sec to the last word's end — i.e. the
+  beat's full span.
+- highlight_target_text/display_text should still be the actual words
+  you're anchoring to (see the quoted-source and display_text guidance
+  below) — anchor_start_sec/anchor_end_sec is the authoritative timing
+  Storybit will use directly; getting the anchored TEXT right is what
+  makes your anchor_start_sec/anchor_end_sec correct in the first place.
+- Sanity-check your own output before returning it: anchor_start_sec must
+  fall within this beat's own words range, and anchor_end_sec must be >=
+  anchor_start_sec. If you cannot find the relevant words in the words
+  array (e.g. this beat's words don't actually contain what you want to
+  show), that is a signal you have the wrong beat_id — reconsider which
+  beat this animation actually belongs to rather than guessing a time.
+
+Language rule: display_text must be written in script_language — it is
+on-screen text tied to spoken narration, so it must match what the viewer
+is hearing. icon_name (fixed vocabulary), content_binding, and
+render_prompt stay in English regardless of script_language, since they
+are internal/documentation values, not viewer-facing text.
+
+Canvas: every video is {CANVAS_WIDTH}x{CANVAS_HEIGHT}px (16:9). All
+positions and sizes you return must be real pixel values on this canvas —
+not vague fractions or percentages.
+
+Placement anchor reference (top-left corner in px for each placement zone,
+before you add your own width/height offset):
+{PLACEMENT_ANCHORS_PX}
+
+Burned-in captions always occupy the bottom {_CAPTION_BAND_HEIGHT}px of the
+frame (y >= {_CAPTION_BAND_TOP_Y}). For overlay_text/overlay_graphic types,
+geometry_px must keep (y + height) at or above {_CAPTION_BAND_TOP_Y} minus
+a small buffer — this is the same caption safe-zone rule as before, just
+now expressed in exact pixels instead of only a placement name.
+
+Your output is consumed by a deterministic renderer, not another LLM —
+there is no interpretation step between your JSON and the rendered clip.
+That means icon_name, display_text, and color_hint (defined below) must be
+exact, final values, not prose for something else to parse.
+
+Icon vocabulary: if this animation involves an icon (overlay_graphic or
+branding category), every icon_name value must come from this fixed set —
+nothing outside it will resolve to a real component prop:
+{sorted(_ICON_VOCAB)}
+
+ICON RELEVANCE IS NON-NEGOTIABLE: an icon must visually represent the
+literal subject, action, or concept named in THIS beat's vo_text/
+key_subject/key_action — never a generic decorative choice. Before picking
+an icon, identify the single concrete noun or action the beat is actually
+about, then pick the closest matching icon from the vocabulary for that
+specific thing (e.g. a beat about a court ruling → "gavel" or "scale", not
+"star"; a beat about a discovered fossil → "search" or a science-group
+icon, not "sparkles"; a beat naming a specific dollar figure → "dollar-sign"
+or "trending-up", not "check"). If nothing in the vocabulary is a close
+semantic match for this beat's specific content, prefer a different
+animation_type entirely (text-based) over forcing an irrelevant icon in —
+a well-chosen full_screen_quote_card beats a mismatched icon every time.
+
+Ban on filler icons: "puzzle", "sparkles", "target", "lightbulb", "check",
+and "star" are the most commonly overused icons because they feel like they
+could apply to almost anything ("puzzle" for "piecing together evidence",
+"lightbulb" for any abstract idea). That vagueness is exactly why they are
+usually WRONG — a beat about a specific physical tool, artifact, or bone
+needs an icon of that literal thing's category (see the vocabulary groups),
+not a metaphor icon. Reach for one of these six only when the beat is
+genuinely abstract with no concrete physical referent at all (e.g. "an
+open question remained" → "puzzle" is defensible; "a stone tool found in
+the dirt" → it is not — use a science/tool-adjacent icon or skip the icon
+in favor of a text treatment instead).
+
+Placement is handled automatically — every icon and text overlay is always
+centered on the frame by the renderer, regardless of what geometry_px you
+provide for it. You do not need to choose or vary placement; just provide
+reasonable width/height for the content (the x/y position is discarded
+and replaced with true center every time). Focus your creative judgment on
+which beats deserve an animation, what animation_type and content fit
+best, and sizing — not on where it sits on screen.
+
+Icon animations should look designed, not bare: pair every icon with a
+short, punchy display_text label when the concept benefits from one (most
+do) rather than shipping an icon alone with nothing to anchor its meaning
+— a floating unlabeled glyph reads as an afterthought. Size geometry_px
+generously enough to read as an intentional graphic element (prefer the
+160-220px range for a standalone icon_pop_in, not the tiny end of the
+40px floor) and pick color_hint deliberately per the mood-aware styling
+guidance above rather than defaulting to the same accent color every time.
+
+Mixing icons for richer visuals: you are not limited to one icon per
+animation. icon_name may be either a single string (the common case) or
+an array of 2-4 icon names when a beat's content genuinely benefits from
+combining concepts visually — e.g. "briefcase" + "trending-up" for a
+promotion, "brain" + "lightbulb" for a psychological insight, "globe" +
+"handshake" for an international deal. When icon_name is "icon_sequence",
+it must be an array (that animation_type exists specifically to reveal
+multiple icons in order). For other overlay_graphic types, use an array
+only when a single icon can't carry the idea — don't mix icons just
+because you can; an unearned combination reads as cluttered, not rich.
+When icon_name is an array, set icon_layout to one of "sequence" (icons
+appear one after another, cascading), "cluster" (icons appear together at
+once, grouped), or "pair" (exactly two icons side by side representing a
+relationship). icon_layout is null when icon_name is a single string.
+
+CONSISTENCY CHECK — required before you finalize any icon animation: if
+render_prompt, content_binding, or display_text describes TWO things
+being compared, contrasted, or juxtaposed (words like "versus", "vs",
+"or", "either/or", a slash as in "cut mark / hyena bite") — icon_name
+MUST actually be a 2-item array with icon_layout: "pair", representing
+BOTH sides of that comparison. Describing a pair in render_prompt while
+sending a single icon_name is a real defect: what actually renders is one
+unrelated-looking icon next to comparison text, which reads as random
+rather than analytical. If the vocabulary has no icon for one side of the
+comparison (e.g. no literal "hyena"), pick the closest available icon for
+EACH side rather than dropping to a single icon — a generic "dog" paired
+with a tool-adjacent icon for "cut mark" still reads as a comparison; a
+lone "dog" next to "cut mark / hyena bite" text does not.
+
+Mood-aware styling: each beat carries a scene_direction.mood from the Beat
+Director (e.g. "tense", "triumphant", "solemn", "playful"). Let it inform
+color_hint (e.g. warmer/brighter for triumphant or playful moods, cooler
+or higher-contrast for tense or solemn ones) and motion_style (e.g. sharp/
+quick for urgent moods, slow/gentle for reflective ones) — within what the
+category's footage_style/tone otherwise allows. This is a styling input,
+not a license to override the category's established palette.
+
+Real vs. fictional subjects: check key_subject_entity_type on the beat's
+animation_signal. If it's "fictional_character", do not choose a
+treatment that implies photographic reality (e.g. full_screen_broll
+framed as if showing that character) — no real footage of them exists.
+Prefer an illustrative/symbolic treatment instead: an icon-based animation
+representing the idea/mood, a full_screen_quote_card, or on-screen text —
+something that doesn't claim to depict a real image of someone who isn't
+real. "real_person" and "element" subjects have no such restriction.
+
+Your job
+
+Hard gate first: if requires_animation (from the Scene Planner, passed in
+as a scene-level field) is false, return an empty animations list for this
+entire scene — no exceptions, regardless of scene_animation_density or any
+beat's animation_signal. requires_animation is the scene-level "should
+this scene have animation treatment AT ALL" decision; it overrides
+everything below. Only proceed past this point if requires_animation is
+true.
+
+Icon requirement (applies whenever requires_animation is true): this scene
+MUST include at least one animation whose category is "overlay_graphic" or
+"branding" (i.e. one that carries a non-null icon_name) on some beat — this
+is a floor, not a suggestion, and it holds even for categories whose
+favored_animation_types/avoided_animation_types lean away from icons.
+Choose the beat where an icon is a genuinely strong content match (see ICON
+RELEVANCE above) rather than bolting one onto an arbitrary beat, and prefer
+icon_pop_in, icon_sequence, or arrow_highlight unless the content calls for
+something else in that category. This requirement stacks with, and does
+not replace, whatever other full_screen/overlay_text animations the
+scene's density and content call for elsewhere.
+
+For each beat, decide whether it actually gets an animation. The beat's
+animation_signal is a PROPOSAL from an earlier step, not a final decision —
+you may accept it, reject it (needs_animation was true but you judge it
+unnecessary), or add one it didn't flag, if the scene's overall
+animation_density budget calls for it. As a guide: "low" density scenes
+should end up with animation on roughly one beat, "medium" on a couple,
+"high" on most beats — but use judgment over rigid counts. The icon
+requirement above still applies regardless of density.
+
+Prefer favored_animation_types for this category and avoid
+avoided_animation_types unless the specific beat content overrides that
+default — except for the icon requirement above, which always wins.
+
+Vary treatment across beats within the scene — do not give consecutive
+animated beats the same animation_type/placement combination back to back
+unless the content specifically calls for repeating it, so the video keeps
+visibly changing rather than looking static. This also applies at the
+scene boundary: if this scene's first animated beat would otherwise match
+previous_scene_last_animation's animation_type AND placement exactly,
+change at least one of the two unless the content clearly calls for
+repeating it.
+
+Space animations out in TIME, not just in type/placement: within your
+animation_density budget, prefer distributing animated beats across the
+scene rather than clustering several back-to-back with plain beats only
+at the very end (or vice versa). A "medium" density scene with 6 beats
+reads better as animation on beats 1, 3, 5 than on beats 1, 2, 3 — the
+viewer needs a few seconds of plain footage between emphasis moments to
+actually register each one, and clustering makes the video feel busy in
+one stretch and empty in another rather than evenly paced throughout.
+
+`trigger` still describes the CHARACTER of the timing (for logging/
+downstream context), but actual sync now comes from anchor_start_sec/
+anchor_end_sec above, not from trigger or from Storybit guessing at your
+text afterward:
+- Use "on_keyword" when this animation is tied to a specific word or
+  phrase being spoken (a named quote, a statistic, a defined term, the
+  exact moment key_subject is said) — and set anchor_start_sec/
+  anchor_end_sec to that phrase's real words[] timestamps per the TIMING
+  section above.
+- Use "on_beat" for animations that characterize the whole beat (a mood
+  wash, a scene-setting title card) rather than a single moment within
+  it — anchor_start_sec/anchor_end_sec still required, spanning the
+  beat's full words range in that case.
+- Whichever trigger you choose, anchor_start_sec/anchor_end_sec must
+  reflect where you're actually placing it — don't let trigger and the
+  anchor timing disagree with each other.
+
+Text sizing: keep display_text short enough to comfortably fit
+geometry_px at a readable size. As a rule of thumb, assume roughly 14-18
+characters fit per 100px of box width at a comfortable reading size — if
+your intended phrase is longer than that, shorten the ON-SCREEN wording
+(never alter the underlying narration) or widen geometry_px within the
+safe margins already described above, rather than shrinking text to the
+point of being unreadable.
+
+Quoted-source handling: if a beat's source_type is "quoted_source", use
+"full_screen_document_highlight" (or another full_screen quote treatment
+only if document_highlight clearly doesn't fit). This treatment is backed
+by a REAL screenshot of the actual source page (captured separately from
+you, using source_name_guess) — not an AI-generated mockup. Because the
+real page's layout is unknown to you in advance, do NOT invent pixel
+coordinates for the highlight itself — instead:
+- set highlight_target_text to the quoted_excerpt exactly as given, so a
+  downstream text-locating step (OCR/text search over the captured
+  screenshot, and the same phrase-timing match described above) can find
+  and highlight it precisely and time it correctly;
+- use render_prompt only to describe the highlight STYLE and timing (e.g.
+  "yellow marker-style highlight sweeps left to right under the sentence,
+  starting 1s after the screenshot appears, holding for the rest of the
+  beat") and to name the source if inferable from vo_text;
+- geometry_px for this animation_type is always the full frame
+  (x=0, y=0, width={CANVAS_WIDTH}, height={CANVAS_HEIGHT}) since the
+  screenshot itself fills the screen.
+
+ALLOWED animation_type VALUES (grouped by category):
+
+FULL_SCREEN (category: "full_screen")
+- full_screen_broll, full_screen_title_card, full_screen_data_viz,
+  full_screen_transition, full_screen_color_wash, full_screen_quote_card,
+  full_screen_document_highlight
+
+OVERLAY_TEXT (category: "overlay_text")
+- lower_third, kinetic_caption, bullet_list_reveal, callout_textbox,
+  stat_counter_overlay
+
+OVERLAY_GRAPHIC (category: "overlay_graphic")
+- icon_pop_in, icon_sequence, logo_watermark, emoji_reaction,
+  arrow_highlight, badge_sticker
+
+PICTURE_IN_PICTURE (category: "pip")
+- pip_video, split_screen, multi_panel_grid
+
+CHARACTER (category: "branding")
+- avatar_overlay, mascot_animation
+
+MOTION_EFFECT (category: "transition")
+- ken_burns_pan_zoom, parallax_layering, shake_impact, speed_ramp_indicator
+
+Placement values: for full_screen/transition, always "full_frame". For
+overlay_text/overlay_graphic, the placement field and any x/y you set in
+geometry_px are informational only — the renderer always centers these on
+the frame automatically, clear of the caption band at the bottom by
+construction. Just set placement to "center" for these two categories.
 
 Output Schema
 
-Return a JSON array where every object contains exactly these fields:
+Return exactly one JSON object, nothing else — no markdown, no code fences:
 
 {{
-  "scene_id": "s1",
-  "vo_text": "Exact narration for this scene.",
-  "visual_intent": "Concise documentary-style description of what should be shown.",
-  "on_screen_text": "Short text overlay or empty string.",
-  "requires_animation": true/false
+  "animations": [
+    {{
+      "beat_id": "s1_beat1",
+      "animation_type": "icon_pop_in",
+      "category": "overlay_graphic",
+      "placement": "top_right",
+      "geometry_px": {{"x": 1696, "y": 64, "width": 160, "height": 160}},
+      "motion": {{
+        "start_xy_px": [1696, 44],
+        "end_xy_px": [1696, 64],
+        "motion_style": "pop-in with slight bounce, scale 80% to 100%"
+      }},
+      "z_index_layer": "foreground",
+      "trigger": "on_keyword",
+      "anchor_start_sec": 14.86,
+      "anchor_end_sec": 15.34,
+      "duration_frames": 45,
+      "content_binding": "icon:lightbulb",
+      "icon_name": "lightbulb",
+      "icon_layout": null,
+      "display_text": null,
+      "color_hint": "#5B9BD5",
+      "background_color_hint": null,
+      "highlight_target_text": null,
+      "render_prompt": "A lightbulb icon pops in from 80% scale to 100% with a slight bounce, positioned top-right, appearing exactly as the word 'idea' is spoken; icon uses the video's accent color; holds for 1.5s then fades.",
+      "render_engine_hint": "remotion"
+    }}
+  ]
 }}
+
 Field Guidelines
 
-scene_id
+beat_id: must match a beat_id from the input beats array. Only include
+beats that actually receive an animation — omit beats with no animation.
 
-Sequential: s1, s2, s3, ...
+anchor_start_sec / anchor_end_sec: REQUIRED for every animation. Copied
+directly from this beat's words array (see the TIMING section above) —
+not estimated, not derived from estimated_duration_seconds. This is what
+Storybit uses to actually position the animation on the timeline; getting
+this right is the single most important thing in your output.
 
-vo_text
+geometry_px: {{x, y, width, height}} in real pixels on the
+{CANVAS_WIDTH}x{CANVAS_HEIGHT} canvas — the element's full rendered
+footprint. Derive x/y from the PLACEMENT_ANCHORS_PX entry for your chosen
+placement, then choose width/height deliberately for this content: icons
+typically 120-240px square depending on emphasis; text overlay boxes sized
+to fit the actual text at a readable size (roughly 36-64px font for
+overlay text, larger for full_screen title/quote cards); pip frames
+roughly 1/3 to 1/2 of canvas width/height. For full_screen and transition
+category types, geometry_px is always the full frame: {{"x": 0, "y": 0,
+"width": {CANVAS_WIDTH}, "height": {CANVAS_HEIGHT}}}.
 
-Copy the narration exactly.
+motion: {{start_xy_px, end_xy_px, motion_style}}. For a static element
+(appears in place, no travel), set start_xy_px equal to end_xy_px and
+describe the entrance/exit behavior (fade, pop, scale) in motion_style.
+For an element that visibly moves or travels across the frame, set
+different start/end coordinates. motion_style is a short phrase, not a
+full paragraph — the paragraph-level detail goes in render_prompt.
 
-Do not paraphrase or rewrite.
+icon_name: a single string, or an array of 2-4 strings (see "Mixing icons"
+above), from the icon vocabulary — required (non-null) whenever category
+is "overlay_graphic" or "branding". null for every other category.
 
-visual_intent
+icon_layout: "sequence", "cluster", or "pair" — required (non-null) when
+icon_name is an array; null when icon_name is a single string or null.
 
-Write a concise documentary-style search query suitable for B-roll retrieval.
+display_text: the literal on-screen text for this animation, grounded in
+this beat's vo_text/on_screen_text/key_subject — never invented wording.
+A single string for most types; an array of short strings for
+bullet_list_reveal or icon_sequence when each item needs its own label.
+null for animation types with no on-screen text (e.g. a plain
+ken_burns_pan_zoom with no overlay copy).
 
-Prefer real-world imagery.
+color_hint: a hex color string (e.g. "#F5A623" for one animation, "#5B9BD5"
+for another), always required — the accent color for this animation,
+chosen to fit the category's footage_style/tone unless the specific beat
+content calls for something else (e.g. a red accent for a warning
+statistic). Do NOT reuse the same hex value across every animation in a
+scene (or across scenes) just because one example value appears in this
+prompt — that value is illustrative, not a default to copy. Vary it
+deliberately per beat the same way you vary placement and animation_type,
+using the mood-aware styling guidance above.
 
-Mention important subjects, locations, time periods, or events.
+background_color_hint: optional hex color for the PANEL/BOX behind the
+text or icon badge itself — distinct from color_hint, which is the
+accent/icon color, not the panel. null (the default) means "use the
+renderer's own neutral panel color" — only set this when the specific
+beat's mood or category calls for a deliberately tinted panel instead of
+the neutral default (e.g. a warm tint for a triumphant beat). Leave null
+far more often than not; this is an occasional accent, not something to
+set on every animation.
 
-Avoid cinematic adjectives like "epic" or "dramatic" unless explicitly stated.
+highlight_target_text: the exact quoted_excerpt from the source beat's
+animation_signal when animation_type is "full_screen_document_highlight"
+(or any other treatment highlighting specific text within a real
+screenshot asset). null for every other animation_type.
 
-on_screen_text
+content_binding: a short free-form label kept for logging/debugging (e.g.
+"icon:lightbulb", "data:quarterly_revenue") — not the authoritative value
+for icon or text content; icon_name/display_text/color_hint above are what
+the renderer actually binds to.
 
-Use only when helpful for viewers, such as:
-
-Years
-
-Dates
-
-Locations
-
-People's names
-
-Statistics
-
-Short titles
-
-Otherwise return "".
-
-requires_animation
-
-Return true only if the scene benefits from:
-
-Kinetic typography
-
-Lower-third text
-
-Maps
-
-Charts
-
-Timelines
-
-Infographics
-
-Otherwise return false.
+render_prompt: a full descriptive creative-direction paragraph — human-
+readable rationale and motion/reveal detail for anyone reviewing this
+animation. It documents the "why" and the motion feel; it is not parsed by
+the renderer, which reads geometry_px/motion/icon_name/display_text/
+color_hint directly.
 
 Constraints
 
-Do not invent facts.
+Every field is required for each animation object. Do not omit any field
+(use null where noted above). Choose placement and geometry deliberately
+based on what will read best against this beat's B-roll and on_screen_text
+— a real creative decision, not a formality. Return ONLY the JSON object.
+"""
 
-Do not create timestamps.
 
-Do not include camera directions unless they improve B-roll retrieval (e.g., "aerial view", "satellite map", "close-up").
+class EditVideo(BaseModel):
+    userId: str
+    script: str
+    voice: str
+    langCode: str = "en"
+    durationMinutes: int = 0
+    volume: Optional[float] = None
+    loudness_normalization: Optional[bool] = None
+    text_normalization: Optional[bool] = None
 
-Keep visual_intent under roughly 15 words.
 
-Ensure the output is valid, parseable JSON.
+class TrackPatch(BaseModel):
+    track_id: str
+    updates: dict[str, Any]
 
-      """    
+
+_VALID_CAPTION_ANIMATION_TYPES = {
+    "kinetic_caption", "static_line", "typewriter", "word_pop",
+}
+
+
+class SceneStyleUpdate(BaseModel):
+    font_size: Optional[int] = None
+    font_family: Optional[str] = None
+    words_per_line: Optional[int] = None
+    text_color: Optional[str] = None
+    outline_color: Optional[str] = None
+    animation_type: Optional[str] = None
+    background_color: Optional[str] = None
+    vertical_position: Optional[Literal["top", "middle", "bottom"]] = None
+    margin_bottom_percent: Optional[float] = None
+    horizontal_position: Optional[Literal["left", "center", "right"]] = None
+    margin_horizontal_percent: Optional[float] = None
+
+
+class BeatSplitUpdate(BaseModel):
+    split_at: float
+
+
+class BeatInsertUpdate(BaseModel):
+    start: float
+    end: float
+
+
+class SceneTrimUpdate(BaseModel):
+    start: float
+    end: float
+
+
+class BeatAnimationUpdate(BaseModel):
+    """Create or edit the (at most one) animation attached to a beat."""
+    animation_type: Optional[str] = None
+    placement: Optional[str] = None
+    geometry_px: Optional[dict[str, Any]] = None
+    motion: Optional[dict[str, Any]] = None
+    duration_frames: Optional[int] = None
+    z_index_layer: Optional[str] = None
+    trigger: Optional[str] = None
+    content_binding: Optional[str] = None
+    icon_name: Optional[Any] = None
+    icon_layout: Optional[str] = None
+    display_text: Optional[Any] = None
+    color_hint: Optional[str] = None
+    background_color_hint: Optional[str] = None
+    font_size: Optional[int] = None
+    highlight_target_text: Optional[str] = None
+    render_prompt: Optional[str] = None
+    render_engine_hint: Optional[str] = None
+
+
+class SceneBrollSelectUpdate(BaseModel):
+    asset_id: Any
+    source: str
+    beat_id: Optional[str] = None
+    motion_type: Optional[str] = None
+    start: Optional[float] = None
+    end: Optional[float] = None
+    adjust_next_beat: bool = True
+
+
+
+_HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
+RUN_SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("RUN_SUBPROCESS_TIMEOUT_SECONDS", "300"))
+
+async def _run(cmd: list[str], cwd: Optional[str] = None, timeout: Optional[float] = None) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout or RUN_SUBPROCESS_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(
+            f"Command timed out after {timeout or RUN_SUBPROCESS_TIMEOUT_SECONDS}s "
+            f"and was killed: {' '.join(cmd)}"
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
+            f"--- stderr ---\n{stderr.decode(errors='replace')[-4000:]}"
+        )
+
+
+def _validate_hex_color(value: Optional[str], field_name: str) -> None:
+    if value is None:
+        return
+    if not _HEX_COLOR_RE.match(value.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} must be a 6-digit hex color like '#111827', got {value!r}",
+        )
+
+
+def _log_token_usage(step_label: str, res: Any) -> None:
+   
+    try:
+        usage = getattr(res, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        total_tokens = getattr(usage, "total_tokens", None) if usage else None
+        if prompt_tokens is None and completion_tokens is None:
+            print(f"[tokens] {step_label}: no usage data on response")
+            return
+        print(
+            f"[tokens] {step_label}: input={prompt_tokens} output={completion_tokens} "
+            f"total={total_tokens if total_tokens is not None else (prompt_tokens or 0) + (completion_tokens or 0)}"
+        )
+    except Exception as e:
+        print(f"[tokens] {step_label}: failed to read usage ({e})")
+
+
+WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "small")
+WHISPERX_DEVICE = os.getenv("WHISPERX_DEVICE", "cpu")
+WHISPERX_COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "int8")
+
+PEXELS_SCENE_RESULT_LIMIT = int(os.getenv("PEXELS_SCENE_RESULT_LIMIT", "6"))
+PEXELS_SCENE_PER_KEYWORD_PER_PAGE = int(os.getenv("PEXELS_SCENE_PER_KEYWORD_PER_PAGE", "4"))
+PEXELS_SCENE_PAGE = 1
+
+PEXELS_SCENE_VIDEO_ORIENTATION = "landscape"
+PEXELS_SCENE_IMAGE_ORIENTATION = os.getenv("PEXELS_SCENE_IMAGE_ORIENTATION", "landscape")
+PEXELS_SCENE_SIZE = os.getenv("PEXELS_SCENE_SIZE", None)
+PEXELS_SCENE_COLOR = os.getenv("PEXELS_SCENE_COLOR", None)
+
+PEXELS_MAX_CONCURRENT_REQUESTS = int(os.getenv("PEXELS_MAX_CONCURRENT_REQUESTS", "8"))
+_pexels_semaphore = asyncio.Semaphore(PEXELS_MAX_CONCURRENT_REQUESTS)
+
+BROLL_KEYWORDS_MAX = int(os.getenv("BROLL_KEYWORDS_MAX", "6"))
+BROLL_KEYWORDS_MIN = int(os.getenv("BROLL_KEYWORDS_MIN", "5"))
+
+TIMELINE_FPS = int(os.getenv("TIMELINE_FPS", "30"))
+TIMELINE_WIDTH = int(os.getenv("TIMELINE_WIDTH", "1920"))
+TIMELINE_HEIGHT = int(os.getenv("TIMELINE_HEIGHT", "1080"))
+
+DEFAULT_CAPTION_STYLE = {
+    "vertical_position": "bottom",
+    "margin_bottom_percent": 3,
+}
+
+
+CAPTION_WORDS_PER_LINE = int(os.getenv("CAPTION_WORDS_PER_LINE", "10"))
+
+DEFAULT_CAPTION_FONT = os.getenv("DEFAULT_CAPTION_FONT", "Roboto")
+
+TTS_MAX_CHARS_PER_CALL = int(os.getenv("TTS_MAX_CHARS_PER_CALL", "900"))
+TTS_AUDIO_BUCKET = os.getenv("TTS_AUDIO_BUCKET", "generated-audio")
+
+_whisperx_model = None
+_whisperx_align_cache = {}
+_whisperx_lock = asyncio.Lock()
+
+
+def _get_whisperx_model():
+    global _whisperx_model
+    if _whisperx_model is None:
+        print(f"[WHISPERX] loading model '{WHISPERX_MODEL_SIZE}' on {WHISPERX_DEVICE}")
+        _whisperx_model = whisperx.load_model(
+            WHISPERX_MODEL_SIZE, WHISPERX_DEVICE, compute_type=WHISPERX_COMPUTE_TYPE,
+        )
+    return _whisperx_model
+
+
+def _run_whisperx_sync(audio_bytes: bytes) -> dict:
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+
+        model = _get_whisperx_model()
+        audio = whisperx.load_audio(tmp.name)
+
+        result = model.transcribe(audio, batch_size=16)
+        language = result["language"]
+
+        if language not in _whisperx_align_cache:
+            print(f"[WHISPERX] loading alignment model for language '{language}'")
+            align_model, metadata = whisperx.load_align_model(language_code=language, device=WHISPERX_DEVICE)
+            _whisperx_align_cache[language] = (align_model, metadata)
+
+        align_model, metadata = _whisperx_align_cache[language]
+
+        aligned_result = whisperx.align(
+            result["segments"], align_model, metadata, audio, WHISPERX_DEVICE,
+            return_char_alignments=False,
+        )
+
+        return {
+            "language": language,
+            "segments": aligned_result["segments"],
+            "word_segments": aligned_result.get("word_segments", []),
+        }
+
+
+async def _generate_word_timestamps(audio_url: str) -> dict:
+    audio_bytes = await _download_bytes(audio_url)
+    async with _whisperx_lock:
+        return await asyncio.to_thread(_run_whisperx_sync, audio_bytes)
+
+
+def _split_text_for_tts(text: str, max_chars: int = TTS_MAX_CHARS_PER_CALL) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks: list[str] = []
+    current = ""
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        candidate = f"{current} {sent}".strip() if current else sent
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(sent) <= max_chars:
+            current = sent
+        else:
+            for i in range(0, len(sent), max_chars):
+                chunks.append(sent[i:i + max_chars])
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _upload_audio_to_storage(local_path: str, user_id: str) -> str:
+    storage_path = f"{user_id}/{uuid.uuid4().hex}.mp3"
+    with open(local_path, "rb") as f:
+        supabase.storage.from_(TTS_AUDIO_BUCKET).upload(
+            storage_path, f, {"content-type": "audio/mpeg", "upsert": "true"}
+        )
+    return supabase.storage.from_(TTS_AUDIO_BUCKET).get_public_url(storage_path)
+
+
+async def _generate_speech_possibly_chunked(
+    user_id: str, tagged_text: str, voice: str, lang_code: str,
+    volume: Optional[float] = None,
+    loudness_normalization: Optional[bool] = None,
+    text_normalization: Optional[bool] = None,
+) -> dict:
+    tts_kwargs = {}
+    if volume is not None:
+        tts_kwargs["volume"] = volume
+    if loudness_normalization is not None:
+        tts_kwargs["loudnessNormalization"] = loudness_normalization
+    if text_normalization is not None:
+        tts_kwargs["textNormalization"] = text_normalization
+
+    chunks = _split_text_for_tts(tagged_text)
+
+    if len(chunks) <= 1:
+        speech_request = GenerateSpeechRequest(
+            userId=user_id, script=tagged_text, voice=voice, langCode=lang_code, durationMinutes=0, **tts_kwargs,
+        )
+        return await generate_speech(speech_request)
+
+    print(f"[tts] narration is {len(tagged_text)} chars — splitting into {len(chunks)} TTS calls to avoid provider truncation")
+
+    work_dir = tempfile.mkdtemp(prefix="tts_chunks_")
+    try:
+        chunk_paths = []
+        for idx, chunk_text in enumerate(chunks):
+            speech_request = GenerateSpeechRequest(
+                userId=user_id, script=chunk_text, voice=voice, langCode=lang_code, durationMinutes=0, **tts_kwargs,
+            )
+            chunk_result = await generate_speech(speech_request)
+            chunk_bytes = await _download_bytes(chunk_result["url"])
+            chunk_path = os.path.join(work_dir, f"chunk_{idx:03d}.mp3")
+            with open(chunk_path, "wb") as f:
+                f.write(chunk_bytes)
+            chunk_paths.append(chunk_path)
+
+        list_path = os.path.join(work_dir, "concat_list.txt")
+        with open(list_path, "w") as f:
+            for p in chunk_paths:
+                f.write(f"file '{p}'\n")
+
+        combined_path = os.path.join(work_dir, "combined.mp3")
+        cmd = [
+            FFMPEG_BIN, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c:a", "libmp3lame", "-b:a", "192k", combined_path,
+        ]
+        await _run(cmd)
+
+        combined_url = await _upload_audio_to_storage(combined_path, user_id)
+        return {"url": combined_url}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _get_scene_broll_keywords(scene: dict) -> list:
+    raw_keywords = scene.get("broll_keywords")
+
+    keywords = []
+    if isinstance(raw_keywords, list):
+        keywords = [k.strip() for k in raw_keywords if isinstance(k, str) and k.strip()]
+        seen = set()
+        deduped = []
+        for k in keywords:
+            key = k.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(k)
+        keywords = deduped
+
+    if len(keywords) >= BROLL_KEYWORDS_MIN:
+        return keywords[:BROLL_KEYWORDS_MAX]
+
+    fallback_extras = []
+    visual_intent = (scene.get("visual_intent") or "").strip()
+    if visual_intent and visual_intent.lower() not in [k.lower() for k in keywords]:
+        fallback_extras.append(visual_intent)
+
+    vo_snippet = (scene.get("vo_text") or "").strip()[:60]
+    if vo_snippet and vo_snippet.lower() not in [k.lower() for k in keywords]:
+        fallback_extras.append(vo_snippet)
+
+    keywords = (keywords + fallback_extras)[:BROLL_KEYWORDS_MAX]
+
+    if not keywords:
+        print(f"[edit-video] scene {scene.get('scene_id')} has no usable broll_keywords or fallback text")
+
+    return keywords
+
+
+def _dedupe_and_trim(items: list, limit: Optional[int] = None) -> list:
+    def _identity(item: dict):
+        for key in ("id", "video_id", "photo_id", "asset_id"):
+            if key in item:
+                return item[key]
+        for key in ("url", "src", "image", "video_url", "link"):
+            if key in item:
+                return item[key]
+        return None
+
+    seen = set()
+    deduped = []
+    for item in items:
+        item_id = _identity(item)
+        if item_id is not None:
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+        deduped.append(item)
+        if limit is not None and len(deduped) >= limit:
+            break
+    return deduped
+
+
+async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
+    empty_result = {
+        "videos": {"total_results": 0, "results": [], "error": None},
+        "images": {"total_results": 0, "results": [], "error": None},
+    }
+
+    if not keywords:
+        return empty_result
+
+    if not PEXELS_API_KEY:
+        empty_result["videos"]["error"] = "PEXELS_API_KEY is not configured on the server."
+        empty_result["images"]["error"] = "PEXELS_API_KEY is not configured on the server."
+        return empty_result
+
+    async def _get_videos_for(keyword: str):
+        try:
+            async with _pexels_semaphore:
+                data = await asyncio.to_thread(
+                    _pexels_search_videos_sync, keyword, PEXELS_SCENE_PER_KEYWORD_PER_PAGE,
+                    PEXELS_SCENE_PAGE, PEXELS_SCENE_VIDEO_ORIENTATION, PEXELS_SCENE_SIZE,
+                )
+            return {"keyword": keyword, "data": data, "error": None}
+        except Exception as e:
+            return {"keyword": keyword, "data": None, "error": str(e)}
+
+    async def _get_images_for(keyword: str):
+        try:
+            async with _pexels_semaphore:
+                data = await asyncio.to_thread(
+                    _pexels_search_images_sync, keyword, PEXELS_SCENE_PER_KEYWORD_PER_PAGE,
+                    PEXELS_SCENE_PAGE, PEXELS_SCENE_IMAGE_ORIENTATION, PEXELS_SCENE_SIZE, PEXELS_SCENE_COLOR,
+                )
+            return {"keyword": keyword, "data": data, "error": None}
+        except Exception as e:
+            return {"keyword": keyword, "data": None, "error": str(e)}
+
+    video_tasks = [_get_videos_for(k) for k in keywords]
+    image_tasks = [_get_images_for(k) for k in keywords]
+    video_results, image_results = await asyncio.gather(
+        asyncio.gather(*video_tasks), asyncio.gather(*image_tasks),
+    )
+
+    video_errors = [r["error"] for r in video_results if r["error"]]
+    videos_pool = []
+    for r in video_results:
+        if r["error"]:
+            continue
+        videos_pool.extend(_format_video_result(v) for v in (r["data"].get("videos") or []))
+
+    pre_filter_count = len(videos_pool)
+    videos_pool = [v for v in videos_pool if _video_is_landscape(v)]
+    dropped = pre_filter_count - len(videos_pool)
+    if dropped:
+        print(f"[edit-video] {label}: dropped {dropped} non-landscape video result(s) at fetch time")
+
+    image_errors = [r["error"] for r in image_results if r["error"]]
+    images_pool = []
+    for r in image_results:
+        if r["error"]:
+            continue
+        images_pool.extend(_format_image_result(p) for p in (r["data"].get("photos") or []))
+
+    pre_filter_img_count = len(images_pool)
+    images_pool = [p for p in images_pool if _image_is_landscape(p)]
+    dropped_img = pre_filter_img_count - len(images_pool)
+    if dropped_img:
+        print(f"[edit-video] {label}: dropped {dropped_img} non-landscape image result(s) at fetch time")
+
+    # No reranking model — dedupe the per-keyword Pexels results and keep
+    # the top N in whatever order they were returned (keyword order, then
+    # within-keyword result order).
+    videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
+    photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
+
+    videos_error = "; ".join(video_errors) if video_errors and not videos else None
+    images_error = "; ".join(image_errors) if image_errors and not photos else None
+
+    return {
+        "videos": {"total_results": len(videos), "results": videos, "error": videos_error},
+        "images": {"total_results": len(photos), "results": photos, "error": images_error},
+    }
+
+
+def _beat_media_is_empty(beat: dict) -> bool:
+    media = beat.get("media") or {}
+    return not (media.get("videos") or {}).get("results") and not (media.get("images") or {}).get("results")
+
+
+_LAST_RESORT_BROLL_TERMS = [
+    "abstract background", "soft light texture", "historical documents",
+    "old map parchment", "clouds sky timelapse", "city skyline aerial",
+]
+
+
+async def _fill_empty_beats(scene: dict, beats: list, fallback_keywords: list) -> None:
+    scene_id = scene.get("scene_id")
+
+    empty_beats = [b for b in beats if _beat_media_is_empty(b)]
+    if not empty_beats:
+        return
+
+    retry_results = await asyncio.gather(*[
+        _fetch_media_for_keywords(fallback_keywords, f"{scene_id}:{b['beat_id']}:retry-scene-keywords")
+        for b in empty_beats
+    ])
+    for b, media in zip(empty_beats, retry_results):
+        if (media.get("videos") or {}).get("results") or (media.get("images") or {}).get("results"):
+            b["media"] = media
+            print(f"[edit-video] beat {b['beat_id']} was empty, filled via scene-level keyword retry")
+
+    still_empty = [b for b in beats if _beat_media_is_empty(b)]
+    if not still_empty:
+        return
+
+    non_empty = [b for b in beats if not _beat_media_is_empty(b)]
+    if non_empty:
+        for b in still_empty:
+            idx = b.get("beat_index", 0)
+            nearest = min(non_empty, key=lambda o: abs(o.get("beat_index", 0) - idx))
+            b["media"] = {
+                "videos": dict(nearest["media"].get("videos") or {}),
+                "images": dict(nearest["media"].get("images") or {}),
+            }
+            b["_media_fallback_reason"] = f"borrowed from {nearest['beat_id']}"
+            print(f"[edit-video] beat {b['beat_id']} was empty, borrowed media from beat {nearest['beat_id']}")
+        return
+
+    print(f"[edit-video][WARN] scene {scene_id}: EVERY beat came back empty — trying generic last-resort terms")
+    last_resort_media = await _fetch_media_for_keywords(_LAST_RESORT_BROLL_TERMS, f"{scene_id}:last-resort")
+    if (last_resort_media.get("videos") or {}).get("results") or (last_resort_media.get("images") or {}).get("results"):
+        for b in still_empty:
+            b["media"] = last_resort_media
+            b["_media_fallback_reason"] = "generic last-resort terms"
+    else:
+        print(
+            f"[edit-video][ERROR] scene {scene_id}: last-resort generic search ALSO returned "
+            f"nothing — check PEXELS_API_KEY / Pexels reachability, this is no longer a content issue"
+        )
+
+
+def _aggregate_beats_media(beats: list) -> dict:
+    all_videos, all_images = [], []
+    for b in beats:
+        m = b.get("media") or {}
+        all_videos.extend((m.get("videos") or {}).get("results") or [])
+        all_images.extend((m.get("images") or {}).get("results") or [])
+    limit = PEXELS_SCENE_RESULT_LIMIT * max(len(beats), 1)
+    videos = _dedupe_and_trim(all_videos, limit=limit)
+    images = _dedupe_and_trim(all_images, limit=limit)
+    return {
+        "videos": {"total_results": len(videos), "results": videos, "error": None},
+        "images": {"total_results": len(images), "results": images, "error": None},
+    }
+
+
+def _resolve_beat_broll_selection(beat: dict) -> tuple:
+    override = beat.get("broll_override")
+    if override and override.get("asset_id") is not None:
+        source = override.get("source")
+        file_url = _resolve_broll_file_url(override, source)
+        if file_url:
+            return (
+                {
+                    "id": override.get("asset_id"), "file_url": file_url, "source": source,
+                    **{k: v for k, v in override.items() if k not in ("asset_id", "source", "file_url")},
+                },
+                source,
+            )
+        print(f"[timeline] beat {beat.get('beat_id')} has a broll_override that couldn't be resolved to a landscape file — falling back to default candidate")
+
+    media = beat.get("media") or {}
+    video_candidates = (media.get("videos") or {}).get("results") or []
+    image_candidates = (media.get("images") or {}).get("results") or []
+
+    best_video = video_candidates[0] if video_candidates else None
+    best_image = image_candidates[0] if image_candidates else None
+
+    preferred = beat.get("preferred_media_type")
+    if preferred == "image":
+        if best_image:
+            return best_image, "image"
+        if best_video:
+            return best_video, "video"
+        return None, None
+    if preferred == "video":
+        if best_video:
+            return best_video, "video"
+        if best_image:
+            return best_image, "image"
+        return None, None
+
+    if best_video:
+        return best_video, "video"
+    if best_image:
+        return best_image, "image"
+    return None, None
+
+_VALID_MEDIA_TYPES = {"video", "image"}
+
+_MOTION_TYPE_LIST = ["zoom_in", "zoom_out", "pan_left", "pan_right", "tilt_up", "tilt_down"]
+_VALID_MOTION_TYPES = set(_MOTION_TYPE_LIST)
+_DEFAULT_MOTION_TYPE = "zoom_in"
+
+
+def _pick_diversified_motion_type(previous_motion_type: Optional[str], beat_index: int) -> str:
+    """B-roll Ken-Burns pan/zoom motion (distinct from the overlay `motion`
+    object the Animation Planner returns). The new BEAT_KEYWORDS_PROMPT no
+    longer asks the model for this, so it's assigned deterministically."""
+    candidates = [m for m in _MOTION_TYPE_LIST if m != previous_motion_type] or list(_MOTION_TYPE_LIST)
+    return candidates[beat_index % len(candidates)]
+
+
+def _resolve_beat_motion_type(beat: dict) -> str:
+    override = beat.get("broll_override") or {}
+    motion = override.get("motion_type")
+    if motion in _VALID_MOTION_TYPES:
+        return motion
+    motion = beat.get("motion_type")
+    if motion in _VALID_MOTION_TYPES:
+        return motion
+    return _DEFAULT_MOTION_TYPE
+
+
+def _find_beat_broll_candidate(beat: dict, asset_id: Any, source: str) -> Optional[dict]:
+    media = beat.get("media") or {}
+    pool_key = "videos" if source == "video" else "images"
+    candidates = (media.get(pool_key) or {}).get("results") or []
+    for c in candidates:
+        if str(c.get("id")) == str(asset_id):
+            return c
+    return None
+
+
+async def _fetch_pexels_asset_by_id(asset_id: Any, source: str) -> Optional[dict]:
+    if not PEXELS_API_KEY:
+        return None
+
+    url = (
+        f"https://api.pexels.com/videos/videos/{asset_id}"
+        if source == "video"
+        else f"https://api.pexels.com/v1/photos/{asset_id}"
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers={"Authorization": PEXELS_API_KEY}, timeout=15.0)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        print(f"[broll] direct Pexels lookup failed for {source} asset {asset_id}: {e}")
+        return None
+
+    return _format_video_result(data) if source == "video" else _format_image_result(data)
+
+
+def _seconds_to_frames(seconds: float, fps: int = TIMELINE_FPS) -> int:
+    return max(round((seconds or 0.0) * fps), 0)
+
+
+def _slim_selected_asset(selected: Optional[dict]) -> Optional[dict]:
+    if not selected:
+        return None
+    return {
+        "asset_id": selected.get("asset_id") if "asset_id" in selected else selected.get("id"),
+        "file_url": selected.get("file_url"),
+        "source": selected.get("source"),
+        "width": selected.get("width"),
+        "height": selected.get("height"),
+    }
+
+
+def _words_in_range(timed_words: list, start: float, end: float) -> str:
+    words = [
+        (w.get("word") or "").strip()
+        for w in timed_words
+        if w.get("start", -1) >= start - 1e-6 and w.get("start", -1) < end + 1e-6
+    ]
+    return " ".join(w for w in words if w)
+
+
+
+def _validate_entity(e: Any) -> Optional[dict]:
+    if not isinstance(e, dict):
+        return None
+    name = e.get("canonical_name") or e.get("name")
+    etype = e.get("entity_type")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if etype not in ("real_person", "fictional_character", "element"):
+        etype = "element"
+    result = {"name": name.strip(), "entity_type": etype}
+    aliases = e.get("aliases")
+    if isinstance(aliases, list):
+        clean_aliases = [a.strip() for a in aliases if isinstance(a, str) and a.strip()]
+        if clean_aliases:
+            result["aliases"] = clean_aliases
+    return result
+
+
+def _validate_scene_direction(raw: Any) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    setting = raw.get("setting") if isinstance(raw.get("setting"), dict) else {}
+    location = setting.get("location") if isinstance(setting.get("location"), str) else ""
+    time_period = setting.get("time_period") if isinstance(setting.get("time_period"), str) else ""
+    mood = raw.get("mood") if isinstance(raw.get("mood"), str) and raw.get("mood").strip() else "neutral"
+    key_action = (
+        raw.get("key_action")
+        if isinstance(raw.get("key_action"), str) and raw.get("key_action").strip()
+        else "narration continues"
+    )
+    return {"setting": {"location": location, "time_period": time_period}, "mood": mood, "key_action": key_action}
+
+
+def _validate_animation_signal(raw: Any) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    needs_animation = bool(raw.get("needs_animation"))
+    intent = raw.get("intent") if isinstance(raw.get("intent"), str) else ""
+    suggested_category = raw.get("suggested_category")
+    if suggested_category not in ANIMATION_TAXONOMY:
+        suggested_category = None
+    key_subject = raw.get("key_subject") if isinstance(raw.get("key_subject"), str) else ""
+    source_type = raw.get("source_type") if raw.get("source_type") in ("quoted_source", "narrative") else "narrative"
+    quoted_excerpt = raw.get("quoted_excerpt") if isinstance(raw.get("quoted_excerpt"), str) else None
+    source_name_guess = raw.get("source_name_guess") if isinstance(raw.get("source_name_guess"), str) else None
+    key_subject_entity_type = raw.get("key_subject_entity_type")
+    if key_subject_entity_type not in ("real_person", "fictional_character", "element"):
+        key_subject_entity_type = None
+    return {
+        "needs_animation": needs_animation,
+        "intent": intent,
+        "suggested_category": suggested_category,
+        "key_subject": key_subject,
+        "source_type": source_type,
+        "quoted_excerpt": quoted_excerpt,
+        "source_name_guess": source_name_guess,
+        "key_subject_entity_type": key_subject_entity_type,
+    }
+
+
+def _validate_beat(raw: Any, id_prefix: str, index: int) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+
+    vo_text = raw.get("vo_text") if isinstance(raw.get("vo_text"), str) else ""
+
+    keywords_raw = raw.get("keywords")
+    keywords = []
+    if isinstance(keywords_raw, list):
+        keywords = [k.strip() for k in keywords_raw if isinstance(k, str) and k.strip()]
+        seen, deduped = set(), []
+        for k in keywords:
+            key = k.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(k)
+        keywords = deduped
+
+    media_type = str(raw.get("media_type") or "").strip().lower()
+    if media_type not in _VALID_MEDIA_TYPES:
+        media_type = "video"
+
+    entities = [v for v in (_validate_entity(e) for e in (raw.get("entities") or [])) if v]
+    scene_direction = _validate_scene_direction(raw.get("scene_direction"))
+    animation_signal = _validate_animation_signal(raw.get("animation_signal"))
+
+    beat_visual_intent = raw.get("visual_intent")
+    if not isinstance(beat_visual_intent, str):
+        beat_visual_intent = ""
+
+    try:
+        est = int(raw.get("estimated_duration_seconds"))
+        if est <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        est = max(1, round(len(vo_text.split()) / 2.33))
+
+    return {
+        "beat_id": f"{id_prefix}_beat{index + 1}",
+        "beat_index": index,
+        "vo_text": vo_text,
+        "visual_intent": beat_visual_intent,
+        "estimated_duration_seconds": est,
+        "keywords": keywords,
+        "media_type": media_type,
+        "preferred_media_type": media_type,
+        "entities": entities,
+        "scene_direction": scene_direction,
+        "animation_signal": animation_signal,
+    }
+
+
+async def _run_beat_director(
+    *, scene_vo_text: str, category: str, style_profile: dict, script_language: str,
+    scene_id: str, scene_visual_intent: str, scene_animation_density: str, scene_on_screen_text: str,
+    previous_scene_last_media_type: Optional[str], known_entities: list, known_setting: dict,
+    id_prefix: str,
+) -> list[dict]:
+    context = {
+        "category": category,
+        "style_profile": style_profile,
+        "script_language": script_language,
+        "scene_id": scene_id,
+        "scene_visual_intent": scene_visual_intent,
+        "scene_animation_density": scene_animation_density,
+        "scene_on_screen_text": scene_on_screen_text,
+        "scene_vo_text": scene_vo_text,
+        "previous_scene_last_media_type": previous_scene_last_media_type,
+        "known_entities": known_entities,
+        "known_setting": known_setting,
+    }
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": BEAT_KEYWORDS_PROMPT},
+                    {"role": "user", "content": json.dumps(context)},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("edit video - beat director", res)
+        _log_token_usage("Beat Director", res)
+
+        content = (res.choices[0].message.content or "").strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            if content.lower().startswith("json"):
+                content = content[4:].strip()
+
+        raw = json.loads(content)
+        raw_beats = raw.get("beats")
+        if not isinstance(raw_beats, list) or not raw_beats:
+            raise ValueError("beat director returned no beats")
+
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} beat director failed, using a single fallback beat: {e}")
+        fallback_keywords = _get_scene_broll_keywords(
+            {"broll_keywords": [], "visual_intent": scene_visual_intent, "vo_text": scene_vo_text}
+        )
+        return [{
+            "beat_id": f"{id_prefix}_beat1",
+            "beat_index": 0,
+            "vo_text": scene_vo_text,
+            "estimated_duration_seconds": max(1, round(len(scene_vo_text.split()) / 2.33)),
+            "keywords": fallback_keywords,
+            "media_type": "video",
+            "preferred_media_type": "video",
+            "entities": [],
+            "scene_direction": {
+                "setting": dict(known_setting or {"location": "", "time_period": ""}),
+                "mood": "neutral",
+                "key_action": "narration continues",
+            },
+            "animation_signal": _validate_animation_signal(None),
+        }]
+
+    beats = [_validate_beat(b, id_prefix, i) for i, b in enumerate(raw_beats)]
+
+    covered_words = sum(len(b["vo_text"].split()) for b in beats)
+    original_words = len(scene_vo_text.split())
+    if covered_words != original_words:
+        print(
+            f"[edit-video][WARN] scene {scene_id}: beat director word count "
+            f"mismatch ({covered_words} vs {original_words} original) — "
+            f"narration may have been dropped, duplicated, or paraphrased across beats"
+        )
+
+    for b in beats:
+        if len(b["keywords"]) < BROLL_KEYWORDS_MIN:
+            fallback = _get_scene_broll_keywords(
+                {"broll_keywords": [], "visual_intent": scene_visual_intent, "vo_text": b["vo_text"]}
+            )
+            merged, seen = [], set()
+            for k in b["keywords"] + fallback:
+                key = k.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(k)
+            b["keywords"] = merged[:BROLL_KEYWORDS_MAX]
+
+    previous_motion = None
+    for b in beats:
+        b["motion_type"] = _pick_diversified_motion_type(previous_motion, b["beat_index"])
+        previous_motion = b["motion_type"]
+
+    return beats
+
+
+def _align_beats_to_timed_words(beats: list, timed_words: list) -> None:
+    """Beats partition the scene's vo_text verbatim and in order, so we can
+    map each beat's word count onto a contiguous slice of WhisperX's
+    word-level timestamps."""
+    ptr = 0
+    n_words = len(timed_words)
+    for i, b in enumerate(beats):
+        count = len(b["vo_text"].split())
+        if count <= 0:
+            b["start"], b["end"] = None, None
+            continue
+        end_ptr = n_words if i == len(beats) - 1 else min(ptr + count, n_words)
+        chunk = timed_words[ptr:end_ptr]
+        if chunk:
+            b["start"] = chunk[0].get("start")
+            b["end"] = chunk[-1].get("end")
+        else:
+            b["start"], b["end"] = None, None
+        ptr = end_ptr
+
+    for i, b in enumerate(beats):
+        if b.get("start") is not None and b.get("end") is not None:
+            continue
+        prev_end = (
+            beats[i - 1]["end"] if i > 0 and beats[i - 1].get("end") is not None
+            else (timed_words[0]["start"] if timed_words else 0.0)
+        )
+        next_start = (
+            beats[i + 1]["start"] if i + 1 < len(beats) and beats[i + 1].get("start") is not None
+            else (timed_words[-1]["end"] if timed_words else prev_end + 1.0)
+        )
+        b["start"] = prev_end
+        b["end"] = max(next_start, prev_end + 0.5)
+
+  
+    for i in range(len(beats) - 1):
+        cur_end = beats[i].get("end")
+        next_start = beats[i + 1].get("start")
+        if cur_end is None or next_start is None:
+            continue
+        if next_start > cur_end:
+            beats[i]["end"] = next_start
+
+
+async def _fetch_beats_media(beats: list, label_prefix: str) -> None:
+    results = await asyncio.gather(*[
+        _fetch_media_for_keywords(b["keywords"], f"{label_prefix}:{b['beat_id']}") for b in beats
+    ])
+    for b, media in zip(beats, results):
+        b["media"] = media
+
+
+def _dedupe_beats_media_across_scene(beats: list) -> None:
+    used_ids: set = set()
+    for beat in beats:
+        media = beat.get("media") or {}
+        for pool_key in ("videos", "images"):
+            pool = media.get(pool_key) or {}
+            results = pool.get("results") or []
+            if not results:
+                continue
+            fresh = [r for r in results if r.get("id") not in used_ids]
+            reused = [r for r in results if r.get("id") in used_ids]
+            pool["results"] = fresh + reused
+        beat["media"] = media
+
+        default_asset, _source = _resolve_beat_broll_selection(beat)
+        if default_asset and default_asset.get("id") is not None:
+            used_ids.add(default_asset["id"])
+
+
+
+def _content_aware_max_box_size(display_text: Any) -> tuple:
+   
+    text = _display_text_to_string(display_text) if isinstance(display_text, (str, list)) else ""
+    if not text:
+        return (400, 110)
+    lines = [l for l in text.split("\n") if l.strip()] or [text]
+    longest_line = max((len(l) for l in lines), default=0)
+    num_lines = max(len(lines), 1)
+    max_width = min(700, max(220, longest_line * 13 + 100))
+    max_height = min(260, max(80, num_lines * 46 + 50))
+    return max_width, max_height
+
+
+def _validate_geometry_px(
+    raw: Any, category: str, allow_manual_placement: bool = False, display_text: Any = None,
+) -> dict:
+    if category in ("full_screen", "transition"):
+        return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
+
+    default = {"width": 520, "height": 160}
+    if not isinstance(raw, dict):
+        geo = {"x": 0, "y": 0, **default}
+    else:
+        try:
+            geo = {
+                "x": int(raw.get("x", 0)) if allow_manual_placement else 0,
+                "y": int(raw.get("y", 0)) if allow_manual_placement else 0,
+                "width": int(raw.get("width", default["width"])),
+                "height": int(raw.get("height", default["height"])),
+            }
+        except (TypeError, ValueError):
+            geo = {"x": 0, "y": 0, **default}
+
+    max_width = max(40, ANIMATION_CANVAS_WIDTH - 2 * _SAFE_MARGIN)
+    max_height = max(40, ANIMATION_CANVAS_HEIGHT - 2 * _SAFE_MARGIN)
+    if category == "overlay_text" and display_text is not None:
+       
+        content_max_w, content_max_h = _content_aware_max_box_size(display_text)
+        max_width = min(max_width, content_max_w)
+        max_height = min(max_height, content_max_h)
+    geo["width"] = max(40, min(geo["width"], max_width))
+    geo["height"] = max(40, min(geo["height"], max_height))
+
+    if allow_manual_placement and isinstance(raw, dict) and ("x" in raw or "y" in raw):
+        
+        geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
+        geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
+        if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
+            if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
+                geo["y"] = CAPTION_SAFE_ZONE_Y - geo["height"]
+            else:
+                geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
+                geo["y"] = _SAFE_MARGIN
+        return geo
+
+    geo["x"] = (ANIMATION_CANVAS_WIDTH - geo["width"]) // 2
+
+    if category in ("overlay_text", "overlay_graphic"):
+        centered_y = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
+        if centered_y + geo["height"] > CAPTION_SAFE_ZONE_Y:
+            if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
+                centered_y = CAPTION_SAFE_ZONE_Y - geo["height"]
+            else:
+                geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
+                centered_y = _SAFE_MARGIN
+        geo["y"] = centered_y
+    else:
+        geo["y"] = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
+
+    return geo
+
+
+def _validate_motion(raw: Any, geometry: dict) -> dict:
+    default_xy = [geometry["x"], geometry["y"]]
+    motion = {"start_xy_px": default_xy, "end_xy_px": default_xy, "motion_style": "fade in"}
+    if isinstance(raw, dict):
+        for key in ("start_xy_px", "end_xy_px"):
+            val = raw.get(key)
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                try:
+                    motion[key] = [float(val[0]), float(val[1])]
+                except (TypeError, ValueError):
+                    pass
+        style = raw.get("motion_style")
+        if isinstance(style, str) and style.strip():
+            motion["motion_style"] = style.strip()[:300]
+    return motion
+
+
+def _validate_beat_animation(
+    raw: Any, beat_ids: set, beats_by_id: Optional[dict] = None, allow_manual_placement: bool = False,
+) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    beat_id = raw.get("beat_id")
+    if beat_id not in beat_ids:
+        return None
+    animation_type = raw.get("animation_type")
+    if animation_type not in _VALID_ANIMATION_TYPES:
+        return None
+    category = _ANIMATION_TYPE_TO_CATEGORY[animation_type]
+
+    placement = raw.get("placement")
+    if category in ("full_screen", "transition"):
+        placement = "full_frame"
+    elif category in ("overlay_text", "overlay_graphic") and not allow_manual_placement:
+        placement = "center"
+    elif placement not in _VALID_PLACEMENTS:
+        placement = "top_left" if allow_manual_placement else "top_center"
+
+    geometry_px = _validate_geometry_px(
+        raw.get("geometry_px"), category, allow_manual_placement=allow_manual_placement,
+        display_text=raw.get("display_text"),
+    )
+    motion = _validate_motion(raw.get("motion"), geometry_px)
+
+    z_index_layer = raw.get("z_index_layer")
+    if z_index_layer not in _VALID_Z_LAYERS:
+        z_index_layer = "background" if category == "full_screen" else "foreground"
+
+    trigger = raw.get("trigger")
+    if trigger not in _VALID_TRIGGERS:
+        trigger = "on_beat"
+
+    try:
+        duration_frames = int(raw.get("duration_frames"))
+        if duration_frames <= 0 or duration_frames > 900:
+            raise ValueError
+    except (TypeError, ValueError):
+        duration_frames = 90
+
+    beat_info = (beats_by_id or {}).get(beat_id)
+    if beat_info is not None:
+        b_start, b_end = beat_info.get("start"), beat_info.get("end")
+        if b_start is not None and b_end is not None and b_end > b_start:
+            beat_frames = max(1, round((b_end - b_start) * TIMELINE_FPS))
+            duration_frames = min(duration_frames, beat_frames)
+
+    content_binding = raw.get("content_binding")
+    if not isinstance(content_binding, str):
+        content_binding = ""
+
+    icon_name = raw.get("icon_name")
+    icon_layout = raw.get("icon_layout")
+    if category in ("overlay_graphic", "branding"):
+        if isinstance(icon_name, str) and icon_name in _ICON_VOCAB:
+            icon_layout = None
+        elif isinstance(icon_name, list):
+            cleaned = [i for i in icon_name if isinstance(i, str) and i in _ICON_VOCAB][:4]
+            if len(cleaned) >= 2:
+                icon_name = cleaned
+                if icon_layout not in _VALID_ICON_LAYOUTS:
+                    icon_layout = "sequence" if animation_type == "icon_sequence" else "cluster"
+            elif len(cleaned) == 1:
+                icon_name, icon_layout = cleaned[0], None
+            else:
+                icon_name, icon_layout = "sparkles", None
+        else:
+            icon_name, icon_layout = "sparkles", None
+    else:
+        icon_name, icon_layout = None, None
+
+    if isinstance(icon_name, str) and icon_name:
+        comparison_source = " ".join(
+            str(x) for x in (raw.get("render_prompt"), raw.get("display_text"), raw.get("content_binding"))
+            if isinstance(x, str)
+        ).lower()
+        comparison_markers = (" versus ", " vs ", " vs. ", "/", " either ")
+        if any(m in comparison_source for m in comparison_markers):
+            print(
+                f"[edit-video] beat {beat_id}: animation_type={animation_type!r} has a single "
+                f"icon_name ({icon_name!r}) but its own render_prompt/display_text reads like a "
+                f"two-sided comparison — this will render as one icon next to comparison text "
+                f"with nothing visually linking them. Should likely have been icon_name=[a, b] "
+                f"with icon_layout='pair'."
+            )
+
+    display_text = raw.get("display_text")
+    if display_text is not None and not isinstance(display_text, (str, list)):
+        display_text = None
+    if isinstance(display_text, list):
+        display_text = [str(d) for d in display_text if isinstance(d, (str, int, float))][:8]
+
+    color_hint = raw.get("color_hint")
+    if not isinstance(color_hint, str) or not _HEX_COLOR_RE.match(color_hint.strip()):
+        color_hint = _pick_fallback_color(beat_id)
+    else:
+        color_hint = color_hint.strip()
+        if not color_hint.startswith("#"):
+            color_hint = f"#{color_hint}"
+
+    background_color_hint = raw.get("background_color_hint")
+    if isinstance(background_color_hint, str) and _HEX_COLOR_RE.match(background_color_hint.strip()):
+        background_color_hint = background_color_hint.strip()
+        if not background_color_hint.startswith("#"):
+            background_color_hint = f"#{background_color_hint}"
+    else:
+        background_color_hint = None
+
+    font_size = raw.get("font_size")
+    try:
+        font_size = int(font_size) if font_size is not None else None
+        if font_size is not None and not (10 <= font_size <= 200):
+            font_size = None
+    except (TypeError, ValueError):
+        font_size = None
+
+    highlight_target_text = raw.get("highlight_target_text")
+    if not isinstance(highlight_target_text, str) or not highlight_target_text.strip():
+        highlight_target_text = None
+
+    anchor_start_sec = raw.get("anchor_start_sec")
+    anchor_end_sec = raw.get("anchor_end_sec")
+    try:
+        anchor_start_sec = float(anchor_start_sec) if anchor_start_sec is not None else None
+    except (TypeError, ValueError):
+        anchor_start_sec = None
+    try:
+        anchor_end_sec = float(anchor_end_sec) if anchor_end_sec is not None else None
+    except (TypeError, ValueError):
+        anchor_end_sec = None
+    if anchor_start_sec is not None and anchor_end_sec is not None and anchor_end_sec < anchor_start_sec:
+        anchor_start_sec, anchor_end_sec = None, None
+
+    render_prompt = raw.get("render_prompt")
+    if not isinstance(render_prompt, str):
+        render_prompt = ""
+
+    render_engine_hint = raw.get("render_engine_hint")
+    if render_engine_hint not in _VALID_RENDER_HINTS:
+        render_engine_hint = "remotion" if category in ("overlay_text", "overlay_graphic", "pip", "branding") else "ffmpeg"
+
+    return {
+        "beat_id": beat_id,
+        "animation_type": animation_type,
+        "category": category,
+        "placement": placement,
+        "geometry_px": geometry_px,
+        "motion": motion,
+        "z_index_layer": z_index_layer,
+        "trigger": trigger,
+        "duration_frames": duration_frames,
+        "content_binding": content_binding,
+        "icon_name": icon_name,
+        "icon_layout": icon_layout,
+        "display_text": display_text,
+        "color_hint": color_hint,
+        "background_color_hint": background_color_hint,
+        "font_size": font_size,
+        "manually_placed": bool(allow_manual_placement or (isinstance(raw, dict) and raw.get("manually_placed"))),
+        "highlight_target_text": highlight_target_text,
+        "anchor_start_sec": anchor_start_sec,
+        "anchor_end_sec": anchor_end_sec,
+        "render_prompt": render_prompt,
+        "render_engine_hint": render_engine_hint,
+    }
+
+
+async def _run_animation_planner(
+    *, scene_id: str, scene_visual_intent: str, scene_on_screen_text: str, requires_animation: bool,
+    scene_animation_density: str, category: str, style_profile: dict, script_language: str,
+    beats: list, previous_scene_last_animation: Optional[dict], timed_words: Optional[list] = None,
+) -> list[dict]:
+    if not requires_animation:
+        return []
+
+    def _beat_words(b: dict) -> list:
+        if not timed_words:
+            return []
+        b_start, b_end = b.get("start"), b.get("end")
+        if b_start is None or b_end is None:
+            return []
+        return [
+            {"word": w.get("word", ""), "start": round(w["start"], 2), "end": round(w["end"], 2)}
+            for w in timed_words
+            if "start" in w and "end" in w and w["start"] >= b_start - 0.05 and w["start"] < b_end + 0.05
+        ]
+
+    beats_context = [
+        {
+            "beat_id": b["beat_id"],
+            "vo_text": b["vo_text"],
+            "estimated_duration_seconds": b["estimated_duration_seconds"],
+            "entities": b["entities"],
+            "scene_direction": b["scene_direction"],
+            "animation_signal": b["animation_signal"],
+            "words": _beat_words(b),
+        }
+        for b in beats
+    ]
+    context = {
+        "category": category,
+        "style_profile": style_profile,
+        "script_language": script_language,
+        "scene_id": scene_id,
+        "scene_visual_intent": scene_visual_intent,
+        "scene_on_screen_text": scene_on_screen_text,
+        "requires_animation": requires_animation,
+        "scene_animation_density": scene_animation_density,
+        "beats": beats_context,
+        "previous_scene_last_animation": previous_scene_last_animation,
+    }
+    beat_ids = {b["beat_id"] for b in beats}
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": ANIMATION_PLANNER_PROMPT},
+                    {"role": "user", "content": json.dumps(context)},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("edit video - animation plan", res)
+        _log_token_usage("Animation Planner", res)
+
+        content = (res.choices[0].message.content or "").strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            if content.lower().startswith("json"):
+                content = content[4:].strip()
+
+        raw = json.loads(content)
+        raw_animations = raw.get("animations")
+        if not isinstance(raw_animations, list):
+            raise ValueError("animation planner returned no 'animations' list")
+
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} animation planning failed, using no animations: {e}")
+        return []
+
+    validated, seen_beat_ids = [], set()
+    beats_by_id = {b["beat_id"]: b for b in beats}
+    for raw_anim in raw_animations:
+        v = _validate_beat_animation(raw_anim, beat_ids, beats_by_id)
+        if v and v["beat_id"] not in seen_beat_ids:
+            validated.append(v)
+            seen_beat_ids.add(v["beat_id"])
+
+
+    has_icon = any(v["category"] in ("overlay_graphic", "branding") for v in validated)
+    if not has_icon and beats:
+        target_beat = next((b for b in beats if b["beat_id"] not in seen_beat_ids), None)
+        replacing = target_beat is None
+        if target_beat is None:
+            target_beat = beats[0]
+
+        fallback_raw = _build_fallback_icon_animation(target_beat, category)
+        fallback_validated = _validate_beat_animation(fallback_raw, beat_ids, beats_by_id)
+        if fallback_validated:
+            if replacing:
+                validated = [v for v in validated if v["beat_id"] != target_beat["beat_id"]]
+            else:
+                seen_beat_ids.add(target_beat["beat_id"])
+            validated.append(fallback_validated)
+            print(f"[edit-video] scene {scene_id}: no icon animation from the model — injected a guaranteed icon_pop_in on beat {target_beat['beat_id']}")
+
+    return validated
+
+
+async def _get_or_create_tagged_text(scene: dict, scene_id, user_id: str, vo_text: str) -> str:
+    tags_request = AddScriptTagsRequest(userId=user_id, script=vo_text)
+    tags_result = await add_script_tags(tags_request)
+    return tags_result["tagged_script"]
+
+
+async def _process_scene(scene: dict, request: EditVideo, category: str, script_language: str, video_ctx: dict, is_first_scene: bool = False) -> dict:
+    scene_out = dict(scene)
+    vo_text = scene.get("vo_text", "")
+    scene_id = scene.get("scene_id")
+    style_profile = STYLE_PROFILES.get(category, STYLE_PROFILES["general_documentary"])
+    scene_animation_density = scene.get("scene_animation_density") or style_profile.get("animation_density", "medium")
+
+    known_entities_in = list(video_ctx["known_entities"])
+    known_setting_in = dict(video_ctx["known_setting"])
+    previous_media_type_in = video_ctx["previous_scene_last_media_type"]
+    previous_animation_in = video_ctx["previous_scene_last_animation"]
+
+    scene_out["_beat_director_context"] = {
+        "category": category,
+        "style_profile": style_profile,
+        "script_language": script_language,
+        "known_entities": known_entities_in,
+        "known_setting": known_setting_in,
+        "previous_scene_last_media_type": previous_media_type_in,
+    }
+    scene_out["_previous_scene_last_animation"] = previous_animation_in
+
+    async def _finalize(timed_words: list) -> dict:
+        beats = await _run_beat_director(
+            scene_vo_text=vo_text, category=category, style_profile=style_profile, script_language=script_language,
+            scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
+            scene_animation_density=scene_animation_density, scene_on_screen_text=scene.get("on_screen_text", ""),
+            previous_scene_last_media_type=previous_media_type_in,
+            known_entities=known_entities_in, known_setting=known_setting_in, id_prefix=scene_id,
+        )
+
+        if timed_words:
+            _align_beats_to_timed_words(beats, timed_words)
+        else:
+            for b in beats:
+                b["start"], b["end"] = None, None
+
+        fallback_keywords = _get_scene_broll_keywords(scene)
+        await _fetch_beats_media(beats, str(scene_id))
+        await _fill_empty_beats(scene, beats, fallback_keywords)
+        _dedupe_beats_media_across_scene(beats)
+
+        animations = await _run_animation_planner(
+            scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
+            scene_on_screen_text=scene.get("on_screen_text", ""),
+            requires_animation=bool(scene.get("requires_animation", False)),
+            scene_animation_density=scene_animation_density, category=category,
+            style_profile=style_profile, script_language=script_language,
+            beats=beats, previous_scene_last_animation=previous_animation_in,
+            timed_words=timed_words,
+        )
+
+        scene_out["beats"] = beats
+        scene_out["media"] = _aggregate_beats_media(beats)
+        scene_out["animations"] = animations
+
+        for b in beats:
+            for e in b["entities"]:
+                if not any(existing["name"].lower() == e["name"].lower() for existing in video_ctx["known_entities"]):
+                    video_ctx["known_entities"].append(e)
+            loc = b["scene_direction"]["setting"]["location"]
+            per = b["scene_direction"]["setting"]["time_period"]
+            if loc or per:
+                video_ctx["known_setting"] = {
+                    "location": loc or video_ctx["known_setting"].get("location", ""),
+                    "time_period": per or video_ctx["known_setting"].get("time_period", ""),
+                }
+        if beats:
+            video_ctx["previous_scene_last_media_type"] = beats[-1].get("preferred_media_type")
+        if animations:
+            last_anim = animations[-1]
+            video_ctx["previous_scene_last_animation"] = {
+                "animation_type": last_anim["animation_type"],
+                "placement": last_anim["placement"],
+                "category": last_anim["category"],
+            }
+
+        if scene_out.get("start") is not None and scene_out.get("end") is not None:
+            scene_out["duration_seconds"] = round(scene_out["end"] - scene_out["start"], 3)
+        else:
+            scene_out["duration_seconds"] = None
+        return scene_out
+
+    if not vo_text.strip():
+        scene_out["voiceover"] = None
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = None
+        return await _finalize([])
+
+    try:
+        tagged_text = await _get_or_create_tagged_text(scene, scene_id, request.userId, vo_text)
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} tagging failed: {e}")
+        scene_out["tagged_vo_text"] = None
+        scene_out["voiceover"] = None
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = f"voice tagging failed: {e}"
+        return await _finalize([])
+
+    try:
+        speech_result = await _generate_speech_possibly_chunked(
+            user_id=request.userId, tagged_text=tagged_text, voice=request.voice, lang_code=request.langCode,
+            volume=request.volume, loudness_normalization=request.loudness_normalization,
+            text_normalization=request.text_normalization,
+        )
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} voice generation failed: {e}")
+        scene_out["tagged_vo_text"] = tagged_text
+        scene_out["voiceover"] = None
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = f"voice generation failed: {e}"
+        return await _finalize([])
+
+    try:
+        scene_timestamps = await _generate_word_timestamps(speech_result["url"])
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} whisperx alignment failed: {e}")
+        scene_out["tagged_vo_text"] = tagged_text
+        scene_out["voiceover"] = speech_result
+        scene_out["start"] = None
+        scene_out["end"] = None
+        scene_out["word_segments"] = []
+        scene_out["error"] = f"timestamp alignment failed: {e}"
+        return await _finalize([])
+
+    word_segments = scene_timestamps.get("word_segments", [])
+    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+
+    if is_first_scene and timed_words and timed_words[0].get("start", 0.0) > 0.0:
+        print(
+            f"[edit-video] scene {scene_id}: clamping first word start "
+            f"{timed_words[0]['start']:.3f}s -> 0.0s so no leading audio is trimmed"
+        )
+        first_word_obj = timed_words[0]
+        for w in word_segments:
+            if w is first_word_obj:
+                w["start"] = 0.0
+                break
+        timed_words[0]["start"] = 0.0
+
+    scene_out["tagged_vo_text"] = tagged_text
+    scene_out["voiceover"] = speech_result
+    scene_out["start"] = timed_words[0]["start"] if timed_words else None
+    scene_out["end"] = timed_words[-1]["end"] if timed_words else None
+    scene_out["word_segments"] = word_segments
+    scene_out["error"] = None
+
+    return await _finalize(timed_words)
+
+
+async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
+    ctx = scene.get("_beat_director_context") or {
+        "category": "general_documentary",
+        "style_profile": STYLE_PROFILES["general_documentary"],
+        "script_language": "en",
+        "known_entities": [],
+        "known_setting": {"location": "", "time_period": ""},
+        "previous_scene_last_media_type": None,
+    }
+    previous_animation = scene.get("_previous_scene_last_animation")
+    scene_id = scene.get("scene_id")
+    vo_text = scene.get("vo_text", "")
+    scene_animation_density = scene.get("scene_animation_density") or ctx["style_profile"].get("animation_density", "medium")
+
+    beats = await _run_beat_director(
+        scene_vo_text=vo_text, category=ctx["category"], style_profile=ctx["style_profile"],
+        script_language=ctx["script_language"], scene_id=scene_id,
+        scene_visual_intent=scene.get("visual_intent", ""), scene_animation_density=scene_animation_density,
+        scene_on_screen_text=scene.get("on_screen_text", ""),
+        previous_scene_last_media_type=ctx["previous_scene_last_media_type"],
+        known_entities=ctx["known_entities"], known_setting=ctx["known_setting"], id_prefix=scene_id,
+    )
+
+    timed_words = [w for w in (scene.get("word_segments") or []) if "start" in w and "end" in w]
+    if timed_words:
+        _align_beats_to_timed_words(beats, timed_words)
+
+    fallback_keywords = _get_scene_broll_keywords(scene)
+    await _fetch_beats_media(beats, str(scene_id))
+    await _fill_empty_beats(scene, beats, fallback_keywords)
+    _dedupe_beats_media_across_scene(beats)
+
+    animations = await _run_animation_planner(
+        scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
+        scene_on_screen_text=scene.get("on_screen_text", ""),
+        requires_animation=bool(scene.get("requires_animation", False)),
+        scene_animation_density=scene_animation_density, category=ctx["category"],
+        style_profile=ctx["style_profile"], script_language=ctx["script_language"],
+        beats=beats, previous_scene_last_animation=previous_animation,
+        timed_words=timed_words,
+    )
+
+    scene["beats"] = beats
+    scene["media"] = _aggregate_beats_media(beats)
+    scene["animations"] = animations
+    return scene
+
+
+async def _rebuild_fragment_beats(scene: dict, local_start: float, local_end: float, id_prefix: str) -> list:
+    ctx = scene.get("_beat_director_context") or {
+        "category": "general_documentary",
+        "style_profile": STYLE_PROFILES["general_documentary"],
+        "script_language": "en",
+        "known_entities": [],
+        "known_setting": {"location": "", "time_period": ""},
+        "previous_scene_last_media_type": None,
+    }
+    word_segments = scene.get("word_segments") or []
+    timed_words_all = [w for w in word_segments if "start" in w and "end" in w]
+    fragment_timed_words = [
+        w for w in timed_words_all if w["start"] >= local_start - 1e-6 and w["start"] < local_end + 1e-6
+    ]
+    fragment_vo_text = _words_in_range(timed_words_all, local_start, local_end)
+
+    if not fragment_vo_text.strip():
+        return [{
+            "beat_id": f"{id_prefix}_beat1", "beat_index": 0, "vo_text": "",
+            "estimated_duration_seconds": max(1, round(local_end - local_start)),
+            "keywords": _get_scene_broll_keywords(scene), "media_type": "video", "preferred_media_type": "video",
+            "entities": [], "scene_direction": {"setting": dict(ctx["known_setting"]), "mood": "neutral", "key_action": "narration continues"},
+            "animation_signal": _validate_animation_signal(None), "motion_type": _DEFAULT_MOTION_TYPE,
+            "start": local_start, "end": local_end,
+        }]
+
+    beats = await _run_beat_director(
+        scene_vo_text=fragment_vo_text, category=ctx["category"], style_profile=ctx["style_profile"],
+        script_language=ctx["script_language"], scene_id=scene.get("scene_id"),
+        scene_visual_intent=scene.get("visual_intent", ""),
+        scene_animation_density=scene.get("scene_animation_density") or ctx["style_profile"].get("animation_density", "medium"),
+        scene_on_screen_text="",  # avoid re-triggering the same on-screen-text checklist item twice
+        previous_scene_last_media_type=None, known_entities=ctx["known_entities"], known_setting=ctx["known_setting"],
+        id_prefix=id_prefix,
+    )
+
+    if fragment_timed_words:
+        _align_beats_to_timed_words(beats, fragment_timed_words)
+    else:
+        for b in beats:
+            b["start"], b["end"] = local_start, local_end
+
+    fallback_keywords = _get_scene_broll_keywords(scene)
+    await _fetch_beats_media(beats, f"{scene.get('scene_id')}:{id_prefix}")
+    await _fill_empty_beats(scene, beats, fallback_keywords)
+    return beats
+
+
+
+_PHRASE_MATCH_PUNCT_RE = re.compile(r"[^\w\s]")
+
+
+def _normalize_phrase_word(w: str) -> str:
+    return _PHRASE_MATCH_PUNCT_RE.sub("", w or "").lower().strip()
+
+
+def _find_phrase_span_sec(
+    target_text: Optional[str], timed_words: list, search_start: float, search_end: float,
+    hint_start_sec: Optional[float] = None,
+) -> Optional[tuple]:
+    if not target_text or not timed_words:
+        return None
+    target_words = [_normalize_phrase_word(w) for w in target_text.split()]
+    target_words = [w for w in target_words if w]
+    if not target_words:
+        return None
+
+    window = [
+        w for w in timed_words
+        if "start" in w and "end" in w and w["start"] >= search_start - 0.05 and w["start"] < search_end + 0.05
+    ]
+    window_norm = [_normalize_phrase_word(w.get("word", "")) for w in window]
+    n = len(window_norm)
+    if n == 0:
+        return None
+
+    n_target = len(target_words)
+    min_run = min(n_target, 3)
+    min_ratio = 0.6 if n_target >= 5 else 1.0  
+
+    candidates = []  
+    best_score = None
+    for offset in range(-n_target, n):
+        matches = 0
+        run = 0
+        best_run = 0
+        for t in range(n_target):
+            wi = t + offset
+            if 0 <= wi < n and window_norm[wi] == target_words[t]:
+                matches += 1
+                run += 1
+                best_run = max(best_run, run)
+            else:
+                run = 0
+        if matches == 0:
+            continue
+        ratio = matches / n_target
+        if best_run < min_run and ratio < min_ratio:
+            continue
+        score = (best_run, matches)
+        candidates.append((score, offset))
+        if best_score is None or score >= best_score:
+            best_score = score
+
+    if not candidates:
+        return None
+
+    def _offset_to_start_sec(offset: int) -> float:
+        idx = max(0, min(offset, n - 1))
+        return window[idx]["start"]
+
+    if hint_start_sec is not None:
+        strong_candidates = [c for c in candidates if c[0][1] >= best_score[1] - 1]
+        best_offset = min(strong_candidates, key=lambda c: abs(_offset_to_start_sec(c[1]) - hint_start_sec))[1]
+    else:
+        best_offset = None
+        best_kept_score = None
+        for score, offset in candidates:
+            if best_kept_score is None or score >= best_kept_score:
+                best_kept_score = score
+                best_offset = offset
+
+    start_idx = max(0, min(best_offset, n - 1))
+    end_idx = max(0, min(n_target - 1 + best_offset, n - 1))
+    if end_idx < start_idx:
+        end_idx = start_idx
+    return window[start_idx]["start"], window[end_idx]["end"]
+
+
+def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
+    tracks = []
+    cumulative_frames = 0
+
+    for scene in scenes:
+        scene_id = scene.get("scene_id")
+        start_sec = scene.get("start") or 0.0
+        end_sec = scene.get("end") or 0.0
+        scene_duration_frames = max(_seconds_to_frames(end_sec - start_sec, fps), fps)
+
+        scene_start_frame = cumulative_frames
+        scene_end_frame = cumulative_frames + scene_duration_frames
+
+        voiceover = scene.get("voiceover")
+        if voiceover and voiceover.get("url"):
+            tracks.append({
+                "track_id": f"audio_{scene_id}", "scene_id": scene_id, "type": "audio",
+                "file_url": voiceover["url"], "vo_text": scene.get("vo_text"),
+                "startFrame": scene_start_frame, "endFrame": scene_end_frame,
+                "start_sec": scene_start_frame / fps, "end_sec": scene_end_frame / fps,
+                "scene_start_sec": start_sec, "scene_end_sec": end_sec,
+            })
+
+        word_segments = scene.get("word_segments") or []
+        timed_words_sec = [w for w in word_segments if "start" in w and "end" in w]
+        words = []
+        for w in word_segments:
+            if "start" not in w or "end" not in w:
+                continue
+            w_start_frame = scene_start_frame + _seconds_to_frames(w["start"] - start_sec, fps)
+            w_end_frame = scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps)
+            w_start_frame = max(scene_start_frame, min(w_start_frame, scene_end_frame))
+            w_end_frame = max(w_start_frame, min(w_end_frame, scene_end_frame))
+            words.append({"word": w.get("word", ""), "startFrame": w_start_frame, "endFrame": w_end_frame})
+        if words:
+            caption_track = {"track_id": f"caption_{scene_id}", "scene_id": scene_id, "type": "caption_word", "words": words}
+            caption_track["style"] = {**DEFAULT_CAPTION_STYLE, **(scene.get("caption_style") or {})}
+            tracks.append(caption_track)
+
+        beats = scene.get("beats") or []
+        if not beats:
+            beats = [{
+                "beat_id": f"{scene_id}_b1", "start": start_sec, "end": end_sec,
+                "media": scene.get("media") or {}, "broll_override": scene.get("broll_override"),
+            }]
+
+        beat_frame_ranges = {}
+        for beat in beats:
+            b_start = beat.get("start")
+            b_end = beat.get("end")
+            if b_start is None or b_end is None:
+                beat_start_frame, beat_end_frame = scene_start_frame, scene_end_frame
+            else:
+                beat_start_frame = scene_start_frame + _seconds_to_frames(b_start - start_sec, fps)
+                beat_end_frame = scene_start_frame + _seconds_to_frames(b_end - start_sec, fps)
+                beat_end_frame = min(beat_end_frame, scene_end_frame)
+                beat_start_frame = max(scene_start_frame, min(beat_start_frame, beat_end_frame))
+            beat_frame_ranges[beat.get("beat_id")] = (beat_start_frame, beat_end_frame)
+
+            default_asset, default_source = _resolve_beat_broll_selection(beat)
+            media = beat.get("media") or {}
+            video_candidates = (media.get("videos") or {}).get("results") or []
+            image_candidates = (media.get("images") or {}).get("results") or []
+
+            broll_track = {
+                "track_id": f"broll_{scene_id}_{beat.get('beat_id')}", "scene_id": scene_id,
+                "beat_id": beat.get("beat_id"), "type": "broll", "layer": "background",
+                "startFrame": beat_start_frame, "endFrame": beat_end_frame,
+                "start_sec": beat_start_frame / fps, "end_sec": beat_end_frame / fps,
+                "beat_start_sec": b_start, "beat_end_sec": b_end,
+                "keywords": beat.get("keywords"), "preferred_media_type": beat.get("preferred_media_type"),
+                "motion_type": _resolve_beat_motion_type(beat),
+                "selected_asset": {
+                    "asset_id": (default_asset or {}).get("id"),
+                    "file_url": _resolve_broll_file_url(default_asset, default_source) if default_asset else None,
+                    "source": default_source,
+                    "width": (default_asset or {}).get("width"),
+                    "height": (default_asset or {}).get("height"),
+                    "video_files": (default_asset or {}).get("video_files"),
+                    "src": (default_asset or {}).get("src"),
+                } if default_asset else None,
+                "candidates": {"videos": video_candidates, "images": image_candidates},
+            }
+
+            background_color = scene.get("background_color")
+            if background_color:
+                broll_track["background_color"] = background_color
+
+            tracks.append(broll_track)
+
+        scene_animation_tracks = []
+        for animation in (scene.get("animations") or []):
+            beat_id = animation.get("beat_id")
+            rng = beat_frame_ranges.get(beat_id)
+            if not rng:
+                continue
+            b_start_frame, b_end_frame = rng
+
+            anim_start_frame = b_start_frame
+            matched_end_frame = None
+
+            target_text = animation.get("highlight_target_text")
+            if not target_text:
+                candidate_text = _display_text_to_string(animation.get("display_text"))
+                if candidate_text:
+                    target_text = candidate_text
+
+            model_anchor_start = animation.get("anchor_start_sec")
+            model_anchor_end = animation.get("anchor_end_sec")
+
+            heuristic_span = _find_phrase_span_sec(
+                target_text, timed_words_sec, start_sec, end_sec, hint_start_sec=model_anchor_start,
+            )
+
+            use_model_anchor = model_anchor_start is not None and heuristic_span is None
+            if model_anchor_start is not None and heuristic_span is not None:
+                heuristic_start_sec = heuristic_span[0]
+                if abs(model_anchor_start - heuristic_start_sec) > 0.5:
+                    print(
+                        f"[edit-video] scene {scene_id} beat {beat_id}: Animation Planner's "
+                        f"anchor_start_sec ({model_anchor_start:.2f}s) disagrees with the "
+                        f"heuristic transcript match ({heuristic_start_sec:.2f}s) — using the "
+                        f"heuristic match (deterministic, grounded in the real transcript, "
+                        f"and has proven more reliable than trusting the model's own anchor)"
+                    )
+
+            if use_model_anchor:
+                candidate_start_frame = scene_start_frame + _seconds_to_frames(model_anchor_start - start_sec, fps)
+                anim_start_frame = max(scene_start_frame, min(candidate_start_frame, scene_end_frame))
+            elif heuristic_span is not None:
+                matched_start_sec, _ = heuristic_span
+                candidate_start_frame = scene_start_frame + _seconds_to_frames(matched_start_sec - start_sec, fps)
+                anim_start_frame = max(scene_start_frame, min(candidate_start_frame, scene_end_frame))
+
+            model_end_frame = min(anim_start_frame + animation.get("duration_frames", 90), scene_end_frame)
+            if heuristic_span is not None:
+                _, heuristic_end_sec = heuristic_span
+                candidate_end_frame = scene_start_frame + _seconds_to_frames(heuristic_end_sec - start_sec, fps)
+                heuristic_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
+                hold_buffer_frames = round(0.8 * fps)
+                speech_end_frame = min(heuristic_end_frame + hold_buffer_frames, scene_end_frame)
+
+                max_reasonable_extra_frames = round(3.0 * fps)
+                max_end_frame = min(speech_end_frame + max_reasonable_extra_frames, scene_end_frame)
+
+                candidate_ends = [speech_end_frame, model_end_frame]
+                if use_model_anchor and model_anchor_end is not None:
+                    candidate_end_frame = scene_start_frame + _seconds_to_frames(model_anchor_end - start_sec, fps)
+                    candidate_ends.append(max(anim_start_frame, min(candidate_end_frame, scene_end_frame)))
+
+                anim_end_frame = max(speech_end_frame, min(max(candidate_ends), max_end_frame))
+            else:
+                anim_end_frame = model_end_frame
+                if use_model_anchor and model_anchor_end is not None:
+                    candidate_end_frame = scene_start_frame + _seconds_to_frames(model_anchor_end - start_sec, fps)
+                    model_anchor_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
+                    anim_end_frame = max(anim_end_frame, model_anchor_end_frame)
+          
+            anim_start_frame = max(scene_start_frame, min(anim_start_frame, scene_end_frame))
+            anim_end_frame = max(anim_start_frame, min(anim_end_frame, scene_end_frame))
+
+            safe_geometry_px = _validate_geometry_px(
+                animation.get("geometry_px"), animation.get("category"),
+                allow_manual_placement=bool(animation.get("manually_placed")),
+                display_text=animation.get("display_text"),
+            )
+
+            scene_animation_tracks.append({
+                "track_id": f"anim_{scene_id}_{beat_id}",
+                "scene_id": scene_id, "beat_id": beat_id, "type": "animation",
+                "layer": animation.get("z_index_layer", "foreground"),
+                "animation_type": animation.get("animation_type"), "category": animation.get("category"),
+                "placement": animation.get("placement"), "geometry_px": safe_geometry_px,
+                "motion": animation.get("motion"), "icon_name": animation.get("icon_name"),
+                "icon_layout": animation.get("icon_layout"), "display_text": animation.get("display_text"),
+                "color_hint": animation.get("color_hint"), "highlight_target_text": animation.get("highlight_target_text"),
+                "content_binding": animation.get("content_binding"), "render_prompt": animation.get("render_prompt"),
+                "trigger": animation.get("trigger"),
+                "startFrame": anim_start_frame, "endFrame": anim_end_frame,
+                "start_sec": anim_start_frame / fps, "end_sec": anim_end_frame / fps,
+                "duration_frames": anim_end_frame - anim_start_frame,
+                "status": "pending_render" if animation.get("render_engine_hint") == "remotion" else "ready",
+                "asset_url": None,
+                "render_engine_hint": animation.get("render_engine_hint"),
+            })
+
+        scene_animation_tracks.sort(key=lambda t: t["startFrame"])
+        for i in range(len(scene_animation_tracks) - 1):
+            cur = scene_animation_tracks[i]
+            nxt = scene_animation_tracks[i + 1]
+            if cur["endFrame"] > nxt["startFrame"]:
+                cur["endFrame"] = max(cur["startFrame"], nxt["startFrame"])
+                cur["end_sec"] = cur["endFrame"] / fps
+                cur["duration_frames"] = cur["endFrame"] - cur["startFrame"]
+        tracks.extend(scene_animation_tracks)
+
+        cumulative_frames = scene_end_frame
+
+    return {
+        "fps": fps, "total_frames": cumulative_frames,
+        "resolution": {"width": TIMELINE_WIDTH, "height": TIMELINE_HEIGHT},
+        "tracks": tracks,
+    }
+
+
+
+_TEXT_ONLY_ANIMATION_TYPES = {
+    "lower_third", "kinetic_caption", "bullet_list_reveal", "callout_textbox",
+    "stat_counter_overlay", "full_screen_title_card", "full_screen_quote_card",
+}
+
+
+def _next_animation_id(raw_scenes: list) -> int:
+    max_id = 0
+    for s in raw_scenes:
+        for a in (s.get("animations") or []):
+            aid = a.get("id")
+            if isinstance(aid, int) and aid > max_id:
+                max_id = aid
+    return max_id + 1
+
+
+def _assign_animation_ids(raw_scenes: list) -> None:
+    next_id = _next_animation_id(raw_scenes)
+    for s in raw_scenes:
+        for a in (s.get("animations") or []):
+            if not isinstance(a.get("id"), int):
+                a["id"] = next_id
+                next_id += 1
+
+
+def _find_animation_by_id(raw_scenes: list, animation_id: int) -> Optional[tuple]:
+    for si, s in enumerate(raw_scenes):
+        animations = s.get("animations") or []
+        for ai, a in enumerate(animations):
+            if a.get("id") == animation_id:
+                return si, ai, s.get("scene_id"), a.get("beat_id")
+    return None
+
+
+def _compute_infographics_and_text_lists(raw_scenes: list, timeline: dict) -> tuple[list, list]:
+    _assign_animation_ids(raw_scenes)
+
+    anim_timing_by_scene_beat = {}
+    for t in (timeline or {}).get("tracks", []):
+        if t.get("type") != "animation":
+            continue
+        anim_timing_by_scene_beat[(t.get("scene_id"), t.get("beat_id"))] = {
+            "start": t.get("start_sec"),
+            "end": t.get("end_sec"),
+        }
+
+    infographics, text_list = [], []
+    for scene in raw_scenes:
+        scene_id = scene.get("scene_id")
+        for anim in (scene.get("animations") or []):
+            beat_id = anim.get("beat_id")
+            animation_type = anim.get("animation_type")
+            has_icon = bool(anim.get("icon_name"))
+            timing = anim_timing_by_scene_beat.get((scene_id, beat_id)) or {"start": None, "end": None}
+            entry = {
+                "id": anim.get("id"),
+                "scene_id": scene_id, "beat_id": beat_id,
+                "animation_type": animation_type, "category": anim.get("category"),
+                "placement": anim.get("placement"), "display_text": anim.get("display_text"),
+                "color_hint": anim.get("color_hint"),
+                "start": timing["start"], "end": timing["end"],
+            }
+            is_text_only = animation_type in _TEXT_ONLY_ANIMATION_TYPES and not has_icon
+            if is_text_only:
+                text_list.append(entry)
+            else:
+                infographics.append(entry)
+    return infographics, text_list
+
+def _compute_broll_list(timeline: dict) -> list:
+    return [
+        {
+            "track_id": t.get("track_id"), "scene_id": t.get("scene_id"), "beat_id": t.get("beat_id"),
+            "start_sec": t.get("start_sec"), "end_sec": t.get("end_sec"),
+            "selected_asset": _slim_selected_asset(t.get("selected_asset")),
+        }
+        for t in timeline.get("tracks", []) if t.get("type") == "broll"
+    ]
+
+
+
+def _slim_beat_for_response(beat: dict, broll_track: Optional[dict] = None) -> dict:
+    default_asset, default_source = _resolve_beat_broll_selection(beat)
+    selected = None
+    if default_asset:
+        selected = {
+            "asset_id": default_asset.get("id"), "file_url": _resolve_broll_file_url(default_asset, default_source),
+            "source": default_source, "width": default_asset.get("width"), "height": default_asset.get("height"),
+        }
+    return {
+        "beat_id": beat.get("beat_id"), "start": beat.get("start"), "end": beat.get("end"),
+        "start_sec": (broll_track or {}).get("start_sec"), "end_sec": (broll_track or {}).get("end_sec"),
+        "vo_text": beat.get("vo_text"), "keywords": beat.get("keywords"),
+        "preferred_media_type": beat.get("preferred_media_type"), "motion_type": _resolve_beat_motion_type(beat),
+        "entities": beat.get("entities"), "scene_direction": beat.get("scene_direction"),
+        "selected_asset": selected,
+    }
+
+
+def _slim_scene_for_response(scene: dict, timeline: Optional[dict] = None) -> dict:
+    scene_id = scene.get("scene_id")
+
+    broll_track_by_beat_id = {}
+    animation_track_by_beat_id = {}
+    if timeline:
+        for t in timeline.get("tracks", []):
+            if t.get("type") == "broll" and t.get("scene_id") == scene_id:
+                broll_track_by_beat_id[t.get("beat_id")] = t
+            elif t.get("type") == "animation" and t.get("scene_id") == scene_id:
+                animation_track_by_beat_id[t.get("beat_id")] = t
+
+    animations_out = []
+    for anim in (scene.get("animations") or []):
+        anim = dict(anim)
+        track = animation_track_by_beat_id.get(anim.get("beat_id"))
+        if track:
+            anim["start_sec"] = track.get("start_sec")
+            anim["end_sec"] = track.get("end_sec")
+        animations_out.append(anim)
+
+    return {
+        "scene_id": scene_id, "vo_text": scene.get("vo_text"), "visual_intent": scene.get("visual_intent"),
+        "on_screen_text": scene.get("on_screen_text"), "requires_animation": scene.get("requires_animation"),
+        "scene_animation_density": scene.get("scene_animation_density"),
+        "start": scene.get("start"), "end": scene.get("end"), "duration_seconds": scene.get("duration_seconds"),
+        "voice_url": (scene.get("voiceover") or {}).get("url"), "error": scene.get("error"),
+        "beats": [_slim_beat_for_response(b, broll_track_by_beat_id.get(b.get("beat_id"))) for b in (scene.get("beats") or [])],
+        "animations": animations_out,
+        "caption_style": scene.get("caption_style"), "background_color": scene.get("background_color"),
+    }
+
+
+def _slim_timeline_for_response(timeline: dict) -> dict:
+    slim_tracks = []
+    for track in timeline.get("tracks", []):
+        if track.get("type") != "broll":
+            slim_tracks.append(track)
+            continue
+        slim_tracks.append({
+            "track_id": track.get("track_id"), "type": "broll", "scene_id": track.get("scene_id"),
+            "beat_id": track.get("beat_id"), "layer": track.get("layer"),
+            "startFrame": track.get("startFrame"), "endFrame": track.get("endFrame"),
+            "beat_start_sec": track.get("beat_start_sec"), "beat_end_sec": track.get("beat_end_sec"),
+            "keywords": track.get("keywords"), "preferred_media_type": track.get("preferred_media_type"),
+            "motion_type": track.get("motion_type"), "selected_asset": _slim_selected_asset(track.get("selected_asset")),
+            "background_color": track.get("background_color"),
+        })
+    return {**timeline, "tracks": slim_tracks}
+
 
 
 @app.post("/edit-video")
 async def edit_video(request: EditVideo):
+
+    EDIT_VIDEO_BASE_CREDITS = 50
+    try:
+        profile_res = supabase.table('user_profiles') \
+            .select('id, credit_batches') \
+            .eq('id', request.userId) \
+            .maybe_single() \
+            .execute()
+
+        if not profile_res.data:
+            raise HTTPException(status_code=404, detail="user profile not found")
+
+        batches = profile_res.data.get('credit_batches') or []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        active_batches = _expire_stale_batches(batches, now)
+        available = _sum_batches(active_batches)
+
+        if available < EDIT_VIDEO_BASE_CREDITS:
+            raise HTTPException(status_code=402, detail="credits not sufficient")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("error checking credits for /edit-video:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
     try:
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
@@ -9522,31 +12496,1212 @@ async def edit_video(request: EditVideo):
                 stream=False,
             )
         )
-        _record_token_usage("thumbnail_prompt_generator", res)
+        _record_token_usage("edit video", res)
+        _log_token_usage("Scene Planner", res)
 
         content = (res.choices[0].message.content or "").strip()
-
         if content.startswith("```"):
             content = content.strip("`")
             if content.lower().startswith("json"):
                 content = content[4:].strip()
 
-        try:
-            parsed = json.loads(content)
-            full_vo_text = " ".join(scene["vo_text"] for scene in parsed["scenes"])
-            full_vo_text_with_tags = add_script_tags(request.userId,full_vo_text)
-        except json.JSONDecodeError as e:
-            print(f"JSON parse failed: {e} | raw content: {content[:500]}")
-            raise HTTPException(
-                status_code=502,
-                detail="Model did not return valid JSON",
-            )
-
-        return {"scenes": parsed,"full_vo_text_with_tags" : full_vo_text_with_tags}
-
     except HTTPException:
         raise
     except Exception as e:
-        print(f"failed: {e}")
+        print(f"[edit-video] scene generation failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate scenes")
 
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict) and "scenes" in parsed:
+            scenes = parsed["scenes"]
+            category = parsed.get("category") or "general_documentary"
+            script_language = parsed.get("script_language") or "en"
+        elif isinstance(parsed, list):
+            scenes = parsed
+            category = "general_documentary"
+            script_language = "en"
+        else:
+            raise ValueError(f"Unexpected JSON shape: {type(parsed)}")
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[edit-video] JSON parse failed: {e} | raw content: {content[:500]}")
+        raise HTTPException(status_code=502, detail="Model did not return valid JSON")
+
+    if category not in STYLE_PROFILES:
+        print(f"[edit-video] model returned unknown category {category!r} — defaulting to general_documentary")
+        category = "general_documentary"
+
+    for _scene in scenes:
+        if isinstance(_scene, dict) and "requires_animation" not in _scene:
+            _scene["requires_animation"] = _scene.get("animation_preference") != "avoid"
+
+    print(f"[edit-video] scene planner produced {len(scenes)} scene(s)")
+
+    video_ctx = {
+        "known_entities": [], "known_setting": {"location": "", "time_period": ""},
+        "previous_scene_last_media_type": None, "previous_scene_last_animation": None,
+    }
+    scenes_with_voice_and_timestamps = []
+    for idx, scene in enumerate(scenes):
+        scene_result = await _process_scene(
+            scene, request, category, script_language, video_ctx, is_first_scene=(idx == 0)
+        )
+        scenes_with_voice_and_timestamps.append(scene_result)
+
+    _ensure_video_has_icon_animation(scenes_with_voice_and_timestamps, category)
+
+    failed_scenes = [s["scene_id"] for s in scenes_with_voice_and_timestamps if s.get("error")]
+    if failed_scenes:
+        print(f"[edit-video] completed with {len(failed_scenes)} failed scene(s): {failed_scenes}")
+
+    timeline_json = build_timeline_from_scenes(scenes_with_voice_and_timestamps)
+
+    scene_timings = [
+        {
+            "scene_id": s.get("scene_id"), "start": s.get("start"), "end": s.get("end"),
+            "duration_seconds": s.get("duration_seconds"),
+            "beats": [{"beat_id": b.get("beat_id"), "start": b.get("start"), "end": b.get("end")} for b in (s.get("beats") or [])],
+        }
+        for s in scenes_with_voice_and_timestamps
+    ]
+
+    infographics, text_overlays = _compute_infographics_and_text_lists(scenes_with_voice_and_timestamps, timeline_json)
+    broll_list = _compute_broll_list(timeline_json)
+
+    video_id = str(uuid.uuid4())
+    try:
+        supabase.table("videos").insert({
+            "id": video_id, "user_id": request.userId, "script": request.script, "voice": request.voice,
+            "lang_code": request.langCode, "category": category, "script_language": script_language,
+            "timeline_json": timeline_json, "timeline_version": 1,
+            "raw_scenes": scenes_with_voice_and_timestamps, "scene_timings": scene_timings,
+            "infographics_list": infographics, "text_list": text_overlays, "broll_list": broll_list,
+        }).execute()
+    except Exception as e:
+        print(f"[edit-video] failed to persist video row: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save video")
+
+    EDIT_VIDEO_BASE_CREDITS = 50
+    EDIT_VIDEO_CREDITS_PER_MINUTE = 5
+    duration_minutes = (timeline_json.get("total_frames", 0) / max(timeline_json.get("fps", 1), 1)) / 60
+    credit_cost = EDIT_VIDEO_BASE_CREDITS + round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
+
+    credit_result = {"cost": credit_cost, "deducted": False, "remaining_credits": None}
+    try:
+        profile_res = supabase.table('user_profiles') \
+            .select('id, credit_batches') \
+            .eq('id', request.userId) \
+            .maybe_single() \
+            .execute()
+
+        if not profile_res.data:
+            print(f"[edit-video] credit deduction skipped for {request.userId}: user profile not found")
+        else:
+            batches = profile_res.data.get('credit_batches') or []
+            now = datetime.datetime.now(datetime.timezone.utc)
+            active_batches = _expire_stale_batches(batches, now)
+
+            updated_batches, deducted = _deduct_from_batches(active_batches, credit_cost)
+            new_total = _sum_batches(updated_batches)
+
+            supabase.table('user_profiles').update({
+                'credit_batches': updated_batches,
+                'credits_remaining': new_total,
+            }).eq('id', request.userId).execute()
+
+            credit_result["deducted"] = deducted > 0
+            credit_result["remaining_credits"] = new_total
+            if deducted == 0:
+                print(f"[edit-video] user {request.userId}: insufficient credits for cost {credit_cost} (video {video_id} was still generated and saved)")
+            elif deducted < credit_cost:
+                print(f"[edit-video] user {request.userId}: only {deducted}/{credit_cost} credits available, partial deduction applied")
+
+    except Exception as e:
+        print(f"[edit-video] credit deduction failed for {request.userId} (video {video_id} was still generated and saved): {e}")
+
+    return {
+        "video_id": video_id, "category": category, "script_language": script_language,
+        "timeline": _slim_timeline_for_response(timeline_json),
+        "scenes": [_slim_scene_for_response(s, timeline_json) for s in scenes_with_voice_and_timestamps],
+        "scene_timings": scene_timings, "failed_scene_ids": failed_scenes,
+        "infographics_list": infographics, "text_list": text_overlays, "broll_list": broll_list,
+        "credits": credit_result,
+    }
+
+
+
+@app.patch("/timeline/{video_id}")
+async def patch_timeline(video_id: str, patch: TrackPatch):
+    try:
+        row = (
+            supabase.table("videos").select("timeline_json, timeline_version, raw_scenes")
+            .eq("id", video_id).single().execute()
+        )
+    except Exception as e:
+        print(f"[patch-timeline] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    timeline = row.data["timeline_json"]
+    current_version = row.data.get("timeline_version", 1)
+    raw_scenes = row.data.get("raw_scenes") or []
+
+    track_found = None
+    for track in timeline.get("tracks", []):
+        if track.get("track_id") == patch.track_id:
+            track.update(patch.updates)
+            track_found = track
+            break
+
+    if not track_found:
+        raise HTTPException(status_code=404, detail=f"Track {patch.track_id} not found in timeline")
+
+    scene_id = track_found.get("scene_id")
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+
+    visual_change = False
+    if scene_index is not None:
+        scene = dict(raw_scenes[scene_index])
+
+        if track_found.get("type") == "broll":
+            beat_id = track_found.get("beat_id")
+            beats = scene.get("beats") or []
+            beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+
+            if "selected_asset" in patch.updates and patch.updates["selected_asset"]:
+                sel = patch.updates["selected_asset"]
+                override = {
+                    "asset_id": sel.get("asset_id") or sel.get("id"), "source": sel.get("source"),
+                    "file_url": sel.get("file_url"), "width": sel.get("width"), "height": sel.get("height"),
+                    "video_files": sel.get("video_files"), "src": sel.get("src"), "motion_type": sel.get("motion_type"),
+                }
+                if beat_idx is not None:
+                    beats[beat_idx] = {**beats[beat_idx], "broll_override": override}
+                    scene["beats"] = beats
+                else:
+                    scene["broll_override"] = override
+                visual_change = True
+
+            if "background_color" in patch.updates:
+                if patch.updates["background_color"]:
+                    _validate_hex_color(patch.updates["background_color"], "background_color")
+                scene["background_color"] = patch.updates["background_color"]
+                visual_change = True
+
+        elif track_found.get("type") == "caption_word":
+            if "style" in patch.updates and isinstance(patch.updates["style"], dict):
+                existing_style = scene.get("caption_style") or {}
+                scene["caption_style"] = {**existing_style, **patch.updates["style"]}
+                visual_change = True
+
+        elif track_found.get("type") == "animation":
+            beat_id = track_found.get("beat_id")
+            animations = scene.get("animations") or []
+            anim_idx = next((i for i, a in enumerate(animations) if a.get("beat_id") == beat_id), None)
+            if anim_idx is not None and "duration_frames" in patch.updates:
+                try:
+                    new_duration = int(patch.updates["duration_frames"])
+                    if new_duration <= 0 or new_duration > 900:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=422, detail="duration_frames must be an integer between 1 and 900 (30s @30fps)")
+                animations[anim_idx] = {**animations[anim_idx], "duration_frames": new_duration}
+                scene["animations"] = animations
+                visual_change = True
+
+        raw_scenes[scene_index] = scene
+
+    new_version = current_version + 1
+    update_payload = {"timeline_json": timeline, "timeline_version": new_version}
+    if scene_index is not None:
+        update_payload["raw_scenes"] = raw_scenes
+    if visual_change:
+        update_payload["final_video_url"] = None
+        update_payload["render_status"] = "stale_needs_render"
+
+    try:
+        supabase.table("videos").update(update_payload).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[patch-timeline] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save edit")
+
+    return {"timeline_version": new_version, "track_id": patch.track_id, "needs_render": visual_change}
+
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/style")
+async def update_scene_style(video_id: str, scene_id: str, update: SceneStyleUpdate):
+    if update.animation_type is not None and update.animation_type not in _VALID_CAPTION_ANIMATION_TYPES:
+        raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_CAPTION_ANIMATION_TYPES)}")
+    _validate_hex_color(update.text_color, "text_color")
+    _validate_hex_color(update.outline_color, "outline_color")
+    _validate_hex_color(update.background_color, "background_color")
+
+    if (
+        update.font_size is None and update.font_family is None and update.words_per_line is None
+        and update.text_color is None and update.outline_color is None
+        and update.animation_type is None and update.background_color is None and update.vertical_position is None
+        and update.margin_bottom_percent is None and update.horizontal_position is None and update.margin_horizontal_percent is None
+    ):
+        raise HTTPException(status_code=422, detail="Provide at least one field to update")
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[update-scene-style] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+
+    style_fields = {
+        "font_size": update.font_size, "font_family": update.font_family, "words_per_line": update.words_per_line,
+        "text_color": update.text_color, "outline_color": update.outline_color,
+        "animation_type": update.animation_type, "vertical_position": update.vertical_position,
+        "margin_bottom_percent": update.margin_bottom_percent, "horizontal_position": update.horizontal_position,
+        "margin_horizontal_percent": update.margin_horizontal_percent,
+    }
+    style_fields = {k: v for k, v in style_fields.items() if v is not None}
+    if style_fields:
+        existing_style = scene.get("caption_style") or {}
+        scene["caption_style"] = {**existing_style, **style_fields}
+
+    if update.background_color is not None:
+        scene["background_color"] = update.background_color
+
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-scene-style] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save style edit")
+
+    return {
+        "video_id": video_id, "scene_id": scene_id, "timeline_version": new_version,
+        "caption_style": scene.get("caption_style"), "background_color": scene.get("background_color"),
+        "timeline": timeline_json, "needs_render": True,
+    }
+
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/trim")
+async def update_scene_trim(video_id: str, scene_id: str, update: SceneTrimUpdate):
+    if update.start < 0 or update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`, and `start` must be >= 0")
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[update-scene-trim] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+
+    full_word_segments = scene.get("word_segments_full")
+    if full_word_segments is None:
+        full_word_segments = scene.get("word_segments") or []
+        scene["word_segments_full"] = full_word_segments
+
+    if not full_word_segments:
+        raise HTTPException(status_code=400, detail=f"Scene {scene_id} has no word-level timestamps to trim against")
+
+    clip_start = full_word_segments[0].get("start", 0.0)
+    clip_end = full_word_segments[-1].get("end", 0.0)
+
+    if update.start < clip_start - 1e-3 or update.end > clip_end + 1e-3:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Trim range [{update.start}, {update.end}] is outside this scene's original audio bounds [{clip_start}, {clip_end}]",
+        )
+
+    trimmed_words = [
+        w for w in full_word_segments if "start" in w and "end" in w and w["start"] >= update.start and w["end"] <= update.end
+    ]
+
+    scene["trim"] = {"start": update.start, "end": update.end}
+    scene["word_segments"] = trimmed_words
+    scene["start"] = trimmed_words[0]["start"] if trimmed_words else update.start
+    scene["end"] = trimmed_words[-1]["end"] if trimmed_words else update.end
+    scene["error"] = None
+
+    scene = await _regenerate_scene_beats_and_animations(scene)
+    scene["duration_seconds"] = round(scene["end"] - scene["start"], 3)
+
+    raw_scenes[scene_index] = scene
+
+    _ensure_video_has_icon_animation(raw_scenes, _infer_video_category(raw_scenes))
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-scene-trim] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save trim edit")
+
+    return {
+        "video_id": video_id, "scene_id": scene_id, "trim": scene["trim"], "timeline_version": new_version,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline": timeline_json, "needs_render": True,
+    }
+
+
+@app.post("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/split")
+async def split_beat(video_id: str, scene_id: str, beat_id: str, update: BeatSplitUpdate):
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[split-beat] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    beats = scene.get("beats") or []
+
+    beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+    if beat_idx is None:
+        raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
+
+    beat = beats[beat_idx]
+    b_start, b_end = beat.get("start"), beat.get("end")
+    if b_start is None or b_end is None:
+        raise HTTPException(status_code=422, detail=f"Beat {beat_id} has no start/end timing to split (silent/implicit beat)")
+
+    MIN_HALF_SECONDS = 1.5
+    if update.split_at <= b_start + MIN_HALF_SECONDS or update.split_at >= b_end - MIN_HALF_SECONDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"split_at must leave at least {MIN_HALF_SECONDS}s on each side — beat spans [{b_start}, {b_end}], got split_at={update.split_at}",
+        )
+
+    id_prefix_a = f"{beat_id}_split_{uuid.uuid4().hex[:6]}_a"
+    id_prefix_b = f"{beat_id}_split_{uuid.uuid4().hex[:6]}_b"
+
+    first_beats = await _rebuild_fragment_beats(scene, b_start, update.split_at, id_prefix_a)
+    second_beats = await _rebuild_fragment_beats(scene, update.split_at, b_end, id_prefix_b)
+
+    new_beats = beats[:beat_idx] + first_beats + second_beats + beats[beat_idx + 1:]
+    for i, b in enumerate(new_beats):
+        b["beat_index"] = i
+
+    fallback_keywords = _get_scene_broll_keywords(scene)
+    await _fill_empty_beats(scene, new_beats, fallback_keywords)
+    _dedupe_beats_media_across_scene(new_beats)
+
+    animations = [a for a in (scene.get("animations") or []) if a.get("beat_id") != beat_id]
+
+    scene["beats"] = new_beats
+    scene["animations"] = animations
+    scene["media"] = _aggregate_beats_media(new_beats)
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    broll_list = _compute_broll_list(timeline_json)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[split-beat] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save beat split")
+
+    return {
+        "video_id": video_id, "scene_id": scene_id, "original_beat_id": beat_id,
+        "new_beats": [
+            {"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end"),
+             "media_type": b.get("preferred_media_type"), "motion_type": b.get("motion_type")}
+            for b in (first_beats + second_beats)
+        ],
+        "broll_list": broll_list, "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+    }
+
+@app.post("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/insert")
+async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatInsertUpdate):
+    MIN_SECONDS = 1.0
+    if update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+    if update.end - update.start < MIN_SECONDS:
+        raise HTTPException(status_code=422, detail=f"the new clip must be at least {MIN_SECONDS}s long")
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[insert-beat] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    beats = scene.get("beats") or []
+
+    beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+    if beat_idx is None:
+        raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
+
+    beat = beats[beat_idx]
+    b_start, b_end = beat.get("start"), beat.get("end")
+    if b_start is None or b_end is None:
+        raise HTTPException(status_code=422, detail=f"Beat {beat_id} has no start/end timing to insert into (silent/implicit beat)")
+    if update.start < b_start - 1e-3 or update.end > b_end + 1e-3:
+        raise HTTPException(status_code=422, detail=f"[{update.start}, {update.end}] must fall inside beat {beat_id}'s own [{b_start}, {b_end}]")
+
+    id_prefix = f"{beat_id}_insert_{uuid.uuid4().hex[:6]}"
+    new_beats = await _rebuild_fragment_beats(scene, update.start, update.end, id_prefix)
+
+    pieces = []
+    if update.start > b_start + 1e-3:
+        before = dict(beat)
+        before["beat_id"] = f"{beat_id}_pre"
+        before["start"], before["end"] = b_start, update.start
+        pieces.append(before)
+
+    pieces.extend(new_beats)
+
+    if update.end < b_end - 1e-3:
+        after = dict(beat)
+        after["beat_id"] = f"{beat_id}_post"
+        after["start"], after["end"] = update.end, b_end
+        pieces.append(after)
+
+    combined_beats = beats[:beat_idx] + pieces + beats[beat_idx + 1:]
+    for i, b in enumerate(combined_beats):
+        b["beat_index"] = i
+
+    fallback_keywords = _get_scene_broll_keywords(scene)
+    await _fill_empty_beats(scene, combined_beats, fallback_keywords)
+    _dedupe_beats_media_across_scene(combined_beats)
+
+    scene["beats"] = combined_beats
+    scene["media"] = _aggregate_beats_media(combined_beats)
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    broll_list = _compute_broll_list(timeline_json)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[insert-beat] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save beat insert")
+
+    return {
+        "video_id": video_id, "scene_id": scene_id, "original_beat_id": beat_id,
+        "new_beats": [
+            {"beat_id": b["beat_id"], "start": b.get("start"), "end": b.get("end"),
+             "media_type": b.get("preferred_media_type"), "motion_type": b.get("motion_type")}
+            for b in new_beats
+        ],
+        "broll_list": broll_list, "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+    }
+
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/animation")
+async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, update: BeatAnimationUpdate):
+    provided = {k: v for k, v in update.dict().items() if v is not None}
+    if not provided:
+        raise HTTPException(status_code=422, detail="Provide at least one field to update")
+
+    if "color_hint" in provided:
+        _validate_hex_color(provided["color_hint"], "color_hint")
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[update-beat-animation] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    beats = scene.get("beats") or []
+    beat_ids = {b.get("beat_id") for b in beats}
+    beats_by_id = {b.get("beat_id"): b for b in beats}
+    if beat_id not in beat_ids:
+        raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id}")
+
+    animations = list(scene.get("animations") or [])
+    anim_idx = next((i for i, a in enumerate(animations) if a.get("beat_id") == beat_id), None)
+
+    if anim_idx is None:
+        if not provided.get("animation_type"):
+            raise HTTPException(status_code=422, detail="animation_type is required to create a new animation on this beat")
+        merged_raw = {"beat_id": beat_id, **provided}
+    else:
+        if "geometry_px" in provided:
+            existing_geo = animations[anim_idx].get("geometry_px") or {}
+            new_geo_partial = provided["geometry_px"] or {}
+            merged_geo = {**existing_geo, **new_geo_partial}
+            provided = {**provided, "geometry_px": merged_geo}
+
+        merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
+        if ("geometry_px" in provided or "placement" in provided) and "motion" not in provided:
+            old_motion_style = (animations[anim_idx].get("motion") or {}).get("motion_style")
+            merged_raw["motion"] = {"motion_style": old_motion_style} if old_motion_style else None
+
+    allow_manual_placement = "placement" in provided or "geometry_px" in provided
+    validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id, allow_manual_placement=allow_manual_placement)
+    if not validated:
+        raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
+    if isinstance(merged_raw.get("id"), int):
+        validated["id"] = merged_raw["id"]
+
+    if anim_idx is None:
+        animations.append(validated)
+    else:
+        animations[anim_idx] = validated
+
+    scene["animations"] = animations
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-beat-animation] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save animation edit")
+
+    return {
+        "video_id": video_id, "scene_id": scene_id, "beat_id": beat_id, "animation": validated,
+        "timeline_version": new_version, "infographics_list": infographics_list, "text_list": text_list,
+        "timeline": timeline_json, "needs_render": True,
+    }
+
+
+@app.delete("/timeline/{video_id}/overlay/{overlay_id}")
+async def delete_animation_by_id(video_id: str, overlay_id: int):
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[delete-overlay-by-id] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    found = _find_animation_by_id(raw_scenes, overlay_id)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"No overlay with id {overlay_id} in this video")
+    scene_index, anim_index, scene_id, beat_id = found
+
+    scene = dict(raw_scenes[scene_index])
+    animations = list(scene.get("animations") or [])
+    del animations[anim_index]
+    scene["animations"] = animations
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[delete-overlay-by-id] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete overlay")
+
+    return {
+        "video_id": video_id, "overlay_id": overlay_id, "scene_id": scene_id, "beat_id": beat_id,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+    }
+
+
+@app.patch("/timeline/{video_id}/scene/{scene_id}/broll")
+async def update_scene_broll(video_id: str, scene_id: str, update: SceneBrollSelectUpdate):
+    if update.source not in ("video", "image"):
+        raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
+    if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
+        raise HTTPException(status_code=422, detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}")
+    if (update.start is None) != (update.end is None):
+        raise HTTPException(status_code=422, detail="start and end must be provided together")
+    if update.start is not None and update.end is not None and update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[update-scene-broll] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+    beats = scene.get("beats") or []
+
+    if not beats:
+        media = scene.get("media") or {}
+        beats = [{
+            "beat_id": f"{scene_id}_b1", "beat_index": 0, "start": scene.get("start"), "end": scene.get("end"),
+            "vo_text": scene.get("vo_text", ""), "keywords": None, "motion_type": _DEFAULT_MOTION_TYPE,
+            "preferred_media_type": None,
+            "media": {
+                "videos": media.get("videos") or {"total_results": 0, "results": [], "error": None},
+                "images": media.get("images") or {"total_results": 0, "results": [], "error": None},
+            },
+        }]
+        print(f"[update-scene-broll] scene {scene_id} had no persisted beats — materializing implicit '{scene_id}_b1'")
+
+    if update.beat_id:
+        beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == update.beat_id), None)
+        if beat_idx is None:
+            raise HTTPException(status_code=404, detail=f"Beat {update.beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
+    else:
+        beat_idx = next((i for i, b in enumerate(beats) if _find_beat_broll_candidate(b, update.asset_id, update.source)), 0)
+
+    beat = dict(beats[beat_idx])
+
+    candidate = _find_beat_broll_candidate(beat, update.asset_id, update.source)
+    if candidate is None:
+        candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
+
+    if candidate is None:
+        raise HTTPException(status_code=404, detail=f"No {update.source} candidate with id {update.asset_id} in beat {beat.get('beat_id')}'s media pool, and it couldn't be fetched directly from Pexels either")
+
+    file_url = _resolve_broll_file_url(candidate, update.source)
+    if not file_url:
+        raise HTTPException(status_code=422, detail=f"Candidate {update.asset_id} has no landscape/horizontal file available — only horizontal videos are allowed")
+
+    if "background_color" in scene:
+        scene["_previous_background_color"] = scene["background_color"]
+        scene.pop("background_color", None)
+
+    beat["broll_override"] = {
+        "asset_id": candidate.get("id"), "source": update.source, "file_url": file_url,
+        "width": candidate.get("width"), "height": candidate.get("height"),
+        "video_files": candidate.get("video_files"), "src": candidate.get("src"), "motion_type": update.motion_type,
+    }
+
+    if update.start is not None and update.end is not None:
+        scene_start = scene.get("start")
+        scene_end = scene.get("end")
+
+        if beat_idx == 0 and scene_start is not None and update.start < scene_start - 1e-3:
+            if update.start < 0:
+                raise HTTPException(status_code=422, detail=f"start {update.start} cannot be negative")
+            print(
+                f"[update-scene-broll] scene {scene_id}: extending scene start {scene_start} -> {update.start} "
+                f"so beat {beat.get('beat_id')} can visually begin before the voice's first word"
+            )
+            scene["start"] = update.start
+            scene_start = update.start
+        elif scene_start is not None and update.start < scene_start - 1e-3:
+            raise HTTPException(
+                status_code=422,
+                detail=f"start {update.start} is before this scene's own start ({scene_start}) — only the scene's FIRST beat can start earlier than the scene",
+            )
+
+        if scene_end is not None and update.end > scene_end + 1e-3:
+            raise HTTPException(status_code=422, detail=f"end {update.end} is after this scene's own end ({scene_end})")
+        beat["start"] = update.start
+        beat["end"] = update.end
+
+    beats[beat_idx] = beat
+
+    if update.start is not None and update.end is not None and update.adjust_next_beat and beat_idx + 1 < len(beats):
+        next_beat = dict(beats[beat_idx + 1])
+        next_beat["start"] = update.end
+        beats[beat_idx + 1] = next_beat
+
+    scene["beats"] = beats
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    broll_list = _compute_broll_list(timeline_json)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-scene-broll] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save broll selection")
+
+    return {
+        "video_id": video_id, "scene_id": scene_id, "beat_id": beat.get("beat_id"),
+        "selected_asset": beat["broll_override"], "resolved_motion_type": _resolve_beat_motion_type(beat),
+        "start": beat.get("start"), "end": beat.get("end"), "broll_list": broll_list,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+    }
+
+
+class AbsoluteBrollUpdate(BaseModel):
+    asset_id: Any
+    source: str
+    start: float
+    end: float
+    motion_type: Optional[str] = None
+
+
+def _carve_scene_beats_for_absolute_range(scene: dict, local_start: float, local_end: float, override: dict, id_prefix: str) -> list:
+    beats = scene.get("beats") or []
+
+    if not beats:
+        media = scene.get("media") or {}
+        beats = [{
+            "beat_id": f"{id_prefix}_b1", "beat_index": 0, "start": scene.get("start"), "end": scene.get("end"),
+            "vo_text": scene.get("vo_text", ""), "keywords": None, "motion_type": _DEFAULT_MOTION_TYPE,
+            "preferred_media_type": None,
+            "media": {
+                "videos": media.get("videos") or {"total_results": 0, "results": [], "error": None},
+                "images": media.get("images") or {"total_results": 0, "results": [], "error": None},
+            },
+        }]
+
+    kept_fragments = []
+    for b in beats:
+        b_start, b_end = b.get("start"), b.get("end")
+        if b_start is None or b_end is None:
+            continue
+        if b_end <= local_start + 1e-6 or b_start >= local_end - 1e-6:
+            kept_fragments.append(b)
+            continue
+        if b_start < local_start - 1e-6:
+            before = dict(b)
+            before["beat_id"] = f"{b.get('beat_id')}_pre"
+            before["end"] = local_start
+            kept_fragments.append(before)
+        if b_end > local_end + 1e-6:
+            after = dict(b)
+            after["beat_id"] = f"{b.get('beat_id')}_post"
+            after["start"] = local_end
+            kept_fragments.append(after)
+
+    new_beat = {
+        "beat_id": f"{id_prefix}_abs_{uuid.uuid4().hex[:6]}", "start": local_start, "end": local_end,
+        "vo_text": "", "keywords": None, "preferred_media_type": override.get("source"),
+        "motion_type": override.get("motion_type") or _DEFAULT_MOTION_TYPE,
+        "media": {"videos": {"total_results": 0, "results": [], "error": None}, "images": {"total_results": 0, "results": [], "error": None}},
+        "broll_override": override,
+    }
+
+    result = kept_fragments + [new_beat]
+    result.sort(key=lambda b: b.get("start") if b.get("start") is not None else 0.0)
+    for i, b in enumerate(result):
+        b["beat_index"] = i
+
+    return result
+
+
+
+
+class BrollInsertGapUpdate(BaseModel):
+    asset_id: Any
+    source: str
+    start: float
+    end: float
+    motion_type: Optional[str] = None
+    scene_id: Optional[str] = None
+
+@app.patch("/timeline/{video_id}/broll")
+async def update_broll_absolute(video_id: str, update: AbsoluteBrollUpdate):
+    if update.source not in ("video", "image"):
+        raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
+    if update.start < 0:
+        raise HTTPException(status_code=422, detail="start cannot be negative")
+    if update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+    if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
+        raise HTTPException(status_code=422, detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}")
+
+    candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail=f"Could not fetch {update.source} asset {update.asset_id} from Pexels")
+    file_url = _resolve_broll_file_url(candidate, update.source)
+    if not file_url:
+        raise HTTPException(status_code=422, detail=f"Asset {update.asset_id} has no landscape/horizontal file available")
+
+    override = {
+        "asset_id": candidate.get("id"), "source": update.source, "file_url": file_url,
+        "width": candidate.get("width"), "height": candidate.get("height"),
+        "video_files": candidate.get("video_files"), "src": candidate.get("src"), "motion_type": update.motion_type,
+    }
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_json, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[update-broll-absolute] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    if not raw_scenes:
+        raise HTTPException(status_code=400, detail="This video has no scenes yet")
+
+    current_version = row.data.get("timeline_version", 1)
+    fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
+
+    def _compute_boundaries(scenes: list):
+        boundaries, cumulative = [], 0.0
+        for i, s in enumerate(scenes):
+            s_start, s_end = s.get("start") or 0.0, s.get("end") or 0.0
+            dur = max(s_end - s_start, 1.0 / fps)
+            boundaries.append({"index": i, "abs_start": cumulative, "abs_end": cumulative + dur, "scene_start": s_start, "scene_end": s_end})
+            cumulative += dur
+        return boundaries, cumulative
+
+    boundaries, total_duration = _compute_boundaries(raw_scenes)
+
+    if update.start < boundaries[0]["abs_start"] - 1e-3:
+        extend_by = boundaries[0]["abs_start"] - update.start
+        first_scene = dict(raw_scenes[0])
+        first_scene["start"] = max(0.0, (first_scene.get("start") or 0.0) - extend_by)
+        print(f"[update-broll-absolute] extending video start to {update.start:.3f}s by pulling scene {first_scene.get('scene_id')}'s own start earlier")
+        raw_scenes[0] = first_scene
+        boundaries, total_duration = _compute_boundaries(raw_scenes)
+
+    if update.end > total_duration + 1e-3:
+        raise HTTPException(status_code=422, detail=f"end {update.end} is beyond the video's current total duration ({total_duration:.2f}s) — extending the END of the video isn't supported yet, only the start")
+
+    touched = []
+    for b in boundaries:
+        if b["abs_end"] <= update.start + 1e-6 or b["abs_start"] >= update.end - 1e-6:
+            continue
+        local_start = max(update.start, b["abs_start"]) - b["abs_start"] + b["scene_start"]
+        local_end = min(update.end, b["abs_end"]) - b["abs_start"] + b["scene_start"]
+        scene = dict(raw_scenes[b["index"]])
+        scene_id = scene.get("scene_id")
+        scene["beats"] = _carve_scene_beats_for_absolute_range(scene, local_start, local_end, override, id_prefix=scene_id)
+        raw_scenes[b["index"]] = scene
+        touched.append(scene_id)
+
+    if not touched:
+        raise HTTPException(status_code=422, detail=f"[{update.start}, {update.end}] didn't overlap any scene in this video")
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    broll_list = _compute_broll_list(timeline_json)
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[update-broll-absolute] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save B-roll placement")
+
+    return {
+        "video_id": video_id, "start": update.start, "end": update.end, "selected_asset": override,
+        "touched_scenes": touched, "broll_list": broll_list,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+    }
+
+
+
+@app.post("/timeline/{video_id}/broll/insert")
+async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
+    if update.source not in ("video", "image"):
+        raise HTTPException(status_code=422, detail="source must be 'video' or 'image'")
+    if update.start < 0:
+        raise HTTPException(status_code=422, detail="start cannot be negative")
+    if update.end <= update.start:
+        raise HTTPException(status_code=422, detail="`end` must be greater than `start`")
+    if update.motion_type is not None and update.motion_type not in _VALID_MOTION_TYPES:
+        raise HTTPException(status_code=422, detail=f"motion_type must be one of {sorted(_VALID_MOTION_TYPES)}")
+
+    duration = update.end - update.start
+
+    candidate = await _fetch_pexels_asset_by_id(update.asset_id, update.source)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail=f"Could not fetch {update.source} asset {update.asset_id} from Pexels")
+    file_url = _resolve_broll_file_url(candidate, update.source)
+    if not file_url:
+        raise HTTPException(status_code=422, detail=f"Asset {update.asset_id} has no landscape/horizontal file available")
+
+    override = {
+        "asset_id": candidate.get("id"), "source": update.source, "file_url": file_url,
+        "width": candidate.get("width"), "height": candidate.get("height"),
+        "video_files": candidate.get("video_files"), "src": candidate.get("src"), "motion_type": update.motion_type,
+    }
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_json, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[insert-broll-gap] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    if not raw_scenes:
+        raise HTTPException(status_code=400, detail="This video has no scenes yet")
+
+    current_version = row.data.get("timeline_version", 1)
+    fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
+
+    if update.scene_id:
+        scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == update.scene_id), None)
+        if scene_index is None:
+            raise HTTPException(status_code=404, detail=f"Scene {update.scene_id} not found")
+
+        scene = dict(raw_scenes[scene_index])
+        scene_start = scene.get("start") or 0.0
+        scene_end = scene.get("end") or 0.0
+        if update.start < scene_start - 1e-3 or update.end > scene_end + 1e-3:
+            raise HTTPException(
+                status_code=422,
+                detail=f"[{update.start}, {update.end}] must fall inside scene {update.scene_id}'s own bounds [{scene_start}, {scene_end}]",
+            )
+
+        scene["beats"] = _carve_scene_beats_for_absolute_range(
+            scene, update.start, update.end, override, id_prefix=update.scene_id,
+        )
+        raw_scenes[scene_index] = scene
+
+        timeline_json = build_timeline_from_scenes(raw_scenes)
+        new_version = current_version + 1
+        broll_list = _compute_broll_list(timeline_json)
+        infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+        try:
+            supabase.table("videos").update({
+                "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+                "final_video_url": None, "render_status": "stale_needs_render", "broll_list": broll_list,
+                "infographics_list": infographics_list, "text_list": text_list,
+            }).eq("id", video_id).execute()
+        except Exception as e:
+            print(f"[insert-broll-gap] failed to save video {video_id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to insert B-roll into scene")
+
+        return {
+            "video_id": video_id, "scene_id": update.scene_id, "start": update.start, "end": update.end,
+            "selected_asset": override, "broll_list": broll_list,
+            "infographics_list": infographics_list, "text_list": text_list,
+            "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+        }
+
+    boundaries, cumulative = [], 0.0
+    for i, s in enumerate(raw_scenes):
+        s_start, s_end = s.get("start") or 0.0, s.get("end") or 0.0
+        dur = max(s_end - s_start, 1.0 / fps)
+        boundaries.append({"index": i, "abs_start": cumulative, "abs_end": cumulative + dur})
+        cumulative += dur
+    total_duration = cumulative
+
+    if update.start <= 0:
+        insert_index, actual_at = 0, 0.0
+    elif update.start >= total_duration:
+        insert_index, actual_at = len(raw_scenes), total_duration
+    else:
+        insert_index, actual_at = None, None
+        for b in boundaries:
+            if abs(update.start - b["abs_start"]) < 1e-3:
+                insert_index, actual_at = b["index"], b["abs_start"]
+                break
+            if abs(update.start - b["abs_end"]) < 1e-3:
+                insert_index, actual_at = b["index"] + 1, b["abs_end"]
+                break
+            if b["abs_start"] < update.start < b["abs_end"]:
+                insert_index, actual_at = b["index"] + 1, b["abs_end"]
+                break
+        if insert_index is None:
+            raise HTTPException(status_code=500, detail="Could not resolve an insertion point")
+
+    snapped = abs(actual_at - update.start) > 1e-3
+
+    new_scene_id = f"s_ins_{uuid.uuid4().hex[:6]}"
+    new_beat = {
+        "beat_id": f"{new_scene_id}_b1", "beat_index": 0, "start": 0.0, "end": duration,
+        "vo_text": "", "keywords": None, "preferred_media_type": update.source,
+        "motion_type": update.motion_type or _DEFAULT_MOTION_TYPE,
+        "media": {"videos": {"total_results": 0, "results": [], "error": None}, "images": {"total_results": 0, "results": [], "error": None}},
+        "broll_override": override,
+    }
+    new_scene = {
+        "scene_id": new_scene_id, "vo_text": "", "visual_intent": "", "on_screen_text": "",
+        "start": 0.0, "end": duration, "duration_seconds": duration, "voiceover": None, "word_segments": [],
+        "error": None, "beats": [new_beat], "media": new_beat["media"], "animations": [],
+        "requires_animation": False, "scene_animation_density": "low",
+    }
+
+    raw_scenes = raw_scenes[:insert_index] + [new_scene] + raw_scenes[insert_index:]
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[insert-broll-gap] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to insert B-roll segment")
+
+    return {
+        "video_id": video_id, "new_scene_id": new_scene_id, "requested_start": update.start, "actual_start": actual_at,
+        "snapped_to_scene_boundary": snapped, "duration": duration, "end": actual_at + duration,
+        "new_total_duration": total_duration + duration, "selected_asset": override,
+        "infographics_list": infographics_list, "text_list": text_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+    }
+
+
+    
+@app.delete("/timeline/{video_id}/scene/{scene_id}/content")
+async def delete_scene_content(
+    video_id: str, scene_id: str,
+    content_type: Literal["video", "image"],
+    beat_id: Optional[str] = None,
+):
+
+    if beat_id is None:
+        raise HTTPException(status_code=422, detail="beat_id is required — content is now beat-owned, not scene-owned")
+
+    try:
+        row = supabase.table("videos").select("raw_scenes, timeline_version").eq("id", video_id).single().execute()
+    except Exception as e:
+        print(f"[delete-scene-content] failed to fetch video {video_id}: {e}")
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    raw_scenes = row.data.get("raw_scenes") or []
+    current_version = row.data.get("timeline_version", 1)
+
+    scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == scene_id), None)
+    if scene_index is None:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_id} not found")
+
+    scene = dict(raw_scenes[scene_index])
+
+    beats = scene.get("beats") or []
+    beat_idx = next((i for i, b in enumerate(beats) if b.get("beat_id") == beat_id), None)
+    if beat_idx is None:
+        raise HTTPException(status_code=404, detail=f"Beat {beat_id} not found in scene {scene_id} (available: {[b.get('beat_id') for b in beats]})")
+    beat = dict(beats[beat_idx])
+    beat["broll_override"] = None
+    beat["preferred_media_type"] = None
+    beat["media"] = {"videos": {"total_results": 0, "results": [], "error": None}, "images": {"total_results": 0, "results": [], "error": None}}
+    beats[beat_idx] = beat
+    scene["beats"] = beats
+
+    raw_scenes[scene_index] = scene
+
+    timeline_json = build_timeline_from_scenes(raw_scenes)
+    new_version = current_version + 1
+
+    infographics_list, text_list = _compute_infographics_and_text_lists(raw_scenes, timeline_json)
+    broll_list = _compute_broll_list(timeline_json)
+
+    try:
+        supabase.table("videos").update({
+            "raw_scenes": raw_scenes, "timeline_json": timeline_json, "timeline_version": new_version,
+            "final_video_url": None, "render_status": "stale_needs_render",
+            "infographics_list": infographics_list, "text_list": text_list, "broll_list": broll_list,
+        }).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[delete-scene-content] failed to save video {video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete content")
+
+    return {
+        "video_id": video_id, "scene_id": scene_id, "content_type": content_type, "beat_id": beat_id,
+        "infographics_list": infographics_list, "text_list": text_list, "broll_list": broll_list,
+        "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
+    }
