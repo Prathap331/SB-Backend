@@ -6699,7 +6699,7 @@ async def generate_thumbnail_for_script(
 def _build_structure_response(selected_template: dict) -> list[dict]:
     segments = selected_template.get("segments") or []
     return [
-        {"name": seg.get("name"), "percentage": seg.get("percentage")}
+        {"name": seg.get("segment_name"), "percentage": seg.get("percentage")}
         for seg in segments
     ]
 
