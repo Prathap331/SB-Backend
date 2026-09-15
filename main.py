@@ -11438,9 +11438,11 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
     geo["width"] = max(40, min(geo["width"], max_width))
     geo["height"] = max(40, min(geo["height"], max_height))
 
-    # Always honor the given x/y — just clamp to safe margins and keep
-    # overlay_text/overlay_graphic clear of the caption band. No more
-    # forced re-centering based on category or a "manually placed" flag.
+    # Always honor the given x/y — clamp to safe margins and keep
+    # overlay_text/overlay_graphic clear of the caption band, but never
+    # force-override the position back to center. Whatever geometry_px
+    # is stored (from the model, a fallback builder, or a human PATCH
+    # reposition) is what renders.
     geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
     geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
     if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
@@ -11451,6 +11453,7 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
             geo["y"] = _SAFE_MARGIN
 
     return geo
+
 
 def _validate_motion(raw: Any, geometry: dict) -> dict:
     default_xy = [geometry["x"], geometry["y"]]
@@ -11469,9 +11472,8 @@ def _validate_motion(raw: Any, geometry: dict) -> dict:
     return motion
 
 
-def _validate_beat_animation(
-    raw: Any, beat_ids: set, beats_by_id: Optional[dict] = None, allow_manual_placement: bool = False,
-) -> Optional[dict]:
+
+def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict] = None) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
     beat_id = raw.get("beat_id")
@@ -11537,14 +11539,6 @@ def _validate_beat_animation(
     else:
         icon_name, icon_layout = None, None
 
-    # Diagnostic only (not an auto-fix — inventing a plausible second icon
-    # from text alone is too unreliable to do safely in code): flag when a
-    # single icon_name is paired with render_prompt/display_text language
-    # that describes a two-sided comparison. What renders in that case is
-    # one icon next to comparison text with no visual link between them —
-    # exactly the "odd, random-looking icon" pattern. The real fix is the
-    # prompt's own CONSISTENCY CHECK instruction; this just makes it
-    # visible in logs when the model doesn't follow it.
     if isinstance(icon_name, str) and icon_name:
         comparison_source = " ".join(
             str(x) for x in (raw.get("render_prompt"), raw.get("display_text"), raw.get("content_binding"))
@@ -11574,11 +11568,6 @@ def _validate_beat_animation(
         if not color_hint.startswith("#"):
             color_hint = f"#{color_hint}"
 
-    # Background/panel color behind the text box or icon badge itself —
-    # distinct from color_hint (the accent/icon color) and distinct from
-    # a scene's own broll background_color (the video background). null
-    # means "let the renderer's own default panel color apply" (theme.panel
-    # on the Remotion side) rather than forcing a specific one.
     background_color_hint = raw.get("background_color_hint")
     if isinstance(background_color_hint, str) and _HEX_COLOR_RE.match(background_color_hint.strip()):
         background_color_hint = background_color_hint.strip()
@@ -11587,13 +11576,6 @@ def _validate_beat_animation(
     else:
         background_color_hint = None
 
-    # Font size for the overlay's own text (distinct from
-    # SceneStyleUpdate.font_size, which controls burned-in word-by-word
-    # captions, not this). null means "let the renderer size it itself"
-    # (auto-fit to the box, or the Remotion component's own default) —
-    # only set when a specific size is actually wanted, e.g. via a manual
-    # PATCH edit. Clamped to a sane range; this field existed in the
-    # schema before but was never actually read anywhere downstream.
     font_size = raw.get("font_size")
     try:
         font_size = int(font_size) if font_size is not None else None
@@ -11606,14 +11588,6 @@ def _validate_beat_animation(
     if not isinstance(highlight_target_text, str) or not highlight_target_text.strip():
         highlight_target_text = None
 
-    # anchor_start_sec/anchor_end_sec: the Animation Planner's own computed
-    # timing, read directly off the real word-level timestamps it was
-    # given for this beat — authoritative when present. build_timeline_
-    # from_scenes prefers these over its own after-the-fact phrase
-    # matching; they're optional here (not every caller of
-    # _validate_beat_animation runs through the Animation Planner, e.g.
-    # the guaranteed-icon fallback), so an absent/invalid value just means
-    # "fall back to the heuristic matcher," not a validation failure.
     anchor_start_sec = raw.get("anchor_start_sec")
     anchor_end_sec = raw.get("anchor_end_sec")
     try:
@@ -11652,23 +11626,12 @@ def _validate_beat_animation(
         "color_hint": color_hint,
         "background_color_hint": background_color_hint,
         "font_size": font_size,
-        # Sticky once set: True either because THIS validation call was
-        # explicitly told it's a manual PATCH, or because the animation
-        # was already manually placed by an earlier PATCH and this call
-        # is just touching some other unrelated field. Without the OR,
-        # a later edit that doesn't mention placement/geometry_px (e.g.
-        # only changing color_hint) would reset this back to False,
-        # silently opting the animation back into auto-centering on the
-        # next render even though nothing about its position was
-        # supposed to change.
-        "manually_placed": bool(allow_manual_placement or (isinstance(raw, dict) and raw.get("manually_placed"))),
         "highlight_target_text": highlight_target_text,
         "anchor_start_sec": anchor_start_sec,
         "anchor_end_sec": anchor_end_sec,
         "render_prompt": render_prompt,
         "render_engine_hint": render_engine_hint,
     }
-
 
 async def _run_animation_planner(
     *, scene_id: str, scene_visual_intent: str, scene_on_screen_text: str, requires_animation: bool,
@@ -12209,9 +12172,6 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 continue
             w_start_frame = scene_start_frame + _seconds_to_frames(w["start"] - start_sec, fps)
             w_end_frame = scene_start_frame + _seconds_to_frames(w["end"] - start_sec, fps)
-            # Defensive clamp: WhisperX timestamps can round to a frame or
-            # two past the scene's own computed end — never let a caption
-            # word render past the scene/voiceover boundary.
             w_start_frame = max(scene_start_frame, min(w_start_frame, scene_end_frame))
             w_end_frame = max(w_start_frame, min(w_end_frame, scene_end_frame))
             words.append({"word": w.get("word", ""), "startFrame": w_start_frame, "endFrame": w_end_frame})
@@ -12281,21 +12241,8 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
 
             anim_start_frame = b_start_frame
             matched_end_frame = None
-
-            # Compute the deterministic heuristic match FIRST, always —
-            # regardless of whether the model also provided its own
-            # anchor. This is what lets us catch a hallucinated
-            # anchor_start_sec: the model was given real word timestamps
-            # and told to read from them, but nothing forces it to
-            # actually do that — it can just default anchor_start_sec to
-            # the beat's own start out of habit while still passing schema
-            # validation. Without a cross-check, that wrong number would
-            # silently override what the heuristic matcher (grounded in
-            # the same real transcript) would have gotten right.
             target_text = animation.get("highlight_target_text")
             if not target_text:
-                # display_text can legally be a list (multi-line
-                # overlays), not just a string.
                 candidate_text = _display_text_to_string(animation.get("display_text"))
                 if candidate_text:
                     target_text = candidate_text
@@ -12303,29 +12250,10 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             model_anchor_start = animation.get("anchor_start_sec")
             model_anchor_end = animation.get("anchor_end_sec")
 
-            # Pass the model's own anchor as a disambiguation hint — see
-            # _find_phrase_span_sec's docstring. Without this, a phrase
-            # that's genuinely spoken more than once in a long scene (a
-            # callback, a recap) could match the wrong occurrence even
-            # though it scores fine in isolation; the model's anchor,
-            # even when not itself precise, is usually close enough to
-            # the TRUE occurrence to pick the right one of several.
             heuristic_span = _find_phrase_span_sec(
                 target_text, timed_words_sec, start_sec, end_sec, hint_start_sec=model_anchor_start,
             )
 
-            # Heuristic-first: the deterministic transcript matcher has
-            # proven reliable in every verified case; the model's own
-            # anchor_start_sec has repeatedly turned out wrong (defaulted
-            # to the beat's start rather than actually read from the
-            # words it was given) even when it landed within a small-
-            # seeming margin of the truth — a "small" 2s disagreement is
-            # still very visibly wrong to a viewer. So the priority is now
-            # inverted from a pure tolerance check: use the heuristic
-            # whenever it finds ANY match at all, and fall back to the
-            # model's anchor only when the heuristic finds nothing to
-            # match against (e.g. a paraphrased display_text with no
-            # verbatim words in the transcript).
             use_model_anchor = model_anchor_start is not None and heuristic_span is None
             if model_anchor_start is not None and heuristic_span is not None:
                 heuristic_start_sec = heuristic_span[0]
@@ -12346,38 +12274,11 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 candidate_start_frame = scene_start_frame + _seconds_to_frames(matched_start_sec - start_sec, fps)
                 anim_start_frame = max(scene_start_frame, min(candidate_start_frame, scene_end_frame))
 
-            # End time. The heuristic-matched end (when we have one) is
-            # the TRUSTED baseline — it's deterministic, grounded in the
-            # real transcript, and by construction lands right at the end
-            # of the actual matched phrase. We extend past that baseline
-            # to accommodate a model-provided anchor_end_sec or
-            # duration_frames that wants extra hold time, but only by a
-            # bounded, reasonable margin — not by an unlimited amount.
-            #
-            # This cap is the fix for a real regression: the previous
-            # version took the unconditional max() of every end candidate,
-            # including the model's own anchor_end_sec/duration_frames
-            # with no sanity check against the heuristic at all. When the
-            # model hallucinated a wildly-too-long end (e.g. defaulting to
-            # something like its own beat's full remaining length), that
-            # unbounded max() would win outright — and because the
-            # cross-beat spillover fix now faithfully renders an animation
-            # across as many beats as its computed end requires, the
-            # result was an overlay lingering for 10+ seconds past when
-            # the phrase actually finished, silently overlapping whatever
-            # came next. Bounding the extension keeps the original intent
-            # (never cut off before the voice finishes) without also
-            # allowing an unverified number to run away unbounded.
             model_end_frame = min(anim_start_frame + animation.get("duration_frames", 90), scene_end_frame)
             if heuristic_span is not None:
                 _, heuristic_end_sec = heuristic_span
                 candidate_end_frame = scene_start_frame + _seconds_to_frames(heuristic_end_sec - start_sec, fps)
                 heuristic_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
-                # Deliberate hold after the phrase finishes being spoken —
-                # this is what makes the overlay actually "stay" once the
-                # voice moves on, rather than disappearing the instant the
-                # last word ends. 0.3s is barely perceptible as a hold; 0.8s
-                # gives a viewer a real beat to keep reading before it goes.
                 hold_buffer_frames = round(0.8 * fps)
                 speech_end_frame = min(heuristic_end_frame + hold_buffer_frames, scene_end_frame)
 
@@ -12391,45 +12292,19 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
 
                 anim_end_frame = max(speech_end_frame, min(max(candidate_ends), max_end_frame))
             else:
-                # No heuristic to sanity-check against — fall back to
-                # trusting the model/duration_frames, same as before.
                 anim_end_frame = model_end_frame
                 if use_model_anchor and model_anchor_end is not None:
                     candidate_end_frame = scene_start_frame + _seconds_to_frames(model_anchor_end - start_sec, fps)
                     model_anchor_end_frame = max(anim_start_frame, min(candidate_end_frame, scene_end_frame))
                     anim_end_frame = max(anim_end_frame, model_anchor_end_frame)
-            # Defensive clamp: b_start_frame/b_end_frame are already bounded
-            # to [scene_start_frame, scene_end_frame], so this is normally
-            # redundant — but never let an animation's computed frames slip
-            # past the scene/voiceover boundary regardless of how it got here.
             anim_start_frame = max(scene_start_frame, min(anim_start_frame, scene_end_frame))
             anim_end_frame = max(anim_start_frame, min(anim_end_frame, scene_end_frame))
 
-            # Re-validate geometry_px against the CURRENT margin rules on
-            # every render, rather than trusting whatever was stored at
-            # the moment this animation was first created. Without this,
-            # geometry safety is frozen forever at creation time — an
-            # animation created before the margin-enforcement fix existed
-            # (or before any future geometry rule change) would stay
-            # unsafe across every subsequent re-render, no matter how
-            # correct the current validation logic or the Remotion
-            # component itself is. This mirrors the same self-healing
-            # approach already applied to sync/timing in this function —
-            # geometry deserves the same guarantee.
-            #
-            # allow_manual_placement is read from the animation's own
-            # stored "manually_placed" flag — set once, sticky, whenever a
-            # human PATCHed a specific placement/geometry_px (see
-            # _validate_beat_animation). Without this, a manually-placed
-            # animation would get silently force-centered back by THIS
-            # re-validation on the very next render, since this pass has
-            # no other way to distinguish "a human chose this position on
-            # purpose" from "the LLM generated this and it needs the
-            # normal safety/auto-center treatment".
             safe_geometry_px = _validate_geometry_px(
                 animation.get("geometry_px"), animation.get("category"),
                 display_text=animation.get("display_text"),
             )
+
             scene_animation_tracks.append({
                 "track_id": f"anim_{scene_id}_{beat_id}",
                 "scene_id": scene_id, "beat_id": beat_id, "type": "animation",
@@ -12449,21 +12324,6 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "render_engine_hint": animation.get("render_engine_hint"),
             })
 
-        # De-conflict: two DIFFERENT animations in the same scene must
-        # never be visibly on screen at the same time. Each animation's
-        # start/end was computed independently above (from its own
-        # anchor/heuristic match), with nothing cross-checking it against
-        # any OTHER animation in the scene — so two overlays with
-        # genuinely overlapping anchor windows (e.g. one ends at 183.6s,
-        # the next starts at 182.2s) would both get composited over the
-        # same frames simultaneously. This was always a latent risk, but
-        # became a guaranteed visual collision once every overlay_text/
-        # overlay_graphic animation started rendering at the same
-        # (center) position — two overlapping-in-time animations now
-        # occupy the exact same screen space, producing garbled double
-        # text. Sort by start and trim the EARLIER animation's end back
-        # to the LATER one's start wherever they overlap, so consecutive
-        # animations are always sequential, never simultaneous.
         scene_animation_tracks.sort(key=lambda t: t["startFrame"])
         for i in range(len(scene_animation_tracks) - 1):
             cur = scene_animation_tracks[i]
@@ -12481,7 +12341,6 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
         "resolution": {"width": TIMELINE_WIDTH, "height": TIMELINE_HEIGHT},
         "tracks": tracks,
     }
-
 
 
 _TEXT_ONLY_ANIMATION_TYPES = {
@@ -13330,9 +13189,7 @@ async def insert_beat(video_id: str, scene_id: str, beat_id: str, update: BeatIn
 
 @app.patch("/timeline/{video_id}/scene/{scene_id}/beat/{beat_id}/animation")
 async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, update: BeatAnimationUpdate):
-    """Create or edit the animation attached to a specific beat. Replaces
-    the old scene-level `update_scene_infographic` endpoint, since a scene
-    can now carry many beat-owned animations rather than one."""
+    """Create or edit the animation attached to a specific beat."""
     provided = {k: v for k, v in update.dict().items() if v is not None}
     if not provided:
         raise HTTPException(status_code=422, detail="Provide at least one field to update")
@@ -13371,69 +13228,21 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
             raise HTTPException(status_code=422, detail="animation_type is required to create a new animation on this beat")
         merged_raw = {"beat_id": beat_id, **provided}
     else:
-        # A partial geometry_px (e.g. just {"width": 240, "height": 240}
-        # to resize an icon without moving it) used to silently replace
-        # the WHOLE geometry_px dict on merge below — losing x/y entirely
-        # and snapping the animation to (0, 0). Merge with the existing
-        # geometry first so an unspecified field is preserved rather than
-        # dropped. When only width/height changed and x/y weren't given,
-        # recompute x/y so the box's CENTER stays put — this is what
-        # makes a resize-only PATCH actually behave like "make this
-        # bigger/smaller in place" instead of shifting the box's visual
-        # position just because its top-left anchor didn't move while its
-        # size did.
         if "geometry_px" in provided:
             existing_geo = animations[anim_idx].get("geometry_px") or {}
             new_geo_partial = provided["geometry_px"] or {}
             merged_geo = {**existing_geo, **new_geo_partial}
-            # x/y are simply left untouched when a PATCH only sends
-            # width/height — the existing top-left corner from
-            # {**existing_geo, **new_geo_partial} above already does
-            # this, since new_geo_partial has no "x"/"y" keys to
-            # override them with. (An earlier version of this resized
-            # around the box's CENTER instead, which meant a big size
-            # change shifted x/y as a side-effect — correct geometry,
-            # but it read as "the icon moved" rather than "it resized",
-            # so anchoring to the unchanged corner instead is simpler
-            # and matches what "just make it bigger/smaller" actually
-            # means to a caller who isn't also repositioning it.)
             provided = {**provided, "geometry_px": merged_geo}
 
         merged_raw = {**animations[anim_idx], **provided, "beat_id": beat_id}
-        # If this PATCH moves the animation (geometry_px and/or placement)
-        # WITHOUT also providing a new motion, drop the old stored motion
-        # rather than silently carrying it forward. _validate_motion
-        # defaults start_xy_px/end_xy_px to the geometry's own x/y, but
-        # only when raw.motion doesn't already have them set — otherwise
-        # it trusts whatever's already there. Left alone, a position-only
-        # PATCH would update geometry_px correctly while motion still
-        # pointed at the OLD coordinates — and if the Remotion component
-        # uses motion.start_xy_px/end_xy_px for its actual entrance
-        # animation (common for a "slide in" or "cascade" effect), the
-        # element visually stays at the old spot despite geometry_px
-        # being right, which is exactly indistinguishable from "the PATCH
-        # didn't work" even though the backend update succeeded.
         if ("geometry_px" in provided or "placement" in provided) and "motion" not in provided:
             old_motion_style = (animations[anim_idx].get("motion") or {}).get("motion_style")
             merged_raw["motion"] = {"motion_style": old_motion_style} if old_motion_style else None
 
-    # A human explicitly setting placement/geometry_px via this endpoint
-    # is a deliberate decision and should be respected, unlike the
-    # Animation Planner's own output which always gets force-centered.
-    # Scoped to only fire when THIS PATCH actually touches one of those
-    # two fields, so an unrelated edit (e.g. just color_hint) on an
-    # existing manually-placed animation doesn't accidentally re-center it,
-    # and a PATCH that never mentions placement doesn't unexpectedly
-    # opt an animation out of auto-centering either.
-    allow_manual_placement = "placement" in provided or "geometry_px" in provided
     validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id)
     if not validated:
         raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
     if isinstance(merged_raw.get("id"), int):
-        # Editing an existing animation — keep its id stable rather than
-        # letting _assign_animation_ids (called inside
-        # _compute_infographics_and_text_lists below) treat this as a new
-        # entry and hand it a fresh one.
         validated["id"] = merged_raw["id"]
 
     if anim_idx is None:
@@ -13464,7 +13273,7 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
         "timeline": timeline_json, "needs_render": True,
     }
 
-
+    
 @app.delete("/timeline/{video_id}/overlay/{overlay_id}")
 async def delete_animation_by_id(video_id: str, overlay_id: int):
     """
