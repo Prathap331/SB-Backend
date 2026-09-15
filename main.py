@@ -9289,16 +9289,6 @@ from pydantic import BaseModel
 
 
 
-def _looks_like_playable_media_url(url: Optional[str]) -> bool:
-    if not url:
-        return False
-    if "videos.pexels.com" in url or "images.pexels.com" in url:
-        return True
-    if re.search(r"\.(mp4|mov|webm|jpg|jpeg|png|webp)(\?|$)", url, re.IGNORECASE):
-        return True
-    return False
-
-
 
 def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) -> Optional[str]:
     if not candidate:
