@@ -9225,20 +9225,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -11436,23 +11422,64 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
     if not isinstance(content_binding, str):
         content_binding = ""
 
-    icon_name = raw.get("icon_name")
+    icon_name_raw = raw.get("icon_name")
     icon_layout = raw.get("icon_layout")
+    display_text_raw = raw.get("display_text")
+    # normalize display_text_raw's list form early so it can be kept in
+    # lockstep with icon_name below — full validation (stringify, len cap
+    # etc.) still happens later at the `display_text = raw.get(...)` block.
+    display_text_list_raw = display_text_raw if isinstance(display_text_raw, list) else None
+
     if category in ("overlay_graphic", "branding"):
-        if isinstance(icon_name, str) and icon_name in _ICON_VOCAB:
+        if isinstance(icon_name_raw, str) and icon_name_raw in _ICON_VOCAB:
+            icon_name = icon_name_raw
             icon_layout = None
-        elif isinstance(icon_name, list):
-            cleaned = [i for i in icon_name if isinstance(i, str) and i in _ICON_VOCAB][:4]
-            if len(cleaned) >= 2:
-                icon_name = cleaned
+        elif isinstance(icon_name_raw, list):
+            # FIX: previously this filtered icon_name_raw down to only
+            # vocabulary-valid entries (dropping invalid ones and
+            # shrinking the array), while display_text was validated
+            # completely independently a few lines below with its own
+            # [:8] cap and zero awareness of which icon indices survived.
+            # For icon_sequence in particular, display_text[i] is the
+            # caption FOR icon_name[i] — so as soon as a model-provided
+            # icon name isn't in _ICON_VOCAB, the two arrays silently
+            # went out of length-sync. IconSequenceOverlay.tsx only
+            # renders per-icon labels when
+            # `perIconLabels.length === iconList.length`; any mismatch
+            # makes it fall back to dumping the ENTIRE unsplit label
+            # string into one unstyled line — the garbled run-on text
+            # reported in chat. Fix: drop the paired label at the same
+            # index whenever an icon is dropped, so the two arrays never
+            # go out of sync in the first place.
+            kept_icons: list = []
+            kept_labels: list = []
+            for idx, i in enumerate(icon_name_raw):
+                if isinstance(i, str) and i in _ICON_VOCAB and len(kept_icons) < 4:
+                    kept_icons.append(i)
+                    if display_text_list_raw is not None and idx < len(display_text_list_raw):
+                        kept_labels.append(display_text_list_raw[idx])
+            if len(kept_icons) >= 2:
+                icon_name = kept_icons
                 if icon_layout not in _VALID_ICON_LAYOUTS:
                     icon_layout = "sequence" if animation_type == "icon_sequence" else "cluster"
-            elif len(cleaned) == 1:
-                icon_name, icon_layout = cleaned[0], None
+                if display_text_list_raw is not None:
+                    display_text_raw = kept_labels or None
+            elif len(kept_icons) == 1:
+                icon_name, icon_layout = kept_icons[0], None
+                if display_text_list_raw is not None:
+                    display_text_raw = kept_labels[0] if kept_labels else None
             else:
+                # Nothing survived vocabulary validation at all — fall
+                # back to a single generic icon, and drop the list-form
+                # labels entirely rather than showing orphaned per-icon
+                # captions with no icons to anchor them to.
                 icon_name, icon_layout = "sparkles", None
+                if display_text_list_raw is not None:
+                    display_text_raw = None
         else:
             icon_name, icon_layout = "sparkles", None
+            if display_text_list_raw is not None:
+                display_text_raw = None
     else:
         icon_name, icon_layout = None, None
 
@@ -11471,11 +11498,18 @@ def _validate_beat_animation(raw: Any, beat_ids: set, beats_by_id: Optional[dict
                 f"with icon_layout='pair'."
             )
 
-    display_text = raw.get("display_text")
+    # display_text now comes from display_text_raw (kept in sync with
+    # icon_name above when both were lists) rather than a fresh,
+    # uncorrelated raw.get("display_text") read.
+    display_text = display_text_raw
     if display_text is not None and not isinstance(display_text, (str, list)):
         display_text = None
     if isinstance(display_text, list):
-        display_text = [str(d) for d in display_text if isinstance(d, (str, int, float))][:8]
+        # Capped to 4 here (not 8) to match icon_name's own 4-icon cap —
+        # a longer label list than the icon list it's meant to pair with
+        # was the other half of this desync bug.
+        display_text = [str(d) for d in display_text if isinstance(d, (str, int, float))][:4]
+
 
     color_hint = raw.get("color_hint")
     if not isinstance(color_hint, str) or not _HEX_COLOR_RE.match(color_hint.strip()):
@@ -13717,6 +13751,20 @@ def _display_text_to_string(display_text: Any) -> str:
     if isinstance(display_text, str):
         return display_text
     return ""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
