@@ -11420,9 +11420,8 @@ def _content_aware_max_box_size(display_text: Any) -> tuple:
     return max_width, max_height
 
 
-def _validate_geometry_px(
-    raw: Any, category: str, allow_manual_placement: bool = False, display_text: Any = None,
-) -> dict:
+
+def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> dict:
     if category in ("full_screen", "transition"):
         return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
 
@@ -11432,8 +11431,8 @@ def _validate_geometry_px(
     else:
         try:
             geo = {
-                "x": int(raw.get("x", 0)) if allow_manual_placement else 0,
-                "y": int(raw.get("y", 0)) if allow_manual_placement else 0,
+                "x": int(raw.get("x", 0)),
+                "y": int(raw.get("y", 0)),
                 "width": int(raw.get("width", default["width"])),
                 "height": int(raw.get("height", default["height"])),
             }
@@ -11443,62 +11442,25 @@ def _validate_geometry_px(
     max_width = max(40, ANIMATION_CANVAS_WIDTH - 2 * _SAFE_MARGIN)
     max_height = max(40, ANIMATION_CANVAS_HEIGHT - 2 * _SAFE_MARGIN)
     if category == "overlay_text" and display_text is not None:
-        # Tighten the ceiling further to what this specific text actually
-        # needs, instead of only capping against the canvas-wide maximum
-        # (which is generous enough to let a 3-word phrase get a
-        # near-half-screen box). Never used for overlay_graphic — an
-        # icon's badge size is a deliberate visual choice independent of
-        # any label text next to it.
         content_max_w, content_max_h = _content_aware_max_box_size(display_text)
         max_width = min(max_width, content_max_w)
         max_height = min(max_height, content_max_h)
     geo["width"] = max(40, min(geo["width"], max_width))
     geo["height"] = max(40, min(geo["height"], max_height))
 
-    if allow_manual_placement and isinstance(raw, dict) and ("x" in raw or "y" in raw):
-        # A human explicitly set a position via a PATCH edit — that's a
-        # deliberate decision, not something to silently override. Still
-        # enforce the same minimum-margin/caption-safe-zone safety rails
-        # as everything else, just don't force it back to dead center.
-        geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
-        geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
-        if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
-            if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
-                geo["y"] = CAPTION_SAFE_ZONE_Y - geo["height"]
-            else:
-                geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
-                geo["y"] = _SAFE_MARGIN
-        return geo
-
-    # Icons and text overlays are always centered on the frame — this is a
-    # deliberate product decision (not a fallback default): whatever
-    # placement/x/y the model or an older stored animation provides is
-    # discarded entirely, the same way full_screen/transition above always
-    # get the full frame regardless of input. Corner placement was tried
-    # earlier and reversed on explicit direction — center is now the only
-    # placement for these two categories, UNLESS allow_manual_placement is
-    # set (only true for direct human PATCH edits — see
-    # update_beat_animation), in which case the block above already
-    # returned an explicit, human-chosen position.
-    geo["x"] = (ANIMATION_CANVAS_WIDTH - geo["width"]) // 2
-
-    if category in ("overlay_text", "overlay_graphic"):
-        # Vertically centered on the frame, but never low enough to reach
-        # the caption band at the bottom — bias upward if a tall box would
-        # otherwise overlap it.
-        centered_y = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
-        if centered_y + geo["height"] > CAPTION_SAFE_ZONE_Y:
-            if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
-                centered_y = CAPTION_SAFE_ZONE_Y - geo["height"]
-            else:
-                geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
-                centered_y = _SAFE_MARGIN
-        geo["y"] = centered_y
-    else:
-        geo["y"] = (ANIMATION_CANVAS_HEIGHT - geo["height"]) // 2
+    # Always honor the given x/y — just clamp to safe margins and keep
+    # overlay_text/overlay_graphic clear of the caption band. No more
+    # forced re-centering based on category or a "manually placed" flag.
+    geo["x"] = max(_SAFE_MARGIN, min(geo["x"], ANIMATION_CANVAS_WIDTH - _SAFE_MARGIN - geo["width"]))
+    geo["y"] = max(_SAFE_MARGIN, min(geo["y"], ANIMATION_CANVAS_HEIGHT - _SAFE_MARGIN - geo["height"]))
+    if category in ("overlay_text", "overlay_graphic") and geo["y"] + geo["height"] > CAPTION_SAFE_ZONE_Y:
+        if geo["height"] < CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN:
+            geo["y"] = CAPTION_SAFE_ZONE_Y - geo["height"]
+        else:
+            geo["height"] = CAPTION_SAFE_ZONE_Y - _SAFE_MARGIN - 4
+            geo["y"] = _SAFE_MARGIN
 
     return geo
-
 
 def _validate_motion(raw: Any, geometry: dict) -> dict:
     default_xy = [geometry["x"], geometry["y"]]
@@ -11533,22 +11495,10 @@ def _validate_beat_animation(
     placement = raw.get("placement")
     if category in ("full_screen", "transition"):
         placement = "full_frame"
-    elif category in ("overlay_text", "overlay_graphic") and not allow_manual_placement:
-        # Icons and text overlays are always centered — see
-        # _validate_geometry_px, which forces the actual geometry to
-        # center regardless of what's given. Keep the placement LABEL
-        # consistent with that so nothing downstream reads a stale
-        # corner name against center coordinates. Manual PATCH edits
-        # (allow_manual_placement=True) keep whatever placement label the
-        # human sent instead — validated below like everything else.
-        placement = "center"
     elif placement not in _VALID_PLACEMENTS:
-        placement = "top_left" if allow_manual_placement else "top_center"
+        placement = "top_left"
 
-    geometry_px = _validate_geometry_px(
-        raw.get("geometry_px"), category, allow_manual_placement=allow_manual_placement,
-        display_text=raw.get("display_text"),
-    )
+    geometry_px = _validate_geometry_px(raw.get("geometry_px"), category, display_text=raw.get("display_text"))
     motion = _validate_motion(raw.get("motion"), geometry_px)
 
     z_index_layer = raw.get("z_index_layer")
@@ -12488,10 +12438,8 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
             # normal safety/auto-center treatment".
             safe_geometry_px = _validate_geometry_px(
                 animation.get("geometry_px"), animation.get("category"),
-                allow_manual_placement=bool(animation.get("manually_placed")),
                 display_text=animation.get("display_text"),
             )
-
             scene_animation_tracks.append({
                 "track_id": f"anim_{scene_id}_{beat_id}",
                 "scene_id": scene_id, "beat_id": beat_id, "type": "animation",
@@ -13488,7 +13436,7 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
     # and a PATCH that never mentions placement doesn't unexpectedly
     # opt an animation out of auto-centering either.
     allow_manual_placement = "placement" in provided or "geometry_px" in provided
-    validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id, allow_manual_placement=allow_manual_placement)
+    validated = _validate_beat_animation(merged_raw, {beat_id}, beats_by_id)
     if not validated:
         raise HTTPException(status_code=422, detail=f"animation_type must be one of {sorted(_VALID_ANIMATION_TYPES)}")
     if isinstance(merged_raw.get("id"), int):
