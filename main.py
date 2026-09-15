@@ -9239,15 +9239,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -10021,9 +10012,14 @@ is hearing. icon_name (fixed vocabulary), content_binding, and
 render_prompt stay in English regardless of script_language, since they
 are internal/documentation values, not viewer-facing text.
 
-Canvas: every video is {CANVAS_WIDTH}x{CANVAS_HEIGHT}px (16:9). All
-positions and sizes you return must be real pixel values on this canvas —
-not vague fractions or percentages.
+Canvas: every video is LANDSCAPE, {CANVAS_WIDTH}px wide by {CANVAS_HEIGHT}px
+tall ({CANVAS_WIDTH}x{CANVAS_HEIGHT}, 16:9) — always this orientation and
+always this exact resolution, never portrait or square. x=0 is the left
+edge, x={CANVAS_WIDTH} is the right edge; y=0 is the top edge,
+y={CANVAS_HEIGHT} is the bottom edge. All positions and sizes you return
+must be real pixel values on this {CANVAS_WIDTH}x{CANVAS_HEIGHT} canvas —
+not vague fractions, percentages, or values assuming a different
+resolution or a portrait/vertical frame.
 
 Placement anchor reference (top-left corner in px for each placement zone,
 before you add your own width/height offset):
@@ -13721,6 +13717,18 @@ def _display_text_to_string(display_text: Any) -> str:
     if isinstance(display_text, str):
         return display_text
     return ""
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
