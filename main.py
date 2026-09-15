@@ -103,7 +103,13 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[Lifespan] Server started.")
+    worker_task = asyncio.create_task(_render_queue_worker())
     yield
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
     print("[Lifespan] Shutting down.")
 
 app = FastAPI(lifespan=lifespan)
@@ -3438,8 +3444,6 @@ async def get_channel_profile(userId: str):
         print(e)
         return None
     
-from fastapi import HTTPException
-
 
 class UnlockRequest(BaseModel):
     userId: str
@@ -9295,14 +9299,6 @@ def _looks_like_playable_media_url(url: Optional[str]) -> bool:
     return False
 
 
-def _is_landscape_dimensions(width, height) -> bool:
-    try:
-        w = float(width)
-        h = float(height)
-    except (TypeError, ValueError):
-        return False
-    return w > 0 and h > 0 and w >= h * 1.2
-
 
 def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) -> Optional[str]:
     if not candidate:
@@ -9339,32 +9335,6 @@ def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) ->
         return best["link"]
 
     return None
-
-
-def _resolve_broll_file_url_any_orientation(candidate: dict, source: str) -> Optional[str]:
-    if not candidate:
-        return None
-
-    existing = candidate.get("file_url")
-    if _looks_like_playable_media_url(existing):
-        return existing
-
-    if source == "video":
-        if candidate.get("video_url") and _looks_like_playable_media_url(candidate["video_url"]):
-            return candidate["video_url"]
-        video_files = candidate.get("video_files") or []
-        if video_files:
-            for vf in video_files:
-                if vf.get("quality") == "hd" and vf.get("file_type") == "video/mp4":
-                    return vf.get("link")
-            return video_files[0].get("link")
-        return candidate.get("url") if _looks_like_playable_media_url(candidate.get("url")) else None
-
-    src = candidate.get("src") or {}
-    for key in ("large2x", "large", "original", "medium"):
-        if src.get(key):
-            return src[key]
-    return candidate.get("url") if _looks_like_playable_media_url(candidate.get("url")) else None
 
 
 def _video_is_landscape(v: dict) -> bool:
@@ -10043,10 +10013,6 @@ _ICON_EMOJI_FALLBACK = {
 _DEFAULT_ICON_EMOJI = "\u2b50"
 
 
-def _icon_glyph(icon_name: str) -> str:
-    return _ICON_EMOJI_FALLBACK.get(icon_name, _DEFAULT_ICON_EMOJI)
-
-
 
 CANVAS_WIDTH = 1920
 CANVAS_HEIGHT = 1080
@@ -10568,20 +10534,6 @@ class SceneBrollSelectUpdate(BaseModel):
     end: Optional[float] = None
     adjust_next_beat: bool = True
 
-
-def _hex_to_ass_color(hex_color: str, alpha_hex: str = "00") -> str:
-    h = (hex_color or "").strip().lstrip("#")
-    if len(h) != 6:
-        h = "FFFFFF"
-    r, g, b = h[0:2], h[2:4], h[4:6]
-    return f"&H{alpha_hex}{b}{g}{r}"
-
-
-def _normalize_ffmpeg_color(hex_color: str) -> str:
-    h = (hex_color or "").strip().lstrip("#")
-    if len(h) != 6:
-        h = "111827"
-    return f"0x{h}"
 
 
 _HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
@@ -14198,44 +14150,7 @@ async def delete_scene_content(
 
 
 
-from fastapi import HTTPException
-
-
-RENDER_TMP_ROOT = os.getenv("RENDER_TMP_ROOT", "/tmp/storybit-render")
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
-
-REMOTION_PROJECT_DIR = os.getenv("REMOTION_PROJECT_DIR", "")
-
-RENDER_CONCURRENCY = int(os.getenv("RENDER_CONCURRENCY", str(max(os.cpu_count() or 2, 2))))
-
-FFMPEG_X264_PRESET = os.getenv("FFMPEG_X264_PRESET", "veryfast")
-FFMPEG_X264_CRF = os.getenv("FFMPEG_X264_CRF", "23")
-FFMPEG_X264_FLAGS = [
-    "-c:v", "libx264",
-    "-preset", FFMPEG_X264_PRESET,
-    "-crf", FFMPEG_X264_CRF,
-    "-pix_fmt", "yuv420p",
-    "-threads", "0",
-]
-
-SILENT_AUDIO_SAMPLE_RATE = int(os.getenv("SILENT_AUDIO_SAMPLE_RATE", "48000"))
-SILENT_AUDIO_CHANNEL_LAYOUT = os.getenv("SILENT_AUDIO_CHANNEL_LAYOUT", "stereo")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RENDER_OUTPUT_DIR = os.environ.get("RENDER_OUTPUT_DIR", os.path.join(BASE_DIR, "rendered_videos"))
-os.makedirs(RENDER_OUTPUT_DIR, exist_ok=True)
-
-LANDSCAPE_RESOLUTION = {"width": 1920, "height": 1080}
-PORTRAIT_RESOLUTION = {"width": 1080, "height": 1920}
-
-SUPABASE_RENDERED_VIDEOS_BUCKET = os.getenv("SUPABASE_RENDERED_VIDEOS_BUCKET", "rendered-videos")
-
-
-class RenderVideoRequest(BaseModel):
-    force: bool = False
-    orientation: Literal["landscape", "portrait"] = "landscape"
-
 
 RUN_SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("RUN_SUBPROCESS_TIMEOUT_SECONDS", "300"))
 
@@ -14272,4 +14187,164 @@ def _display_text_to_string(display_text: Any) -> str:
     if isinstance(display_text, str):
         return display_text
     return ""
+
+
+
+
+
+RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://62.83.19.227:8000")
+RENDER_QUEUE_MAX_CONCURRENT = int(os.getenv("RENDER_QUEUE_MAX_CONCURRENT", "1"))
+RENDER_QUEUE_POLL_SECONDS = int(os.getenv("RENDER_QUEUE_POLL_SECONDS", "5"))
+RENDER_QUEUE_HTTP_TIMEOUT = float(os.getenv("RENDER_QUEUE_HTTP_TIMEOUT", "1800"))  
+ 
+
+class RenderQueueRequest(BaseModel):
+    video_id: str
+    orientation: Literal["landscape", "portrait"] = "landscape"
+ 
+ 
+@app.post("/render/queue")
+async def enqueue_render(request: RenderQueueRequest):
+    """Adds a video to the render waitlist instead of rendering it
+    immediately. A background worker (started at app startup — see
+    _render_queue_worker) picks entries up in FIFO order, capped at
+    RENDER_QUEUE_MAX_CONCURRENT actually rendering at once, and dispatches
+    each one to RENDER_SERVICE_URL — the actual render box — via a plain
+    HTTP call to its existing /render/{video_id} endpoint. This process
+    doesn't have to be the render box itself; it can sit on your main API
+    server and just dispatch to wherever the render service actually
+    lives."""
+    try:
+        row = supabase.table("render_queue").insert({
+            "video_id": request.video_id,
+            "orientation": request.orientation,
+            "status": "pending",
+        }).execute()
+    except Exception as e:
+        print(f"[render-queue] failed to enqueue {request.video_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to add to render queue")
+ 
+    if not row.data:
+        raise HTTPException(status_code=500, detail="Failed to add to render queue")
+ 
+    entry = row.data[0]
+    try:
+        pending_ahead = (
+            supabase.table("render_queue")
+            .select("id", count="exact")
+            .eq("status", "pending")
+            .lt("created_at", entry["created_at"])
+            .execute()
+        )
+        position = (pending_ahead.count or 0) + 1
+    except Exception:
+        position = None
+ 
+    return {
+        "queue_id": entry["id"], "video_id": request.video_id, "status": "pending",
+        "position_in_queue": position,
+    }
+ 
+ 
+@app.get("/render/queue/{queue_id}")
+async def get_render_queue_status(queue_id: str):
+    """Check one queued render's status: pending, processing, completed
+    (with final_video_url), or failed (with error_message)."""
+    try:
+        row = supabase.table("render_queue").select("*").eq("id", queue_id).maybe_single().execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not row.data:
+        raise HTTPException(status_code=404, detail="Queue entry not found")
+    return row.data
+ 
+ 
+@app.get("/render/queue")
+async def list_render_queue(status: Optional[str] = None, limit: int = 50):
+    """Lists queue entries, most recent first. Pass status= to filter to
+    just pending/processing/completed/failed."""
+    try:
+        query = supabase.table("render_queue").select("*").order("created_at", desc=True).limit(min(limit, 200))
+        if status:
+            query = query.eq("status", status)
+        rows = query.execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"entries": rows.data or []}
+ 
+ 
+async def _process_one_queued_render(entry: dict) -> None:
+    """Dispatches ONE queue entry to the render service over HTTP and
+    records the outcome. Runs inside the semaphore in _render_queue_worker,
+    so at most RENDER_QUEUE_MAX_CONCURRENT of these are ever in flight —
+    that's the actual point of this whole system: protecting the render
+    box from every /render call landing on it simultaneously."""
+    queue_id = entry["id"]
+    video_id = entry["video_id"]
+    orientation = entry.get("orientation") or "landscape"
+ 
+    try:
+        supabase.table("render_queue").update({
+            "status": "processing",
+            "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }).eq("id", queue_id).execute()
+    except Exception as e:
+        print(f"[render-queue] failed to mark {queue_id} as processing (continuing anyway): {e}")
+ 
+    try:
+        async with httpx.AsyncClient(timeout=RENDER_QUEUE_HTTP_TIMEOUT) as client:
+            resp = await client.post(
+                f"{RENDER_SERVICE_URL}/render/{video_id}",
+                json={"orientation": orientation},
+            )
+            resp.raise_for_status()
+            result = resp.json()
+ 
+        supabase.table("render_queue").update({
+            "status": "completed",
+            "final_video_url": result.get("final_video_url"),
+            "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }).eq("id", queue_id).execute()
+        print(f"[render-queue] {queue_id} ({video_id}) completed")
+ 
+    except Exception as e:
+        print(f"[render-queue] {queue_id} ({video_id}) failed: {e}")
+        try:
+            supabase.table("render_queue").update({
+                "status": "failed",
+                "error_message": str(e)[:2000],
+                "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }).eq("id", queue_id).execute()
+        except Exception as e2:
+            print(f"[render-queue] also failed to record the failure for {queue_id}: {e2}")
+ 
+ 
+async def _render_queue_worker() -> None:
+    """Background loop: every RENDER_QUEUE_POLL_SECONDS, picks up pending
+    entries (oldest first) and processes them, never exceeding
+    RENDER_QUEUE_MAX_CONCURRENT in flight at once. Runs for the lifetime
+    of the process — started once from the startup hook below."""
+    print(f"[render-queue] worker started (max concurrent={RENDER_QUEUE_MAX_CONCURRENT}, polling every {RENDER_QUEUE_POLL_SECONDS}s, dispatching to {RENDER_SERVICE_URL})")
+    in_flight: set = set()
+    while True:
+        try:
+            in_flight = {t for t in in_flight if not t.done()}
+            free_slots = RENDER_QUEUE_MAX_CONCURRENT - len(in_flight)
+            if free_slots > 0:
+                pending = (
+                    supabase.table("render_queue")
+                    .select("*")
+                    .eq("status", "pending")
+                    .order("created_at")
+                    .limit(free_slots)
+                    .execute()
+                )
+                for entry in (pending.data or []):
+                    task = asyncio.create_task(_process_one_queued_render(entry))
+                    in_flight.add(task)
+        except Exception as e:
+            print(f"[render-queue] worker loop error (will retry next poll): {e}")
+ 
+        await asyncio.sleep(RENDER_QUEUE_POLL_SECONDS)
+ 
 
