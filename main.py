@@ -14189,14 +14189,12 @@ def _display_text_to_string(display_text: Any) -> str:
     return ""
 
 
-
-
-
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://62.83.19.227:8000")
-RENDER_QUEUE_MAX_CONCURRENT = int(os.getenv("RENDER_QUEUE_MAX_CONCURRENT", "1"))
+RENDER_QUEUE_MAX_CONCURRENT = int(os.getenv("RENDER_QUEUE_MAX_CONCURRENT", "2"))
 RENDER_QUEUE_POLL_SECONDS = int(os.getenv("RENDER_QUEUE_POLL_SECONDS", "5"))
 RENDER_QUEUE_HTTP_TIMEOUT = float(os.getenv("RENDER_QUEUE_HTTP_TIMEOUT", "1800"))  
- 
+
+
 
 class RenderQueueRequest(BaseModel):
     video_id: str
@@ -14319,11 +14317,37 @@ async def _process_one_queued_render(entry: dict) -> None:
             print(f"[render-queue] also failed to record the failure for {queue_id}: {e2}")
  
  
+async def _recover_stale_processing_jobs() -> None:
+    """Runs once at startup. Any row still marked "processing" at boot
+    time is orphaned — the process that was working on it is the one
+    that just (re)started, so nothing is actually running it anymore. A
+    server restart mid-render otherwise leaves that row stuck showing
+    "processing" forever, since the worker only ever polls for "pending"
+    and the in-memory in_flight tracking that would have known about it
+    is gone along with the old process.
+ 
+    Safe ONLY under the single-worker assumption this whole queue is
+    built for. If this is ever run with multiple worker processes, this
+    would incorrectly reset a job another still-live process is
+    legitimately processing, causing it to be dispatched twice — don't
+    add this without pgmq-style visibility timeouts (or similar) once
+    you're actually running more than one worker.
+    """
+    try:
+        stuck = supabase.table("render_queue").select("id", "video_id").eq("status", "processing").execute()
+        for row in (stuck.data or []):
+            supabase.table("render_queue").update({"status": "pending"}).eq("id", row["id"]).execute()
+            print(f"[render-queue] recovered orphaned job {row['id']} ({row['video_id']}) — was stuck 'processing' from before this restart, reset to 'pending'")
+    except Exception as e:
+        print(f"[render-queue] failed to recover stale processing jobs on startup: {e}")
+ 
+ 
 async def _render_queue_worker() -> None:
     """Background loop: every RENDER_QUEUE_POLL_SECONDS, picks up pending
     entries (oldest first) and processes them, never exceeding
     RENDER_QUEUE_MAX_CONCURRENT in flight at once. Runs for the lifetime
     of the process — started once from the startup hook below."""
+    await _recover_stale_processing_jobs()
     print(f"[render-queue] worker started (max concurrent={RENDER_QUEUE_MAX_CONCURRENT}, polling every {RENDER_QUEUE_POLL_SECONDS}s, dispatching to {RENDER_SERVICE_URL})")
     in_flight: set = set()
     while True:
@@ -14346,5 +14370,3 @@ async def _render_queue_worker() -> None:
             print(f"[render-queue] worker loop error (will retry next poll): {e}")
  
         await asyncio.sleep(RENDER_QUEUE_POLL_SECONDS)
- 
-
