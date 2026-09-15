@@ -9248,29 +9248,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import os
 import json
@@ -9773,10 +9750,6 @@ _ICON_LIBRARY_GROUPS = {
 }
 _ICON_VOCAB = {icon for group in _ICON_LIBRARY_GROUPS.values() for icon in group}
 
-# Maps each STYLE_PROFILES category to the icon-library group most likely
-# to fit its content, so the guaranteed-icon fallback below (see
-# _pick_fallback_icon) reaches for something topical instead of always
-# defaulting to "sparkles".
 _ICON_GROUP_BY_CATEGORY = {
     "anthropology": "history_religion_anthropology_culture",
     "biography": "emotion_people",
@@ -9822,14 +9795,6 @@ _FALLBACK_ACCENT_COLORS = [
 
 
 def _pick_fallback_color(beat_id: Optional[str]) -> str:
-    """Rotates through a small palette instead of one hardcoded hex, keyed
-    on beat_id so the same beat always gets the same color across repeat
-    validation. This exists specifically because every other color_hint
-    default in this file used to be the identical "#F5A623" — the fallback
-    icon, the invalid/missing-color validation default, AND the example in
-    ANIMATION_PLANNER_PROMPT all converged on the same yellow, which is
-    almost certainly why generated videos ended up with everything yellow
-    regardless of what the model actually intended."""
     idx = sum(ord(c) for c in (beat_id or "")) % len(_FALLBACK_ACCENT_COLORS)
     return _FALLBACK_ACCENT_COLORS[idx]
 
@@ -9841,10 +9806,6 @@ def _pick_fallback_icon(category: str) -> str:
 
 
 def _fallback_icon_geometry() -> tuple[dict, dict]:
-    """Centered geometry for the fallback icon — icons and text overlays
-    are always centered on the frame per product direction, not placed in
-    a corner. Vertically centered but kept clear of the caption band at
-    the bottom by construction (icon is small relative to the frame)."""
     size = 160
     x = (CANVAS_WIDTH - size) // 2
     y = (CANVAS_HEIGHT - size) // 2
@@ -9858,12 +9819,6 @@ def _fallback_icon_geometry() -> tuple[dict, dict]:
 
 
 def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
-    """Guaranteed icon_pop_in for a scene that came back from the
-    Animation Planner with zero icon-bearing animations. Kept intentionally
-    plain — a small pop-in icon, not competing for the same visual weight
-    as a model-authored animation. Placement rotates across a beat's own
-    index so a video that leans on this fallback more than once doesn't
-    end up with every fallback icon parked in the same corner."""
     icon = _pick_fallback_icon(category)
     key_action = ((beat.get("scene_direction") or {}).get("key_action") or "").strip()
     on_screen_words = key_action.split()
@@ -9894,11 +9849,6 @@ def _build_fallback_icon_animation(beat: dict, category: str) -> dict:
 
 
 def _infer_video_category(scenes: list) -> str:
-    """Best-effort category lookup from whatever scenes already carry —
-    used by the video-level icon guarantee below when it needs to pick a
-    fallback icon but isn't running inside the main /edit-video request
-    (e.g. a single-scene rebuild/trim endpoint) where `category` isn't
-    already in scope."""
     for s in scenes:
         ctx = s.get("_beat_director_context")
         if ctx and ctx.get("category"):
@@ -9907,14 +9857,6 @@ def _infer_video_category(scenes: list) -> str:
 
 
 def _ensure_video_has_icon_animation(scenes: list, category: str) -> None:
-    """Final, video-wide safety net: guarantees at least one icon-bearing
-    animation (category "overlay_graphic" or "branding") exists SOMEWHERE
-    across the whole video, regardless of any individual scene's
-    requires_animation gate or how many animations the Animation Planner
-    (plus its own per-scene fallback) happened to produce. Call this once,
-    after all scenes for a video have been finalized, right before the
-    timeline is built. Mutates `scenes` in place.
-    """
     for scene in scenes:
         for anim in (scene.get("animations") or []):
             if anim.get("category") in ("overlay_graphic", "branding"):
@@ -9943,9 +9885,6 @@ def _ensure_video_has_icon_animation(scenes: list, category: str) -> None:
             animations = [a for a in animations if a.get("beat_id") != target_beat["beat_id"]]
         animations.append(fallback_validated)
         scene["animations"] = animations
-        # requires_animation only gates the Animation Planner call itself —
-        # by the time this runs that call is already done, but keep the
-        # flag consistent for anything downstream that inspects it.
         scene["requires_animation"] = True
 
         print(
@@ -9956,8 +9895,6 @@ def _ensure_video_has_icon_animation(scenes: list, category: str) -> None:
 
     print("[edit-video][WARN] video-wide icon guarantee found no beat in any scene to attach an icon to")
 
-# icon_name -> emoji glyph, used by the FFmpeg fallback renderer below when
-# Remotion isn't available. Every key must exist in _ICON_VOCAB.
 _ICON_EMOJI_FALLBACK = {
     "arrow-right": "\u27a1", "bell": "\U0001f514", "calendar": "\U0001f4c5", "camera": "\U0001f4f7",
     "check": "\u2705", "clock": "\U0001f550", "infinity": "\u267e", "lightbulb": "\U0001f4a1",
@@ -10540,13 +10477,6 @@ def _validate_hex_color(value: Optional[str], field_name: str) -> None:
 
 
 def _log_token_usage(step_label: str, res: Any) -> None:
-    """Explicit input/output token logging for every LLM call in the
-    /edit-video pipeline, independent of whatever _record_token_usage
-    itself does (that function may or may not already persist this —
-    this is a plain, always-on log line so token counts are visible per
-    call without depending on that). Reads the standard OpenAI response
-    usage fields; degrades gracefully (logs a note, doesn't raise) if a
-    response shape doesn't have them."""
     try:
         usage = getattr(res, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
@@ -10591,17 +10521,8 @@ DEFAULT_CAPTION_STYLE = {
     "margin_bottom_percent": 3,
 }
 
-# How many words are grouped into one burned-in caption line at a time.
-# Bumped up from the previous default of 4 for a longer, more readable
-# chunk per line — still perfectly in sync with the voice, since each
-# line's on/off timing is still taken directly from the real start/end of
-# its first/last word (see _build_ass_from_words) regardless of how many
-# words are grouped together; this only changes how much text shows at
-# once, not when it appears.
 CAPTION_WORDS_PER_LINE = int(os.getenv("CAPTION_WORDS_PER_LINE", "10"))
 
-# Default burned-in caption font. Can still be overridden per scene via
-# caption_style.font_family (see SceneStyleUpdate / update_scene_style).
 DEFAULT_CAPTION_FONT = os.getenv("DEFAULT_CAPTION_FONT", "Roboto")
 
 TTS_MAX_CHARS_PER_CALL = int(os.getenv("TTS_MAX_CHARS_PER_CALL", "900"))
@@ -10882,9 +10803,6 @@ async def _fetch_media_for_keywords(keywords: list, label: str) -> dict:
     if dropped_img:
         print(f"[edit-video] {label}: dropped {dropped_img} non-landscape image result(s) at fetch time")
 
-    # No reranking model — dedupe the per-keyword Pexels results and keep
-    # the top N in whatever order they were returned (keyword order, then
-    # within-keyword result order).
     videos = _dedupe_and_trim(videos_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
     photos = _dedupe_and_trim(images_pool, limit=PEXELS_SCENE_RESULT_LIMIT)
 
@@ -11019,9 +10937,6 @@ _DEFAULT_MOTION_TYPE = "zoom_in"
 
 
 def _pick_diversified_motion_type(previous_motion_type: Optional[str], beat_index: int) -> str:
-    """B-roll Ken-Burns pan/zoom motion (distinct from the overlay `motion`
-    object the Animation Planner returns). The new BEAT_KEYWORDS_PROMPT no
-    longer asks the model for this, so it's assigned deterministically."""
     candidates = [m for m in _MOTION_TYPE_LIST if m != previous_motion_type] or list(_MOTION_TYPE_LIST)
     return candidates[beat_index % len(candidates)]
 
@@ -11308,9 +11223,6 @@ async def _run_beat_director(
 
 
 def _align_beats_to_timed_words(beats: list, timed_words: list) -> None:
-    """Beats partition the scene's vo_text verbatim and in order, so we can
-    map each beat's word count onto a contiguous slice of WhisperX's
-    word-level timestamps."""
     ptr = 0
     n_words = len(timed_words)
     for i, b in enumerate(beats):
@@ -11341,18 +11253,6 @@ def _align_beats_to_timed_words(beats: list, timed_words: list) -> None:
         b["start"] = prev_end
         b["end"] = max(next_start, prev_end + 0.5)
 
-    # Close every gap between consecutive beats so they form a perfectly
-    # contiguous partition of the scene — not even a millisecond of dead
-    # space. WhisperX leaves small natural silences between a beat's last
-    # word and the next beat's first word; left alone, that stretch has no
-    # broll/animation covering it, and gaps like this compound: instead of
-    # showing as a pause where it belongs, the render pipeline concatenates
-    # beat clips back-to-back and pads the SHORTFALL as a single frozen
-    # hold at the very end of the scene — so broll silently drifts earlier
-    # than the voice for the rest of the scene. Extending each beat's end
-    # to meet the next beat's start (rather than shrinking the next beat's
-    # start) keeps every beat's audio-derived start_sec anchored to the
-    # word that actually begins it.
     for i in range(len(beats) - 1):
         cur_end = beats[i].get("end")
         next_start = beats[i + 1].get("start")
@@ -11391,14 +11291,6 @@ def _dedupe_beats_media_across_scene(beats: list) -> None:
 
 
 def _content_aware_max_box_size(display_text: Any) -> tuple:
-    """Caps how big a text overlay box can be relative to what it's
-    actually showing — sized for a small, ~20-25px understated callout
-    (not a headline), so a short phrase doesn't get stretched into an
-    oversized box with a lot of empty space around it. This is a
-    ceiling, not a target: a smaller box that already fits the text is
-    left alone. ~13px of width per character at a 20-25px reading size,
-    plus fixed padding; height scales with line count at that same
-    small size."""
     text = _display_text_to_string(display_text) if isinstance(display_text, (str, list)) else ""
     if not text:
         return (400, 110)
@@ -11412,12 +11304,28 @@ def _content_aware_max_box_size(display_text: Any) -> tuple:
 
 
 def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> dict:
-    if category in ("full_screen", "transition"):
-        return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
+    """
+    FIX (reposition bug): this used to unconditionally return the
+    full-canvas box for category in ("full_screen", "transition"),
+    discarding ANY custom x/y/width/height the user set (e.g. via
+    PATCH .../beat/{beat_id}/animation) and silently resetting every
+    full_screen-category animation back to {0,0,CANVAS_WIDTH,CANVAS_HEIGHT}
+    on every save. That reset then got persisted to raw_scenes/timeline_json,
+    so by the time the render service picked it up, the user's chosen
+    position was already gone.
 
+    Now: only fall back to the full-canvas default when no real geometry
+    was ever provided (raw is missing/invalid). If a geometry_px dict was
+    given — whether from the Animation Planner's own initial output or
+    from a user's PATCH reposition — honor it, just clamp it to the canvas
+    so a bad value can't push the card off-frame. This mirrors the
+    render service's own (already-correct) _validate_geometry_px so both
+    services agree on what "the user's position" means.
+    """
     default = {"width": 520, "height": 160}
+
     if not isinstance(raw, dict):
-        geo = {"x": 0, "y": 0, **default}
+        geo = None
     else:
         try:
             geo = {
@@ -11427,7 +11335,20 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
                 "height": int(raw.get("height", default["height"])),
             }
         except (TypeError, ValueError):
-            geo = {"x": 0, "y": 0, **default}
+            geo = None
+
+    if category in ("full_screen", "transition"):
+        if geo is None:
+            return {"x": 0, "y": 0, "width": ANIMATION_CANVAS_WIDTH, "height": ANIMATION_CANVAS_HEIGHT}
+        # Honor whatever was actually stored/submitted — just clamp to canvas.
+        geo["width"] = max(80, min(geo["width"], ANIMATION_CANVAS_WIDTH))
+        geo["height"] = max(80, min(geo["height"], ANIMATION_CANVAS_HEIGHT))
+        geo["x"] = max(0, min(geo["x"], ANIMATION_CANVAS_WIDTH - geo["width"]))
+        geo["y"] = max(0, min(geo["y"], ANIMATION_CANVAS_HEIGHT - geo["height"]))
+        return geo
+
+    if geo is None:
+        geo = {"x": 0, "y": 0, **default}
 
     max_width = max(40, ANIMATION_CANVAS_WIDTH - 2 * _SAFE_MARGIN)
     max_height = max(40, ANIMATION_CANVAS_HEIGHT - 2 * _SAFE_MARGIN)
@@ -11641,16 +11562,6 @@ async def _run_animation_planner(
     if not requires_animation:
         return []
 
-    # Word-level timestamps for each beat's own span, sliced from the
-    # scene's real WhisperX alignment (timed_words). Giving the model the
-    # ACTUAL time each word is spoken — not just the narration text — lets
-    # it compute exact anchor_start_sec/anchor_end_sec itself by reading
-    # real ground truth, instead of Storybit trying to reverse-engineer
-    # timing afterward by fuzzy-matching display_text against the
-    # transcript. That heuristic approach kept finding new edge cases
-    # (wrong beat, list vs string display_text, tie-breaking bias); having
-    # the model do the matching with the real data in front of it removes
-    # the whole class of guesswork.
     def _beat_words(b: dict) -> list:
         if not timed_words:
             return []
@@ -11726,12 +11637,6 @@ async def _run_animation_planner(
             validated.append(v)
             seen_beat_ids.add(v["beat_id"])
 
-    # Guaranteed icon floor: the prompt asks for at least one icon-bearing
-    # animation per scene, but model output isn't guaranteed to comply —
-    # enforce it here rather than trusting the LLM alone. Prefer an
-    # unanimated beat so we don't clobber something the model chose;
-    # fall back to overwriting the first beat's animation only if every
-    # beat already has one.
     has_icon = any(v["category"] in ("overlay_graphic", "branding") for v in validated)
     if not has_icon and beats:
         target_beat = next((b for b in beats if b["beat_id"] not in seen_beat_ids), None)
@@ -11815,7 +11720,6 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         scene_out["media"] = _aggregate_beats_media(beats)
         scene_out["animations"] = animations
 
-        # Advance video-level continuity for the NEXT scene.
         for b in beats:
             for e in b["entities"]:
                 if not any(existing["name"].lower() == e["name"].lower() for existing in video_ctx["known_entities"]):
@@ -11917,9 +11821,6 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
 
 
 async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
-    """Used by the scene trim endpoint: re-runs the Beat Director +
-    Animation Planner for a single scene using the continuity context that
-    was captured when the scene was first processed."""
     ctx = scene.get("_beat_director_context") or {
         "category": "general_documentary",
         "style_profile": STYLE_PROFILES["general_documentary"],
@@ -11968,9 +11869,6 @@ async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
 
 
 async def _rebuild_fragment_beats(scene: dict, local_start: float, local_end: float, id_prefix: str) -> list:
-    """Re-runs the Beat Director scoped to a single sub-range of a scene's
-    narration (used by split/insert). The Director still decides how many
-    beats the fragment needs — usually one, but not necessarily."""
     ctx = scene.get("_beat_director_context") or {
         "category": "general_documentary",
         "style_profile": STYLE_PROFILES["general_documentary"],
@@ -12001,7 +11899,7 @@ async def _rebuild_fragment_beats(scene: dict, local_start: float, local_end: fl
         script_language=ctx["script_language"], scene_id=scene.get("scene_id"),
         scene_visual_intent=scene.get("visual_intent", ""),
         scene_animation_density=scene.get("scene_animation_density") or ctx["style_profile"].get("animation_density", "medium"),
-        scene_on_screen_text="",  # avoid re-triggering the same on-screen-text checklist item twice
+        scene_on_screen_text="",
         previous_scene_last_media_type=None, known_entities=ctx["known_entities"], known_setting=ctx["known_setting"],
         id_prefix=id_prefix,
     )
@@ -12033,36 +11931,6 @@ def _find_phrase_span_sec(
     target_text: Optional[str], timed_words: list, search_start: float, search_end: float,
     hint_start_sec: Optional[float] = None,
 ) -> Optional[tuple]:
-    """Finds when `target_text` is actually spoken, by matching it against
-    word-level timestamps within [search_start, search_end] (a beat's own
-    span). Returns (phrase_start_sec, phrase_end_sec) — the start of the
-    first matched word and the end of the last matched word — or None if
-    no confident match is found. Callers use the start to anchor when an
-    overlay appears and the end to make sure it doesn't disappear before
-    the narration finishes saying it.
-
-    Scores every possible alignment offset between target_text and the
-    transcript window, tolerant of a handful of individual word mismatches
-    rather than requiring a perfect run — this matters in practice because
-    WhisperX can mis-transcribe an unusual proper noun (e.g. "Maciej"
-    heard as "Massey") even though the surrounding words transcribe
-    cleanly; a strict-match approach fails on names like that even though
-    the rest of a long phrase lines up perfectly. A match is accepted when
-    either a long enough exact run is found, or enough of the phrase's
-    words match overall (allowing scattered individual misses).
-
-    hint_start_sec, when given (the Animation Planner's own anchor_start_
-    sec), disambiguates between multiple qualifying candidates by picking
-    whichever is CLOSEST to it, rather than always the single highest-
-    scoring one in isolation. This matters for a real failure mode: a
-    scene can genuinely say the same distinctive words more than once (a
-    callback, a recap, a repeated key phrase) — searching the whole scene
-    with no hint at all can and did match a coincidentally-similar-scoring
-    occurrence far from the true one (observed: a 77-second jump to a
-    completely wrong position). The model's own anchor is usually roughly
-    right even when not pixel-perfect, so it's a strong signal for WHICH
-    occurrence is the correct one, even when it can't be trusted as the
-    exact final number on its own."""
     if not target_text or not timed_words:
         return None
     target_words = [_normalize_phrase_word(w) for w in target_text.split()]
@@ -12081,9 +11949,9 @@ def _find_phrase_span_sec(
 
     n_target = len(target_words)
     min_run = min(n_target, 3)
-    min_ratio = 0.6 if n_target >= 5 else 1.0  # short phrases still need a near-exact hit
+    min_ratio = 0.6 if n_target >= 5 else 1.0
 
-    candidates = []  # every qualifying (score, offset) pair, not just the best
+    candidates = []
     best_score = None
     for offset in range(-n_target, n):
         matches = 0
@@ -12115,18 +11983,9 @@ def _find_phrase_span_sec(
         return window[idx]["start"]
 
     if hint_start_sec is not None:
-        # Among candidates that are at least reasonably strong (within one
-        # matched-word of the single best score — not just "qualified at
-        # all", so a barely-passing coincidental match elsewhere can't
-        # outrank a strong true match just for being closer to the hint by
-        # chance), pick whichever is closest in time to the model's own
-        # anchor.
         strong_candidates = [c for c in candidates if c[0][1] >= best_score[1] - 1]
         best_offset = min(strong_candidates, key=lambda c: abs(_offset_to_start_sec(c[1]) - hint_start_sec))[1]
     else:
-        # No hint available — same tie-break as before: ties keep the
-        # LATEST candidate, since every sync complaint prior to this one
-        # was "shows too early", never "too late".
         best_offset = None
         best_kept_score = None
         for score, offset in candidates:
@@ -12497,42 +12356,18 @@ def _slim_timeline_for_response(timeline: dict) -> dict:
 
 
 
-_SCENE_SPLIT_MAX_WORDS = 400  # meaningfully over the 260-280 target before we intervene
+_SCENE_SPLIT_MAX_WORDS = 400
 _SCENE_SPLIT_TARGET_WORDS = 270
 
 
 def _split_oversized_scene(scene: dict, original_script: str) -> list:
-    """If a scene came back drastically over the 260-280 word target (the
-    model ignoring SCRIPT_SCENE_PROMPT's own length instruction), split it
-    into multiple ~270-word sub-scenes at sentence boundaries instead of
-    silently leaving one oversized scene in place. This is a deliberate
-    code-level guarantee rather than relying on the prompt harder — the
-    pattern across this whole project has been that prompt-only length/
-    structure guidance gets violated regularly (sync anchors, icon
-    relevance, placement all eventually needed the same treatment), and
-    this was the one place scene length had zero enforcement at all: an
-    "always X" cap only produces one plain count, so seeing the actual
-    scene count swing between different values run to run (rather than
-    landing on a single wrong-but-consistent number) is itself the
-    signature of a model-compliance issue, not a code bug — this closes
-    that gap by never trusting length compliance in the first place.
-    Sub-scenes inherit the parent's other fields (visual_intent,
-    animation_preference, broll_keywords, etc.) rather than getting
-    fresh per-chunk LLM direction — a reasonable functional baseline over
-    the alternative of staying as one giant scene, not a creative-parity
-    claim; a second LLM pass per split could refine this later if needed.
-    """
     vo_text = scene.get("vo_text") or ""
     words = vo_text.split()
     if len(words) <= _SCENE_SPLIT_MAX_WORDS:
         return [scene]
 
-    # Split into sentences, then greedily pack sentences into ~270-word
-    # chunks so a chunk boundary never lands mid-sentence.
     sentences = [s for s in re.split(r'(?<=[.!?])\s+', vo_text.strip()) if s.strip()]
     if len(sentences) < 2:
-        # One giant run-on with no sentence breaks to split on — leave it
-        # rather than cut mid-sentence.
         return [scene]
 
     chunks = []
@@ -12551,11 +12386,6 @@ def _split_oversized_scene(scene: dict, original_script: str) -> list:
     if len(chunks) < 2:
         return [scene]
 
-    # Locate each chunk's real position within the ORIGINAL full script
-    # (not just this scene's own vo_text) so char_start/char_end stay
-    # meaningful, searching forward from wherever the previous chunk was
-    # found so a repeated phrase elsewhere in the script can't make the
-    # cursor jump backward.
     source_range = scene.get("source_range")
     search_from = source_range.get("char_start", 0) if isinstance(source_range, dict) else 0
     base_scene_id = scene.get("scene_id") or "s"
@@ -12566,14 +12396,11 @@ def _split_oversized_scene(scene: dict, original_script: str) -> list:
         if idx == -1:
             idx = original_script.find(chunk_text)
         if idx == -1:
-            # Couldn't relocate this chunk as a literal substring of the
-            # original script (shouldn't normally happen) — abandon the
-            # split entirely rather than emit a scene with wrong offsets.
             return [scene]
         char_start, char_end = idx, idx + len(chunk_text)
         cursor = char_end
         sub_scene = dict(scene)
-        sub_scene["scene_id"] = f"{base_scene_id}_{chr(97 + i)}"  # s2_a, s2_b, ...
+        sub_scene["scene_id"] = f"{base_scene_id}_{chr(97 + i)}"
         sub_scene["vo_text"] = chunk_text
         sub_scene["source_range"] = {
             "char_start": char_start, "char_end": char_end,
@@ -12699,13 +12526,6 @@ async def edit_video(request: EditVideo):
         print(f"[edit-video] failed to persist video row: {e}")
         raise HTTPException(status_code=500, detail="Failed to save video")
 
-    # Credit deduction — happens ONLY here, after generation has fully
-    # succeeded. Cost = 11 credits per minute of the video's actual
-    # generated duration (known only now, from timeline_json). No base
-    # fee, and no partial deduction: if the user doesn't have enough
-    # credits to cover the full cost, nothing is deducted and the
-    # response reports "no credits" — the video itself was still
-    # generated and saved regardless.
     EDIT_VIDEO_CREDITS_PER_MINUTE = 11
     duration_minutes = (timeline_json.get("total_frames", 0) / max(timeline_json.get("fps", 1), 1)) / 60
     credit_cost = round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
@@ -13273,7 +13093,7 @@ async def update_beat_animation(video_id: str, scene_id: str, beat_id: str, upda
         "timeline": timeline_json, "needs_render": True,
     }
 
-    
+
 @app.delete("/timeline/{video_id}/overlay/{overlay_id}")
 async def delete_animation_by_id(video_id: str, overlay_id: int):
     """
@@ -13680,13 +13500,6 @@ async def insert_broll_gap(video_id: str, update: BrollInsertGapUpdate):
     current_version = row.data.get("timeline_version", 1)
     fps = (row.data.get("timeline_json") or {}).get("fps", TIMELINE_FPS)
 
-    # Scene-scoped insert: put this asset INTO an existing scene's own beat
-    # timeline (splitting whichever beat currently occupies [start, end]),
-    # instead of the old behavior below of always creating a brand new,
-    # voiceover-less standalone scene and extending the whole video's
-    # duration. This is what callers usually mean by "insert broll into
-    # this scene" — start/end here are scene-LOCAL seconds, matching the
-    # convention used by update_scene_broll's start/end.
     if update.scene_id:
         scene_index = next((i for i, s in enumerate(raw_scenes) if s.get("scene_id") == update.scene_id), None)
         if scene_index is None:
@@ -13871,32 +13684,6 @@ async def delete_scene_content(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 
 RUN_SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("RUN_SUBPROCESS_TIMEOUT_SECONDS", "300"))
@@ -13934,6 +13721,168 @@ def _display_text_to_string(display_text: Any) -> str:
     if isinstance(display_text, str):
         return display_text
     return ""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://62.83.19.227:8000")
