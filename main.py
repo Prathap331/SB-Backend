@@ -4360,6 +4360,7 @@ async def generate_script_from_context(
     segments_block = _segments_brief(selected_template.get("segments") or [], brief_field="llm_brief")
 
     print( "script_segments" + segments_block)
+    print(request.time)
 
     user_prompt = f"""
 Video Title: "{request.title}"
