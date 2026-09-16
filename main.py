@@ -103,8 +103,15 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[Lifespan] Server started.")
+    worker_task = asyncio.create_task(_render_queue_worker())
     yield
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
     print("[Lifespan] Shutting down.")
+
 
 app = FastAPI(lifespan=lifespan)
 
