@@ -134,11 +134,6 @@ class PromptRequest(BaseModel):
     topic: str
 
 
-# class CreateOrderRequest(BaseModel):
-#     amount: float
-#     currency: str = "INR"
-#     receipt: str | None = None
-#     target_tier: str
 
 from typing import Literal
 
@@ -234,6 +229,14 @@ async def eci(request: PromptRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline metrics failed: {e}")
+
+
+
+
+
+
+
+
 
 
 
