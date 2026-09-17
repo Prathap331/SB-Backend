@@ -701,21 +701,44 @@ def _chunk_text_for_translation(text_value: str, max_chars: int = TRANSLATE_CHUN
 
 
 
+TRANSLATE_BATCH_MAX_RETRIES = 3
+TRANSLATE_BATCH_RETRY_BASE_DELAY = 3.0  
+
+
 def _translate_with_library_sync(text_value: str, target_lang_code: str) -> str:
     chunks = _chunk_text_for_translation(text_value)
-    translated_chunks = []
-    for chunk in chunks:
-        if not chunk.strip():
-            translated_chunks.append(chunk)
-            continue
-        try:
-            translated = GoogleTranslator(source="en", target=target_lang_code).translate(chunk)
-            translated_chunks.append(translated or chunk)
-        except Exception as e:
-            print(f"[TRANSLATE] library translation failed for a chunk ({len(chunk)} chars): {e}")
-            translated_chunks.append(chunk)  
-    return "\n".join(translated_chunks)
+    indices_to_translate = [i for i, c in enumerate(chunks) if c.strip()]
+    texts_to_translate = [chunks[i] for i in indices_to_translate]
 
+    translated_chunks = list(chunks)  
+
+    if texts_to_translate:
+        for attempt in range(TRANSLATE_BATCH_MAX_RETRIES):
+            try:
+                results = GoogleTranslator(
+                    source="auto", target=target_lang_code
+                ).translate_batch(texts_to_translate)
+                for idx, translated in zip(indices_to_translate, results):
+                    translated_chunks[idx] = translated or chunks[idx]
+                break
+            except Exception as e:
+                is_last = attempt == TRANSLATE_BATCH_MAX_RETRIES - 1
+                if not is_last:
+                    delay = TRANSLATE_BATCH_RETRY_BASE_DELAY * (2 ** attempt)
+                    print(
+                        f"[TRANSLATE] batch translation failed for {len(texts_to_translate)} "
+                        f"chunk(s) (attempt {attempt + 1}/{TRANSLATE_BATCH_MAX_RETRIES}): "
+                        f"{e} — retrying in {delay:.0f}s"
+                    )
+                    time.sleep(delay)
+                else:
+                    print(
+                        f"[TRANSLATE] batch translation failed for {len(texts_to_translate)} "
+                        f"chunk(s) after {TRANSLATE_BATCH_MAX_RETRIES} attempts: {e} — "
+                        f"keeping original text for these chunks"
+                    )
+
+    return "\n".join(translated_chunks)
 
 
 
