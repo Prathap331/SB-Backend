@@ -8402,30 +8402,29 @@ async def razorpay_webhook(
 
 
 
-
-
-
-
 from fastapi import UploadFile, File, Form
 
 AUDIO_BUCKET = "user-audio"
 AUDIO_TABLE = "user_audio"
 
 ALLOWED_AUDIO_CONTENT_TYPES = {
-    "audio/mpeg",     
+    "audio/mpeg",
     "audio/mp3",
     "audio/wav",
     "audio/x-wav",
     "audio/wave",
     "audio/webm",
     "audio/ogg",
-    "audio/mp4",       
+    "audio/mp4",
     "audio/x-m4a",
     "audio/aac",
 }
 
 MAX_AUDIO_SIZE_BYTES = int(os.getenv("MAX_AUDIO_SIZE_BYTES", str(200 * 1024 * 1024)))
 SIGNED_URL_EXPIRY_SECONDS = int(os.getenv("AUDIO_SIGNED_URL_EXPIRY_SECONDS", str(60 * 60 * 24 * 7)))
+
+# Keep this in sync with whatever language codes your app actually uses.
+ALLOWED_LANGUAGE_CODES = {"en", "te", "hi", "ta", "kn", "ml"}
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -8478,12 +8477,52 @@ def _create_signed_url_sync(bucket: str, storage_path: str, expires_in: int) -> 
         return None
 
 
+def _get_current_audio_url_array_sync(user_id: str) -> list:
+    """Fetch the existing audio_url jsonb array for this user (defaults to [])."""
+    result = (
+        supabase.table("user_profiles")
+        .select("audio_url")
+        .eq("id", user_id)
+        .single()
+        .execute()
+    )
+    data = result.data or {}
+    existing = data.get("audio_url")
+    return existing if isinstance(existing, list) else []
+
+
+def _merge_language_entry(existing_array: list, language: str, url: str) -> list:
+    """
+    Replace the entry for `language` if present, otherwise append a new one.
+    Result shape: [{"en": "..."}, {"te": "..."}, ...]
+    """
+    updated = []
+    replaced = False
+    for entry in existing_array:
+        if isinstance(entry, dict) and language in entry:
+            updated.append({language: url})
+            replaced = True
+        else:
+            updated.append(entry)
+    if not replaced:
+        updated.append({language: url})
+    return updated
+
+
 @app.post("/save-audio")
 async def save_audio(
     userId: str = Form(...),
+    language: str = Form(...),
     audio: UploadFile = File(...),
 ):
     await require_valid_user(userId)
+
+    language = language.strip().lower()
+    if language not in ALLOWED_LANGUAGE_CODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language code: {language}",
+        )
 
     if audio.content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
         raise HTTPException(
@@ -8506,11 +8545,11 @@ async def save_audio(
     safe_name = _sanitize_filename(audio.filename)
     extension = _guess_extension(audio.content_type, safe_name)
     unique_name = f"{uuid.uuid4().hex}{extension}"
-    storage_path = f"{userId}/{unique_name}"
+    storage_path = f"{userId}/{language}/{unique_name}"
 
     print(
         f"[AUDIO] uploading '{safe_name}' ({size_bytes} bytes, {audio.content_type}) "
-        f"for userId={userId} -> {AUDIO_BUCKET}/{storage_path}"
+        f"for userId={userId}, language={language} -> {AUDIO_BUCKET}/{storage_path}"
     )
 
     try:
@@ -8535,14 +8574,17 @@ async def save_audio(
         raise HTTPException(status_code=500, detail="Audio uploaded but failed to generate URL")
 
     try:
+        current_array = await asyncio.to_thread(_get_current_audio_url_array_sync, userId)
+        updated_array = _merge_language_entry(current_array, language, file_url)
+
         await asyncio.to_thread(
             lambda: supabase.table("user_profiles")
-            .update({"audio-url": file_url})
+            .update({"audio_url": updated_array})
             .eq("id", userId)
             .execute()
         )
     except Exception as e:
-        print(f"[AUDIO] failed to save audio-url on user_profiles: {e}")
+        print(f"[AUDIO] failed to save audio_url on user_profiles: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Audio uploaded but failed to save URL to profile: {e}")
@@ -8550,9 +8592,13 @@ async def save_audio(
     return {
         "message": "Audio uploaded successfully",
         "userId": userId,
+        "language": language,
         "url": file_url,
         "url_expires_in_seconds": SIGNED_URL_EXPIRY_SECONDS,
+        "audio_url": updated_array,
     }
+
+
 
 
 
@@ -8612,6 +8658,272 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
 
 
 
+# import math
+
+# FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
+# FISH_AUDIO_TTS_URL = "https://api.fish.audio/v1/tts"
+
+# import httpx
+# import base64
+# from fish_audio_sdk import Session, TTSRequest, Prosody  # FIX (voice too fast): added Prosody import
+
+# fish_session = Session(FISH_AUDIO_API_KEY)
+
+# GENERATED_AUDIO_BUCKET = "generated-audio"
+
+# # FIX (voice too fast): _run_fish_tts_sync below never set any prosody/speed
+# # option, so Fish Audio used its own default speed of 1.0 (normal) — nothing
+# # was ever making it fast, nothing was ever slowing it down either. This is
+# # the global default speed applied whenever a request doesn't specify its
+# # own `speed`. Range 0.5-2.0, lower = slower. Kept as an env var so it can be
+# # tuned without a redeploy.
+# TTS_SPEECH_SPEED = float(os.getenv("TTS_SPEECH_SPEED", "0.95"))
+
+# # ---- Credit pricing for voice generation ----
+# # 1 minute of generated audio = 5 credits.
+# #
+# # NOTE: despite the field name, `durationMinutes` sent by the client is
+# # actually a whole number of MINUTES (1, 2, 3, ...), not seconds. We deduct
+# # credits directly as minutes * VOICE_CREDITS_PER_MINUTE — no /60 conversion.
+# VOICE_CREDITS_PER_MINUTE = 5
+
+
+# _LANG_CODE_TO_NAME = {v.lower(): k for k, v in SUPPORTED_LANGUAGES.items()}
+
+
+# def _lang_name_from_code(lang_code: str) -> str:
+#     if not lang_code or not lang_code.strip():
+#         return DEFAULT_LANGUAGE
+#     name = _LANG_CODE_TO_NAME.get(lang_code.strip().lower())
+#     if not name:
+#         print(f"[TTS] unrecognized langCode '{lang_code}', defaulting to English")
+#         return DEFAULT_LANGUAGE
+#     return _normalize_language(name)
+
+
+# class GenerateSpeechRequest(BaseModel):
+#     userId: str
+#     script: str
+#     voice: str
+#     langCode: str = "en"
+#     durationMinutes: int = 0
+#     speed: float | None = None  # FIX (voice too fast): 0.5-2.0, lower = slower; None = use TTS_SPEECH_SPEED
+#     volume: float | None = None  # Fish Audio prosody.volume — dB adjustment, roughly -20..20; None = Fish Audio's own default (0)
+#     loudnessNormalization: bool | None = None  # Fish Audio prosody.normalize_loudness; None = Fish Audio's own default
+#     textNormalization: bool | None = None  # Fish Audio top-level "normalize"; None = Fish Audio's own default (true)
+
+
+# async def _download_bytes(url: str) -> bytes:
+#     async with httpx.AsyncClient(timeout=60) as client:
+#         resp = await client.get(url)
+#         resp.raise_for_status()
+#         return resp.content
+
+
+# def _create_fish_model_sync(ref_audio_bytes: bytes, title: str) -> str:
+#     model = fish_session.create_model(
+#         title=title,
+#         description="Auto-created voice clone",
+#         voices=[ref_audio_bytes],
+#         visibility="private",
+#     )
+#     return model.id
+
+
+# def _run_fish_tts_sync(
+#     script: str,
+#     reference_id: str,
+#     speed: float = TTS_SPEECH_SPEED,
+#     volume: float | None = None,
+#     loudness_normalization: bool | None = None,
+#     text_normalization: bool | None = None,
+# ) -> bytes:
+#     prosody_kwargs = {"speed": speed}
+#     if volume is not None:
+#         prosody_kwargs["volume"] = volume
+#     if loudness_normalization is not None:
+#         prosody_kwargs["normalize_loudness"] = loudness_normalization
+
+#     tts_request = TTSRequest(
+#         text=script,
+#         reference_id=reference_id,
+#         temperature=0.5,
+#         top_p=0.7,
+#         repetition_penalty=1.2,
+#         chunk_length=300,
+#         latency="normal",
+#         normalize=text_normalization if text_normalization is not None else True,
+#         format="mp3",
+#         mp3_bitrate=192,
+#         condition_on_previous_chunks=True,
+#         prosody=Prosody(**prosody_kwargs),
+#     )
+#     audio_chunks = []
+#     for chunk in fish_session.tts(tts_request):
+#         audio_chunks.append(chunk)
+#     return b"".join(audio_chunks)
+
+# def _credits_for_voice_minutes(duration_minutes: float) -> int:
+#     if duration_minutes <= 0:
+#         return 0
+#     credits = math.ceil(duration_minutes * VOICE_CREDITS_PER_MINUTE)
+#     return max(credits, 1)
+
+
+# async def _deduct_voice_credits(user_id: str, duration_minutes: float):
+#     credits_to_deduct = _credits_for_voice_minutes(duration_minutes)
+#     if credits_to_deduct <= 0:
+#         print(f"[CREDITS] (voice_generation) nothing to deduct for user {user_id} (duration={duration_minutes:.2f} min)")
+#         return
+#     print(
+#         f"[CREDITS] (voice_generation) user {user_id} — {duration_minutes:.2f} min of audio "
+#         f"→ {credits_to_deduct} credits (rate: {VOICE_CREDITS_PER_MINUTE}/min)"
+#     )
+#     # Reuses the same batch-aware FIFO deduction (credit_batches) already used
+#     # for thumbnail credits: _deduct_credits_for_action -> _deduct_profile_credits
+#     # -> _expire_stale_batches / _deduct_from_batches / _sum_batches.
+#     await _deduct_credits_for_action(user_id, credits_to_deduct, action_label="voice_generation")
+
+
+# def _get_public_url_sync(bucket: str, path: str) -> str:
+#     res = supabase.storage.from_(bucket).get_public_url(path)
+#     if isinstance(res, dict):
+#         return res.get("publicUrl") or res.get("public_url")
+#     return res
+
+# @app.post("/generate-speech")
+# async def generate_speech(body: GenerateSpeechRequest):
+#     userId = body.userId
+#     script = body.script
+#     voice = body.voice.strip() if body.voice else ""
+#     lang_code = (body.langCode or "en").strip()
+#     speed = body.speed if body.speed is not None else TTS_SPEECH_SPEED
+
+#     await require_valid_user(userId)
+
+#     if not script.strip():
+#         raise HTTPException(status_code=400, detail="script cannot be empty")
+
+#     if not voice:
+#         raise HTTPException(status_code=400, detail="voice cannot be empty")
+
+#     if not FISH_AUDIO_API_KEY:
+#         raise HTTPException(status_code=500, detail="Fish Audio API key not configured")
+
+#     target_language = _lang_name_from_code(lang_code)
+#     if target_language != "English":
+#         try:
+#             print(f"[TTS] translating script into {target_language} (langCode='{lang_code}') before TTS")
+#             script = await translate_text_full_pipeline(script, target_language)
+#         except Exception as e:
+#             print(f"[TTS] translation to {target_language} failed, using original script as-is: {e}")
+
+#     if voice.lower() == "user":
+#         try:
+#             result = await asyncio.to_thread(
+#                 lambda: supabase.table("user_profiles")
+#                 .select("audio-url")
+#                 .eq("id", userId)
+#                 .maybe_single()
+#                 .execute()
+#             )
+#         except Exception as e:
+#             print(f"[TTS] failed to fetch user_profiles row: {e}")
+#             raise HTTPException(status_code=500, detail=f"Failed to fetch user profile: {e}")
+
+#         row = result.data if result else None
+#         audio_url = row.get("audio-url") if row else None
+
+#         if not audio_url:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="No reference audio on file for this user. Upload one via /save-audio first.",
+#             )
+
+#         try:
+#             ref_audio_bytes = await _download_bytes(audio_url)
+#         except Exception as e:
+#             print(f"[TTS] failed to download user reference audio: {e}")
+#             raise HTTPException(status_code=500, detail=f"Failed to download user reference audio: {e}")
+
+#         try:
+#             reference_id = await asyncio.to_thread(
+#                 _create_fish_model_sync, ref_audio_bytes, f"user-{userId}"
+#             )
+#         except Exception as e:
+#             print(f"[TTS] failed to create Fish Audio model: {e}")
+#             import traceback
+#             traceback.print_exc()
+#             raise HTTPException(status_code=502, detail=f"Failed to create voice model: {e}")
+#     else:
+#         reference_id = voice
+
+#     try:
+#         audio_bytes = await asyncio.to_thread(_run_fish_tts_sync, script, reference_id,speed,body.volume,
+#             body.loudnessNormalization,
+#             body.textNormalization,
+# )
+#     except Exception as e:
+#         print(f"[TTS] Fish Audio TTS failed: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         raise HTTPException(status_code=502, detail=f"Fish Audio TTS failed: {e}")
+
+#     if not audio_bytes:
+#         raise HTTPException(status_code=502, detail="Fish Audio returned empty audio")
+
+#     storage_path = f"{userId}/{uuid.uuid4().hex}.mp3"
+
+#     try:
+#         await asyncio.to_thread(
+#             _upload_audio_to_storage_sync,
+#             GENERATED_AUDIO_BUCKET,
+#             storage_path,
+#             audio_bytes,
+#             "audio/mpeg",
+#         )
+#     except Exception as e:
+#         print(f"[TTS] failed to upload generated audio to storage: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         raise HTTPException(status_code=500, detail=f"Failed to save generated audio: {e}")
+
+#     try:
+#         public_url = await asyncio.to_thread(
+#             _get_public_url_sync, GENERATED_AUDIO_BUCKET, storage_path
+#         )
+#     except Exception as e:
+#         print(f"[TTS] failed to build public URL: {e}")
+#         raise HTTPException(status_code=500, detail="Generated audio saved but failed to create URL")
+
+#     if not public_url:
+#         raise HTTPException(status_code=500, detail="Generated audio saved but failed to create URL")
+
+#     try:
+#         duration_minutes = body.durationMinutes or 0
+#         await _deduct_voice_credits(userId, duration_minutes)
+#     except Exception as e:
+#         print(f"[TTS] credit deduction failed for user {userId}: {e}")
+#         import traceback
+#         traceback.print_exc()
+
+#     return {
+#         "message": "Speech generated successfully",
+#         "userId": userId,
+#         "voice": voice,
+#         "langCode": lang_code,
+#         "speed": speed,
+#         "reference_id": reference_id,
+#         "storage_path": storage_path,
+#         "url": public_url,
+#     }
+
+
+
+
+
+
+
 import math
 
 FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
@@ -8620,6 +8932,7 @@ FISH_AUDIO_TTS_URL = "https://api.fish.audio/v1/tts"
 import httpx
 import base64
 from fish_audio_sdk import Session, TTSRequest, Prosody  # FIX (voice too fast): added Prosody import
+from langdetect import detect, LangDetectException  # FIX (lang skip): script-language detection
 
 fish_session = Session(FISH_AUDIO_API_KEY)
 
@@ -8653,6 +8966,28 @@ def _lang_name_from_code(lang_code: str) -> str:
         print(f"[TTS] unrecognized langCode '{lang_code}', defaulting to English")
         return DEFAULT_LANGUAGE
     return _normalize_language(name)
+
+
+# FIX (lang skip): Fish Audio's TTSRequest (see _run_fish_tts_sync below)
+# has NO separate "language" field at all — reference_id picks the voice,
+# but the actual language spoken is determined ENTIRELY by what script
+# text is in `text=script`. That means whether the voiceover comes out in
+# the right language depends completely on whether `script` genuinely IS
+# in that language by the time it reaches TTS — there's no fallback
+# parameter to correct it. This detector is what lets the endpoint tell
+# "script is already Telugu" apart from "script is English and needs
+# translating", instead of assuming every input is English.
+def _detect_script_lang_code(text: str) -> str | None:
+    """Best-effort ISO 639-1 detection of the script's actual language.
+    Checked against a few hundred chars — enough for langdetect to be
+    reliable without scanning a whole long script."""
+    sample = (text or "").strip()[:500]
+    if not sample:
+        return None
+    try:
+        return detect(sample)
+    except LangDetectException:
+        return None
 
 
 class GenerateSpeechRequest(BaseModel):
@@ -8766,11 +9101,31 @@ async def generate_speech(body: GenerateSpeechRequest):
 
     target_language = _lang_name_from_code(lang_code)
     if target_language != "English":
-        try:
-            print(f"[TTS] translating script into {target_language} (langCode='{lang_code}') before TTS")
-            script = await translate_text_full_pipeline(script, target_language)
-        except Exception as e:
-            print(f"[TTS] translation to {target_language} failed, using original script as-is: {e}")
+        # FIX (lang skip): previously translated unconditionally whenever
+        # langCode != "en", assuming `script` was always English-authored.
+        # For /edit-video specifically, the payload contract sends script
+        # already written in the target language — so this was
+        # re-translating already-correct text every time, risking
+        # corruption and burning Google Translate's rate limit on calls
+        # that never needed to happen. Now: detect the script's actual
+        # language first, and only translate if it doesn't already match
+        # langCode. Since Fish Audio's TTSRequest has no separate language
+        # field (see _detect_script_lang_code's comment above), whatever
+        # ends up in `script` here is exactly what determines the spoken
+        # language — this check is the only thing standing between "script
+        # is really Telugu" and "script silently gets mistranslated".
+        detected = _detect_script_lang_code(script)
+        if detected == lang_code:
+            print(
+                f"[TTS] script already detected as '{detected}' "
+                f"(matches langCode='{lang_code}') — skipping translation"
+            )
+        else:
+            try:
+                print(f"[TTS] translating script into {target_language} (langCode='{lang_code}') before TTS")
+                script = await translate_text_full_pipeline(script, target_language)
+            except Exception as e:
+                print(f"[TTS] translation to {target_language} failed, using original script as-is: {e}")
 
     if voice.lower() == "user":
         try:
@@ -8871,12 +9226,6 @@ async def generate_speech(body: GenerateSpeechRequest):
         "storage_path": storage_path,
         "url": public_url,
     }
-
-
-
-
-
-
 
 
 
@@ -13892,13 +14241,6 @@ async def delete_scene_content(
         "infographics_list": infographics_list, "text_list": text_list, "broll_list": broll_list,
         "timeline_version": new_version, "timeline": timeline_json, "needs_render": True,
     }
-
-
-
-
-
-
-
 
 
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
