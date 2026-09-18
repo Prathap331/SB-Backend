@@ -8978,15 +8978,6 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
 
 
 
-
-
-
-
-
-
-
-
-
 import math
 
 FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
@@ -9051,6 +9042,45 @@ def _detect_script_lang_code(text: str) -> str | None:
         return detect(sample)
     except LangDetectException:
         return None
+
+
+# FIX (per-language reference audio): audio_url used to be a single plain
+# URL string on user_profiles. It's now an array of { langCode: url }
+# entries — one recorded reference clip per language, e.g.:
+#   [{ "en": "https://.../en/xxx.m4a?..." }, { "mr": "https://.../mr/yyy.m4a?..." }]
+# This picks the entry matching lang_code. Also tolerates two edge cases
+# so it doesn't hard-break on data that predates the format change:
+#   - the column coming back as a raw JSON string instead of an
+#     already-parsed list (depends on how the client/driver handles
+#     jsonb — parse it defensively rather than assume)
+#   - a legacy row that's still a single plain string URL (the old
+#     one-URL-per-user format) — since that shape carries no language
+#     info, it's only used when the request is for English, which is
+#     the only thing a single legacy URL could ever have meant.
+# Returns None if there's no reference audio for that language at all.
+def _find_reference_audio_url_for_lang(audio_url_data, lang_code: str) -> str | None:
+    if audio_url_data is None:
+        return None
+
+    if isinstance(audio_url_data, str):
+        stripped = audio_url_data.strip()
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                audio_url_data = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return stripped if lang_code == "en" else None
+        else:
+            return stripped if lang_code == "en" else None
+
+    if isinstance(audio_url_data, dict):
+        return audio_url_data.get(lang_code)
+
+    if isinstance(audio_url_data, list):
+        for entry in audio_url_data:
+            if isinstance(entry, dict) and lang_code in entry:
+                return entry[lang_code]
+
+    return None
 
 
 class GenerateSpeechRequest(BaseModel):
@@ -9173,10 +9203,10 @@ async def generate_speech(body: GenerateSpeechRequest):
         # that never needed to happen. Now: detect the script's actual
         # language first, and only translate if it doesn't already match
         # langCode. Since Fish Audio's TTSRequest has no separate language
-        # field (see _detect_script_lang_code's comment above), whatever
-        # ends up in `script` here is exactly what determines the spoken
-        # language — this check is the only thing standing between "script
-        # is really Telugu" and "script silently gets mistranslated".
+        # field, whatever ends up in `script` here is exactly what
+        # determines the spoken language — this check is the only thing
+        # standing between "script is really Telugu" and "script silently
+        # gets mistranslated".
         detected = _detect_script_lang_code(script)
         if detected == lang_code:
             print(
@@ -9194,7 +9224,7 @@ async def generate_speech(body: GenerateSpeechRequest):
         try:
             result = await asyncio.to_thread(
                 lambda: supabase.table("user_profiles")
-                .select("audio-url")
+                .select("audio_url")
                 .eq("id", userId)
                 .maybe_single()
                 .execute()
@@ -9204,12 +9234,24 @@ async def generate_speech(body: GenerateSpeechRequest):
             raise HTTPException(status_code=500, detail=f"Failed to fetch user profile: {e}")
 
         row = result.data if result else None
-        audio_url = row.get("audio-url") if row else None
+        audio_url_data = row.get("audio_url") if row else None
+
+        # FIX (per-language reference audio): audio_url is now an array of
+        # { langCode: url } entries — one recorded reference clip per
+        # language — instead of a single URL. Pick the one matching this
+        # request's langCode so the voice clone is actually built from
+        # audio spoken in that language, not whatever the user's default/
+        # first-recorded clip happened to be.
+        audio_url = _find_reference_audio_url_for_lang(audio_url_data, lang_code.lower())
 
         if not audio_url:
             raise HTTPException(
                 status_code=400,
-                detail="No reference audio on file for this user. Upload one via /save-audio first.",
+                detail=(
+                    f"No reference audio on file for this user in language "
+                    f"'{lang_code}'. Upload one for this language via "
+                    f"/save-audio first."
+                ),
             )
 
         try:
@@ -9289,8 +9331,6 @@ async def generate_speech(body: GenerateSpeechRequest):
         "storage_path": storage_path,
         "url": public_url,
     }
-
-
 
 
 
