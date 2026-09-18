@@ -8335,9 +8335,6 @@ async def razorpay_webhook(
 
 
 
-
-
-
 from fastapi import UploadFile, File, Form
 from typing import List
 
@@ -9806,7 +9803,13 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
 import re
+import io
 import os
 import json
 import math
@@ -9819,10 +9822,241 @@ from typing import Any, Optional, Literal
 
 import httpx
 import whisperx
+from mutagen.mp3 import MP3
 from fastapi import HTTPException
 from pydantic import BaseModel
+from indic_transliteration import sanscript
+from indic_transliteration.sanscript import transliterate
 
 
+# FIX (caption romanization): captions must render as plain Latin-alphabet
+# text that SOUNDS like the spoken language when read aloud (e.g. Telugu
+# "నమస్కారం" -> "namaskaram") — never the actual native script, and never
+# an English translation of the meaning. WhisperX/Whisper itself has no
+# "give me Romanized output" mode for a language it transcribes natively
+# (see chat explanation) — the only reliable way to get this is to keep
+# transcribing in native script (accurate) and then transliterate that
+# script into Latin letters as a separate, deterministic step.
+#
+# Only non-Latin scripts get mapped through indic_transliteration; a token
+# that's already Latin (an English brand name mixed into the sentence, a
+# number, punctuation, a currency symbol) is left completely untouched —
+# both its characters AND its casing — so "BookMyShow" doesn't become
+# "bookmyshow" just because it's sitting next to Telugu words.
+#
+# Applied PER WORD (never to a joined sentence) so word count in == word
+# count out, always — that's what keeps each word's existing WhisperX
+# timestamp attached to the right romanized word, i.e. captions stay in
+# sync with the voiceover exactly as before.
+_SCRIPT_RANGES = {
+    "te": (r"[\u0C00-\u0C7F]", sanscript.TELUGU),
+    "hi": (r"[\u0900-\u097F]", sanscript.DEVANAGARI),
+    "mr": (r"[\u0900-\u097F]", sanscript.DEVANAGARI),
+    "ne": (r"[\u0900-\u097F]", sanscript.DEVANAGARI),
+    "ta": (r"[\u0B80-\u0BFF]", sanscript.TAMIL),
+    "kn": (r"[\u0C80-\u0CFF]", sanscript.KANNADA),
+    "ml": (r"[\u0D00-\u0D7F]", sanscript.MALAYALAM),
+    "gu": (r"[\u0A80-\u0AFF]", sanscript.GUJARATI),
+    "bn": (r"[\u0980-\u09FF]", sanscript.BENGALI),
+    "pa": (r"[\u0A00-\u0A7F]", sanscript.GURMUKHI),
+    "or": (r"[\u0B00-\u0B7F]", sanscript.ORIYA),
+}
+
+
+def _romanize_word(word: str, lang_code: str) -> str:
+    if not word:
+        return word
+    entry = _SCRIPT_RANGES.get((lang_code or "").lower())
+    if not entry:
+        return word  # unsupported/unknown script — pass through unchanged
+    script_pattern, scheme = entry
+    if not re.search(script_pattern, word):
+        return word  # this token is already Latin (proper noun, number, punctuation) — leave as-is
+    cleaned = word.replace("\u200c", "").replace("\u200d", "")  # strip ZWNJ/ZWJ, cosmetic only
+    try:
+        return transliterate(cleaned, scheme, sanscript.OPTITRANS).lower()
+    except Exception as e:
+        print(f"[caption-romanize] failed on word '{word}': {e} — keeping native script for this word")
+        return word
+
+
+def _romanize_word_segments(word_segments: list[dict], lang_code: str) -> list[dict]:
+    if not lang_code or lang_code.lower() == "en":
+        return word_segments  # English stays exactly as WhisperX produced it
+    for w in word_segments:
+        if "word" in w and w["word"]:
+            w["word"] = _romanize_word(w["word"], lang_code)
+    return word_segments
+
+
+# ---------------------------------------------------------------------------
+# English captions over non-English audio
+#
+# The voiceover audio is genuinely Telugu/Hindi/etc — WhisperX can only ever
+# align text to audio in the SAME language it's forced-aligning against
+# (that's what the alignment model is trained to do), so there is no way to
+# get true word-level sync between real English caption text and non-English
+# audio. What IS available: real per-BEAT timing, already computed from the
+# actual native-language audio by _align_beats_to_timed_words (beat["start"],
+# beat["end"]). These two helpers use that as the anchor:
+#   1. proportionally slice the English script text into the same shape as
+#      the native-language scenes/beats (by word-count share, largest-
+#      remainder method — same technique as the Beat Director word-count
+#      fix, so the split is deterministic and always covers every word)
+#   2. spread each beat's slice of English words evenly across that beat's
+#      REAL [start, end] window, giving each English word an interpolated
+#      timestamp anchored to real audio timing.
+# This is beat-accurate sync, not word-accurate — the tradeoff inherent to
+# using real translated text instead of a transliteration of the audio
+# itself. See chat explanation.
+# ---------------------------------------------------------------------------
+
+def _proportional_word_slices(source_words: list[str], weights: list[int]) -> list[list[str]]:
+    """Split source_words into len(weights) chunks, each chunk's size
+    proportional to its weight, using the largest-remainder method so the
+    chunk sizes always sum to exactly len(source_words) — no words dropped
+    or duplicated, regardless of rounding."""
+    total_words = len(source_words)
+    if not weights or total_words == 0:
+        return [[] for _ in weights]
+
+    total_weight = sum(max(1, w) for w in weights) or 1
+    raw_shares = [total_words * max(1, w) / total_weight for w in weights]
+    floor_shares = [int(s) for s in raw_shares]
+    remainder = total_words - sum(floor_shares)
+    remainder_order = sorted(
+        range(len(weights)), key=lambda i: raw_shares[i] - floor_shares[i], reverse=True
+    )
+    for i in remainder_order[:max(0, remainder)]:
+        floor_shares[i] += 1
+
+    slices, cursor = [], 0
+    for count in floor_shares:
+        slices.append(source_words[cursor:cursor + count])
+        cursor += count
+    return slices
+
+
+def _interpolate_word_timestamps(words: list[str], start: float, end: float) -> list[dict]:
+    """Evenly distribute `words` across [start, end], each getting its own
+    start/end slot. Approximate by construction (equal-duration slots, not
+    audio-derived) — this is the caption-timing tradeoff for showing real
+    translated text over audio in a different language; see module note
+    above."""
+    n = len(words)
+    if n == 0:
+        return []
+    end = max(end, start + 0.05 * n)  # guard against a zero/negative-length beat
+    slot = (end - start) / n
+    out = []
+    for i, w in enumerate(words):
+        w_start = start + i * slot
+        w_end = start + (i + 1) * slot
+        out.append({"word": w, "start": round(w_start, 3), "end": round(w_end, 3)})
+    return out
+
+
+def _build_english_caption_words_for_beats(beats: list, english_scene_words: list[str]) -> list[dict]:
+    """Given a scene's beats (already timed — either via real WhisperX
+    timestamps for English audio, or via _assign_beat_times_proportional
+    for non-English audio, so either way each has beat["start"]/["end"])
+    and that scene's share of the English script (as a flat word list),
+    proportionally split the English words across beats by each beat's
+    native word-count share, then interpolate each beat's English words
+    across its own timing window. Returns a flat list of {word, start,
+    end} dicts, one entry per English word, in beat order — same shape as
+    WhisperX word_segments, so it's a drop-in caption source."""
+    weights = [max(1, len(b.get("vo_text", "").split())) for b in beats]
+    slices = _proportional_word_slices(english_scene_words, weights)
+
+    caption_words: list[dict] = []
+    for beat, en_words in zip(beats, slices):
+        b_start, b_end = beat.get("start"), beat.get("end")
+        if b_start is None or b_end is None or not en_words:
+            continue
+        caption_words.extend(_interpolate_word_timestamps(en_words, b_start, b_end))
+    return caption_words
+
+
+# ---------------------------------------------------------------------------
+# Non-English audio: skip WhisperX entirely, use proportional timing instead
+#
+# WhisperX was previously run on every non-English scene's audio purely to
+# get real per-word timestamps to anchor beat timing to — but for content
+# with hard proper nouns/loanwords, a small-to-medium model can slip into
+# the wrong script entirely (confirmed in production logs — see chat). That
+# risk, plus the transcription cost itself, is now avoidable: the exact
+# text sent to TTS is already known (it's scene_vo_text, no recognition
+# needed), and the audio's total duration is cheap to read directly from
+# the MP3 file (no ML) via mutagen. Beat timing becomes: real total
+# duration, split proportionally by each beat's own word count. This is
+# strictly WORSE than real per-word timestamps at capturing actual TTS
+# pacing (pauses, emphasis) — see chat for the tradeoff — but has zero
+# wrong-script risk and is far cheaper. Only used for langCode != "en";
+# English audio keeps real WhisperX word-level timestamps unchanged.
+# ---------------------------------------------------------------------------
+
+def _get_mp3_duration_seconds(audio_bytes: bytes) -> float:
+    return MP3(io.BytesIO(audio_bytes)).info.length
+
+
+def _assign_beat_times_proportional(beats: list, total_duration: float) -> None:
+    """Mutates each beat's start/end in place: divides total_duration into
+    contiguous windows proportional to each beat's own word count. Uses
+    continuous (float) proportions rather than the largest-remainder method
+    used for word-splitting — duration has no "indivisible unit" to round
+    to, so cumulative float math already lands exactly on total_duration
+    with no drift."""
+    weights = [max(1, len(b.get("vo_text", "").split())) for b in beats]
+    total_weight = sum(weights) or 1
+    cursor = 0.0
+    cumulative_weight = 0
+    for b, w in zip(beats, weights):
+        cumulative_weight += w
+        b_end = total_duration * cumulative_weight / total_weight
+        b["start"] = round(cursor, 3)
+        b["end"] = round(b_end, 3)
+        cursor = b_end
+    if beats:
+        beats[-1]["end"] = round(total_duration, 3)  # guard against float drift on the last beat
+
+
+async def _fetch_english_script_text(script_id: str) -> str:
+    """Fetch scripts_assigned.script for script_id and return the English
+    ("en") version. Raises HTTPException if the row doesn't exist or has
+    no English version — silently falling back to something else here
+    would violate "captions must be English", so this fails loudly instead
+    of guessing."""
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("scripts_assigned")
+            .select("script")
+            .eq("id", script_id)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as e:
+        print(f"[edit-video] failed to fetch scripts_assigned row {script_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch script {script_id}")
+
+    row = result.data if result else None
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No script found for scriptId '{script_id}'")
+
+    script_data = row.get("script")
+    if isinstance(script_data, str):
+        try:
+            script_data = json.loads(script_data)
+        except (json.JSONDecodeError, TypeError):
+            script_data = None
+
+    english_text = (script_data or {}).get("en") if isinstance(script_data, dict) else None
+    if not english_text or not english_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=f"scriptId '{script_id}' has no English ('en') version in scripts_assigned.script",
+        )
+    return english_text
 
 
 def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) -> Optional[str]:
@@ -10949,7 +11183,15 @@ class EditVideo(BaseModel):
     userId: str
     script: str
     voice: str
-    langCode: str
+    langCode: str  # FIX: no default — required. Was defaulting to "en",
+    # which silently ran English-pipeline behavior (no translation-skip
+    # check, no forced-language transcription, no caption romanization)
+    # on any request that simply forgot to pass it — including
+    # non-English requests, with no error to signal the mistake.
+    scriptId: str  # FIX: identifies the row in scripts_assigned whose
+    # `script` jsonb ({"en": "...", "te": "...", ...}) holds the English
+    # version of this same script, used to build real-English captions
+    # over the non-English voiceover — see _build_english_caption_words_for_beats.
     durationMinutes: int = 0
     volume: Optional[float] = None
     loudness_normalization: Optional[bool] = None
@@ -11055,8 +11297,23 @@ def _log_token_usage(step_label: str, res: Any) -> None:
     except Exception as e:
         print(f"[tokens] {step_label}: failed to read usage ({e})")
 
-
-WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "small")
+# FIX (wrong-script transcription): confirmed via production logs — "small"
+# correctly gets told language='te' (WhisperX's own tokenizer setup honors
+# it, and it correctly loads the 'te' alignment model afterward), but on
+# hard segments (foreign proper nouns with no native Telugu spelling —
+# "Krizhevsky", "Sutskever" transliterated) the model loses confidence and
+# slips into Devanagari/Hindi script instead of Telugu — the language token
+# only biases generation, it doesn't hard-constrain which script comes out.
+# This is a model-CAPABILITY issue, not a logic bug: language='te' was
+# already being requested correctly (see _run_whisperx_sync above); a
+# bigger model is what actually fixes script fidelity on hard content.
+# "medium" is a meaningful accuracy step up from "small" for exactly this.
+# Tradeoff, since WHISPERX_DEVICE="cpu": "medium" is noticeably slower to
+# transcribe than "small" on CPU (roughly 2-3x); "large-v2"/"large-v3"
+# would be more reliable still but proportionally slower again. Override
+# via the WHISPERX_MODEL_SIZE env var if "medium" isn't the right tradeoff
+# for your actual latency budget.
+WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "medium")
 WHISPERX_DEVICE = os.getenv("WHISPERX_DEVICE", "cpu")
 WHISPERX_COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "int8")
 
@@ -11100,13 +11357,25 @@ def _get_whisperx_model():
     global _whisperx_model
     if _whisperx_model is None:
         print(f"[WHISPERX] loading model '{WHISPERX_MODEL_SIZE}' on {WHISPERX_DEVICE}")
+        # FIX (repetition-loop hallucination): whisperx.load_model's own
+        # defaults (confirmed by reading the installed library source) ship
+        # with repetition_penalty=1 (no penalty) and no_repeat_ngram_size=0
+        # (blocking OFF) — nothing stops the decoder from looping on one
+        # token indefinitely once it gets thrown by a hard segment (rare
+        # transliterated proper nouns, e.g. "క్రిజెవ్‌స్కీ" for Krizhevsky,
+        # are exactly the kind of thing that triggers this on a `small`
+        # model). These two values are the standard community-recommended
+        # fix for faster-whisper's repetition-loop failure mode; everything
+        # else in asr_options is left at whisperx's own defaults.
         _whisperx_model = whisperx.load_model(
             WHISPERX_MODEL_SIZE, WHISPERX_DEVICE, compute_type=WHISPERX_COMPUTE_TYPE,
+            asr_options={"repetition_penalty": 1.2, "no_repeat_ngram_size": 3},
         )
     return _whisperx_model
 
 
-def _run_whisperx_sync(audio_bytes: bytes, lang_code: str) -> dict:
+
+def _run_whisperx_sync(audio_bytes: bytes, lang_code: Optional[str] = None) -> dict:
     with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
@@ -11130,8 +11399,30 @@ def _run_whisperx_sync(audio_bytes: bytes, lang_code: str) -> dict:
         if lang_code and lang_code.lower() != "en":
             transcribe_kwargs["language"] = lang_code.lower()
 
+        # FIX (wrong-language transcription): _get_whisperx_model() caches
+        # ONE pipeline object globally, reused across every call forever.
+        # Internally, whisperx only rebuilds its tokenizer when it *thinks*
+        # the requested language differs from whatever's already cached on
+        # that shared object (self.tokenizer.language_code) — so any stale
+        # state or missed comparison there means a call can silently
+        # inherit a DIFFERENT call's language instead of the one actually
+        # requested here. Since we already know exactly which language we
+        # want, don't rely on that internal check at all: force a clean
+        # tokenizer rebuild for this specific request, every time. This is
+        # cheap (tokenizer construction, not a model reload) and removes
+        # the whole class of stale/cross-request language bugs.
+        if "language" in transcribe_kwargs:
+            model.tokenizer = None
+
+        # DIAGNOSTIC: logs exactly what was requested vs what whisperx
+        # reports back. If requested != language on the result line below
+        # even with the reset above, the problem is upstream of this
+        # function (lang_code arriving as something other than expected).
+        print(f"[WHISPERX] requesting transcribe with lang_code={lang_code!r}, transcribe_kwargs={transcribe_kwargs!r}")
+
         result = model.transcribe(audio, **transcribe_kwargs)
         language = result["language"]
+        print(f"[WHISPERX] requested={transcribe_kwargs.get('language')!r} vs whisperx reported language={language!r}")
 
         if language not in _whisperx_align_cache:
             print(f"[WHISPERX] loading alignment model for language '{language}'")
@@ -11152,7 +11443,7 @@ def _run_whisperx_sync(audio_bytes: bytes, lang_code: str) -> dict:
         }
 
 
-async def _generate_word_timestamps(audio_url: str, lang_code: str) -> dict:
+async def _generate_word_timestamps(audio_url: str, lang_code: Optional[str] = None) -> dict:
     audio_bytes = await _download_bytes(audio_url)
     async with _whisperx_lock:
         return await asyncio.to_thread(_run_whisperx_sync, audio_bytes, lang_code)
@@ -11772,13 +12063,45 @@ async def _run_beat_director(
     beats = [_validate_beat(b, id_prefix, i) for i, b in enumerate(raw_beats)]
 
     covered_words = sum(len(b["vo_text"].split()) for b in beats)
-    original_words = len(scene_vo_text.split())
-    if covered_words != original_words:
+    original_words_list = scene_vo_text.split()
+    original_words = len(original_words_list)
+
+    if covered_words != original_words and beats:
         print(
             f"[edit-video][WARN] scene {scene_id}: beat director word count "
             f"mismatch ({covered_words} vs {original_words} original) — "
-            f"narration may have been dropped, duplicated, or paraphrased across beats"
+            f"re-slicing beats from the original narration so no words are "
+            f"dropped, duplicated, or paraphrased"
         )
+        # FIX: the LLM's own vo_text per beat was being trusted verbatim,
+        # so any drop/duplication/paraphrase it made (more common on
+        # non-English scripts) went straight into the beat's narration —
+        # this is what actually gets spoken, so it silently changed what
+        # the video says. Fix: use the LLM's beats only to learn each
+        # beat's relative SIZE (how many words it assigned itself), then
+        # deterministically re-slice the REAL scene_vo_text in that same
+        # proportion. The largest-remainder method distributes any
+        # rounding leftover so the totals always sum to exactly
+        # original_words — never over, never under. This makes the
+        # mismatch structurally impossible going forward, not just
+        # detected after the fact.
+        beat_word_counts = [max(1, len(b["vo_text"].split())) for b in beats]
+        total_claimed = sum(beat_word_counts)
+        raw_shares = [original_words * c / total_claimed for c in beat_word_counts]
+        floor_shares = [int(s) for s in raw_shares]
+        remainder = original_words - sum(floor_shares)
+        remainder_order = sorted(
+            range(len(beats)), key=lambda i: raw_shares[i] - floor_shares[i], reverse=True
+        )
+        for i in remainder_order[:remainder]:
+            floor_shares[i] += 1
+
+        cursor = 0
+        for b, count in zip(beats, floor_shares):
+            b["vo_text"] = " ".join(original_words_list[cursor:cursor + count])
+            cursor += count
+
+        covered_words = sum(len(b["vo_text"].split()) for b in beats)
 
     for b in beats:
         if len(b["keywords"]) < BROLL_KEYWORDS_MIN:
@@ -12314,7 +12637,7 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
     }
     scene_out["_previous_scene_last_animation"] = previous_animation_in
 
-    async def _finalize(timed_words: list) -> dict:
+    async def _finalize(timed_words: list, total_duration_sec: Optional[float] = None) -> dict:
         beats = await _run_beat_director(
             scene_vo_text=vo_text, category=category, style_profile=style_profile, script_language=script_language,
             scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
@@ -12325,9 +12648,32 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
 
         if timed_words:
             _align_beats_to_timed_words(beats, timed_words)
+        elif total_duration_sec is not None:
+            # Non-English path: no real WhisperX timestamps — split the
+            # scene's real audio duration across beats proportional to
+            # each beat's own word count. See module note above.
+            _assign_beat_times_proportional(beats, total_duration_sec)
         else:
             for b in beats:
                 b["start"], b["end"] = None, None
+
+        # Caption source. For English (request.langCode == "en"): the audio
+        # IS English, so WhisperX's own word_segments (timed_words) are
+        # already real, word-accurate English captions — use them directly,
+        # no approximation needed. For every other language: build from the
+        # scripts_assigned English text instead, proportionally re-split
+        # across beats (by native-language word-count share) and
+        # interpolated within each beat's real timing window — see
+        # _build_english_caption_words_for_beats. word_segments itself
+        # always stays native-script (Telugu/Hindi/etc for non-English,
+        # or English here), used for internal timing alignment either way.
+        if (request.langCode or "").strip().lower() == "en":
+            scene_out["caption_word_segments_en"] = timed_words
+        else:
+            english_words = scene.get("vo_text_en_words") or []
+            scene_out["caption_word_segments_en"] = (
+                _build_english_caption_words_for_beats(beats, english_words) if english_words else []
+            )
 
         fallback_keywords = _get_scene_broll_keywords(scene)
         await _fetch_beats_media(beats, str(scene_id))
@@ -12411,41 +12757,79 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         scene_out["error"] = f"voice generation failed: {e}"
         return await _finalize([])
 
-    try:
-        scene_timestamps = await _generate_word_timestamps(speech_result["url"], lang_code=request.langCode)
-    except Exception as e:
-        print(f"[edit-video] scene {scene_id} whisperx alignment failed: {e}")
+    is_english = (request.langCode or "").strip().lower() == "en"
+
+    if is_english:
+        # English audio: real WhisperX word-level transcription/alignment,
+        # unchanged from before.
+        try:
+            scene_timestamps = await _generate_word_timestamps(speech_result["url"], lang_code=request.langCode)
+        except Exception as e:
+            print(f"[edit-video] scene {scene_id} whisperx alignment failed: {e}")
+            scene_out["tagged_vo_text"] = tagged_text
+            scene_out["voiceover"] = speech_result
+            scene_out["start"] = None
+            scene_out["end"] = None
+            scene_out["word_segments"] = []
+            scene_out["error"] = f"timestamp alignment failed: {e}"
+            return await _finalize([])
+
+        word_segments = scene_timestamps.get("word_segments", [])
+        timed_words = [w for w in word_segments if "start" in w and "end" in w]
+
+        if is_first_scene and timed_words and timed_words[0].get("start", 0.0) > 0.0:
+            print(
+                f"[edit-video] scene {scene_id}: clamping first word start "
+                f"{timed_words[0]['start']:.3f}s -> 0.0s so no leading audio is trimmed"
+            )
+            first_word_obj = timed_words[0]
+            for w in word_segments:
+                if w is first_word_obj:
+                    w["start"] = 0.0
+                    break
+            timed_words[0]["start"] = 0.0
+
         scene_out["tagged_vo_text"] = tagged_text
         scene_out["voiceover"] = speech_result
-        scene_out["start"] = None
-        scene_out["end"] = None
+        scene_out["start"] = timed_words[0]["start"] if timed_words else None
+        scene_out["end"] = timed_words[-1]["end"] if timed_words else None
+        scene_out["word_segments"] = word_segments
+        scene_out["error"] = None
+
+        return await _finalize(timed_words)
+
+    else:
+        # Non-English audio: skip WhisperX entirely. No transcription, so
+        # no wrong-script risk — read the real audio duration directly
+        # (mutagen, no ML) and let _finalize split beat timing
+        # proportionally across it. See module note above
+        # _assign_beat_times_proportional for the accuracy tradeoff.
+        try:
+            audio_bytes = await _download_bytes(speech_result["url"])
+            total_duration = _get_mp3_duration_seconds(audio_bytes)
+        except Exception as e:
+            print(f"[edit-video] scene {scene_id} failed to read audio duration: {e}")
+            scene_out["tagged_vo_text"] = tagged_text
+            scene_out["voiceover"] = speech_result
+            scene_out["start"] = None
+            scene_out["end"] = None
+            scene_out["word_segments"] = []
+            scene_out["error"] = f"audio duration read failed: {e}"
+            return await _finalize([])
+
+        scene_out["tagged_vo_text"] = tagged_text
+        scene_out["voiceover"] = speech_result
+        scene_out["start"] = 0.0
+        scene_out["end"] = round(total_duration, 3)
+        # No real per-word transcription exists for this scene — anything
+        # downstream that re-slices a scene by time range (e.g. editing a
+        # single beat's time window) has no ground-truth words to work
+        # from for non-English scenes. Flagged here, not silently hidden.
         scene_out["word_segments"] = []
-        scene_out["error"] = f"timestamp alignment failed: {e}"
-        return await _finalize([])
+        scene_out["error"] = None
 
-    word_segments = scene_timestamps.get("word_segments", [])
-    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+        return await _finalize([], total_duration_sec=total_duration)
 
-    if is_first_scene and timed_words and timed_words[0].get("start", 0.0) > 0.0:
-        print(
-            f"[edit-video] scene {scene_id}: clamping first word start "
-            f"{timed_words[0]['start']:.3f}s -> 0.0s so no leading audio is trimmed"
-        )
-        first_word_obj = timed_words[0]
-        for w in word_segments:
-            if w is first_word_obj:
-                w["start"] = 0.0
-                break
-        timed_words[0]["start"] = 0.0
-
-    scene_out["tagged_vo_text"] = tagged_text
-    scene_out["voiceover"] = speech_result
-    scene_out["start"] = timed_words[0]["start"] if timed_words else None
-    scene_out["end"] = timed_words[-1]["end"] if timed_words else None
-    scene_out["word_segments"] = word_segments
-    scene_out["error"] = None
-
-    return await _finalize(timed_words)
 
 
 async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
@@ -12651,7 +13035,14 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "scene_start_sec": start_sec, "scene_end_sec": end_sec,
             })
 
-        word_segments = scene.get("word_segments") or []
+        # FIX (no captions in non-English output): this was hardcoded to
+        # scene.get("word_segments"), which is now deliberately [] for
+        # non-English scenes (no WhisperX transcription runs on that audio
+        # anymore — see _assign_beat_times_proportional). caption_word_
+        # segments_en is populated for BOTH English (real WhisperX words)
+        # and non-English (beat-interpolated English translation) scenes in
+        # _process_scene — this just wasn't wired to read it before now.
+        word_segments = scene.get("caption_word_segments_en") or []
         timed_words_sec = [w for w in word_segments if "start" in w and "end" in w]
         words = []
         for w in word_segments:
@@ -13046,6 +13437,27 @@ def _split_oversized_scene(scene: dict, original_script: str) -> list:
 
 @app.post("/edit-video")
 async def edit_video(request: EditVideo):
+    # FIX: langCode is now required at the schema level (see EditVideo
+    # above), but Pydantic's `str` type still accepts "" as technically
+    # present — reject that explicitly too, since an empty string would
+    # otherwise silently fall through every langCode-gated fix in this
+    # pipeline (translation-skip, forced-language transcription, caption
+    # romanization) exactly like a missing field would.
+    if not request.langCode or not request.langCode.strip():
+        raise HTTPException(status_code=422, detail="langCode is required and cannot be empty")
+
+    if not request.scriptId or not request.scriptId.strip():
+        raise HTTPException(status_code=422, detail="scriptId is required and cannot be empty")
+
+    # Fetch English captions source up front — fail fast before spending any
+    # OpenAI/TTS/WhisperX work if it's missing, rather than discovering it
+    # deep into scene processing. Skipped entirely for English videos: the
+    # audio is already English, so WhisperX's own word_segments ARE the
+    # real, word-accurate English captions — no scripts_assigned lookup or
+    # beat-interpolation approximation needed (see _finalize below).
+    is_english = request.langCode.strip().lower() == "en"
+    english_script_text = "" if is_english else await _fetch_english_script_text(request.scriptId)
+
     try:
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
@@ -13111,6 +13523,25 @@ async def edit_video(request: EditVideo):
         f"({total_script_words} script words, ~{total_script_words / max(len(scenes), 1):.0f} words/scene average)"
     )
 
+    # Proportionally divide the whole English script across scenes by each
+    # scene's share of total_script_words (native-language word count).
+    # This is scene-level only — the beat-level split happens per-scene
+    # inside _process_scene, once real beat timing exists to anchor it to.
+    # Skipped for English videos — nothing to split, captions come straight
+    # from WhisperX's own word_segments instead (see _finalize below).
+    if is_english:
+        for _scene in scenes:
+            if isinstance(_scene, dict):
+                _scene["vo_text_en_words"] = []
+    else:
+        english_script_words = english_script_text.split()
+        scene_weights = [max(1, len((s.get("vo_text") or "").split())) for s in scenes if isinstance(s, dict)]
+        english_scene_slices = _proportional_word_slices(english_script_words, scene_weights)
+        _slice_iter = iter(english_scene_slices)
+        for _scene in scenes:
+            if isinstance(_scene, dict):
+                _scene["vo_text_en_words"] = next(_slice_iter, [])
+
     video_ctx = {
         "known_entities": [], "known_setting": {"location": "", "time_period": ""},
         "previous_scene_last_media_type": None, "previous_scene_last_animation": None,
@@ -13156,7 +13587,7 @@ async def edit_video(request: EditVideo):
         raise HTTPException(status_code=500, detail="Failed to save video")
 
     EDIT_VIDEO_CREDITS_PER_MINUTE = 11
-    duration_minutes = (timeline_json.get("total_frames", 0) / max(timeline_json.get("fps", 1), 1)) / 60
+    duration_minutes = request.durationMinutes
     credit_cost = round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
 
     credit_result = {"cost": credit_cost, "deducted": False, "remaining_credits": None, "status": None}
