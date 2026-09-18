@@ -12397,8 +12397,17 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         return await _finalize([])
 
     try:
+        # CHANGE: lang_code was request.langCode — the raw client-supplied
+        # field on the /edit-video request body (defaults to "en" and isn't
+        # guaranteed to be kept in sync with the script's actual language,
+        # e.g. if /translate-script was called first but the follow-up
+        # /edit-video call still sent the original langCode). script_language
+        # is what the Scene Planner actually detected from the real script
+        # text earlier in this request, and is already the source of truth
+        # used for beat director / animation planner above — using it here
+        # too means voice generation can't silently target the wrong language.
         speech_result = await _generate_speech_possibly_chunked(
-            user_id=request.userId, tagged_text=tagged_text, voice=request.voice, lang_code=request.langCode,
+            user_id=request.userId, tagged_text=tagged_text, voice=request.voice, lang_code=script_language,
             volume=request.volume, loudness_normalization=request.loudness_normalization,
             text_normalization=request.text_normalization,
         )
@@ -12413,7 +12422,15 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         return await _finalize([])
 
     try:
-        scene_timestamps = await _generate_word_timestamps(speech_result["url"], lang_code=request.langCode)
+        # CHANGE: same fix as above — this was the actual cause of WhisperX
+        # transcribing Telugu narration as English-shaped words. Passing
+        # request.langCode (often stale/default "en") meant _run_whisperx_sync's
+        # `if lang_code and lang_code.lower() != "en":` check was silently
+        # skipped, so it fell back to Whisper's language auto-detect, which
+        # misfired on the Telugu audio and force-decoded it into English.
+        # script_language forces the correct language every time, matching
+        # what was actually spoken by _generate_speech_possibly_chunked above.
+        scene_timestamps = await _generate_word_timestamps(speech_result["url"], lang_code=script_language)
     except Exception as e:
         print(f"[edit-video] scene {scene_id} whisperx alignment failed: {e}")
         scene_out["tagged_vo_text"] = tagged_text
@@ -12447,7 +12464,6 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
     scene_out["error"] = None
 
     return await _finalize(timed_words)
-
 
 async def _regenerate_scene_beats_and_animations(scene: dict) -> dict:
     ctx = scene.get("_beat_director_context") or {
