@@ -8385,24 +8385,8 @@ async def razorpay_webhook(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 from fastapi import UploadFile, File, Form
+from typing import List
 
 AUDIO_BUCKET = "user-audio"
 AUDIO_TABLE = "user_audio"
@@ -8423,8 +8407,10 @@ ALLOWED_AUDIO_CONTENT_TYPES = {
 MAX_AUDIO_SIZE_BYTES = int(os.getenv("MAX_AUDIO_SIZE_BYTES", str(200 * 1024 * 1024)))
 SIGNED_URL_EXPIRY_SECONDS = int(os.getenv("AUDIO_SIGNED_URL_EXPIRY_SECONDS", str(60 * 60 * 24 * 7)))
 
-# Keep this in sync with whatever language codes your app actually uses.
-ALLOWED_LANGUAGE_CODES = {"en", "te", "hi", "ta", "kn", "ml"}
+# Language code is provided by the frontend and isn't restricted to a fixed
+# list. It's just validated for shape (short, alphanumeric/hyphen/underscore)
+# so it's safe to use as a JSON key and storage path segment.
+LANGUAGE_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,20}$")
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -8512,70 +8498,104 @@ def _merge_language_entry(existing_array: list, language: str, url: str) -> list
 @app.post("/save-audio")
 async def save_audio(
     userId: str = Form(...),
-    language: str = Form(...),
-    audio: UploadFile = File(...),
+    languages: List[str] = Form(...),
+    audios: List[UploadFile] = File(...),
 ):
+    """
+    Upload one or more audio files at once, each tagged with a language code.
+    `languages` and `audios` are matched up by position, so send them in the
+    same order, e.g.:
+
+        languages = ["en", "te"]
+        audios    = [en_recording.m4a, te_recording.m4a]
+    """
     await require_valid_user(userId)
 
-    language = language.strip().lower()
-    if language not in ALLOWED_LANGUAGE_CODES:
+    if len(languages) != len(audios):
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported language code: {language}",
+            detail=f"Got {len(languages)} language codes but {len(audios)} audio files; they must match 1:1.",
         )
 
-    if audio.content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported audio content type: {audio.content_type}",
+    if len(languages) == 0:
+        raise HTTPException(status_code=400, detail="No audio files provided")
+
+    cleaned_languages = [lang.strip().lower() for lang in languages]
+
+    # Reject duplicate language codes within the same request up front.
+    seen = set()
+    for lang in cleaned_languages:
+        if lang in seen:
+            raise HTTPException(status_code=400, detail=f"Duplicate language code in request: {lang}")
+        seen.add(lang)
+
+    # Validate everything before uploading anything, so a bad entry doesn't
+    # leave a partial set of files sitting in storage.
+    for lang, audio in zip(cleaned_languages, audios):
+        if not LANGUAGE_CODE_PATTERN.match(lang):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid language code: {lang!r} (must be 1-20 chars, letters/numbers/-/_ only)",
+            )
+        if audio.content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported audio content type for '{lang}': {audio.content_type}",
+            )
+
+    results = []  # list of (language, file_url)
+
+    for lang, audio in zip(cleaned_languages, audios):
+        file_bytes = await audio.read()
+        size_bytes = len(file_bytes)
+
+        if size_bytes == 0:
+            raise HTTPException(status_code=400, detail=f"Uploaded audio file for '{lang}' is empty")
+
+        if size_bytes > MAX_AUDIO_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Audio file for '{lang}' too large ({size_bytes} bytes, max {MAX_AUDIO_SIZE_BYTES} bytes)",
+            )
+
+        safe_name = _sanitize_filename(audio.filename)
+        extension = _guess_extension(audio.content_type, safe_name)
+        unique_name = f"{uuid.uuid4().hex}{extension}"
+        storage_path = f"{userId}/{lang}/{unique_name}"
+
+        print(
+            f"[AUDIO] uploading '{safe_name}' ({size_bytes} bytes, {audio.content_type}) "
+            f"for userId={userId}, language={lang} -> {AUDIO_BUCKET}/{storage_path}"
         )
 
-    file_bytes = await audio.read()
-    size_bytes = len(file_bytes)
+        try:
+            await asyncio.to_thread(
+                _upload_audio_to_storage_sync,
+                AUDIO_BUCKET,
+                storage_path,
+                file_bytes,
+                audio.content_type,
+            )
+        except Exception as e:
+            print(f"[AUDIO] storage upload FAILED for '{lang}': {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Failed to upload audio for '{lang}' to storage: {e}")
 
-    if size_bytes == 0:
-        raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
-
-    if size_bytes > MAX_AUDIO_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Audio file too large ({size_bytes} bytes, max {MAX_AUDIO_SIZE_BYTES} bytes)",
+        file_url = await asyncio.to_thread(
+            _create_signed_url_sync, AUDIO_BUCKET, storage_path, SIGNED_URL_EXPIRY_SECONDS
         )
 
-    safe_name = _sanitize_filename(audio.filename)
-    extension = _guess_extension(audio.content_type, safe_name)
-    unique_name = f"{uuid.uuid4().hex}{extension}"
-    storage_path = f"{userId}/{language}/{unique_name}"
+        if not file_url:
+            raise HTTPException(status_code=500, detail=f"Audio for '{lang}' uploaded but failed to generate URL")
 
-    print(
-        f"[AUDIO] uploading '{safe_name}' ({size_bytes} bytes, {audio.content_type}) "
-        f"for userId={userId}, language={language} -> {AUDIO_BUCKET}/{storage_path}"
-    )
-
-    try:
-        await asyncio.to_thread(
-            _upload_audio_to_storage_sync,
-            AUDIO_BUCKET,
-            storage_path,
-            file_bytes,
-            audio.content_type,
-        )
-    except Exception as e:
-        print(f"[AUDIO] storage upload FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to upload audio to storage: {e}")
-
-    file_url = await asyncio.to_thread(
-        _create_signed_url_sync, AUDIO_BUCKET, storage_path, SIGNED_URL_EXPIRY_SECONDS
-    )
-
-    if not file_url:
-        raise HTTPException(status_code=500, detail="Audio uploaded but failed to generate URL")
+        results.append((lang, file_url))
 
     try:
         current_array = await asyncio.to_thread(_get_current_audio_url_array_sync, userId)
-        updated_array = _merge_language_entry(current_array, language, file_url)
+        updated_array = current_array
+        for lang, file_url in results:
+            updated_array = _merge_language_entry(updated_array, lang, file_url)
 
         await asyncio.to_thread(
             lambda: supabase.table("user_profiles")
@@ -8587,16 +8607,51 @@ async def save_audio(
         print(f"[AUDIO] failed to save audio_url on user_profiles: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Audio uploaded but failed to save URL to profile: {e}")
+        raise HTTPException(status_code=500, detail=f"Audio uploaded but failed to save URLs to profile: {e}")
 
     return {
         "message": "Audio uploaded successfully",
         "userId": userId,
-        "language": language,
-        "url": file_url,
+        "uploaded": [{"language": lang, "url": url} for lang, url in results],
         "url_expires_in_seconds": SIGNED_URL_EXPIRY_SECONDS,
         "audio_url": updated_array,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -8924,6 +8979,14 @@ async def upload(file: UploadFile = File(...), userId: str = Form(...)):
 
 
 
+
+
+
+
+
+
+
+
 import math
 
 FISH_AUDIO_API_KEY = os.getenv("FISH_AUDIO_API_KEY")
@@ -9226,14 +9289,6 @@ async def generate_speech(body: GenerateSpeechRequest):
         "storage_path": storage_path,
         "url": public_url,
     }
-
-
-
-
-
-
-
-
 
 
 
