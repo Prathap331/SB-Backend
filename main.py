@@ -270,6 +270,7 @@ import trafilatura
 SCRIPTS_UNIVERSAL_TABLE = "scripts_universal"
 IDEAS_HYDE_DOC_COUNT = 5
 
+
 SUPPORTED_LANGUAGES = {
     "afrikaans": "af",
     "albanian": "sq",
@@ -277,134 +278,86 @@ SUPPORTED_LANGUAGES = {
     "arabic": "ar",
     "armenian": "hy",
     "assamese": "as",
-    "aymara": "ay",
     "azerbaijani": "az",
-    "bambara": "bm",
     "basque": "eu",
     "belarusian": "be",
     "bengali": "bn",
-    "bhojpuri": "bho",
     "bosnian": "bs",
+    "breton": "br",
     "bulgarian": "bg",
+    "burmese": "my",
     "catalan": "ca",
-    "cebuano": "ceb",
-    "chichewa": "ny",
-    "chinese simplified": "zh-CN",
-    "chinese traditional": "zh-TW",
-    "corsican": "co",
+    "chinese": "zh",
     "croatian": "hr",
     "czech": "cs",
     "danish": "da",
-    "dhivehi": "dv",
-    "dogri": "doi",
     "dutch": "nl",
     "english": "en",
-    "esperanto": "eo",
     "estonian": "et",
-    "ewe": "ee",
-    "filipino": "tl",
+    "faroese": "fo",
     "finnish": "fi",
     "french": "fr",
-    "frisian": "fy",
     "galician": "gl",
     "georgian": "ka",
     "german": "de",
     "greek": "el",
-    "guarani": "gn",
     "gujarati": "gu",
     "haitian creole": "ht",
-    "hausa": "ha",
-    "hawaiian": "haw",
     "hebrew": "iw",
     "hindi": "hi",
-    "hmong": "hmn",
     "hungarian": "hu",
     "icelandic": "is",
-    "igbo": "ig",
-    "ilocano": "ilo",
     "indonesian": "id",
-    "irish": "ga",
     "italian": "it",
     "japanese": "ja",
     "javanese": "jw",
     "kannada": "kn",
     "kazakh": "kk",
     "khmer": "km",
-    "kinyarwanda": "rw",
-    "konkani": "gom",
     "korean": "ko",
-    "krio": "kri",
-    "kurdish kurmanji": "ku",
-    "kurdish sorani": "ckb",
-    "kyrgyz": "ky",
-    "lao": "lo",
     "latin": "la",
     "latvian": "lv",
-    "lingala": "ln",
     "lithuanian": "lt",
-    "luganda": "lg",
-    "luxembourgish": "lb",
     "macedonian": "mk",
-    "maithili": "mai",
-    "malagasy": "mg",
     "malay": "ms",
     "malayalam": "ml",
-    "maltese": "mt",
     "maori": "mi",
     "marathi": "mr",
-    "meiteilon/manipuri": "mni-Mtei",
-    "mizo": "lus",
     "mongolian": "mn",
-    "myanmar": "my",
     "nepali": "ne",
     "norwegian": "no",
-    "odia": "or",
-    "oromo": "om",
+    "norwegian nynorsk": "nn",
     "pashto": "ps",
     "persian": "fa",
     "polish": "pl",
     "portuguese": "pt",
     "punjabi": "pa",
-    "quechua": "qu",
     "romanian": "ro",
     "russian": "ru",
-    "samoan": "sm",
     "sanskrit": "sa",
-    "scots gaelic": "gd",
-    "sepedi": "nso",
     "serbian": "sr",
-    "sesotho": "st",
     "shona": "sn",
     "sindhi": "sd",
     "sinhala": "si",
     "slovak": "sk",
     "slovenian": "sl",
-    "somali": "so",
     "spanish": "es",
-    "sundanese": "su",
     "swahili": "sw",
     "swedish": "sv",
-    "tajik": "tg",
+    "filipino": "tl",
     "tamil": "ta",
-    "tatar": "tt",
     "telugu": "te",
     "thai": "th",
-    "tigrinya": "ti",
-    "tsonga": "ts",
+    "tibetan": "bo",
     "turkish": "tr",
-    "turkmen": "tk",
-    "twi": "ak",
     "ukrainian": "uk",
     "urdu": "ur",
-    "uyghur": "ug",
-    "uzbek": "uz",
     "vietnamese": "vi",
     "welsh": "cy",
-    "xhosa": "xh",
     "yiddish": "yi",
     "yoruba": "yo",
-    "zulu": "zu",
 }
+
 
 
 from qdrant_client import QdrantClient
@@ -9854,7 +9807,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
 import re
 import os
 import json
@@ -11155,7 +11107,7 @@ def _get_whisperx_model():
     return _whisperx_model
 
 
-def _run_whisperx_sync(audio_bytes: bytes) -> dict:
+def _run_whisperx_sync(audio_bytes: bytes, lang_code: Optional[str] = None) -> dict:
     with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
@@ -11163,7 +11115,23 @@ def _run_whisperx_sync(audio_bytes: bytes) -> dict:
         model = _get_whisperx_model()
         audio = whisperx.load_audio(tmp.name)
 
-        result = model.transcribe(audio, batch_size=16)
+        # FIX (caption language): previously called model.transcribe with no
+        # `language=` at all, so Whisper always auto-detected from the first
+        # 30s of audio — even though the video's actual language (langCode)
+        # is already known at this point in the pipeline. Auto-detection is
+        # a documented weak point specifically for lower-resource languages
+        # (Whisper has been reported picking the wrong language for Kannada/
+        # Tamil, and defaulting to English output when detection goes wrong
+        # on non-English audio) — exactly the risk for Telugu/Hindi/etc.
+        # narration. Passing the known language explicitly skips detection
+        # entirely: faster, and removes this whole failure mode. Only used
+        # when lang_code is a real non-English code we trust; None/"en"
+        # keeps the previous auto-detect behavior unchanged.
+        transcribe_kwargs = {"batch_size": 16}
+        if lang_code and lang_code.lower() != "en":
+            transcribe_kwargs["language"] = lang_code.lower()
+
+        result = model.transcribe(audio, **transcribe_kwargs)
         language = result["language"]
 
         if language not in _whisperx_align_cache:
@@ -11185,10 +11153,11 @@ def _run_whisperx_sync(audio_bytes: bytes) -> dict:
         }
 
 
-async def _generate_word_timestamps(audio_url: str) -> dict:
+async def _generate_word_timestamps(audio_url: str, lang_code: Optional[str] = None) -> dict:
     audio_bytes = await _download_bytes(audio_url)
     async with _whisperx_lock:
-        return await asyncio.to_thread(_run_whisperx_sync, audio_bytes)
+        return await asyncio.to_thread(_run_whisperx_sync, audio_bytes, lang_code)
+
 
 
 def _split_text_for_tts(text: str, max_chars: int = TTS_MAX_CHARS_PER_CALL) -> list[str]:
@@ -12444,7 +12413,7 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         return await _finalize([])
 
     try:
-        scene_timestamps = await _generate_word_timestamps(speech_result["url"])
+        scene_timestamps = await _generate_word_timestamps(speech_result["url"], lang_code=request.langCode)
     except Exception as e:
         print(f"[edit-video] scene {scene_id} whisperx alignment failed: {e}")
         scene_out["tagged_vo_text"] = tagged_text
@@ -14338,6 +14307,13 @@ async def delete_scene_content(
     }
 
 
+
+
+
+
+
+
+
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 
 RUN_SUBPROCESS_TIMEOUT_SECONDS = int(os.getenv("RUN_SUBPROCESS_TIMEOUT_SECONDS", "300"))
@@ -14375,48 +14351,6 @@ def _display_text_to_string(display_text: Any) -> str:
     if isinstance(display_text, str):
         return display_text
     return ""
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
