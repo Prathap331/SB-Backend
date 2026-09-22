@@ -255,7 +255,6 @@ import hashlib
 import contextvars
 import concurrent.futures
 from urllib.parse import urlparse
-from deep_translator import GoogleTranslator
 
 
 import requests
@@ -399,209 +398,9 @@ DEFAULT_LANGUAGE = "English"
  
 TRANSLATE_CHUNK_MAX_CHARS = 4000
 
-_TRANSLATE_ARRAY_SEP_LINE = "\u2021\u2021\u2021ITEM\u2021\u2021\u2021"  
-_LEADING_NUMBERING_RE = re.compile(r"^\s*(?:[\-\*\u2022]|\d+[\.\)])\s*")
- 
-TRANSLATION_QC_ARRAY_SYSTEM_PROMPT = """
-You are a professional {language} language editor and translation QC specialist
-working on YouTube metadata (titles, descriptions, or hashtag phrases).
- 
-You will be given:
-1. The ORIGINAL English text — exactly {item_count} item(s), each separated
-   by a line that contains exactly the token: {sep_token}
-2. A DRAFT machine translation of the same text into {language}, using the
-   same separator token
- 
-## Task
-- Fix grammar, spelling, and word order so each item reads naturally to a
-  native {language} speaker
-- Keep each item short and punchy, suitable for a YouTube title, description,
-  or hashtag phrase
-- Translate EVERY item independently. Do NOT merge, deduplicate, reorder,
-  drop, summarize, or combine items — even if two items look similar or
-  redundant to you, keep them as separate items in the same position
-- Do NOT add numbering, bullets, or any new formatting
-- Preserve names, numbers, and proper nouns accurately
- 
-## CRITICAL OUTPUT REQUIREMENT
-Your output MUST contain EXACTLY {item_count} item(s) separated by the exact
-token "{sep_token}" on its own line — the same count as the input, no more,
-no fewer. This is a hard structural requirement, not a style suggestion.
- 
-## Output
-Return ONLY the corrected {language} text, items separated by "{sep_token}"
-on their own line, same order, same count — no preamble, no notes, no
-markdown, no explanations.
-"""
 
-
-
-async def refine_array_translation_with_llm(
-    original_text: str, draft_translation: str, target_language: str, item_count: int
-) -> str:
-    if not draft_translation:
-        return draft_translation
- 
-    system_prompt = TRANSLATION_QC_ARRAY_SYSTEM_PROMPT.format(
-        language=target_language,
-        item_count=item_count,
-        sep_token=_TRANSLATE_ARRAY_SEP_LINE,
-    )
-    user_prompt = f"""ORIGINAL (English):
-{original_text}
- 
-DRAFT TRANSLATION ({target_language}):
-{draft_translation}
-"""
- 
-    try:
-        res = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                stream=False,
-                temperature=0.15,   
-                top_p=0.85,        
-
-            )
-        )
-        _record_token_usage(f"translation_qc_array_{target_language.lower()}", res)
-        refined = (res.choices[0].message.content or "").strip()
-        return refined or draft_translation
-    except Exception as e:
-        print(f"[TRANSLATE] array LLM QC pass failed for {target_language}: {e} — using library draft as-is")
-        return draft_translation
-
-
-
-_PURE_DIGIT_TAG_RE = re.compile(r"^#?\d+$")
-_MIN_HASHTAG_LEN = 3  
-
-async def translate_hashtag_sets(
-    hashtag_sets: list[list[str]], target_language: str
-) -> list[list[str]]:
-    target_language = _normalize_language(target_language)
-    if target_language == "English" or not hashtag_sets:
-        return hashtag_sets
- 
-    flat_phrases: list[str] = []
-    set_sizes: list[int] = []
-    for tag_set in hashtag_sets:
-        set_sizes.append(len(tag_set))
-        flat_phrases.extend(_hashtag_to_phrase(tag) for tag in tag_set)
- 
-    if not flat_phrases:
-        return hashtag_sets
- 
-    try:
-        translated_phrases = await translate_array_full_pipeline(flat_phrases, target_language)
-    except Exception as e:
-        print(f"[TRANSLATE] hashtag translation failed, keeping English hashtags: {e}")
-        return hashtag_sets
- 
-    if len(translated_phrases) != len(flat_phrases):
-        print("[TRANSLATE] hashtag translation count mismatch, keeping English hashtags")
-        return hashtag_sets
- 
-    rebuilt: list[list[str]] = []
-    cursor = 0
-    for tag_set, size in zip(hashtag_sets, set_sizes):
-        translated_slice = translated_phrases[cursor: cursor + size]
-        cursor += size
- 
-        tags: list[str] = []
-        seen: set[str] = set()
- 
-        for original_tag, phrase in zip(tag_set, translated_slice):
-            candidate = _keyword_to_hashtag(phrase)
- 
-            is_invalid = (
-                not candidate
-                or _PURE_DIGIT_TAG_RE.match(candidate)
-                or len(candidate.lstrip("#")) < _MIN_HASHTAG_LEN
-                or candidate.lower() in seen
-            )
- 
-            if is_invalid:
-                candidate = original_tag if original_tag.lower() not in seen else None
- 
-            if candidate and candidate.lower() not in seen:
-                seen.add(candidate.lower())
-                tags.append(candidate)
-        if len(tags) < size:
-            for original_tag in tag_set:
-                if len(tags) >= size:
-                    break
-                if original_tag.lower() not in seen:
-                    seen.add(original_tag.lower())
-                    tags.append(original_tag)
- 
-        rebuilt.append(tags)
- 
-    return rebuilt
-
-
-async def translate_array_full_pipeline(items: list[str], target_language: str) -> list[str]:
-    if not items:
-        return items
- 
-    target_language = _normalize_language(target_language)
-    if target_language == "English":
-        return items
- 
-    joined = f"\n{_TRANSLATE_ARRAY_SEP_LINE}\n".join(items)
- 
-    parts: list[str] = []
-    try:
-        draft = await translate_with_library(joined, target_language)
-        refined = await refine_array_translation_with_llm(
-            joined, draft, target_language, item_count=len(items)
-        )
-        raw_parts = [
-            p.strip()
-            for p in re.split(re.escape(_TRANSLATE_ARRAY_SEP_LINE), refined)
-        ]
-        # Strip any stray numbering/bullets the model might have added despite
-        # instructions not to (this is what caused artifacts like a lone "#3").
-        parts = [_LEADING_NUMBERING_RE.sub("", p).strip() for p in raw_parts if p.strip()]
-    except Exception as e:
-        print(f"[TRANSLATE] array batch translation failed: {e}")
-        parts = []
- 
-    if len(parts) == len(items):
-        return parts
- 
-    print(
-        f"[TRANSLATE] batch array translation returned {len(parts)} part(s), "
-        f"expected {len(items)} — falling back to per-item translation "
-        f"(never drops items)"
-    )
- 
-    results = []
-    for item in items:
-        try:
-            translated = await translate_text_full_pipeline(item, target_language)
-            results.append(translated or item)
-        except Exception as e:
-            print(f"[TRANSLATE] per-item fallback failed for '{item[:40]}...': {e} — keeping original")
-            results.append(item)
-    return results
-
-
-_CAMEL_SPLIT_RE = re.compile(r'(?<!^)(?=[A-Z])')
 _HASHTAG_WORD_RE = re.compile(r"[^\s#]+", re.UNICODE)
  
-def _hashtag_to_phrase(hashtag: str) -> str:
-        """Reverses '#artificialIntelligence' -> 'artificial Intelligence' so it
-        can be sent through translation like normal text."""
-        word = (hashtag or "").lstrip("#")
-        spaced = _CAMEL_SPLIT_RE.sub(" ", word)
-        return spaced.strip()
-
-
 
 def _keyword_to_hashtag(keyword: str) -> str:
     words = _HASHTAG_WORD_RE.findall(keyword or "")
@@ -625,292 +424,6 @@ def _normalize_language(language: str | None) -> str:
         return DEFAULT_LANGUAGE
     return "Odia" if key == "odia" else language.strip().title()
  
- 
-def _lang_code(language: str) -> str:
-    return SUPPORTED_LANGUAGES.get(language.strip().lower(), "en")
- 
-
-
-def _chunk_text_for_translation(text_value: str, max_chars: int = TRANSLATE_CHUNK_MAX_CHARS) -> list[str]:
-    """Splits on paragraph boundaries so we never cut a sentence mid-way and
-    never exceed the translator's per-request character limit."""
-    if len(text_value) <= max_chars:
-        return [text_value]
- 
-    paragraphs = text_value.split("\n")
-    chunks: list[str] = []
-    current = ""
-    for para in paragraphs:
-        candidate = (current + "\n" + para) if current else para
-        if len(candidate) > max_chars and current:
-            chunks.append(current)
-            current = para
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    return chunks
- 
-
-
-
-TRANSLATE_BATCH_MAX_RETRIES = 3
-TRANSLATE_BATCH_RETRY_BASE_DELAY = 3.0  
-
-
-def _translate_with_library_sync(text_value: str, target_lang_code: str) -> str:
-    chunks = _chunk_text_for_translation(text_value)
-    indices_to_translate = [i for i, c in enumerate(chunks) if c.strip()]
-    texts_to_translate = [chunks[i] for i in indices_to_translate]
-
-    translated_chunks = list(chunks)  
-
-    if texts_to_translate:
-        for attempt in range(TRANSLATE_BATCH_MAX_RETRIES):
-            try:
-                results = GoogleTranslator(
-                    source="auto", target=target_lang_code
-                ).translate_batch(texts_to_translate)
-                for idx, translated in zip(indices_to_translate, results):
-                    translated_chunks[idx] = translated or chunks[idx]
-                break
-            except Exception as e:
-                is_last = attempt == TRANSLATE_BATCH_MAX_RETRIES - 1
-                if not is_last:
-                    delay = TRANSLATE_BATCH_RETRY_BASE_DELAY * (2 ** attempt)
-                    print(
-                        f"[TRANSLATE] batch translation failed for {len(texts_to_translate)} "
-                        f"chunk(s) (attempt {attempt + 1}/{TRANSLATE_BATCH_MAX_RETRIES}): "
-                        f"{e} — retrying in {delay:.0f}s"
-                    )
-                    time.sleep(delay)
-                else:
-                    print(
-                        f"[TRANSLATE] batch translation failed for {len(texts_to_translate)} "
-                        f"chunk(s) after {TRANSLATE_BATCH_MAX_RETRIES} attempts: {e} — "
-                        f"keeping original text for these chunks"
-                    )
-
-    return "\n".join(translated_chunks)
-
-
-
-async def translate_with_library(text_value: str, target_language: str) -> str:
-    if not text_value:
-        return text_value
-    target_lang_code = _lang_code(target_language)
-    return await asyncio.to_thread(_translate_with_library_sync, text_value, target_lang_code)
- 
-
-
-TRANSLATION_QC_SYSTEM_PROMPT = """
-You are a professional native {language} linguist, literary translator, localization specialist, and translation quality reviewer.
-
-You will be given:
-
-1. The ORIGINAL English script.
-2. A DRAFT translation of that script into {language}.
-
-Your task is NOT to translate from scratch.
-
-Your task is to perform a professional Translation Quality Check (Translation QC), correcting only what is necessary so the final script reads as though it was originally written in {language}, while preserving the author's intent exactly.
-
-────────────────────────
-PRIMARY OBJECTIVE
-────────────────────────
-
-Produce a publication-ready {language} script that is:
-
-• Semantically identical to the English original.
-• Completely natural to native speakers.
-• Fluent, idiomatic, and engaging.
-• Optimized for spoken narration.
-• Emotionally equivalent to the original.
-• Free from machine translation artifacts.
-
-Never:
-- add information
-- remove information
-- change facts
-- rewrite for personal preference
-
-────────────────────────
-QUALITY REQUIREMENTS
-────────────────────────
-
-1. Semantic Fidelity
-- Preserve explicit and implicit meaning.
-- Preserve logical relationships.
-- Preserve chronology.
-- Preserve cause and effect.
-- Preserve emphasis.
-- Preserve comparisons and negations.
-- Never hallucinate.
-- Never omit information.
-
-2. Tone & Style
-Preserve:
-- writing style
-- narrative voice
-- documentary storytelling style
-- emotional intensity
-- suspense
-- curiosity
-- humor
-- irony
-- persuasion
-- inspiration
-
-3. Native Fluency
-Rewrite unnatural machine-translated text into language that sounds completely native.
-
-Ensure:
-- natural grammar
-- natural sentence structure
-- natural word order
-- natural punctuation
-- natural vocabulary
-- natural collocations
-- smooth transitions
-- idiomatic phrasing where appropriate
-
-The reader should never feel the text was translated.
-
-4. Spoken Narration
-Since this script will be narrated:
-
-- Prefer conversational but professional language.
-- Improve rhythm and readability.
-- Avoid awkward literal translations.
-- Preserve dramatic pacing.
-- Preserve emotional flow.
-
-5. Context
-Interpret every sentence using surrounding context.
-
-Ensure:
-- correct pronoun references
-- correct meaning of ambiguous words
-- correct domain terminology
-- consistent terminology throughout the script
-
-6. Cultural Localization
-Where appropriate:
-
-- Localize idioms naturally.
-- Localize metaphors naturally.
-- Replace literal expressions with native equivalents.
-
-Do NOT localize:
-- historical facts
-- company names
-- organization names
-- government names
-- product names
-- official titles
-unless an officially established equivalent exists.
-
-7. Grammar
-Correct:
-- grammar
-- spelling
-- punctuation
-- agreement
-- tense consistency
-- gender agreement
-- plurality
-- syntax
-
-────────────────────────
-PRESERVE EXACTLY
-────────────────────────
-
-Keep exactly as written unless an official localized form is universally used.
-
-This includes:
-
-- numbers
-- dates
-- statistics
-- URLs
-- email addresses
-- product names
-- brand names
-- company names
-- organization names
-- government bodies
-- ministry names
-- official department names
-- common English abbreviations
-- well-known English acronyms
-- programming languages
-- APIs
-- file names
-- code
-- technical standards
-
-Examples include:
-
-NASA
-ISRO
-WHO
-UN
-NATO
-GDP
-AI
-ML
-GPU
-CPU
-USB
-Wi-Fi
-Google
-Microsoft
-Windows
-Linux
-Android
-iPhone
-
-Keep these in English exactly as written.
-
-Personal names should only be transliterated if that is the accepted convention in {language}.
-
-────────────────────────
-FORMATTING
-────────────────────────
-
-Preserve:
-
-- paragraph breaks
-- line breaks
-- dialogue formatting
-- bullet lists
-- numbering
-- quotation marks
-- sentence boundaries
-
-Do not merge or split paragraphs unless required for grammatically correct {language}.
-
-────────────────────────
-OUTPUT
-────────────────────────
-
-Return ONLY the corrected {language} script.
-
-Do NOT include:
-
-- explanations
-- comments
-- notes
-- markdown
-- analysis
-- confidence scores
-- comparisons
-- introductory text
-- closing text
-
-Output only the final corrected translation.
-
-"""
 
 
 
@@ -1028,60 +541,7 @@ Document 5: <text>
 
     return capped_docs
 
-async def refine_translation_with_llm(
-    original_text: str, draft_translation: str, target_language: str
-) -> str:
-    if not draft_translation:
-        return draft_translation
  
-    system_prompt = TRANSLATION_QC_SYSTEM_PROMPT.format(language=target_language)
-    user_prompt = f"""ORIGINAL (English):
-{original_text}
- 
-DRAFT TRANSLATION ({target_language}):
-{draft_translation}
-"""
- 
-    try:
-        res = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                stream=False,
-            ),
-            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
-        )
-        _record_token_usage(f"translation_qc_{target_language.lower()}", res)
-        refined = (res.choices[0].message.content or "").strip()
-        return refined or draft_translation
-    except Exception as e:
-        print(f"[TRANSLATE] LLM grammar/QC pass failed for {target_language}: {e} — using library draft as-is")
-        return draft_translation
- 
-
-
-async def translate_text_full_pipeline(text_value: str, target_language: str) -> str:
-    if not text_value:
-        return text_value
- 
-    target_language = _normalize_language(target_language)
-    if target_language == "English":
-        return text_value
- 
-    print(f"[TRANSLATE] translating text into {target_language} ({len(text_value)} chars)")
-    try:
-        draft = await translate_with_library(text_value, target_language)
-        refined = await refine_translation_with_llm(text_value, draft, target_language)
-        print(f"[TRANSLATE] translation into {target_language} complete ({len(refined)} chars)")
-        return refined
-    except Exception as e:
-        print(f"[TRANSLATE] full pipeline failed for {target_language}, returning original English: {e}")
-        return text_value
-
-
 
 
 _BLOCKED_SOURCE_DOMAINS = {
@@ -3144,8 +2604,7 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
         try:
             table_name = await select_table_for_topic(topic)
         except Exception as exc:
-            print(f"[MAIN] table selection failed, defaulting to {TABLES[0]}: {exc}")
-            table_name = TABLES[0]
+            print(f"[MAIN] table selection failed, defaulting to {exc}")
 
         similar_task = asyncio.create_task(get_similar_saved_ideas(topic, combined_hyde_doc))
 
@@ -3528,7 +2987,9 @@ class ScriptRequest(BaseModel):
     title: str
     description: str
     time: int
-    topic : str
+    topic: str
+    language: str
+
 
 def build_topic_text(request: "ScriptRequest") -> str:
     return f"{request.title}\n\n{request.description}".strip()
@@ -4334,6 +3795,7 @@ async def generate_script_from_context(
     db_results: list[dict],
     new_articles: list[dict],
     target_word_count: int,
+    language: str 
 ) -> dict:
     context_block, _context_payload = await _build_script_context_json(db_results, new_articles)
     segments_block = _segments_brief(selected_template.get("segments") or [], brief_field="llm_brief")
@@ -4346,6 +3808,8 @@ Video Title: "{request.title}"
 Video Description: "{request.description}"
 Target Duration: {request.time} minute(s)
 Target Word Count: approximately {target_word_count} words
+Script Language: Write the ENTIRE script narration in {language}. All narration text must be in {language} — do not mix languages, do not default to English unless {language} is English. (Field names/JSON keys still stay in English as shown in the OUTPUT schema.)
+
 
 Template: "{selected_template.get('title')}" (cluster: {selected_template.get('cluster')})
 Template Purpose: {selected_template.get('about')}
@@ -5523,15 +4987,13 @@ def _tag_chunks_with_segment(chunks: list[dict], seg_info: dict) -> None:
 
 
 
-
-
-
 async def _generate_script_impl(request: "ScriptRequest"):
     _start_token_tracking()
 
     total_start_time = time.time()
     topic_text = build_topic_text(request)
-    print(f"[SCRIPT] ===== NEW REQUEST ===== title='{request.title}' time={request.time}min userId={request.userId}")
+    language = _normalize_language(getattr(request, "language", None))
+    print(f"[SCRIPT] ===== NEW REQUEST ===== title='{request.title}' time={request.time}min userId={request.userId} language='{language}'")
 
     # Stage 4 (YouTube) has no dependency on Stage 1's HyDE output at all —
     # kick it off immediately so it runs fully in the background.
@@ -5861,7 +5323,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
         target_word_count = target_word_count_for_time(request.time)
         print(f"[STAGE 6] target word count: {target_word_count} (±3%) for {request.time} minute(s)")
         script_result = await generate_script_from_context(
-            request, selected_template, db_results, new_articles, target_word_count
+            request, selected_template, db_results, new_articles, target_word_count, language=language
         )
         script_text = script_result["script"]
         script_metrics = script_result["metrics"]
@@ -5998,19 +5460,9 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "structure": structure,
         "category": classification.get("category", "UNKNOWN"),
         "subcategories": classification.get("subcategories", []),
+        "language": language,
         "token_usage": token_usage,
     }
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -6897,33 +6349,88 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class TranslateScriptRequest(BaseModel):
     userId: str
     script: str
-    language: str = "English"
+    language: str
+
+
+def _resolve_language(raw: str) -> tuple[str, str]:
+    key = (raw or "English").strip().lower()
+
+    if key in SUPPORTED_LANGUAGES:
+        return key.title(), SUPPORTED_LANGUAGES[key]
+
+    name = next((n for n, c in SUPPORTED_LANGUAGES.items() if c == key), None)
+    if name:
+        return name.title(), key
+
+    raise HTTPException(status_code=400, detail=f"Unsupported language: {raw}")
+
+
+def _build_translation_system_prompt(language_name: str, language_code: str) -> str:
+    return f"""You are an expert native-level translator and scriptwriter for {language_name} ({language_code}).
+Translate the given script into natural, conversational {language_name} as it is spoken in daily life by ordinary people in the region where {language_name} is spoken.
+
+STYLE RULES (very important):
+1. Use everyday spoken {language_name}, the way native speakers actually talk at home, in the market, with friends and family. Do NOT use the formal, bookish, literary, classical, or textbook register.
+2. Prefer common, daily-use words over rare, heavy, or "pure" formal words. Avoid over-Sanskritized, over-Arabicized/Persianized, or otherwise archaic vocabulary. If a simple word and a formal word mean the same thing, always choose the simple one that people really say.
+3. Use the natural spoken grammar, sentence flow, and casual expressions of {language_name}. It must sound like it was originally written in {language_name} by a native speaker, not like a literal or machine translation.
+4. Words that people commonly use as-is in daily speech (e.g. phone, bus, doctor, hospital, mobile, online, TV, school, office, bank) may stay in English, written in the {language_name} script when natural. Do not force unnatural "pure" translations of such words.
+5. Keep the tone, emotion, humor and pacing of the original. Keep sentences short, simple and speakable, since this script will be read aloud.
+6. Make it easy to understand for the common viewer, not for scholars.
+
+PRESERVE EXACTLY:
+- Line breaks, paragraph breaks, bullet points and overall structure.
+- Speaker labels, scene headings, timestamps, and any markup such as [SCENE 1], (pause), **bold**, etc. Translate only the human-readable words inside them.
+- Numbers, dates, URLs, emails, hashtags, emojis.
+- Proper nouns, brand names and product names (transliterate into {language_name} script only if that is how they are normally written).
+
+OUTPUT RULES:
+- Return ONLY the translated script. No explanations, notes, quotes, or code fences.
+- Translate the ENTIRE script from start to finish. Do not add, remove, skip or summarize anything."""
+
+
+
+async def translate_text_gpt_only(script: str, language_name: str, language_code: str) -> str:
+    system_prompt = _build_translation_system_prompt(language_name, language_code)
+    user_prompt = f"Translate this full script into everyday spoken {language_name}:\n\n{script}"
+
+    last_exc: Exception | None = None
+    for attempt in (1, 2):  # second attempt only if the first call errors
+        try:
+            completion = await _openai_create_with_timeout(
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-5.4-mini",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    stream=False,
+                ),
+                timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
+            )
+            _record_token_usage("translate_script", completion)
+
+            choice = completion.choices[0]
+
+            if choice.finish_reason == "length":
+                raise RuntimeError("Translation was cut off; script is too long for a single call")
+
+            text = (choice.message.content or "").strip()
+            if not text:
+                raise ValueError("Empty translation returned by GPT")
+            return text
+
+        except RuntimeError:
+            raise  # cut off: retrying would give the same result
+        except Exception as exc:
+            last_exc = exc
+            print(f"[TRANSLATE-SCRIPT] attempt {attempt}/2 failed: {exc}")
+            if attempt == 1:
+                await asyncio.sleep(1.5)
+
+    raise RuntimeError(f"GPT translation failed: {last_exc}")
 
 
 @app.post("/translate-script")
@@ -6937,36 +6444,56 @@ async def translate_script_endpoint(request: TranslateScriptRequest):
 async def _translate_script_impl(request: "TranslateScriptRequest"):
     _start_token_tracking()
 
-    target_language = _normalize_language(request.language)
+    language_name, language_code = _resolve_language(request.language)
 
-    if not request.script:
+    if not request.script or not request.script.strip():
         return {
             "script": request.script,
-            "language": target_language,
+            "language": language_name,
+            "language_code": language_code,
+            "translated": False,
             "token_usage": _get_token_usage_summary(),
         }
 
-    if target_language == "English":
+    if language_code == "en":
         return {
             "script": request.script,
-            "language": target_language,
+            "language": language_name,
+            "language_code": language_code,
+            "translated": False,
             "token_usage": _get_token_usage_summary(),
         }
 
+    translated = True
     try:
-        print(f"[TRANSLATE-SCRIPT] Translating script into {target_language}.")
-        translated_script = await translate_text_full_pipeline(request.script, target_language)
+        print(f"[TRANSLATE-SCRIPT] Translating script into {language_name} (single call).")
+        translated_script = await translate_text_gpt_only(request.script, language_name, language_code)
     except Exception as exc:
         print(f"--- /translate-script failed, returning original script: {exc} ---")
         translated_script = request.script
-
-    token_usage = _get_token_usage_summary()
+        translated = False
 
     return {
         "script": translated_script,
-        "language": target_language,
-        "token_usage": token_usage,
+        "language": language_name,
+        "language_code": language_code,
+        "translated": translated,
+        "token_usage": _get_token_usage_summary(),
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -8984,7 +8511,20 @@ def _lang_name_from_code(lang_code: str) -> str:
 def _detect_script_lang_code(text: str) -> str | None:
     """Best-effort ISO 639-1 detection of the script's actual language.
     Checked against a few hundred chars — enough for langdetect to be
-    reliable without scanning a whole long script."""
+    reliable without scanning a whole long script.
+
+    Returns None when detection genuinely could not produce an answer
+    (langdetect RAISES LangDetectException on short/low-feature text —
+    a handful of words, mostly numbers/punctuation, etc — this is not a
+    "detected as some other language" result, it is "no answer at all".
+    Callers MUST treat None as "inconclusive, assume the input is already
+    correct" — never as a signal to translate. Conflating the two was a
+    real production bug: a short second-chunk fragment (TTS calls get
+    split for provider character limits) raised this exception, came back
+    as None, and a caller comparing `detected == lang_code` treated that
+    the same as a genuine mismatch and tried to translate an already-
+    correct Telugu script.
+    """
     sample = (text or "").strip()[:500]
     if not sample:
         return None
@@ -8992,45 +8532,6 @@ def _detect_script_lang_code(text: str) -> str | None:
         return detect(sample)
     except LangDetectException:
         return None
-
-
-# FIX (per-language reference audio): audio_url used to be a single plain
-# URL string on user_profiles. It's now an array of { langCode: url }
-# entries — one recorded reference clip per language, e.g.:
-#   [{ "en": "https://.../en/xxx.m4a?..." }, { "mr": "https://.../mr/yyy.m4a?..." }]
-# This picks the entry matching lang_code. Also tolerates two edge cases
-# so it doesn't hard-break on data that predates the format change:
-#   - the column coming back as a raw JSON string instead of an
-#     already-parsed list (depends on how the client/driver handles
-#     jsonb — parse it defensively rather than assume)
-#   - a legacy row that's still a single plain string URL (the old
-#     one-URL-per-user format) — since that shape carries no language
-#     info, it's only used when the request is for English, which is
-#     the only thing a single legacy URL could ever have meant.
-# Returns None if there's no reference audio for that language at all.
-def _find_reference_audio_url_for_lang(audio_url_data, lang_code: str) -> str | None:
-    if audio_url_data is None:
-        return None
-
-    if isinstance(audio_url_data, str):
-        stripped = audio_url_data.strip()
-        if stripped.startswith("[") or stripped.startswith("{"):
-            try:
-                audio_url_data = json.loads(stripped)
-            except (json.JSONDecodeError, TypeError):
-                return stripped if lang_code == "en" else None
-        else:
-            return stripped if lang_code == "en" else None
-
-    if isinstance(audio_url_data, dict):
-        return audio_url_data.get(lang_code)
-
-    if isinstance(audio_url_data, list):
-        for entry in audio_url_data:
-            if isinstance(entry, dict) and lang_code in entry:
-                return entry[lang_code]
-
-    return None
 
 
 class GenerateSpeechRequest(BaseModel):
@@ -9123,6 +8624,46 @@ def _get_public_url_sync(bucket: str, path: str) -> str:
         return res.get("publicUrl") or res.get("public_url")
     return res
 
+
+# FIX (per-language reference audio): audio_url used to be a single plain
+# URL string on user_profiles. It's now an array of { langCode: url }
+# entries — one recorded reference clip per language, e.g.:
+#   [{ "en": "https://.../en/xxx.m4a?..." }, { "mr": "https://.../mr/yyy.m4a?..." }]
+# This picks the entry matching lang_code. Also tolerates two edge cases
+# so it doesn't hard-break on data that predates the format change:
+#   - the column coming back as a raw JSON string instead of an
+#     already-parsed list (depends on how the client/driver handles
+#     jsonb — parse it defensively rather than assume)
+#   - a legacy row that's still a single plain string URL (the old
+#     one-URL-per-user format) — since that shape carries no language
+#     info, it's only used when the request is for English, which is
+#     the only thing a single legacy URL could ever have meant.
+# Returns None if there's no reference audio for that language at all.
+def _find_reference_audio_url_for_lang(audio_url_data, lang_code: str) -> str | None:
+    if audio_url_data is None:
+        return None
+
+    if isinstance(audio_url_data, str):
+        stripped = audio_url_data.strip()
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                audio_url_data = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return stripped if lang_code == "en" else None
+        else:
+            return stripped if lang_code == "en" else None
+
+    if isinstance(audio_url_data, dict):
+        return audio_url_data.get(lang_code)
+
+    if isinstance(audio_url_data, list):
+        for entry in audio_url_data:
+            if isinstance(entry, dict) and lang_code in entry:
+                return entry[lang_code]
+
+    return None
+
+
 @app.post("/generate-speech")
 async def generate_speech(body: GenerateSpeechRequest):
     userId = body.userId
@@ -9148,25 +8689,38 @@ async def generate_speech(body: GenerateSpeechRequest):
         # langCode != "en", assuming `script` was always English-authored.
         # For /edit-video specifically, the payload contract sends script
         # already written in the target language — so this was
-        # re-translating already-correct text every time, risking
-        # corruption and burning Google Translate's rate limit on calls
-        # that never needed to happen. Now: detect the script's actual
-        # language first, and only translate if it doesn't already match
-        # langCode. Since Fish Audio's TTSRequest has no separate language
-        # field, whatever ends up in `script` here is exactly what
-        # determines the spoken language — this check is the only thing
-        # standing between "script is really Telugu" and "script silently
-        # gets mistranslated".
+        # re-translating already-correct text every time.
+        #
+        # FIX 2 (None-detection fail-safe): _detect_script_lang_code
+        # returns None when langdetect could not produce ANY answer (it
+        # raises on short/low-feature text — a few words, a chunk
+        # boundary landing on mostly numbers, etc — that is not the same
+        # thing as "detected as a different language"). The original
+        # `if detected == lang_code` treated None and a genuine mismatch
+        # identically, so an inconclusive detection on a short TTS chunk
+        # (narrations get split into multiple calls for provider length
+        # limits) fell through to "translate it" — corrupting an
+        # already-correct Telugu chunk. Since this endpoint's payload
+        # contract already guarantees script arrives in the target
+        # language, an inconclusive detection should side with trusting
+        # that contract, not overriding it.
+        #
+        # FIX 3 (this message): translate_text_full_pipeline never
+        # actually existed in this codebase (see chat) — the real,
+        # already-built translation function is translate_text_gpt_only
+        # (single LLM call, native-spoken-register prompt, no Google
+        # Translate dependency), the same one /translate-script uses.
+        # Calling that directly here instead.
         detected = _detect_script_lang_code(script)
-        if detected == lang_code:
+        if detected is None or detected == lang_code:
             print(
-                f"[TTS] script already detected as '{detected}' "
-                f"(matches langCode='{lang_code}') — skipping translation"
+                f"[TTS] script already assumed '{lang_code}' "
+                f"(detector said: {detected!r}) — skipping translation"
             )
         else:
             try:
                 print(f"[TTS] translating script into {target_language} (langCode='{lang_code}') before TTS")
-                script = await translate_text_full_pipeline(script, target_language)
+                script = await translate_text_gpt_only(script, target_language, lang_code)
             except Exception as e:
                 print(f"[TTS] translation to {target_language} failed, using original script as-is: {e}")
 
@@ -9281,20 +8835,6 @@ async def generate_speech(body: GenerateSpeechRequest):
         "storage_path": storage_path,
         "url": public_url,
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -9612,7 +9152,6 @@ The attached/input content is the **complete final user-generated script**.
 
 Analyze the entire script first, then return the same script with **only the necessary Fish Audio S2/S2-Pro performance tags inserted according to the tag-specific interpretation, placement, frequency, and emotional-continuity rules above**.
 
-
 """.strip()
 
 
@@ -9808,9 +9347,77 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import re
 import io
 import os
+import base64
 import json
 import math
 import uuid
@@ -9889,93 +9496,377 @@ def _romanize_word_segments(word_segments: list[dict], lang_code: str) -> list[d
     return word_segments
 
 
-# ---------------------------------------------------------------------------
-# English captions over non-English audio
-#
-# The voiceover audio is genuinely Telugu/Hindi/etc — WhisperX can only ever
-# align text to audio in the SAME language it's forced-aligning against
-# (that's what the alignment model is trained to do), so there is no way to
-# get true word-level sync between real English caption text and non-English
-# audio. What IS available: real per-BEAT timing, already computed from the
-# actual native-language audio by _align_beats_to_timed_words (beat["start"],
-# beat["end"]). These two helpers use that as the anchor:
-#   1. proportionally slice the English script text into the same shape as
-#      the native-language scenes/beats (by word-count share, largest-
-#      remainder method — same technique as the Beat Director word-count
-#      fix, so the split is deterministic and always covers every word)
-#   2. spread each beat's slice of English words evenly across that beat's
-#      REAL [start, end] window, giving each English word an interpolated
-#      timestamp anchored to real audio timing.
-# This is beat-accurate sync, not word-accurate — the tradeoff inherent to
-# using real translated text instead of a transliteration of the audio
-# itself. See chat explanation.
-# ---------------------------------------------------------------------------
-
-def _proportional_word_slices(source_words: list[str], weights: list[int]) -> list[list[str]]:
-    """Split source_words into len(weights) chunks, each chunk's size
-    proportional to its weight, using the largest-remainder method so the
-    chunk sizes always sum to exactly len(source_words) — no words dropped
-    or duplicated, regardless of rounding."""
-    total_words = len(source_words)
-    if not weights or total_words == 0:
-        return [[] for _ in weights]
-
-    total_weight = sum(max(1, w) for w in weights) or 1
-    raw_shares = [total_words * max(1, w) / total_weight for w in weights]
-    floor_shares = [int(s) for s in raw_shares]
-    remainder = total_words - sum(floor_shares)
-    remainder_order = sorted(
-        range(len(weights)), key=lambda i: raw_shares[i] - floor_shares[i], reverse=True
-    )
-    for i in remainder_order[:max(0, remainder)]:
-        floor_shares[i] += 1
-
-    slices, cursor = [], 0
-    for count in floor_shares:
-        slices.append(source_words[cursor:cursor + count])
-        cursor += count
-    return slices
+MAX_CAPTION_WORD_SECONDS = float(os.getenv("MAX_CAPTION_WORD_SECONDS", "1.4"))
+MIN_CAPTION_WORD_SECONDS = float(os.getenv("MIN_CAPTION_WORD_SECONDS", "0.28"))
 
 
 def _interpolate_word_timestamps(words: list[str], start: float, end: float) -> list[dict]:
     """Evenly distribute `words` across [start, end], each getting its own
-    start/end slot. Approximate by construction (equal-duration slots, not
-    audio-derived) — this is the caption-timing tradeoff for showing real
-    translated text over audio in a different language; see module note
-    above."""
+    start/end slot. This is the fallback path — used only when silence
+    detection found no usable speech segments in this window (see
+    _interpolate_word_timestamps_speech_aware below, which is what's
+    actually used whenever real silence data is available).
+
+    FIX (captions freezing on screen for many seconds — confirmed on a
+    real render): when a real segment/beat's window is long but the
+    translated English text for it came back SHORT (fewer words than the
+    original — natural, since translated meaning isn't word-count-
+    matched to the source), the old unconditional `slot = (end-start)/n`
+    stretched those few words to fill the ENTIRE window — a 3-word
+    translation of an 8-second segment meant each word sat on screen for
+    ~2.7s, reading as a frozen/stuck caption. Each word's slot is capped
+    at MAX_CAPTION_WORD_SECONDS; any leftover time in the window is
+    simply left blank (no caption) rather than stretched.
+
+    FIX (captions cycling unreadably fast — confirmed on a real render,
+    lines visible for as little as ~0.3s at ~8-10 words each): the
+    mirror-image problem — a real beat window that's SHORT (e.g. Sarvam's
+    natural speaking pace can differ from Fish Audio's, producing shorter
+    real audio for the same content) combined with a NORMAL-length
+    translation compresses every word into a fraction of a second. Each
+    word's slot now has a floor of MIN_CAPTION_WORD_SECONDS too. When the
+    words genuinely don't fit in [start, end] at that floor, the last
+    word's end is simply allowed to run slightly past the beat's nominal
+    end rather than compressing to unreadable speed — a little overflow
+    into the next beat's window reads far better than flashing text."""
     n = len(words)
     if n == 0:
         return []
     end = max(end, start + 0.05 * n)  # guard against a zero/negative-length beat
-    slot = (end - start) / n
+    raw_slot = (end - start) / n
+    slot = min(max(raw_slot, MIN_CAPTION_WORD_SECONDS), MAX_CAPTION_WORD_SECONDS)
     out = []
-    for i, w in enumerate(words):
-        w_start = start + i * slot
-        w_end = start + (i + 1) * slot
+    cursor = start
+    for w in words:
+        w_start = cursor
+        w_end = cursor + slot
         out.append({"word": w, "start": round(w_start, 3), "end": round(w_end, 3)})
+        cursor = w_end
     return out
 
 
-def _build_english_caption_words_for_beats(beats: list, english_scene_words: list[str]) -> list[dict]:
-    """Given a scene's beats (already timed — either via real WhisperX
-    timestamps for English audio, or via _assign_beat_times_proportional
-    for non-English audio, so either way each has beat["start"]/["end"])
-    and that scene's share of the English script (as a flat word list),
-    proportionally split the English words across beats by each beat's
-    native word-count share, then interpolate each beat's English words
-    across its own timing window. Returns a flat list of {word, start,
-    end} dicts, one entry per English word, in beat order — same shape as
-    WhisperX word_segments, so it's a drop-in caption source."""
-    weights = [max(1, len(b.get("vo_text", "").split())) for b in beats]
-    slices = _proportional_word_slices(english_scene_words, weights)
+# ---------------------------------------------------------------------------
+# FIX (subtitle/audio sync for translated captions): the original even-
+# pacing approach above spreads words uniformly across a beat's whole
+# window, including any real pauses in the Telugu speech — so captions
+# visibly drift out of sync with where the speaker actually is, worse the
+# longer a beat runs. Confirmed on a real render: ffmpeg's silencedetect
+# (amplitude-only — no transcription, no wrong-script risk at all, see
+# chat) found 66 real pauses of 0.4–0.9s each across one 314s video.
+# These helpers detect those real pauses and skip them when placing
+# caption words, so a word's START time never lands inside actual dead
+# silence — captions now track the real rhythm of the speech instead of
+# a flat average.
+# ---------------------------------------------------------------------------
 
+async def _detect_silence_gaps_seconds(
+    audio_bytes: bytes, noise_db: str = "-30dB", min_silence_sec: float = 0.35,
+) -> list[tuple]:
+    """Runs ffmpeg's silencedetect over the audio (amplitude only — reads
+    nothing about content/language) and returns [(start, end), ...] for
+    each real pause found. Returns [] on any failure — callers must treat
+    that as 'no pause data available' and fall back gracefully, never as
+    an error to surface to the user."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        cmd = [
+            FFMPEG_BIN, "-i", tmp.name,
+            "-af", f"silencedetect=noise={noise_db}:d={min_silence_sec}",
+            "-f", "null", "-",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except Exception as e:
+            print(f"[caption-sync] silencedetect failed to run: {e} — captions will use even pacing for this scene")
+            return []
+
+    text = stderr.decode(errors="replace")
+    try:
+        duration_match = re.search(r"time=(\d+):(\d+):([\d.]+)", text)
+        total_duration = (
+            int(duration_match.group(1)) * 3600 + int(duration_match.group(2)) * 60 + float(duration_match.group(3))
+        ) if duration_match else None
+    except Exception:
+        total_duration = None
+
+    starts = [float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", text)]
+    ends = [float(m) for m in re.findall(r"silence_end:\s*([\d.]+)", text)]
+    gaps = list(zip(starts, ends))
+    if len(starts) > len(ends) and total_duration is not None:
+        gaps.append((starts[-1], total_duration))  # trailing silence ran to end of file
+    return gaps
+
+
+def _speech_segments_within(silence_gaps: list, window_start: float, window_end: float) -> list:
+    """Real speech-only sub-intervals within [window_start, window_end] —
+    the window with every overlapping silence gap cut out."""
+    clipped = []
+    for s, e in silence_gaps:
+        s2, e2 = max(s, window_start), min(e, window_end)
+        if e2 > s2:
+            clipped.append((s2, e2))
+    clipped.sort()
+
+    segments = []
+    cursor = window_start
+    for s, e in clipped:
+        if s > cursor:
+            segments.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < window_end:
+        segments.append((cursor, window_end))
+    return segments
+
+
+def _map_speech_time_to_real(t: float, segments: list) -> float:
+    """t is a position along the CONCATENATED speech-only timeline (pauses
+    already removed) — maps it back to a real timestamp within `segments`.
+
+    FIX (needed for the min-word-duration floor below): t can now exceed
+    the total speech time in `segments` — when a minimum per-word floor
+    pushes the last few words past what real speech time is actually
+    available. The old behavior clamped every such t to segments[-1][1]
+    (the end of the last real speech span), which would have collapsed
+    all overflow words onto the exact same instant — worse than the
+    problem being fixed. Now it extrapolates linearly past the last
+    segment's end instead, so overflow words still get spread out."""
+    cursor = 0.0
+    for seg_start, seg_end in segments:
+        seg_len = seg_end - seg_start
+        if t <= cursor + seg_len:
+            return seg_start + (t - cursor)
+        cursor += seg_len
+    if not segments:
+        return t
+    overflow = t - cursor
+    return segments[-1][1] + overflow
+
+
+def _interpolate_word_timestamps_speech_aware(
+    words: list[str], start: float, end: float, silence_gaps: list,
+) -> list[dict]:
+    """Same job as _interpolate_word_timestamps (spread `words` across
+    [start, end]), but distributes them across real SPEECH time only —
+    silence_gaps within the window are skipped entirely, so no word's
+    start time ever lands inside actual dead air. Falls back to plain
+    even pacing if silence_gaps is empty or covers almost the whole
+    window (detection failure or a near-silent clip)."""
+    n = len(words)
+    if n == 0:
+        return []
+    segments = _speech_segments_within(silence_gaps, start, end)
+    total_speech = sum(e - s for s, e in segments)
+    if not segments or total_speech <= 0.05 * n:
+        return _interpolate_word_timestamps(words, start, end)
+
+    # FIX (freezing AND too-fast cycling — see module note on
+    # _interpolate_word_timestamps above): same min/max caps, applied in
+    # speech-time units before mapping back to real timestamps. Without
+    # the max, a long real speech span with few words would stretch each
+    # one for seconds; without the min, a short real speech span with
+    # many words (e.g. Sarvam's pace producing shorter audio than Fish
+    # Audio did for the same content) compresses each word into a
+    # fraction of a second, unreadable.
+    slot = min(max(total_speech / n, MIN_CAPTION_WORD_SECONDS), MAX_CAPTION_WORD_SECONDS)
+    out = []
+    for i, w in enumerate(words):
+        real_start = _map_speech_time_to_real(i * slot, segments)
+        real_end = _map_speech_time_to_real((i + 1) * slot, segments)
+        out.append({"word": w, "start": round(real_start, 3), "end": round(real_end, 3)})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# FIX (translated content not matching the actual script — confirmed on a
+# real render: captions read "In the 2000s, the mix..." for audio that
+# never said any of that): translating WhisperX's own TRANSCRIPTION of
+# the native audio is unsafe — even with the medium model, forced
+# language, and repetition-penalty fix, WhisperX can still mis-hear
+# content on hard audio, and once that happens the LLM faithfully
+# translates whatever garbage WhisperX produced into fluent-sounding but
+# WRONG English.
+#
+# WhisperX is removed from this path ENTIRELY again — not used for
+# content, not used for timing (a brief detour through using it for
+# timing-only anchoring has been reverted; see chat). Instead:
+#   - CONTENT: translate the scene's own vo_text directly — the real,
+#     already-correct native text (it's literally what was sent to TTS),
+#     never a guess at what the audio contains.
+#   - TIMING: pure audio signal only — real total duration (mutagen) and
+#     real pause locations (ffmpeg silencedetect, amplitude only, zero
+#     content recognition of any kind) — sliced into real speech-only
+#     segments (_speech_segments_within). No transcription anywhere.
+#   - MATCHING WORDS TO SEGMENTS: rather than Python interpolating words
+#     evenly/proportionally across each segment, ONE LLM call per scene
+#     is given the real segment DURATIONS (numbers only, not audio, not
+#     content) and asked to translate the full script and distribute
+#     it across those segments itself — using its own judgment of
+#     natural phrase pacing instead of a rigid word-count formula. This
+#     is strictly safer than the old WhisperX-timing approach: the
+#     segment boundaries themselves are 100% content-blind (pure
+#     amplitude), so there is no path for wrong content to enter through
+#     the timing signal, only through translation itself — the same
+#     already-accepted risk as any LLM translation call in this file.
+# ---------------------------------------------------------------------------
+
+_SEGMENT_WORDS_PROMPT = """You translate a script into natural English and distribute it across a fixed number of real timing segments measured from the actual audio recording.
+
+You will receive the FULL NATIVE SCRIPT TEXT, followed by a numbered list of SEGMENT DURATIONS in seconds — these are real, pause-bounded chunks of the actual spoken audio. You are not creating these boundaries; they are already fixed. Your job is to translate the entire script into natural, fluent spoken English (not a literal word-for-word rendering) and then decide how that translation should be distributed across the segments, in order: segment 1 holds the English for the start of the script, the last segment holds the English for the end. Segment duration tells you roughly how much can naturally fit — a long segment can hold a full clause or sentence, a very short segment should get only a word or two — but let real phrase and sentence boundaries guide the actual split, not a rigid word-count formula.
+
+Return a JSON object: {"segments": ["...", "...", ...]} with EXACTLY one string per input segment duration, in the SAME order. Every word of the translated script must appear in exactly one segment, covering the full script from start to end — nothing skipped, nothing duplicated. A segment may be an empty string "" only if there is genuinely no natural content left to place there (e.g. more segments than the script has content for).
+
+Rules:
+- Translate meaning, not literal words — natural spoken English.
+- The source is often CODE-MIXED — native-script text with English words and phrases (technical terms, common borrowed words like "training", "model", "app") embedded in it, glued together with native grammar (particles, suffixes, verb endings) around those English words. Translate the ENTIRE thing into pure, fluent English — every native particle, suffix, and connecting word must become proper English grammar. The output must be 100% English with NO native-script characters anywhere in any segment, even a single leftover particle or word ending — do not just leave the embedded English words in place with native grammar still attached around them.
+- Keep proper nouns (people, places, brands, products) exactly as they'd naturally appear in English text — do not alter, guess, or substitute a name.
+- Numbers, currency, dates: render naturally in English (e.g. "85 crore rupees", "50 percent").
+- No commentary, no markdown fences, no extra keys — just the JSON object."""
+
+
+async def _translate_scene_to_segment_words(
+    vo_text: str, segment_durations: list[float], scene_id: str, lang_code: str = "",
+) -> list[str]:
+    """One LLM call per scene: translate the scene's real, already-correct
+    vo_text (never a transcription guess) and have the model itself
+    decide how to distribute that translation across a list of REAL
+    TIMING SEGMENTS — pause-bounded chunks measured directly from the
+    actual audio via pure amplitude-based silence detection, not
+    transcription. No content-recognition of any kind produced these
+    segment boundaries, so there is no risk of the wrong-content failure
+    mode WhisperX produced. The LLM's job is purely: given how long each
+    real segment is, how much of the translated script's natural
+    phrasing belongs in it. Returns a same-length list of English
+    strings, or a list of empty strings on any failure — callers must
+    treat an empty string as "no caption for this segment" and skip it,
+    never crash."""
+    vo_text = (vo_text or "").strip()
+    if not vo_text or not segment_durations:
+        return ["" for _ in segment_durations]
+
+    numbered = "\n".join(f"{i + 1}. {d:.2f}s" for i, d in enumerate(segment_durations))
+    user_content = f"FULL NATIVE SCRIPT TEXT:\n{vo_text}\n\nSEGMENT DURATIONS (in order):\n{numbered}"
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": _SEGMENT_WORDS_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                stream=False,
+            )
+        )
+        _record_token_usage("edit video - segment word matching", res)
+        _log_token_usage("Segment Word Matching", res)
+
+        content = (res.choices[0].message.content or "").strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            if content.lower().startswith("json"):
+                content = content[4:].strip()
+
+        parsed = json.loads(content)
+        segments_out = parsed.get("segments")
+        if not isinstance(segments_out, list):
+            raise ValueError("response had no 'segments' array")
+
+        if len(segments_out) != len(segment_durations):
+            print(
+                f"[edit-video] scene {scene_id}: segment word matching returned "
+                f"{len(segments_out)} item(s) for {len(segment_durations)} segment(s) — "
+                f"padding/truncating to line up 1:1"
+            )
+            if len(segments_out) < len(segment_durations):
+                segments_out = segments_out + [""] * (len(segment_durations) - len(segments_out))
+            else:
+                segments_out = segments_out[:len(segment_durations)]
+
+        segments_out = [str(t or "").strip() for t in segments_out]
+
+        script_pattern = None
+        entry = _SCRIPT_RANGES.get((lang_code or "").lower())
+        if entry:
+            script_pattern = entry[0]
+
+        if script_pattern:
+            cleaned = []
+            for i, t in enumerate(segments_out):
+                if t and re.search(script_pattern, t):
+                    print(
+                        f"[edit-video] scene {scene_id}: segment {i + 1} translation still "
+                        f"contains native-script characters after translation ({t!r}) — "
+                        f"dropping this segment's caption rather than showing mixed-script text"
+                    )
+                    cleaned.append("")
+                else:
+                    cleaned.append(t)
+            segments_out = cleaned
+
+        return segments_out
+
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id}: segment word matching failed ({e}) — this scene will have no captions")
+        return ["" for _ in segment_durations]
+
+
+def _build_english_caption_words_from_segments(
+    segments: list[tuple], english_texts: list[str],
+) -> list[dict]:
+    """Given real speech segments (pure silence-detection-derived
+    [start, end] pairs from the actual audio — see _speech_segments_
+    within) and their matching English text (same order/count — see
+    _translate_scene_to_segment_words), place each segment's words
+    across THAT segment's own real timing window. _interpolate_word_
+    timestamps' min/max per-word duration caps still apply here — see
+    its own note — so a short or long allocation within a segment never
+    freezes or flashes on screen."""
     caption_words: list[dict] = []
-    for beat, en_words in zip(beats, slices):
-        b_start, b_end = beat.get("start"), beat.get("end")
-        if b_start is None or b_end is None or not en_words:
+    for (seg_start, seg_end), en_text in zip(segments, english_texts):
+        en_words = en_text.split()
+        if not en_words:
             continue
-        caption_words.extend(_interpolate_word_timestamps(en_words, b_start, b_end))
-    return caption_words
+        caption_words.extend(_interpolate_word_timestamps(en_words, seg_start, seg_end))
+    return _dedupe_overlapping_word_timestamps(caption_words)
+
+
+def _dedupe_overlapping_word_timestamps(words: list[dict]) -> list[dict]:
+    """FIX (captions overlapping/stacking on screen — confirmed on a real
+    render: two full caption lines visible simultaneously, unreadable):
+    each beat's words are timed independently within THAT beat's own real
+    window. The min-duration-floor fix (see _interpolate_word_timestamps)
+    can legitimately push a beat's last word to overflow slightly past
+    its own nominal end when there isn't enough real time to keep every
+    word readable — but the NEXT beat's words are computed independently,
+    starting at ITS OWN real timestamp, which can be earlier than the
+    previous beat's overflow point. Since captions are chunked into
+    on-screen lines purely by word count (not by beat), two chunks could
+    end up with overlapping time ranges and get drawn on screen at the
+    same time.
+
+    This is a global cleanup pass over the FULL concatenated word list
+    (every beat's words, in order) that guarantees no word's start ever
+    precedes the previous word's end — the next beat's own real timestamp
+    is treated as authoritative (it's grounded in real audio duration),
+    so any overflow from the previous beat gets clamped back instead of
+    intruding into it."""
+    cleaned: list[dict] = []
+    prev_end: Optional[float] = None
+    for w in words:
+        start, end = w.get("start"), w.get("end")
+        if start is None or end is None:
+            continue
+        if prev_end is not None and start < prev_end:
+            start = prev_end
+            end = max(end, start + 0.05)  # keep a minimal sliver of duration, never zero/negative
+        cleaned.append({**w, "start": round(start, 3), "end": round(end, 3)})
+        prev_end = end
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -10019,44 +9910,6 @@ def _assign_beat_times_proportional(beats: list, total_duration: float) -> None:
         cursor = b_end
     if beats:
         beats[-1]["end"] = round(total_duration, 3)  # guard against float drift on the last beat
-
-
-async def _fetch_english_script_text(script_id: str) -> str:
-    """Fetch scripts_assigned.script for script_id and return the English
-    ("en") version. Raises HTTPException if the row doesn't exist or has
-    no English version — silently falling back to something else here
-    would violate "captions must be English", so this fails loudly instead
-    of guessing."""
-    try:
-        result = await asyncio.to_thread(
-            lambda: supabase.table("scripts_assigned")
-            .select("script")
-            .eq("id", script_id)
-            .maybe_single()
-            .execute()
-        )
-    except Exception as e:
-        print(f"[edit-video] failed to fetch scripts_assigned row {script_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch script {script_id}")
-
-    row = result.data if result else None
-    if not row:
-        raise HTTPException(status_code=404, detail=f"No script found for scriptId '{script_id}'")
-
-    script_data = row.get("script")
-    if isinstance(script_data, str):
-        try:
-            script_data = json.loads(script_data)
-        except (json.JSONDecodeError, TypeError):
-            script_data = None
-
-    english_text = (script_data or {}).get("en") if isinstance(script_data, dict) else None
-    if not english_text or not english_text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail=f"scriptId '{script_id}' has no English ('en') version in scripts_assigned.script",
-        )
-    return english_text
 
 
 def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) -> Optional[str]:
@@ -10807,11 +10660,14 @@ animation is FOR, and reading their real start/end directly:
   show), that is a signal you have the wrong beat_id — reconsider which
   beat this animation actually belongs to rather than guessing a time.
 
-Language rule: display_text must be written in script_language — it is
-on-screen text tied to spoken narration, so it must match what the viewer
-is hearing. icon_name (fixed vocabulary), content_binding, and
-render_prompt stay in English regardless of script_language, since they
-are internal/documentation values, not viewer-facing text.
+Language rule: display_text and highlight_target_text must ALWAYS be
+written in English, regardless of script_language — every piece of
+on-screen text the viewer sees (titles, labels, stats, quotes, bullet
+items, lower thirds, and any highlighted/quoted excerpt) must be in
+natural English. If the narration is in another language, translate the
+meaning into concise English for both fields; never output native-script
+characters in display_text or highlight_target_text. icon_name (fixed
+vocabulary), content_binding, and render_prompt also stay in English.
 
 Canvas: every video is LANDSCAPE, {CANVAS_WIDTH}px wide by {CANVAS_HEIGHT}px
 tall ({CANVAS_WIDTH}x{CANVAS_HEIGHT}, 16:9) — always this orientation and
@@ -10867,13 +10723,16 @@ open question remained" → "puzzle" is defensible; "a stone tool found in
 the dirt" → it is not — use a science/tool-adjacent icon or skip the icon
 in favor of a text treatment instead).
 
-Placement is handled automatically — every icon and text overlay is always
-centered on the frame by the renderer, regardless of what geometry_px you
-provide for it. You do not need to choose or vary placement; just provide
-reasonable width/height for the content (the x/y position is discarded
-and replaced with true center every time). Focus your creative judgment on
-which beats deserve an animation, what animation_type and content fit
-best, and sizing — not on where it sits on screen.
+Placement matters and IS respected by the renderer — whatever x/y you
+provide in geometry_px is what actually renders (clamped only to stay
+within safe margins and clear of the caption band at the bottom). Choose
+placement deliberately per beat rather than defaulting to the same spot
+every time: consider what's already in the b-roll at that moment (avoid
+covering a subject's face or the visual focal point), vary position
+across consecutive beats in a scene so overlays don't feel like they're
+stamped in the same place repeatedly, and use off-center placement
+(upper-third, a side third) for anything that should coexist on screen
+alongside the caption band rather than only ever centering everything.
 
 Icon animations should look designed, not bare: pair every icon with a
 short, punchy display_text label when the concept benefits from one (most
@@ -10883,6 +10742,13 @@ generously enough to read as an intentional graphic element (prefer the
 160-220px range for a standalone icon_pop_in, not the tiny end of the
 40px floor) and pick color_hint deliberately per the mood-aware styling
 guidance above rather than defaulting to the same accent color every time.
+
+Icon variety across a scene: don't reuse the same icon_name for more than
+one beat within the same scene unless the beats are genuinely about the
+same literal thing. If you notice you're reaching for "arrow-right" or
+one of the banned filler icons again, stop and re-derive the icon from
+that specific beat's concrete noun/action instead — see the relevance and
+filler-ban guidance above, which applies per-scene, not just per-beat.
 
 Mixing icons for richer visuals: you are not limited to one icon per
 animation. icon_name may be either a single string (the common case) or
@@ -10912,6 +10778,19 @@ comparison (e.g. no literal "hyena"), pick the closest available icon for
 EACH side rather than dropping to a single icon — a generic "dog" paired
 with a tool-adjacent icon for "cut mark" still reads as a comparison; a
 lone "dog" next to "cut mark / hyena bite" text does not.
+
+This check also constrains animation_type, not just icon_name/icon_layout:
+arrow_highlight cannot render icon_layout: "pair" at all — it renders one
+arrow shape plus a text label, nothing else, regardless of what icon_name
+you give it. If a beat's content is a two-sided comparison, arrow_highlight
+is the wrong animation_type for it full stop, no matter how you set
+icon_name — reassign it to icon_sequence with icon_layout: "pair" (two
+icons, category overlay_graphic, no category change needed) or to
+split_screen (category pip) if the comparison is the beat's entire focus
+rather than one detail within it. Catch this at animation_type selection
+time, before you've committed to arrow_highlight — don't pick
+arrow_highlight as a safe default for a beat whose content you haven't
+first checked against the comparison markers above.
 
 Mood-aware styling: each beat carries a scene_direction.mood from the Beat
 Director (e.g. "tense", "triumphant", "solemn", "playful"). Let it inform
@@ -11154,10 +11033,13 @@ the neutral default (e.g. a warm tint for a triumphant beat). Leave null
 far more often than not; this is an occasional accent, not something to
 set on every animation.
 
-highlight_target_text: the exact quoted_excerpt from the source beat's
-animation_signal when animation_type is "full_screen_document_highlight"
-(or any other treatment highlighting specific text within a real
-screenshot asset). null for every other animation_type.
+highlight_target_text: the on-screen highlighted/quoted excerpt when
+animation_type is "full_screen_document_highlight" (or any other
+treatment highlighting specific text within a real screenshot asset) —
+grounded in the source beat's quoted_excerpt, but see the Language rule
+below: this is shown directly to the viewer, so it must be in English
+regardless of script_language, not copied verbatim from a native-language
+quoted_excerpt. null for every other animation_type.
 
 content_binding: a short free-form label kept for logging/debugging (e.g.
 "icon:lightbulb", "data:quarterly_revenue") — not the authoritative value
@@ -11188,10 +11070,6 @@ class EditVideo(BaseModel):
     # check, no forced-language transcription, no caption romanization)
     # on any request that simply forgot to pass it — including
     # non-English requests, with no error to signal the mistake.
-    scriptId: str  # FIX: identifies the row in scripts_assigned whose
-    # `script` jsonb ({"en": "...", "te": "...", ...}) holds the English
-    # version of this same script, used to build real-English captions
-    # over the non-English voiceover — see _build_english_caption_words_for_beats.
     durationMinutes: int = 0
     volume: Optional[float] = None
     loudness_normalization: Optional[bool] = None
@@ -11490,12 +11368,155 @@ async def _upload_audio_to_storage(local_path: str, user_id: str) -> str:
     return supabase.storage.from_(TTS_AUDIO_BUCKET).get_public_url(storage_path)
 
 
+# ---------------------------------------------------------------------------
+# Indian languages -> Sarvam (Bulbul). Everything else -> generate_speech
+# (Fish Audio), unchanged.
+# ---------------------------------------------------------------------------
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
+SARVAM_DEFAULT_SPEAKER = os.getenv("SARVAM_DEFAULT_SPEAKER", "shubh")
+SARVAM_TTS_PACE = float(os.getenv("SARVAM_TTS_PACE", "1.0"))
+SARVAM_TTS_MAX_CHARS = int(os.getenv("SARVAM_TTS_MAX_CHARS", "2500"))
+
+# app langCode -> Sarvam BCP-47 code
+_SARVAM_LANG_MAP = {
+    "hi": "hi-IN", "bn": "bn-IN", "ta": "ta-IN", "te": "te-IN", "kn": "kn-IN",
+    "ml": "ml-IN", "mr": "mr-IN", "gu": "gu-IN", "pa": "pa-IN",
+    "or": "od-IN", "od": "od-IN",
+}
+
+
+def _is_sarvam_language(lang_code: str) -> bool:
+    return (lang_code or "").strip().lower() in _SARVAM_LANG_MAP
+
+
+def _split_text_for_sarvam(text: str, max_chars: int = SARVAM_TTS_MAX_CHARS) -> list[str]:
+    """Same idea as _split_text_for_tts, but also splits on the Devanagari
+    danda (।, ॥), so Indian-language text breaks at real sentence ends
+    instead of being cut mid-word."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    sentences = re.split(r'(?<=[.!?।॥])\s+', text)
+    chunks: list[str] = []
+    current = ""
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        candidate = f"{current} {sent}".strip() if current else sent
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(sent) <= max_chars:
+            current = sent
+        else:
+            for i in range(0, len(sent), max_chars):
+                chunks.append(sent[i:i + max_chars])
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _sarvam_tts_chunk(client: httpx.AsyncClient, text: str, sarvam_lang: str, speaker: str) -> bytes:
+    payload = {
+        "text": text,
+        "target_language_code": sarvam_lang,
+        "speaker": speaker,
+        "model": SARVAM_TTS_MODEL,
+        "pace": SARVAM_TTS_PACE,
+    }
+    headers = {"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"}
+
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            resp = await client.post(SARVAM_TTS_URL, headers=headers, json=payload)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_err = RuntimeError(f"Sarvam TTS {resp.status_code}: {resp.text[:300]}")
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            if resp.status_code != 200:
+                raise RuntimeError(f"Sarvam TTS {resp.status_code}: {resp.text[:300]}")
+            audios = resp.json().get("audios") or []
+            if not audios:
+                raise RuntimeError("Sarvam TTS returned no audio")
+            return base64.b64decode("".join(audios))
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_err = e
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Sarvam TTS failed after retries: {last_err}")
+
+
+async def _generate_speech_sarvam(user_id: str, text: str, voice: str, lang_code: str) -> dict:
+    if not SARVAM_API_KEY:
+        raise RuntimeError("SARVAM_API_KEY is not configured on the server.")
+
+    sarvam_lang = _SARVAM_LANG_MAP[lang_code.strip().lower()]
+    # Sarvam speakers are plain lowercase names ("shubh", "anushka"). If the
+    # request carries something else (e.g. a Fish voice id), use the default.
+    speaker = voice.strip().lower() if voice and re.fullmatch(r"[a-z_]+", voice.strip().lower()) else SARVAM_DEFAULT_SPEAKER
+
+    chunks = _split_text_for_sarvam(text)
+    if not chunks:
+        raise RuntimeError("No text to synthesize")
+
+    print(f"[tts-sarvam] {len(text)} chars, lang={sarvam_lang}, speaker={speaker}, {len(chunks)} call(s)")
+
+    work_dir = tempfile.mkdtemp(prefix="sarvam_tts_")
+    try:
+        chunk_paths = []
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for idx, chunk_text in enumerate(chunks):
+                audio_bytes = await _sarvam_tts_chunk(client, chunk_text, sarvam_lang, speaker)
+                p = os.path.join(work_dir, f"chunk_{idx:03d}.wav")
+                with open(p, "wb") as f:
+                    f.write(audio_bytes)
+                chunk_paths.append(p)
+
+        list_path = os.path.join(work_dir, "concat_list.txt")
+        with open(list_path, "w") as f:
+            for p in chunk_paths:
+                f.write(f"file '{p}'\n")
+
+        # Always go through ffmpeg: Sarvam returns WAV by default, but the rest
+        # of the pipeline (mutagen MP3, silencedetect, storage) expects an MP3.
+        combined_path = os.path.join(work_dir, "combined.mp3")
+        await _run([
+            FFMPEG_BIN, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c:a", "libmp3lame", "-b:a", "192k", combined_path,
+        ])
+
+        return {"url": await _upload_audio_to_storage(combined_path, user_id)}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 async def _generate_speech_possibly_chunked(
     user_id: str, tagged_text: str, voice: str, lang_code: str,
     volume: Optional[float] = None,
     loudness_normalization: Optional[bool] = None,
     text_normalization: Optional[bool] = None,
 ) -> dict:
+    # FIX (Sarvam integration): this function previously always called
+    # generate_speech (Fish Audio) regardless of language — Sarvam was
+    # defined but never actually wired in anywhere, so no request could
+    # ever reach it. Indian languages now route here first; everything
+    # else falls through to the unchanged Fish Audio path below. Sarvam
+    # does its own internal chunking (_split_text_for_sarvam) and
+    # concatenation, so it doesn't need the chunk/concat logic below —
+    # that's Fish-specific (working around that provider's own
+    # truncation behavior).
+    if _is_sarvam_language(lang_code):
+        return await _generate_speech_sarvam(user_id, tagged_text, voice, lang_code)
+
     tts_kwargs = {}
     if volume is not None:
         tts_kwargs["volume"] = volume
@@ -11717,6 +11738,10 @@ async def _fill_empty_beats(scene: dict, beats: list, fallback_keywords: list) -
     if not still_empty:
         return
 
+    # REVERTED, per explicit request: a plain color-card background for
+    # an empty beat was judged worse than borrowing real footage from a
+    # nearby beat, even with the repetition tradeoff. Back to borrowing
+    # from the nearest non-empty sibling beat by beat_index proximity.
     non_empty = [b for b in beats if not _beat_media_is_empty(b)]
     if non_empty:
         for b in still_empty:
@@ -12126,21 +12151,54 @@ async def _run_beat_director(
 
 
 def _align_beats_to_timed_words(beats: list, timed_words: list) -> None:
-    ptr = 0
     n_words = len(timed_words)
-    for i, b in enumerate(beats):
-        count = len(b["vo_text"].split())
-        if count <= 0:
+    if n_words == 0:
+        for b in beats:
             b["start"], b["end"] = None, None
-            continue
-        end_ptr = n_words if i == len(beats) - 1 else min(ptr + count, n_words)
-        chunk = timed_words[ptr:end_ptr]
+        return
+
+    # FIX (captions drifting further out of sync the later a scene runs —
+    # the actual root cause behind persistent "captions not in sync"
+    # reports, distinct from the overlap/freeze/too-fast bugs already
+    # fixed): this used to walk timed_words by SEQUENTIALLY CONSUMING
+    # exactly len(beat["vo_text"].split()) words per beat — assuming the
+    # WRITTEN SCRIPT's word count for a beat exactly matches how many
+    # words WhisperX actually transcribed for that same span of real
+    # audio. These are two independent counts from two different sources
+    # and routinely disagree (numbers, native-script compound words,
+    # code-mixed terms, minor TTS mispronunciation) — and a mismatch of
+    # even one word shifts every subsequent beat's window by that same
+    # amount, compounding beat after beat through the scene.
+    #
+    # Fixed with the same proportional-distribution technique already
+    # used elsewhere in this file for exactly this class of problem:
+    # split n_words (the REAL total actually available) across beats by
+    # each beat's share of the total word count, using the largest-
+    # remainder method so the shares always sum to exactly n_words. When
+    # counts happen to match exactly, this produces the identical result
+    # to the old sequential method — it only changes behavior when they
+    # don't match, and in that case an error stays bounded to its own
+    # beat instead of accumulating into every beat that follows.
+    weights = [max(1, len(b["vo_text"].split())) for b in beats]
+    total_weight = sum(weights) or 1
+    raw_shares = [n_words * w / total_weight for w in weights]
+    floor_shares = [int(s) for s in raw_shares]
+    remainder = n_words - sum(floor_shares)
+    remainder_order = sorted(
+        range(len(beats)), key=lambda i: raw_shares[i] - floor_shares[i], reverse=True
+    )
+    for i in remainder_order[:max(0, remainder)]:
+        floor_shares[i] += 1
+
+    ptr = 0
+    for b, count in zip(beats, floor_shares):
+        chunk = timed_words[ptr:ptr + count]
         if chunk:
             b["start"] = chunk[0].get("start")
             b["end"] = chunk[-1].get("end")
         else:
             b["start"], b["end"] = None, None
-        ptr = end_ptr
+        ptr += count
 
     for i, b in enumerate(beats):
         if b.get("start") is not None and b.get("end") is not None:
@@ -12246,8 +12304,25 @@ def _validate_geometry_px(raw: Any, category: str, display_text: Any = None) -> 
         # Honor whatever was actually stored/submitted — just clamp to canvas.
         geo["width"] = max(80, min(geo["width"], ANIMATION_CANVAS_WIDTH))
         geo["height"] = max(80, min(geo["height"], ANIMATION_CANVAS_HEIGHT))
-        geo["x"] = max(0, min(geo["x"], ANIMATION_CANVAS_WIDTH - geo["width"]))
-        geo["y"] = max(0, min(geo["y"], ANIMATION_CANVAS_HEIGHT - geo["height"]))
+        # FIX (content rendering off-screen, cut off at the frame edge —
+        # confirmed on a real render: a label card's text was cut off
+        # mid-word at the left edge): a full_screen/transition animation
+        # that's genuinely covering the whole canvas has no margin to
+        # apply (there's no "edge" to clear). But this category is also
+        # used for narrower cards that DON'T cover the full canvas (a
+        # label/callout-style card within a full_screen treatment) — and
+        # those were only ever clamped to x/y >= 0, the true canvas edge,
+        # with zero buffer. A box sitting flush against x=0 with no
+        # margin is exactly how text can render partially off-canvas.
+        # Apply the same _SAFE_MARGIN every other category gets, but only
+        # when the box isn't actually full-canvas-sized (a real full-
+        # bleed treatment still legitimately starts at x=0).
+        is_full_bleed_width = geo["width"] >= ANIMATION_CANVAS_WIDTH
+        is_full_bleed_height = geo["height"] >= ANIMATION_CANVAS_HEIGHT
+        x_min = 0 if is_full_bleed_width else _SAFE_MARGIN
+        y_min = 0 if is_full_bleed_height else _SAFE_MARGIN
+        geo["x"] = max(x_min, min(geo["x"], ANIMATION_CANVAS_WIDTH - x_min - geo["width"]))
+        geo["y"] = max(y_min, min(geo["y"], ANIMATION_CANVAS_HEIGHT - y_min - geo["height"]))
         return geo
 
     if geo is None:
@@ -12637,7 +12712,9 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
     }
     scene_out["_previous_scene_last_animation"] = previous_animation_in
 
-    async def _finalize(timed_words: list, total_duration_sec: Optional[float] = None) -> dict:
+    async def _finalize(
+        timed_words: list, total_duration_sec: Optional[float] = None, silence_gaps: Optional[list] = None,
+    ) -> dict:
         beats = await _run_beat_director(
             scene_vo_text=vo_text, category=category, style_profile=style_profile, script_language=script_language,
             scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
@@ -12649,31 +12726,48 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         if timed_words:
             _align_beats_to_timed_words(beats, timed_words)
         elif total_duration_sec is not None:
-            # Non-English path: no real WhisperX timestamps — split the
-            # scene's real audio duration across beats proportional to
-            # each beat's own word count. See module note above.
+            # Non-English path (always, now — WhisperX is not used at all
+            # for non-English audio again, see module note above
+            # _translate_scene_to_segment_words): split the scene's real
+            # audio duration across BEATS proportional to each beat's own
+            # word count, for B-ROLL/media purposes only. Captions no
+            # longer depend on beat timing at all — see below.
             _assign_beat_times_proportional(beats, total_duration_sec)
         else:
             for b in beats:
                 b["start"], b["end"] = None, None
 
-        # Caption source. For English (request.langCode == "en"): the audio
-        # IS English, so WhisperX's own word_segments (timed_words) are
-        # already real, word-accurate English captions — use them directly,
-        # no approximation needed. For every other language: build from the
-        # scripts_assigned English text instead, proportionally re-split
-        # across beats (by native-language word-count share) and
-        # interpolated within each beat's real timing window — see
-        # _build_english_caption_words_for_beats. word_segments itself
-        # always stays native-script (Telugu/Hindi/etc for non-English,
-        # or English here), used for internal timing alignment either way.
+        # Caption source. English audio (request.langCode == "en"):
+        # WhisperX's own word_segments (timed_words) ARE the real, word-
+        # accurate English captions already — used directly, untouched.
+        # Every other language: captions are now built independently of
+        # BEAT timing entirely. Real speech segments (pure silence-
+        # detection, zero content recognition) are computed across the
+        # WHOLE scene, and one LLM call translates the scene's real
+        # vo_text and decides how to distribute it across those segments
+        # itself. See _translate_scene_to_segment_words / _build_
+        # english_caption_words_from_segments and the module note above
+        # them. No fallback: if the call failed for this scene, captions
+        # are simply empty rather than falling back to a less accurate
+        # method.
         if (request.langCode or "").strip().lower() == "en":
             scene_out["caption_word_segments_en"] = timed_words
+        elif total_duration_sec is not None:
+            segments = _speech_segments_within(silence_gaps or [], 0.0, total_duration_sec)
+            if segments:
+                segment_durations = [e - s for s, e in segments]
+                english_texts = await _translate_scene_to_segment_words(
+                    vo_text, segment_durations, str(scene_id), lang_code=request.langCode,
+                )
+                scene_out["caption_word_segments_en"] = (
+                    _build_english_caption_words_from_segments(segments, english_texts)
+                    if any(english_texts) else []
+                )
+            else:
+                print(f"[edit-video] scene {scene_id}: no real speech segments detected — this scene will have no captions")
+                scene_out["caption_word_segments_en"] = []
         else:
-            english_words = scene.get("vo_text_en_words") or []
-            scene_out["caption_word_segments_en"] = (
-                _build_english_caption_words_for_beats(beats, english_words) if english_words else []
-            )
+            scene_out["caption_word_segments_en"] = []
 
         fallback_keywords = _get_scene_broll_keywords(scene)
         await _fetch_beats_media(beats, str(scene_id))
@@ -12730,7 +12824,14 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         return await _finalize([])
 
     try:
-        tagged_text = await _get_or_create_tagged_text(scene, scene_id, request.userId, vo_text)
+        # Indian languages go to Sarvam, which has no use for Fish-style
+        # voice tags (it would read them aloud) — send the plain vo_text.
+        # Every other language still goes through tagging + Fish as before.
+        tagged_text = (
+            vo_text
+            if _is_sarvam_language(request.langCode)
+            else await _get_or_create_tagged_text(scene, scene_id, request.userId, vo_text)
+        )
     except Exception as e:
         print(f"[edit-video] scene {scene_id} tagging failed: {e}")
         scene_out["tagged_vo_text"] = None
@@ -12799,11 +12900,30 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         return await _finalize(timed_words)
 
     else:
-        # Non-English audio: skip WhisperX entirely. No transcription, so
-        # no wrong-script risk — read the real audio duration directly
-        # (mutagen, no ML) and let _finalize split beat timing
-        # proportionally across it. See module note above
-        # _assign_beat_times_proportional for the accuracy tradeoff.
+        # Non-English audio: NO WhisperX at all — neither for content nor
+        # for timing. A text-only LLM call (which is what "LLM for sync"
+        # refers to — _translate_scene_to_segment_words, which now drives
+        # captions) has no audio-perception capability, so it can never
+        # itself know exactly when a word is spoken; that was never on
+        # the table as a literal replacement for WhisperX's real
+        # transcription. What IS available without any transcription
+        # risk: real total duration (mutagen, reads the file header, no
+        # ML) and real pause locations (ffmpeg silencedetect, amplitude
+        # only, no content recognition of any kind) — combined with
+        # _assign_beat_times_proportional (real duration split by each
+        # beat's word-count share of the real, known-correct vo_text),
+        # for BEAT/B-roll timing only.
+        #
+        # Honest tradeoff, stated plainly: this removes ALL sub-beat/
+        # word-level precision for ANIMATIONS (they anchor to their full
+        # beat window only, never a specific phrase within it — see the
+        # build_timeline_from_scenes beat-clamp fix, which now applies to
+        # every non-English animation, not just the ones that fell
+        # through to it before). CAPTIONS are unaffected either way —
+        # they're built from real vo_text and real silence-detected
+        # segments via _translate_scene_to_segment_words, never from
+        # WhisperX, and were never anchored to beat timing at all (see
+        # _finalize).
         try:
             audio_bytes = await _download_bytes(speech_result["url"])
             total_duration = _get_mp3_duration_seconds(audio_bytes)
@@ -12817,18 +12937,26 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
             scene_out["error"] = f"audio duration read failed: {e}"
             return await _finalize([])
 
+        try:
+            silence_gaps = await _detect_silence_gaps_seconds(audio_bytes)
+        except Exception as e:
+            print(f"[edit-video] scene {scene_id} silence detection failed: {e} — captions will use even pacing")
+            silence_gaps = []
+
         scene_out["tagged_vo_text"] = tagged_text
         scene_out["voiceover"] = speech_result
         scene_out["start"] = 0.0
         scene_out["end"] = round(total_duration, 3)
-        # No real per-word transcription exists for this scene — anything
-        # downstream that re-slices a scene by time range (e.g. editing a
-        # single beat's time window) has no ground-truth words to work
-        # from for non-English scenes. Flagged here, not silently hidden.
+        # No transcription runs for this scene at all — nothing to
+        # populate here. Anything downstream that re-slices a scene by
+        # time range has no ground-truth words to work from for non-
+        # English scenes. Flagged here, not silently hidden.
         scene_out["word_segments"] = []
         scene_out["error"] = None
 
-        return await _finalize([], total_duration_sec=total_duration)
+        return await _finalize([], total_duration_sec=total_duration, silence_gaps=silence_gaps)
+
+
 
 
 
@@ -13117,6 +13245,49 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 continue
             b_start_frame, b_end_frame = rng
 
+            # FIX (animations misaligned/flickering/reappearing on non-
+            # English scenes): the Animation Planner's own prompt tells it
+            # to derive anchor_start_sec/anchor_end_sec from a real per-
+            # word "words" array — but for non-English scenes that array
+            # is now always empty (WhisperX no longer runs there at all,
+            # see chat). With no real words, timed_words_sec is empty
+            # here too, so the phrase-matching heuristic below always
+            # returns None, and every animation fell back to the model's
+            # own UNGROUNDED anchor guess — clamped only to the whole
+            # SCENE's bounds, not its own beat's bounds. That's exactly
+            # how an animation could land outside its actual beat, get
+            # composited onto the wrong beat's clip in _render_scene, and
+            # appear to pop in/out when beats are stitched together.
+            # Whenever there's no real transcript for this scene at all,
+            # skip the ungrounded model-anchor path entirely and anchor
+            # straight to this animation's own beat's REAL timing
+            # (b_start_frame/b_end_frame — audio-duration- and silence-
+            # detection-derived, already validated) instead.
+            if not timed_words_sec:
+                scene_animation_tracks.append({
+                    "track_id": f"anim_{scene_id}_{beat_id}",
+                    "scene_id": scene_id, "beat_id": beat_id, "type": "animation",
+                    "layer": animation.get("z_index_layer", "foreground"),
+                    "animation_type": animation.get("animation_type"), "category": animation.get("category"),
+                    "placement": animation.get("placement"),
+                    "geometry_px": _validate_geometry_px(
+                        animation.get("geometry_px"), animation.get("category"),
+                        display_text=animation.get("display_text"),
+                    ),
+                    "motion": animation.get("motion"), "icon_name": animation.get("icon_name"),
+                    "icon_layout": animation.get("icon_layout"), "display_text": animation.get("display_text"),
+                    "color_hint": animation.get("color_hint"), "highlight_target_text": animation.get("highlight_target_text"),
+                    "content_binding": animation.get("content_binding"), "render_prompt": animation.get("render_prompt"),
+                    "trigger": animation.get("trigger"),
+                    "startFrame": b_start_frame, "endFrame": b_end_frame,
+                    "start_sec": b_start_frame / fps, "end_sec": b_end_frame / fps,
+                    "duration_frames": b_end_frame - b_start_frame,
+                    "status": "pending_render" if animation.get("render_engine_hint") == "remotion" else "ready",
+                    "asset_url": None,
+                    "render_engine_hint": animation.get("render_engine_hint"),
+                })
+                continue
+
             anim_start_frame = b_start_frame
             matched_end_frame = None
             target_text = animation.get("highlight_target_text")
@@ -13177,6 +13348,42 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                     anim_end_frame = max(anim_end_frame, model_anchor_end_frame)
             anim_start_frame = max(scene_start_frame, min(anim_start_frame, scene_end_frame))
             anim_end_frame = max(anim_start_frame, min(anim_end_frame, scene_end_frame))
+
+            # FIX (animation rendering in the wrong beat entirely — e.g.
+            # a scene-closing card appearing at frame 0 instead of near
+            # the scene's end, confirmed on a real render): target_text
+            # (display_text/highlight_target_text) is ALWAYS English now
+            # (see the Language Rule fix), but timed_words_sec is the
+            # SCENE'S OWN LANGUAGE transcript for non-English audio (real
+            # per-word timing was restored for beat/animation anchoring —
+            # see chat). English-against-native-language phrase matching
+            # essentially never succeeds, so heuristic_span comes back
+            # None on effectively every non-English animation, which
+            # routed it into the model_anchor_start path above — clamped
+            # only to the whole SCENE's bounds, not this animation's own
+            # BEAT's bounds. That's how an animation ends up rendering
+            # during a completely different beat's window. Whatever path
+            # computed anim_start_frame/anim_end_frame above (heuristic
+            # match or model anchor), it can never be trusted to stay
+            # inside the right beat on its own — so it's relocated into
+            # this animation's own beat's real range here, unconditionally,
+            # as a final safety net rather than something contingent on
+            # correctly detecting language or transcript quality.
+            #
+            # Clamping start and end independently can degenerate to a
+            # near-zero-length animation when the original (wrong) anchor
+            # was far outside the beat — e.g. start=0/end=15frames against
+            # a beat starting at frame 1356 collapses to zero duration if
+            # each endpoint is clamped separately. Instead, preserve the
+            # animation's own intended length and relocate the whole
+            # window to fit inside the beat, with a sane minimum hold so
+            # it's never so brief it can't actually register on screen.
+            _min_hold_frames = round(1.5 * fps)
+            _orig_duration = max(anim_end_frame - anim_start_frame, _min_hold_frames)
+            _beat_span = max(b_end_frame - b_start_frame, 1)
+            _duration = min(_orig_duration, _beat_span)
+            anim_start_frame = max(b_start_frame, min(anim_start_frame, b_end_frame - _duration))
+            anim_end_frame = anim_start_frame + _duration
 
             safe_geometry_px = _validate_geometry_px(
                 animation.get("geometry_px"), animation.get("category"),
@@ -13446,18 +13653,6 @@ async def edit_video(request: EditVideo):
     if not request.langCode or not request.langCode.strip():
         raise HTTPException(status_code=422, detail="langCode is required and cannot be empty")
 
-    if not request.scriptId or not request.scriptId.strip():
-        raise HTTPException(status_code=422, detail="scriptId is required and cannot be empty")
-
-    # Fetch English captions source up front — fail fast before spending any
-    # OpenAI/TTS/WhisperX work if it's missing, rather than discovering it
-    # deep into scene processing. Skipped entirely for English videos: the
-    # audio is already English, so WhisperX's own word_segments ARE the
-    # real, word-accurate English captions — no scripts_assigned lookup or
-    # beat-interpolation approximation needed (see _finalize below).
-    is_english = request.langCode.strip().lower() == "en"
-    english_script_text = "" if is_english else await _fetch_english_script_text(request.scriptId)
-
     try:
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
@@ -13523,25 +13718,6 @@ async def edit_video(request: EditVideo):
         f"({total_script_words} script words, ~{total_script_words / max(len(scenes), 1):.0f} words/scene average)"
     )
 
-    # Proportionally divide the whole English script across scenes by each
-    # scene's share of total_script_words (native-language word count).
-    # This is scene-level only — the beat-level split happens per-scene
-    # inside _process_scene, once real beat timing exists to anchor it to.
-    # Skipped for English videos — nothing to split, captions come straight
-    # from WhisperX's own word_segments instead (see _finalize below).
-    if is_english:
-        for _scene in scenes:
-            if isinstance(_scene, dict):
-                _scene["vo_text_en_words"] = []
-    else:
-        english_script_words = english_script_text.split()
-        scene_weights = [max(1, len((s.get("vo_text") or "").split())) for s in scenes if isinstance(s, dict)]
-        english_scene_slices = _proportional_word_slices(english_script_words, scene_weights)
-        _slice_iter = iter(english_scene_slices)
-        for _scene in scenes:
-            if isinstance(_scene, dict):
-                _scene["vo_text_en_words"] = next(_slice_iter, [])
-
     video_ctx = {
         "known_entities": [], "known_setting": {"location": "", "time_period": ""},
         "previous_scene_last_media_type": None, "previous_scene_last_animation": None,
@@ -13587,7 +13763,7 @@ async def edit_video(request: EditVideo):
         raise HTTPException(status_code=500, detail="Failed to save video")
 
     EDIT_VIDEO_CREDITS_PER_MINUTE = 11
-    duration_minutes = request.durationMinutes
+    duration_minutes = (timeline_json.get("total_frames", 0) / max(timeline_json.get("fps", 1), 1)) / 60
     credit_cost = round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
 
     credit_result = {"cost": credit_cost, "deducted": False, "remaining_credits": None, "status": None}
@@ -14781,9 +14957,6 @@ def _display_text_to_string(display_text: Any) -> str:
     if isinstance(display_text, str):
         return display_text
     return ""
-
-
-
 
 
 
