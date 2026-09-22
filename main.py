@@ -3453,6 +3453,8 @@ async def get_context_with_timeout(
 
 
 
+
+
 SCRIPT_SYSTEM_PROMPT = """
 # YOUTUBE DOCUMENTARY SCRIPT GENERATION AGENT
 
@@ -3466,12 +3468,15 @@ Turn the supplied idea, template, retrieved knowledge, and recent web/news mater
 
 You will receive:
 
-* **Idea Title**
-* **Idea Description**
-* **Target Duration (minutes)**
-* **Script Template:** title, cluster, purpose, and ordered segments
-* **Retrieved Knowledge Chunks with sources:** Book name, author, published year
-* **Recent Web/News Chunks with source details:** including the web article link
+* *Idea Title*
+* *Idea Description*
+* *Target Duration (minutes)*
+* *Output Language:* language required for the final narration
+* *Script Template:* title, cluster, purpose, and ordered segments
+* *Retrieved Knowledge Chunks with sources:* book name, author, published year
+* *Recent Web/News Chunks with source details:* including the web article link
+
+The *Output Language* is mandatory. Generate the complete `script` in that language while preserving the supplied meaning, narrative flow, factual accuracy, analysis, emotional continuity, and engagement intent.
 
 Treat the supplied template and retrieved material as the primary source of truth. Never invent facts, sources, quotations, dates, numbers, events, or claims.
 
@@ -3479,56 +3484,109 @@ Treat the supplied template and retrieved material as the primary source of trut
 
 Apply all layers together:
 
-1. **Template Structure** = WHAT happens and WHEN.
-2. **LLM Brief / Retrieval Directive** = WHICH source information belongs in each segment.
-3. **Engagement Craft** = HOW that information should work inside the segment.
-4. **Global Storytelling Rules below** = HOW the complete script should sound and flow.
+1. *Template Structure* = WHAT happens and WHEN.
+2. *LLM Brief / Retrieval Directive* = WHICH source information belongs in each segment.
+3. *Engagement Craft* = HOW that information works inside the segment.
+4. *Global Storytelling Rules* = HOW the complete script sounds and flows.
+5. *Output Language + TTS Rules* = HOW the narration is expressed and spoken.
 
-Never replace the template with generic storytelling rules. Never ignore a segment's LLM Brief or retrieval purpose.
+Never replace the template with generic storytelling rules or ignore a segment's LLM Brief or retrieval purpose.
 
 ## SOURCE → STORY
 
-Use retrieved material as **raw material, not as text to summarize**. Select only information that serves the current segment. Preserve important names, dates, numbers, places, evidence, and causal relationships accurately.
+Use retrieved material as *raw material, not text to summarize*. Select only information serving the current segment. Preserve names, dates, numbers, places, evidence, and causal relationships accurately.
 
-Do not force every retrieved chunk into the script. Prefer concrete, specific, story-worthy details over broad background.
+Do not force every chunk into the script. Prefer concrete, specific, story-worthy details over broad background.
 
-Use recent web/news material when relevant. For time-sensitive information, retain the appropriate date and context rather than presenting it as timeless fact.
+Use recent web/news material when relevant. For time-sensitive information, retain its appropriate date and context rather than presenting it as timeless fact.
+
+## OUTPUT LANGUAGE + TTS-READY NARRATION
+
+Generate the entire `script` in the supplied *Output Language*.
+
+Preserve the original story logic, analysis, segment progression, emotional flow, and factual relationships while expressing them naturally in the requested language.
+
+Translate for *meaning and narration*, not word-for-word literal translation. The result must sound like it was naturally written by a skilled native-language documentary narrator.
+
+Use:
+
+* natural grammar, word order, vocabulary, and transitions
+* language-appropriate emotional expression
+* consistent terminology
+* natural spoken rhythm and pronunciation
+* culturally natural expressions where appropriate
+
+Do not produce robotic, mechanical, academic, or literal translation.
+
+The script must be directly usable as Text-to-Speech input without additional preprocessing.
+
+### TTS NUMBER RULES
+
+Write every numerical expression in the `script` as its *spoken-word form in the Output Language*. Never use numerical digits in the narration.
+
+This applies to:
+
+* numbers and quantities
+* years and dates
+* ages
+* percentages
+* statistics
+* currencies and monetary values
+* measurements and units
+* decimals
+* ranges
+* rankings and numbered references
+
+Examples:
+
+* `1942` → spoken year in the Output Language
+* `10 minutes` → spoken number and unit
+* `₹10,000` → spoken currency amount
+* `25%` → spoken percentage
+* `3.5` → spoken decimal
+* `2–3` → spoken range
+
+Preserve the exact factual value while converting its written representation into natural speech.
+
+Avoid symbols, abbreviations, or notation that could produce unnatural TTS pronunciation. Express them as words when appropriate.
+
+Keep proper nouns, brands, places, technical terms, and established names factually correct while using the form that produces natural pronunciation in the requested language.
+
+Do not add phonetic annotations, pronunciation instructions, SSML, brackets, or meta-commentary unless explicitly requested.
 
 ## OPENING + OVERALL VIDEO PROMISE
 
-At the very beginning of the script, after establishing the initial engaging hook, naturally give the viewer a **brief, engaging overview of what the video will explore overall**.
+After the initial engaging hook, naturally give the viewer a *brief overview of what the video will explore*.
 
-This overview should feel like a friend telling you, “Here’s what we’re about to uncover,” rather than a formal introduction or agenda.
+It should feel like a conversational orientation, not an agenda.
 
-* Briefly orient the viewer to the video's overall subject, journey, question, or discovery.
-* Make the viewer understand what they are going to learn, discover, or experience by staying until the end.
-* Keep it conversational, warm, natural, and curiosity-driven.
-* Connect it directly to the Hook so it feels like part of the story rather than a separate introduction.
-* Do not turn it into a list of sections or a detailed roadmap.
-* Do not reveal the final answer, major reveal, or full conclusion.
-* Do not use generic phrases such as “In this video, we will discuss…” unless naturally rephrased.
-* Do not sacrifice the strength or immediacy of the Hook merely to provide the overview.
+* Establish the overall subject, journey, question, or discovery.
+* Tell the viewer what they will learn, discover, or experience by staying.
+* Keep it warm, natural, and curiosity-driven.
+* Connect it directly to the Hook.
+* Do not list sections or reveal the final answer, major reveal, or full conclusion.
+* Avoid generic phrases such as “In this video, we will discuss…” unless naturally rephrased.
 
-The opening should therefore accomplish two things quickly:
+The opening should quickly accomplish:
 
-**Hook the viewer → naturally orient them to the journey ahead.**
+*Hook the viewer → orient them to the journey.*
 
 ## HOOK
 
 Open immediately with the strongest supported incident, fact, contradiction, image, result, or human moment available for the template.
 
-The Hook must function as a **YouTube hook, not a topic introduction**.
+The Hook must be a *YouTube hook, not a topic introduction*.
 
 * No “today we're going to…”
-* No generic greetings.
-* No broad textbook definitions.
+* No generic greeting.
+* No broad textbook definition.
 * No empty scene-setting.
 * Put a concrete detail in the opening lines.
-* Create immediate curiosity, tension, contradiction, uncertainty, or a held-back promise.
-* Make the audience want the next sentence.
+* Create curiosity, tension, contradiction, uncertainty, or a held-back promise.
+* Make the viewer want the next sentence.
 * Follow the template's Hook LLM Brief and Engagement Craft precisely.
 
-A natural audience-facing line is allowed later if it does not weaken the opening.
+A natural audience-facing line may appear later if it does not weaken the opening.
 
 ## CONTINUOUS ENGAGEMENT
 
@@ -3536,25 +3594,27 @@ Every segment must earn its place.
 
 Create forward motion through causation, contrast, escalation, unanswered questions, expectations, consequences, and revelations.
 
-Prefer **“but,” “therefore,” and “because”** logic over disconnected “and then” accumulation.
+Prefer *“but,” “therefore,” and “because”* logic over disconnected “and then” accumulation.
 
-Plant details that can pay off later. Use Breadcrumbs, Backpacks, open questions, or other Engagement Craft techniques when the template calls for them.
+Plant details that can pay off later. Use Breadcrumbs, Backpacks, open questions, or other Engagement Craft techniques when required by the template.
 
-Do not manufacture suspense when the evidence does not support it.
+Do not manufacture suspense unsupported by evidence.
 
 ## STORY + EXPLANATION
 
 Teach through story whenever possible.
 
 Prefer:
-**concrete example → context → meaning**
 
-rather than:
-**background → explanation → facts**
+*concrete example → context → meaning*
 
-Explain difficult ideas in plain language. Use intuitive analogies, comparisons, or hypothetical examples when useful, without distorting the evidence.
+over:
 
-Avoid list-like narration unless the selected template explicitly requires a list, ranking, checklist, timeline, or similar structure.
+*background → explanation → facts*
+
+Explain difficult ideas in plain language. Use intuitive analogies, comparisons, or hypothetical examples when useful without distorting evidence.
+
+Avoid list-like narration unless the template explicitly requires a list, ranking, checklist, timeline, or similar structure.
 
 ## HUMAN VOICE
 
@@ -3563,12 +3623,12 @@ Write like an intelligent human narrator speaking naturally to a real audience:
 * conversational, confident, curious, vivid, and natural
 * varied sentence length and rhythm
 * occasional short sentences for emphasis
-* concrete verbs and sensory detail where supported
+* concrete verbs and supported sensory detail
 * natural transitions
 * no corporate, academic, robotic, or Wikipedia-like phrasing
 * no repetitive “this is important because…” constructions
 * no excessive rhetorical questions
-* no filler, padding, or ornamental language
+* no filler or ornamental padding
 
 Do not fabricate dialogue or inner thoughts.
 
@@ -3578,9 +3638,9 @@ Any quotation must be supported by the retrieved material. Do not present wordin
 
 Use the template's ordered segments and proportions as the narrative architecture.
 
-Segment proportions guide **pacing only** and must NOT appear as labels in the final script.
+Segment proportions guide *pacing only* and must not appear as labels in the final script.
 
-Maintain natural transitions between segments so the story feels continuous rather than stitched together.
+Maintain natural transitions so the story feels continuous rather than stitched together.
 
 Do not over-explain merely to satisfy a segment percentage.
 
@@ -3588,11 +3648,11 @@ Do not over-explain merely to satisfy a segment percentage.
 
 The final script must contain exactly:
 
-**Target Duration × 130 words**
+*Target Duration × 130 words*
 
-This is a hard production requirement, not an estimate.
+This is a hard production requirement.
 
-Internally revise, compress, or expand the narration until the required word count is reached while preserving factual accuracy, narrative quality, pacing, and template structure.
+Internally revise, compress, or expand the narration until the required word count is reached while preserving factual accuracy, narrative quality, pacing, template structure, and natural language.
 
 ## ENDING + CTA
 
@@ -3602,12 +3662,12 @@ The ending must pay off the Hook's question, promise, image, contradiction, or t
 
 When the template contains a CTA:
 
-* make it feel earned and connected to the story
-* explicitly invite viewers to share their **thoughts, interpretation, opinion, experience, or feedback in the comments**
+* make it earned and connected to the story
+* explicitly invite thoughts, interpretation, opinion, experience, or feedback in the comments
 * use a specific question when appropriate
-* callback to a concrete earlier detail when the template calls for it
+* callback to a concrete earlier detail when required
 
-Do not end with a generic “like and subscribe” unless the supplied template specifically requires it.
+Do not use a generic “like and subscribe” unless the supplied template specifically requires it.
 
 ## FACTUAL INTEGRITY
 
@@ -3617,83 +3677,77 @@ Do not merge separate facts into a false causal relationship.
 
 Clearly distinguish documented fact from interpretation, hypothesis, prediction, or uncertainty.
 
-When sources disagree, preserve the relevant uncertainty rather than silently choosing a convenient version.
+When sources disagree, preserve the relevant uncertainty rather than silently selecting a convenient version.
 
 ## FINAL INTERNAL QA
 
 Before returning the answer, silently verify:
 
 * template order and segment purposes are respected
-* each segment uses information according to its LLM Brief
+* each segment follows its LLM Brief and retrieval purpose
 * Engagement Craft is reflected in execution
-* Hook is genuinely a hook, not an introduction
-* opening naturally gives viewers a brief overview of what the video will explore
+* Hook is genuinely a hook
+* opening naturally provides the required overview
 * overview does not spoil the major reveal or conclusion
-* narrative remains coherent and progressively engaging
-* no unsupported factual claims or fabricated quotations
-* script contains exactly **Target Duration × 130 words**
+* narrative is coherent and progressively engaging
+* entire `script` is in the requested Output Language
+* language is natural rather than mechanically translated
+* narration flow, analysis, and factual meaning are preserved
+* script is TTS-ready
+* all numerical expressions in the script are written as spoken words
+* no unsupported claims or fabricated quotations
+* script contains exactly *Target Duration × 130 words*
 * CTA explicitly invites comments/feedback when applicable
-* all metrics are calculated from the actual generated script
+* metrics are calculated from the actual generated script
 * JSON is valid
 * nothing appears outside the JSON object
 
 ## SCRIPT ANALYTICS
 
-Return these metrics:
+Return:
 
-* **Every numeric value must be at least 1.**
-* `videoLengthMinutes`: copy **Target Duration exactly**.
-* `wordCount`: total words in the generated script.
-* `emotionalDepth` (1–10): emotional engagement, storytelling quality, tension, vivid imagery, and human resonance.
-* `generalExamples`: illustrative examples, analogies, comparisons, or hypothetical scenarios that are **NOT historical examples**.
-* `proverbs_count`: proverbs, sayings, quotations, aphorisms, and memorable quotes.
-* `historicalExamples`: historical events, figures, discoveries, civilizations, companies, or eras.
-* `researchFacts`: distinct research-backed facts, reports, studies, surveys, or statistics.
+* *Every numeric value must be at least 1.*
+* videoLengthMinutes: copy *Target Duration exactly*.
+* wordCount: total words in the generated script.
+* emotionalDepth (1–10): emotional engagement, storytelling quality, tension, vivid imagery, and human resonance.
+* generalExamples: illustrative examples, analogies, comparisons, or hypothetical scenarios that are *NOT historical examples*.
+* proverbs_count: proverbs, sayings, quotations, aphorisms, and memorable quotes.
+* historicalExamples: historical events, figures, discoveries, civilizations, companies, or eras.
+* researchFacts: distinct research-backed facts, reports, studies, surveys, or statistics.
 
 ## CONTENT CLASSIFICATION
 
 Return:
 
-* `category`: one primary category, **1–3 words**.
-* `subcategories`: up to five concise subcategories, **1–3 words each**.
+* category: one primary category, *1–3 words*.
+* subcategories: up to five concise subcategories, *1–3 words each*.
 * Do not repeat the category inside subcategories.
 
 ## OUTPUT
 
-Return **only valid JSON**.
+Return *only valid JSON*.
 
-**IMPORTANT — JSON EXAMPLE STATUS:**
+The JSON example below is a *STRUCTURE/SCHEMA EXAMPLE ONLY*. It is not a fixed set of values, wording, counts, or classifications. Do not copy its sample content. Generate every value dynamically from the actual input and generated script.
 
-The JSON example below is a **STRUCTURE/SCHEMA EXAMPLE ONLY**.
-
-It is **NOT a perfect, fixed, or authoritative set of values, wording, counts, or classifications**.
-
-Do **not** copy its sample numbers, text, counts, category, or subcategories.
-
-The example exists only to demonstrate the expected **field names, nesting, and data types**.
-
-The detailed requirements above are the authoritative specification. Generate every value dynamically from the actual input and generated script.
-
-```json id="rpj990"
+json id="rpj990"
 {
-  "script": "Complete documentary narration in continuous paragraphs.",
-  "metrics": {
-    "videoLengthMinutes": 10,
-    "wordCount": 1300,
-    "emotionalDepth": 1,
-    "generalExamples": 1,
-    "proverbs_count": 1,
-    "historicalExamples": 1,
-    "researchFacts": 1
-  },
-  "classification": {
-    "category": "string",
-    "subcategories": [
-      "string"
-    ]
-  }
+"script": "Complete documentary narration in the requested Output Language, written as natural TTS-ready continuous paragraphs.",
+"metrics": {
+"videoLengthMinutes": 10,
+"wordCount": 1300,
+"emotionalDepth": 1,
+"generalExamples": 1,
+"proverbs_count": 1,
+"historicalExamples": 1,
+"researchFacts": 1
+},
+"classification": {
+"category": "string",
+"subcategories": [
+"string"
+]
 }
-```
+}
 """
 
 
@@ -4987,13 +5041,15 @@ def _tag_chunks_with_segment(chunks: list[dict], seg_info: dict) -> None:
 
 
 
+
+
+
 async def _generate_script_impl(request: "ScriptRequest"):
     _start_token_tracking()
 
     total_start_time = time.time()
     topic_text = build_topic_text(request)
-    language = _normalize_language(getattr(request, "language", None))
-    print(f"[SCRIPT] ===== NEW REQUEST ===== title='{request.title}' time={request.time}min userId={request.userId} language='{language}'")
+    print(f"[SCRIPT] ===== NEW REQUEST ===== title='{request.title}' time={request.time}min userId={request.userId}")
 
     # Stage 4 (YouTube) has no dependency on Stage 1's HyDE output at all —
     # kick it off immediately so it runs fully in the background.
@@ -5323,7 +5379,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
         target_word_count = target_word_count_for_time(request.time)
         print(f"[STAGE 6] target word count: {target_word_count} (±3%) for {request.time} minute(s)")
         script_result = await generate_script_from_context(
-            request, selected_template, db_results, new_articles, target_word_count, language=language
+            request, selected_template, db_results, new_articles, target_word_count
         )
         script_text = script_result["script"]
         script_metrics = script_result["metrics"]
@@ -5460,9 +5516,19 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "structure": structure,
         "category": classification.get("category", "UNKNOWN"),
         "subcategories": classification.get("subcategories", []),
-        "language": language,
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -9372,48 +9438,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import re
 import io
 import os
@@ -9429,487 +9453,10 @@ from typing import Any, Optional, Literal
 
 import httpx
 import whisperx
-from mutagen.mp3 import MP3
 from fastapi import HTTPException
 from pydantic import BaseModel
-from indic_transliteration import sanscript
-from indic_transliteration.sanscript import transliterate
 
 
-# FIX (caption romanization): captions must render as plain Latin-alphabet
-# text that SOUNDS like the spoken language when read aloud (e.g. Telugu
-# "నమస్కారం" -> "namaskaram") — never the actual native script, and never
-# an English translation of the meaning. WhisperX/Whisper itself has no
-# "give me Romanized output" mode for a language it transcribes natively
-# (see chat explanation) — the only reliable way to get this is to keep
-# transcribing in native script (accurate) and then transliterate that
-# script into Latin letters as a separate, deterministic step.
-#
-# Only non-Latin scripts get mapped through indic_transliteration; a token
-# that's already Latin (an English brand name mixed into the sentence, a
-# number, punctuation, a currency symbol) is left completely untouched —
-# both its characters AND its casing — so "BookMyShow" doesn't become
-# "bookmyshow" just because it's sitting next to Telugu words.
-#
-# Applied PER WORD (never to a joined sentence) so word count in == word
-# count out, always — that's what keeps each word's existing WhisperX
-# timestamp attached to the right romanized word, i.e. captions stay in
-# sync with the voiceover exactly as before.
-_SCRIPT_RANGES = {
-    "te": (r"[\u0C00-\u0C7F]", sanscript.TELUGU),
-    "hi": (r"[\u0900-\u097F]", sanscript.DEVANAGARI),
-    "mr": (r"[\u0900-\u097F]", sanscript.DEVANAGARI),
-    "ne": (r"[\u0900-\u097F]", sanscript.DEVANAGARI),
-    "ta": (r"[\u0B80-\u0BFF]", sanscript.TAMIL),
-    "kn": (r"[\u0C80-\u0CFF]", sanscript.KANNADA),
-    "ml": (r"[\u0D00-\u0D7F]", sanscript.MALAYALAM),
-    "gu": (r"[\u0A80-\u0AFF]", sanscript.GUJARATI),
-    "bn": (r"[\u0980-\u09FF]", sanscript.BENGALI),
-    "pa": (r"[\u0A00-\u0A7F]", sanscript.GURMUKHI),
-    "or": (r"[\u0B00-\u0B7F]", sanscript.ORIYA),
-}
-
-
-def _romanize_word(word: str, lang_code: str) -> str:
-    if not word:
-        return word
-    entry = _SCRIPT_RANGES.get((lang_code or "").lower())
-    if not entry:
-        return word  # unsupported/unknown script — pass through unchanged
-    script_pattern, scheme = entry
-    if not re.search(script_pattern, word):
-        return word  # this token is already Latin (proper noun, number, punctuation) — leave as-is
-    cleaned = word.replace("\u200c", "").replace("\u200d", "")  # strip ZWNJ/ZWJ, cosmetic only
-    try:
-        return transliterate(cleaned, scheme, sanscript.OPTITRANS).lower()
-    except Exception as e:
-        print(f"[caption-romanize] failed on word '{word}': {e} — keeping native script for this word")
-        return word
-
-
-def _romanize_word_segments(word_segments: list[dict], lang_code: str) -> list[dict]:
-    if not lang_code or lang_code.lower() == "en":
-        return word_segments  # English stays exactly as WhisperX produced it
-    for w in word_segments:
-        if "word" in w and w["word"]:
-            w["word"] = _romanize_word(w["word"], lang_code)
-    return word_segments
-
-
-MAX_CAPTION_WORD_SECONDS = float(os.getenv("MAX_CAPTION_WORD_SECONDS", "1.4"))
-MIN_CAPTION_WORD_SECONDS = float(os.getenv("MIN_CAPTION_WORD_SECONDS", "0.28"))
-
-
-def _interpolate_word_timestamps(words: list[str], start: float, end: float) -> list[dict]:
-    """Evenly distribute `words` across [start, end], each getting its own
-    start/end slot. This is the fallback path — used only when silence
-    detection found no usable speech segments in this window (see
-    _interpolate_word_timestamps_speech_aware below, which is what's
-    actually used whenever real silence data is available).
-
-    FIX (captions freezing on screen for many seconds — confirmed on a
-    real render): when a real segment/beat's window is long but the
-    translated English text for it came back SHORT (fewer words than the
-    original — natural, since translated meaning isn't word-count-
-    matched to the source), the old unconditional `slot = (end-start)/n`
-    stretched those few words to fill the ENTIRE window — a 3-word
-    translation of an 8-second segment meant each word sat on screen for
-    ~2.7s, reading as a frozen/stuck caption. Each word's slot is capped
-    at MAX_CAPTION_WORD_SECONDS; any leftover time in the window is
-    simply left blank (no caption) rather than stretched.
-
-    FIX (captions cycling unreadably fast — confirmed on a real render,
-    lines visible for as little as ~0.3s at ~8-10 words each): the
-    mirror-image problem — a real beat window that's SHORT (e.g. Sarvam's
-    natural speaking pace can differ from Fish Audio's, producing shorter
-    real audio for the same content) combined with a NORMAL-length
-    translation compresses every word into a fraction of a second. Each
-    word's slot now has a floor of MIN_CAPTION_WORD_SECONDS too. When the
-    words genuinely don't fit in [start, end] at that floor, the last
-    word's end is simply allowed to run slightly past the beat's nominal
-    end rather than compressing to unreadable speed — a little overflow
-    into the next beat's window reads far better than flashing text."""
-    n = len(words)
-    if n == 0:
-        return []
-    end = max(end, start + 0.05 * n)  # guard against a zero/negative-length beat
-    raw_slot = (end - start) / n
-    slot = min(max(raw_slot, MIN_CAPTION_WORD_SECONDS), MAX_CAPTION_WORD_SECONDS)
-    out = []
-    cursor = start
-    for w in words:
-        w_start = cursor
-        w_end = cursor + slot
-        out.append({"word": w, "start": round(w_start, 3), "end": round(w_end, 3)})
-        cursor = w_end
-    return out
-
-
-# ---------------------------------------------------------------------------
-# FIX (subtitle/audio sync for translated captions): the original even-
-# pacing approach above spreads words uniformly across a beat's whole
-# window, including any real pauses in the Telugu speech — so captions
-# visibly drift out of sync with where the speaker actually is, worse the
-# longer a beat runs. Confirmed on a real render: ffmpeg's silencedetect
-# (amplitude-only — no transcription, no wrong-script risk at all, see
-# chat) found 66 real pauses of 0.4–0.9s each across one 314s video.
-# These helpers detect those real pauses and skip them when placing
-# caption words, so a word's START time never lands inside actual dead
-# silence — captions now track the real rhythm of the speech instead of
-# a flat average.
-# ---------------------------------------------------------------------------
-
-async def _detect_silence_gaps_seconds(
-    audio_bytes: bytes, noise_db: str = "-30dB", min_silence_sec: float = 0.35,
-) -> list[tuple]:
-    """Runs ffmpeg's silencedetect over the audio (amplitude only — reads
-    nothing about content/language) and returns [(start, end), ...] for
-    each real pause found. Returns [] on any failure — callers must treat
-    that as 'no pause data available' and fall back gracefully, never as
-    an error to surface to the user."""
-    with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp:
-        tmp.write(audio_bytes)
-        tmp.flush()
-        cmd = [
-            FFMPEG_BIN, "-i", tmp.name,
-            "-af", f"silencedetect=noise={noise_db}:d={min_silence_sec}",
-            "-f", "null", "-",
-        ]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        except Exception as e:
-            print(f"[caption-sync] silencedetect failed to run: {e} — captions will use even pacing for this scene")
-            return []
-
-    text = stderr.decode(errors="replace")
-    try:
-        duration_match = re.search(r"time=(\d+):(\d+):([\d.]+)", text)
-        total_duration = (
-            int(duration_match.group(1)) * 3600 + int(duration_match.group(2)) * 60 + float(duration_match.group(3))
-        ) if duration_match else None
-    except Exception:
-        total_duration = None
-
-    starts = [float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", text)]
-    ends = [float(m) for m in re.findall(r"silence_end:\s*([\d.]+)", text)]
-    gaps = list(zip(starts, ends))
-    if len(starts) > len(ends) and total_duration is not None:
-        gaps.append((starts[-1], total_duration))  # trailing silence ran to end of file
-    return gaps
-
-
-def _speech_segments_within(silence_gaps: list, window_start: float, window_end: float) -> list:
-    """Real speech-only sub-intervals within [window_start, window_end] —
-    the window with every overlapping silence gap cut out."""
-    clipped = []
-    for s, e in silence_gaps:
-        s2, e2 = max(s, window_start), min(e, window_end)
-        if e2 > s2:
-            clipped.append((s2, e2))
-    clipped.sort()
-
-    segments = []
-    cursor = window_start
-    for s, e in clipped:
-        if s > cursor:
-            segments.append((cursor, s))
-        cursor = max(cursor, e)
-    if cursor < window_end:
-        segments.append((cursor, window_end))
-    return segments
-
-
-def _map_speech_time_to_real(t: float, segments: list) -> float:
-    """t is a position along the CONCATENATED speech-only timeline (pauses
-    already removed) — maps it back to a real timestamp within `segments`.
-
-    FIX (needed for the min-word-duration floor below): t can now exceed
-    the total speech time in `segments` — when a minimum per-word floor
-    pushes the last few words past what real speech time is actually
-    available. The old behavior clamped every such t to segments[-1][1]
-    (the end of the last real speech span), which would have collapsed
-    all overflow words onto the exact same instant — worse than the
-    problem being fixed. Now it extrapolates linearly past the last
-    segment's end instead, so overflow words still get spread out."""
-    cursor = 0.0
-    for seg_start, seg_end in segments:
-        seg_len = seg_end - seg_start
-        if t <= cursor + seg_len:
-            return seg_start + (t - cursor)
-        cursor += seg_len
-    if not segments:
-        return t
-    overflow = t - cursor
-    return segments[-1][1] + overflow
-
-
-def _interpolate_word_timestamps_speech_aware(
-    words: list[str], start: float, end: float, silence_gaps: list,
-) -> list[dict]:
-    """Same job as _interpolate_word_timestamps (spread `words` across
-    [start, end]), but distributes them across real SPEECH time only —
-    silence_gaps within the window are skipped entirely, so no word's
-    start time ever lands inside actual dead air. Falls back to plain
-    even pacing if silence_gaps is empty or covers almost the whole
-    window (detection failure or a near-silent clip)."""
-    n = len(words)
-    if n == 0:
-        return []
-    segments = _speech_segments_within(silence_gaps, start, end)
-    total_speech = sum(e - s for s, e in segments)
-    if not segments or total_speech <= 0.05 * n:
-        return _interpolate_word_timestamps(words, start, end)
-
-    # FIX (freezing AND too-fast cycling — see module note on
-    # _interpolate_word_timestamps above): same min/max caps, applied in
-    # speech-time units before mapping back to real timestamps. Without
-    # the max, a long real speech span with few words would stretch each
-    # one for seconds; without the min, a short real speech span with
-    # many words (e.g. Sarvam's pace producing shorter audio than Fish
-    # Audio did for the same content) compresses each word into a
-    # fraction of a second, unreadable.
-    slot = min(max(total_speech / n, MIN_CAPTION_WORD_SECONDS), MAX_CAPTION_WORD_SECONDS)
-    out = []
-    for i, w in enumerate(words):
-        real_start = _map_speech_time_to_real(i * slot, segments)
-        real_end = _map_speech_time_to_real((i + 1) * slot, segments)
-        out.append({"word": w, "start": round(real_start, 3), "end": round(real_end, 3)})
-    return out
-
-
-# ---------------------------------------------------------------------------
-# FIX (translated content not matching the actual script — confirmed on a
-# real render: captions read "In the 2000s, the mix..." for audio that
-# never said any of that): translating WhisperX's own TRANSCRIPTION of
-# the native audio is unsafe — even with the medium model, forced
-# language, and repetition-penalty fix, WhisperX can still mis-hear
-# content on hard audio, and once that happens the LLM faithfully
-# translates whatever garbage WhisperX produced into fluent-sounding but
-# WRONG English.
-#
-# WhisperX is removed from this path ENTIRELY again — not used for
-# content, not used for timing (a brief detour through using it for
-# timing-only anchoring has been reverted; see chat). Instead:
-#   - CONTENT: translate the scene's own vo_text directly — the real,
-#     already-correct native text (it's literally what was sent to TTS),
-#     never a guess at what the audio contains.
-#   - TIMING: pure audio signal only — real total duration (mutagen) and
-#     real pause locations (ffmpeg silencedetect, amplitude only, zero
-#     content recognition of any kind) — sliced into real speech-only
-#     segments (_speech_segments_within). No transcription anywhere.
-#   - MATCHING WORDS TO SEGMENTS: rather than Python interpolating words
-#     evenly/proportionally across each segment, ONE LLM call per scene
-#     is given the real segment DURATIONS (numbers only, not audio, not
-#     content) and asked to translate the full script and distribute
-#     it across those segments itself — using its own judgment of
-#     natural phrase pacing instead of a rigid word-count formula. This
-#     is strictly safer than the old WhisperX-timing approach: the
-#     segment boundaries themselves are 100% content-blind (pure
-#     amplitude), so there is no path for wrong content to enter through
-#     the timing signal, only through translation itself — the same
-#     already-accepted risk as any LLM translation call in this file.
-# ---------------------------------------------------------------------------
-
-_SEGMENT_WORDS_PROMPT = """You translate a script into natural English and distribute it across a fixed number of real timing segments measured from the actual audio recording.
-
-You will receive the FULL NATIVE SCRIPT TEXT, followed by a numbered list of SEGMENT DURATIONS in seconds — these are real, pause-bounded chunks of the actual spoken audio. You are not creating these boundaries; they are already fixed. Your job is to translate the entire script into natural, fluent spoken English (not a literal word-for-word rendering) and then decide how that translation should be distributed across the segments, in order: segment 1 holds the English for the start of the script, the last segment holds the English for the end. Segment duration tells you roughly how much can naturally fit — a long segment can hold a full clause or sentence, a very short segment should get only a word or two — but let real phrase and sentence boundaries guide the actual split, not a rigid word-count formula.
-
-Return a JSON object: {"segments": ["...", "...", ...]} with EXACTLY one string per input segment duration, in the SAME order. Every word of the translated script must appear in exactly one segment, covering the full script from start to end — nothing skipped, nothing duplicated. A segment may be an empty string "" only if there is genuinely no natural content left to place there (e.g. more segments than the script has content for).
-
-Rules:
-- Translate meaning, not literal words — natural spoken English.
-- The source is often CODE-MIXED — native-script text with English words and phrases (technical terms, common borrowed words like "training", "model", "app") embedded in it, glued together with native grammar (particles, suffixes, verb endings) around those English words. Translate the ENTIRE thing into pure, fluent English — every native particle, suffix, and connecting word must become proper English grammar. The output must be 100% English with NO native-script characters anywhere in any segment, even a single leftover particle or word ending — do not just leave the embedded English words in place with native grammar still attached around them.
-- Keep proper nouns (people, places, brands, products) exactly as they'd naturally appear in English text — do not alter, guess, or substitute a name.
-- Numbers, currency, dates: render naturally in English (e.g. "85 crore rupees", "50 percent").
-- No commentary, no markdown fences, no extra keys — just the JSON object."""
-
-
-async def _translate_scene_to_segment_words(
-    vo_text: str, segment_durations: list[float], scene_id: str, lang_code: str = "",
-) -> list[str]:
-    """One LLM call per scene: translate the scene's real, already-correct
-    vo_text (never a transcription guess) and have the model itself
-    decide how to distribute that translation across a list of REAL
-    TIMING SEGMENTS — pause-bounded chunks measured directly from the
-    actual audio via pure amplitude-based silence detection, not
-    transcription. No content-recognition of any kind produced these
-    segment boundaries, so there is no risk of the wrong-content failure
-    mode WhisperX produced. The LLM's job is purely: given how long each
-    real segment is, how much of the translated script's natural
-    phrasing belongs in it. Returns a same-length list of English
-    strings, or a list of empty strings on any failure — callers must
-    treat an empty string as "no caption for this segment" and skip it,
-    never crash."""
-    vo_text = (vo_text or "").strip()
-    if not vo_text or not segment_durations:
-        return ["" for _ in segment_durations]
-
-    numbered = "\n".join(f"{i + 1}. {d:.2f}s" for i, d in enumerate(segment_durations))
-    user_content = f"FULL NATIVE SCRIPT TEXT:\n{vo_text}\n\nSEGMENT DURATIONS (in order):\n{numbered}"
-
-    try:
-        res = await _openai_create_with_timeout(
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4-mini",
-                messages=[
-                    {"role": "system", "content": _SEGMENT_WORDS_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                stream=False,
-            )
-        )
-        _record_token_usage("edit video - segment word matching", res)
-        _log_token_usage("Segment Word Matching", res)
-
-        content = (res.choices[0].message.content or "").strip()
-        if content.startswith("```"):
-            content = content.strip("`")
-            if content.lower().startswith("json"):
-                content = content[4:].strip()
-
-        parsed = json.loads(content)
-        segments_out = parsed.get("segments")
-        if not isinstance(segments_out, list):
-            raise ValueError("response had no 'segments' array")
-
-        if len(segments_out) != len(segment_durations):
-            print(
-                f"[edit-video] scene {scene_id}: segment word matching returned "
-                f"{len(segments_out)} item(s) for {len(segment_durations)} segment(s) — "
-                f"padding/truncating to line up 1:1"
-            )
-            if len(segments_out) < len(segment_durations):
-                segments_out = segments_out + [""] * (len(segment_durations) - len(segments_out))
-            else:
-                segments_out = segments_out[:len(segment_durations)]
-
-        segments_out = [str(t or "").strip() for t in segments_out]
-
-        script_pattern = None
-        entry = _SCRIPT_RANGES.get((lang_code or "").lower())
-        if entry:
-            script_pattern = entry[0]
-
-        if script_pattern:
-            cleaned = []
-            for i, t in enumerate(segments_out):
-                if t and re.search(script_pattern, t):
-                    print(
-                        f"[edit-video] scene {scene_id}: segment {i + 1} translation still "
-                        f"contains native-script characters after translation ({t!r}) — "
-                        f"dropping this segment's caption rather than showing mixed-script text"
-                    )
-                    cleaned.append("")
-                else:
-                    cleaned.append(t)
-            segments_out = cleaned
-
-        return segments_out
-
-    except Exception as e:
-        print(f"[edit-video] scene {scene_id}: segment word matching failed ({e}) — this scene will have no captions")
-        return ["" for _ in segment_durations]
-
-
-def _build_english_caption_words_from_segments(
-    segments: list[tuple], english_texts: list[str],
-) -> list[dict]:
-    """Given real speech segments (pure silence-detection-derived
-    [start, end] pairs from the actual audio — see _speech_segments_
-    within) and their matching English text (same order/count — see
-    _translate_scene_to_segment_words), place each segment's words
-    across THAT segment's own real timing window. _interpolate_word_
-    timestamps' min/max per-word duration caps still apply here — see
-    its own note — so a short or long allocation within a segment never
-    freezes or flashes on screen."""
-    caption_words: list[dict] = []
-    for (seg_start, seg_end), en_text in zip(segments, english_texts):
-        en_words = en_text.split()
-        if not en_words:
-            continue
-        caption_words.extend(_interpolate_word_timestamps(en_words, seg_start, seg_end))
-    return _dedupe_overlapping_word_timestamps(caption_words)
-
-
-def _dedupe_overlapping_word_timestamps(words: list[dict]) -> list[dict]:
-    """FIX (captions overlapping/stacking on screen — confirmed on a real
-    render: two full caption lines visible simultaneously, unreadable):
-    each beat's words are timed independently within THAT beat's own real
-    window. The min-duration-floor fix (see _interpolate_word_timestamps)
-    can legitimately push a beat's last word to overflow slightly past
-    its own nominal end when there isn't enough real time to keep every
-    word readable — but the NEXT beat's words are computed independently,
-    starting at ITS OWN real timestamp, which can be earlier than the
-    previous beat's overflow point. Since captions are chunked into
-    on-screen lines purely by word count (not by beat), two chunks could
-    end up with overlapping time ranges and get drawn on screen at the
-    same time.
-
-    This is a global cleanup pass over the FULL concatenated word list
-    (every beat's words, in order) that guarantees no word's start ever
-    precedes the previous word's end — the next beat's own real timestamp
-    is treated as authoritative (it's grounded in real audio duration),
-    so any overflow from the previous beat gets clamped back instead of
-    intruding into it."""
-    cleaned: list[dict] = []
-    prev_end: Optional[float] = None
-    for w in words:
-        start, end = w.get("start"), w.get("end")
-        if start is None or end is None:
-            continue
-        if prev_end is not None and start < prev_end:
-            start = prev_end
-            end = max(end, start + 0.05)  # keep a minimal sliver of duration, never zero/negative
-        cleaned.append({**w, "start": round(start, 3), "end": round(end, 3)})
-        prev_end = end
-    return cleaned
-
-
-# ---------------------------------------------------------------------------
-# Non-English audio: skip WhisperX entirely, use proportional timing instead
-#
-# WhisperX was previously run on every non-English scene's audio purely to
-# get real per-word timestamps to anchor beat timing to — but for content
-# with hard proper nouns/loanwords, a small-to-medium model can slip into
-# the wrong script entirely (confirmed in production logs — see chat). That
-# risk, plus the transcription cost itself, is now avoidable: the exact
-# text sent to TTS is already known (it's scene_vo_text, no recognition
-# needed), and the audio's total duration is cheap to read directly from
-# the MP3 file (no ML) via mutagen. Beat timing becomes: real total
-# duration, split proportionally by each beat's own word count. This is
-# strictly WORSE than real per-word timestamps at capturing actual TTS
-# pacing (pauses, emphasis) — see chat for the tradeoff — but has zero
-# wrong-script risk and is far cheaper. Only used for langCode != "en";
-# English audio keeps real WhisperX word-level timestamps unchanged.
-# ---------------------------------------------------------------------------
-
-def _get_mp3_duration_seconds(audio_bytes: bytes) -> float:
-    return MP3(io.BytesIO(audio_bytes)).info.length
-
-
-def _assign_beat_times_proportional(beats: list, total_duration: float) -> None:
-    """Mutates each beat's start/end in place: divides total_duration into
-    contiguous windows proportional to each beat's own word count. Uses
-    continuous (float) proportions rather than the largest-remainder method
-    used for word-splitting — duration has no "indivisible unit" to round
-    to, so cumulative float math already lands exactly on total_duration
-    with no drift."""
-    weights = [max(1, len(b.get("vo_text", "").split())) for b in beats]
-    total_weight = sum(weights) or 1
-    cursor = 0.0
-    cumulative_weight = 0
-    for b, w in zip(beats, weights):
-        cumulative_weight += w
-        b_end = total_duration * cumulative_weight / total_weight
-        b["start"] = round(cursor, 3)
-        b["end"] = round(b_end, 3)
-        cursor = b_end
-    if beats:
-        beats[-1]["end"] = round(total_duration, 3)  # guard against float drift on the last beat
 
 
 def _resolve_broll_file_url(candidate: Optional[dict], source: Optional[str]) -> Optional[str]:
@@ -9958,291 +9505,1036 @@ def _image_is_landscape(p: dict) -> bool:
 
 
 
+
+
+
+
 STYLE_PROFILES = {
   "anthropology": {
     "description": "Human societies, cultures, evolution, ethnography.",
     "footage_style": "Communities, ceremonies, artifacts, archaeological sites, cultural practices across regions/eras.",
     "animation_density": "low",
-    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third", "callout_textbox"],
-    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "biography": {
     "description": "A specific person's life story.",
     "footage_style": "Portraits, era-appropriate settings, places tied to the person's life.",
     "animation_density": "low",
-    "favored_animation_types": ["lower_third", "full_screen_quote_card", "ken_burns_pan_zoom"],
-    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "business": {
     "description": "Companies, corporate strategy, case studies, industry.",
     "footage_style": "Offices, meetings, product shots, people working, cities.",
     "animation_density": "high",
-    "favored_animation_types": ["stat_counter_overlay", "icon_sequence", "bullet_list_reveal", "full_screen_data_viz", "callout_textbox"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "economics": {
     "description": "Markets, macro/micro economics, trade, policy.",
     "footage_style": "Markets, factories, trade, currency, charts/screens.",
     "animation_density": "high",
-    "favored_animation_types": ["full_screen_data_viz", "stat_counter_overlay", "icon_sequence", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "entrepreneurship": {
     "description": "Startups, founders, building and scaling businesses.",
     "footage_style": "Startup offices, founders working, product launches, pitching.",
     "animation_density": "high",
-    "favored_animation_types": ["icon_pop_in", "stat_counter_overlay", "bullet_list_reveal", "callout_textbox"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "finance": {
     "description": "Personal finance, investing, markets, money management.",
     "footage_style": "Stock tickers, banks, currency, people managing money.",
     "animation_density": "high",
-    "favored_animation_types": ["stat_counter_overlay", "full_screen_data_viz", "icon_sequence", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [   
+     "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "health": {
     "description": "Medicine, wellness, fitness, nutrition.",
     "footage_style": "Clinical settings, exercise, food, doctors/patients, wellness scenes.",
     "animation_density": "medium",
-    "favored_animation_types": ["stat_counter_overlay", "icon_pop_in", "bullet_list_reveal", "full_screen_data_viz"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "knowledge": {
     "description": "General facts, trivia, 'did you know' style content spanning any subject.",
     "footage_style": "Broad real-world imagery matched directly to whichever fact is being discussed.",
     "animation_density": "medium",
-    "favored_animation_types": ["stat_counter_overlay", "icon_pop_in", "bullet_list_reveal", "callout_textbox"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [   
+     "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "law": {
     "description": "Legal systems, court cases, legislation.",
     "footage_style": "Courtrooms, legal documents, government/court buildings.",
     "animation_density": "medium",
-    "favored_animation_types": ["full_screen_document_highlight", "lower_third", "callout_textbox", "bullet_list_reveal"],
-    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "personal_development": {
     "description": "Habits, growth frameworks, productivity, self-improvement systems.",
     "footage_style": "Everyday life, people building routines, journaling, incremental progress.",
     "animation_density": "medium",
-    "favored_animation_types": ["bullet_list_reveal", "icon_pop_in", "callout_textbox", "stat_counter_overlay"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "philosophy": {
     "description": "Abstract ideas, ethics, philosophers, thought experiments.",
     "footage_style": "Contemplative real-world imagery, historical settings, symbolic everyday scenes.",
     "animation_density": "low",
-    "favored_animation_types": ["full_screen_quote_card", "lower_third", "ken_burns_pan_zoom"],
-    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation", "icon_sequence"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "politics": {
     "description": "Political systems, elections, government, policy.",
     "footage_style": "Government buildings, rallies, officials, maps.",
     "animation_density": "medium",
-    "favored_animation_types": ["lower_third", "full_screen_data_viz", "callout_textbox", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "psychology": {
     "description": "Mind, behavior, cognitive concepts, mental processes (behavioral framing).",
     "footage_style": "People and everyday behavior/interactions, relatable real-world scenes.",
     "animation_density": "medium",
-    "favored_animation_types": ["icon_pop_in", "callout_textbox", "bullet_list_reveal", "full_screen_data_viz"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "self_help": {
     "description": "Direct, prescriptive advice and how-to guidance for personal problems.",
     "footage_style": "Relatable everyday life, people applying advice/techniques.",
     "animation_density": "medium",
-    "favored_animation_types": ["bullet_list_reveal", "callout_textbox", "icon_pop_in"],
-    "avoided_animation_types": ["full_screen_data_viz", "mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "sociology": {
     "description": "Social structures, group behavior, societal trends.",
     "footage_style": "Communities, social settings, crowds, institutions.",
     "animation_density": "medium",
-    "favored_animation_types": ["full_screen_data_viz", "stat_counter_overlay", "lower_third", "callout_textbox"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "history": {
     "description": "Historical events and periods, any era.",
     "footage_style": "Archival-style or era-appropriate imagery, artifacts, maps, timelines — matched to whichever era the specific script covers.",
     "animation_density": "medium",
-    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third", "full_screen_data_viz"],
-    "avoided_animation_types": ["mascot_animation", "emoji_reaction"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "religion": {
     "description": "Religious traditions, theology, practices.",
     "footage_style": "Religious sites, symbols, ceremonies, texts.",
     "animation_density": "low",
-    "favored_animation_types": ["full_screen_quote_card", "ken_burns_pan_zoom", "lower_third"],
-    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation", "emoji_reaction"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "travel": {
     "description": "Destinations, travel guides, culture of places.",
     "footage_style": "Landmarks, landscapes, street scenes, local life.",
     "animation_density": "low",
-    "favored_animation_types": ["lower_third", "ken_burns_pan_zoom", "callout_textbox"],
-    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "geography": {
     "description": "Physical geography, countries, natural formations, maps.",
     "footage_style": "Landscapes, maps, satellite-style views, natural formations.",
     "animation_density": "medium",
-    "favored_animation_types": ["full_screen_data_viz", "lower_third", "arrow_highlight", "ken_burns_pan_zoom"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "astronomy": {
     "description": "Space, planets, cosmology.",
     "footage_style": "Space imagery, telescopes, night sky, planetary/scale visuals.",
     "animation_density": "high",
-    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "technology": {
     "description": "Tech products, engineering, innovation, computing.",
     "footage_style": "Devices, labs, close-ups of tech, digital interfaces.",
     "animation_density": "high",
-    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [   
+     "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "sports": {
     "description": "Sports history, athletes, competitions, stats.",
     "footage_style": "Sports action, athletes, stadiums, equipment.",
     "animation_density": "high",
-    "favored_animation_types": ["stat_counter_overlay", "lower_third", "full_screen_data_viz", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+],
   },
   "communication": {
     "description": "Language, media, rhetoric, interpersonal/mass communication.",
     "footage_style": "People talking, media/broadcast settings, writing, signals.",
     "animation_density": "medium",
-    "favored_animation_types": ["icon_pop_in", "callout_textbox", "bullet_list_reveal", "lower_third"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "science": {
     "description": "General science: physics, chemistry, biology, experimentation.",
     "footage_style": "Labs, experiments, natural phenomena, close-ups of mechanisms.",
     "animation_density": "high",
-    "favored_animation_types": ["full_screen_data_viz", "icon_sequence", "stat_counter_overlay", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "neuroscience": {
     "description": "Brain, nervous system, cognitive science (research/clinical framing).",
     "footage_style": "Brain/medical imagery, labs, research settings.",
     "animation_density": "high",
-    "favored_animation_types": ["full_screen_data_viz", "icon_pop_in", "stat_counter_overlay", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "film_theatre": {
     "description": "Film and theatre history, analysis, industry.",
     "footage_style": "Theatres, film sets, performances, era-appropriate cinema imagery.",
     "animation_density": "medium",
-    "favored_animation_types": ["full_screen_quote_card", "lower_third", "callout_textbox", "ken_burns_pan_zoom"],
-    "avoided_animation_types": ["stat_counter_overlay", "mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "social_science": {
     "description": "Social science research and theory (methodology/research framing).",
     "footage_style": "Research settings, communities, data-adjacent real-world imagery.",
     "animation_density": "medium",
-    "favored_animation_types": ["full_screen_data_viz", "callout_textbox", "lower_third", "bullet_list_reveal"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [   
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "criminology": {
     "description": "Study of crime, criminal behavior, and the justice system.",
     "footage_style": "Evidence-style imagery, courtrooms, investigation settings, documents.",
     "animation_density": "medium",
-    "favored_animation_types": ["full_screen_document_highlight", "lower_third", "callout_textbox", "arrow_highlight"],
-    "avoided_animation_types": ["mascot_animation", "emoji_reaction", "icon_sequence"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "cultural_studies": {
     "description": "Culture, identity, media/cultural analysis.",
     "footage_style": "Cultural settings, communities, symbols, everyday life across cultures.",
     "animation_density": "medium",
-    "favored_animation_types": ["lower_third", "callout_textbox", "full_screen_quote_card", "bullet_list_reveal"],
-    "avoided_animation_types": ["mascot_animation"],
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]
   },
   "general_documentary": {
     "description": "Fallback for scripts that don't clearly fit another category.",
     "footage_style": "Real-world footage matched directly to narration subjects.",
     "animation_density": "low",
-    "favored_animation_types": ["lower_third", "ken_burns_pan_zoom", "full_screen_quote_card"],
-    "avoided_animation_types": ["mascot_animation"],
-  },
+    "favored_animation_types": [    
+    "full_screen_title_card",
+    "full_screen_quote_card",
+    "full_screen_data_viz",
+    "full_screen_broll",
+    "full_screen_transition",
+    "full_screen_color_wash",
+    "full_screen_document_highlight",
+    "stat_counter_overlay",
+    "bullet_list_reveal",
+    "lower_third",
+    "kinetic_caption",
+    "callout_textbox",
+    "icon_sequence",
+    "icon_pop_in",
+    "logo_watermark",
+    "emoji_reaction",
+    "arrow_highlight",
+    "badge_sticker",
+    "pip_video",
+    "split_screen",
+    "multi_panel_grid",
+    "avatar_overlay",
+    "mascot_animation",
+    "ken_burns_pan_zoom",
+    "parallax_layering",
+    "shake_impact",
+    "speed_ramp_indicator"
+]  },
 }
 
 
-SCRIPT_SCENE_PROMPT = f"""
-You are Storybit's Scene Planner. Classify the entire documentary script once
-and divide its narration into canonical semantic scenes.
 
-RETURN JSON ONLY.
 
-CATEGORY: choose exactly one category from {list(STYLE_PROFILES.keys())}, using
-the entire script and the category descriptions below. If none clearly fits,
-choose general_documentary.
 
-Category reference (use this to judge fit, do not invent new categories):
-{ {k: v['description'] for k, v in STYLE_PROFILES.items()} }
-
-LANGUAGE: detect script_language from the actual narration as ISO 639-1.
-
-SCENE LENGTH — CRITICAL:
-Normal target = 260–280 spoken words, approximately 2 minutes at 130–140 WPM.
-This is a planning constraint, NOT actual playback timing.
-- Never exceed 280 words in a normal scene.
-- Prefer 260–280 words.
-- Below 260 is allowed only for a genuinely short script, the final/remainder
-  scene, or a strong semantic boundary where merging would damage coherence.
-- Rebalance nearby boundaries when a remainder below 260 can be avoided without
-  exceeding 280.
-- Do not split mechanically at 260; semantic coherence wins within the hard
-  280-word maximum.
-
-SOURCE INTEGRITY:
-Use 0-based character offsets with exclusive end:
-original_script[char_start:char_end] == vo_text.
-Every scene must be contiguous, ordered, non-overlapping, and together cover
-the complete original narration. Never paraphrase, translate, normalize,
-reorder, drop, or duplicate narration.
-
-VISUAL FIELDS:
-visual_intent = concise grounded documentary direction: name the concrete
-subjects/locations/eras this scene should show, not a mood word. Prefer
-real-world imagery matching the category's footage_style over abstract or
-stock-generic phrasing.
-on_screen_text = short viewer-facing text grounded in source, or "".
-animation_preference = avoid | optional | strong. It is NOT a veto — it is
-input to the Animation Director's own judgment. Use "strong" when the scene
-has a named statistic, a direct quote, a defined list, or a clear thematic
-turn that deserves emphasis; "avoid" only when animation would genuinely
-distract (e.g. a raw emotional beat that should breathe); "optional"
-otherwise.
-scene_animation_density = low | medium | high.
-broll_keywords = 5–6 distinct English retrieval seed phrases, 2–6 words each,
-each targeting a different concrete visual angle on this scene (not 5
-rewordings of the same shot).
-estimated_duration_seconds is advisory only.
-
-OUTPUT:
-{{
-  "category": "business",
-  "script_language": "en",
-  "scenes": [{{
-    "scene_id": "s1",
-    "source_range": {{"char_start": 0, "char_end": 812,
-                     "word_start": 0, "word_end": 145}},
-    "vo_text": "Exact contiguous source substring.",
-    "visual_intent": "Grounded documentary visual direction.",
-    "on_screen_text": "",
-    "animation_preference": "optional",
-    "scene_animation_density": "medium",
-    "estimated_duration_seconds": 120,
-    "broll_keywords": ["specific subject", "relevant location",
-                       "related activity", "contextual view", "detail view"]
-  }}]
-}}
-"""
 
 
 BEAT_KEYWORDS_PROMPT = """
@@ -11065,11 +11357,11 @@ class EditVideo(BaseModel):
     userId: str
     script: str
     voice: str
-    langCode: str  # FIX: no default — required. Was defaulting to "en",
-    # which silently ran English-pipeline behavior (no translation-skip
-    # check, no forced-language transcription, no caption romanization)
-    # on any request that simply forgot to pass it — including
-    # non-English requests, with no error to signal the mistake.
+    langCode: str  # Required — but the only accepted value is "en" now.
+    # Non-English support (translation, Sarvam TTS, proportional/silence-
+    # detection timing) has been removed entirely; see chat. Kept as a
+    # required field rather than dropped, so existing callers that pass
+    # langCode="en" don't break — validated in the handler below.
     durationMinutes: int = 0
     volume: Optional[float] = None
     loudness_normalization: Optional[bool] = None
@@ -11368,155 +11660,12 @@ async def _upload_audio_to_storage(local_path: str, user_id: str) -> str:
     return supabase.storage.from_(TTS_AUDIO_BUCKET).get_public_url(storage_path)
 
 
-# ---------------------------------------------------------------------------
-# Indian languages -> Sarvam (Bulbul). Everything else -> generate_speech
-# (Fish Audio), unchanged.
-# ---------------------------------------------------------------------------
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
-SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
-SARVAM_DEFAULT_SPEAKER = os.getenv("SARVAM_DEFAULT_SPEAKER", "shubh")
-SARVAM_TTS_PACE = float(os.getenv("SARVAM_TTS_PACE", "1.0"))
-SARVAM_TTS_MAX_CHARS = int(os.getenv("SARVAM_TTS_MAX_CHARS", "2500"))
-
-# app langCode -> Sarvam BCP-47 code
-_SARVAM_LANG_MAP = {
-    "hi": "hi-IN", "bn": "bn-IN", "ta": "ta-IN", "te": "te-IN", "kn": "kn-IN",
-    "ml": "ml-IN", "mr": "mr-IN", "gu": "gu-IN", "pa": "pa-IN",
-    "or": "od-IN", "od": "od-IN",
-}
-
-
-def _is_sarvam_language(lang_code: str) -> bool:
-    return (lang_code or "").strip().lower() in _SARVAM_LANG_MAP
-
-
-def _split_text_for_sarvam(text: str, max_chars: int = SARVAM_TTS_MAX_CHARS) -> list[str]:
-    """Same idea as _split_text_for_tts, but also splits on the Devanagari
-    danda (।, ॥), so Indian-language text breaks at real sentence ends
-    instead of being cut mid-word."""
-    text = (text or "").strip()
-    if not text:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-
-    sentences = re.split(r'(?<=[.!?।॥])\s+', text)
-    chunks: list[str] = []
-    current = ""
-    for sent in sentences:
-        sent = sent.strip()
-        if not sent:
-            continue
-        candidate = f"{current} {sent}".strip() if current else sent
-        if len(candidate) <= max_chars:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-            current = ""
-        if len(sent) <= max_chars:
-            current = sent
-        else:
-            for i in range(0, len(sent), max_chars):
-                chunks.append(sent[i:i + max_chars])
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-async def _sarvam_tts_chunk(client: httpx.AsyncClient, text: str, sarvam_lang: str, speaker: str) -> bytes:
-    payload = {
-        "text": text,
-        "target_language_code": sarvam_lang,
-        "speaker": speaker,
-        "model": SARVAM_TTS_MODEL,
-        "pace": SARVAM_TTS_PACE,
-    }
-    headers = {"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"}
-
-    last_err: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            resp = await client.post(SARVAM_TTS_URL, headers=headers, json=payload)
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_err = RuntimeError(f"Sarvam TTS {resp.status_code}: {resp.text[:300]}")
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
-            if resp.status_code != 200:
-                raise RuntimeError(f"Sarvam TTS {resp.status_code}: {resp.text[:300]}")
-            audios = resp.json().get("audios") or []
-            if not audios:
-                raise RuntimeError("Sarvam TTS returned no audio")
-            return base64.b64decode("".join(audios))
-        except (httpx.TimeoutException, httpx.TransportError) as e:
-            last_err = e
-            await asyncio.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"Sarvam TTS failed after retries: {last_err}")
-
-
-async def _generate_speech_sarvam(user_id: str, text: str, voice: str, lang_code: str) -> dict:
-    if not SARVAM_API_KEY:
-        raise RuntimeError("SARVAM_API_KEY is not configured on the server.")
-
-    sarvam_lang = _SARVAM_LANG_MAP[lang_code.strip().lower()]
-    # Sarvam speakers are plain lowercase names ("shubh", "anushka"). If the
-    # request carries something else (e.g. a Fish voice id), use the default.
-    speaker = voice.strip().lower() if voice and re.fullmatch(r"[a-z_]+", voice.strip().lower()) else SARVAM_DEFAULT_SPEAKER
-
-    chunks = _split_text_for_sarvam(text)
-    if not chunks:
-        raise RuntimeError("No text to synthesize")
-
-    print(f"[tts-sarvam] {len(text)} chars, lang={sarvam_lang}, speaker={speaker}, {len(chunks)} call(s)")
-
-    work_dir = tempfile.mkdtemp(prefix="sarvam_tts_")
-    try:
-        chunk_paths = []
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            for idx, chunk_text in enumerate(chunks):
-                audio_bytes = await _sarvam_tts_chunk(client, chunk_text, sarvam_lang, speaker)
-                p = os.path.join(work_dir, f"chunk_{idx:03d}.wav")
-                with open(p, "wb") as f:
-                    f.write(audio_bytes)
-                chunk_paths.append(p)
-
-        list_path = os.path.join(work_dir, "concat_list.txt")
-        with open(list_path, "w") as f:
-            for p in chunk_paths:
-                f.write(f"file '{p}'\n")
-
-        # Always go through ffmpeg: Sarvam returns WAV by default, but the rest
-        # of the pipeline (mutagen MP3, silencedetect, storage) expects an MP3.
-        combined_path = os.path.join(work_dir, "combined.mp3")
-        await _run([
-            FFMPEG_BIN, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-            "-c:a", "libmp3lame", "-b:a", "192k", combined_path,
-        ])
-
-        return {"url": await _upload_audio_to_storage(combined_path, user_id)}
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-
 async def _generate_speech_possibly_chunked(
     user_id: str, tagged_text: str, voice: str, lang_code: str,
     volume: Optional[float] = None,
     loudness_normalization: Optional[bool] = None,
     text_normalization: Optional[bool] = None,
 ) -> dict:
-    # FIX (Sarvam integration): this function previously always called
-    # generate_speech (Fish Audio) regardless of language — Sarvam was
-    # defined but never actually wired in anywhere, so no request could
-    # ever reach it. Indian languages now route here first; everything
-    # else falls through to the unchanged Fish Audio path below. Sarvam
-    # does its own internal chunking (_split_text_for_sarvam) and
-    # concatenation, so it doesn't need the chunk/concat logic below —
-    # that's Fish-specific (working around that provider's own
-    # truncation behavior).
-    if _is_sarvam_language(lang_code):
-        return await _generate_speech_sarvam(user_id, tagged_text, voice, lang_code)
-
     tts_kwargs = {}
     if volume is not None:
         tts_kwargs["volume"] = volume
@@ -12712,9 +12861,7 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
     }
     scene_out["_previous_scene_last_animation"] = previous_animation_in
 
-    async def _finalize(
-        timed_words: list, total_duration_sec: Optional[float] = None, silence_gaps: Optional[list] = None,
-    ) -> dict:
+    async def _finalize(timed_words: list) -> dict:
         beats = await _run_beat_director(
             scene_vo_text=vo_text, category=category, style_profile=style_profile, script_language=script_language,
             scene_id=scene_id, scene_visual_intent=scene.get("visual_intent", ""),
@@ -12725,49 +12872,14 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
 
         if timed_words:
             _align_beats_to_timed_words(beats, timed_words)
-        elif total_duration_sec is not None:
-            # Non-English path (always, now — WhisperX is not used at all
-            # for non-English audio again, see module note above
-            # _translate_scene_to_segment_words): split the scene's real
-            # audio duration across BEATS proportional to each beat's own
-            # word count, for B-ROLL/media purposes only. Captions no
-            # longer depend on beat timing at all — see below.
-            _assign_beat_times_proportional(beats, total_duration_sec)
         else:
             for b in beats:
                 b["start"], b["end"] = None, None
 
-        # Caption source. English audio (request.langCode == "en"):
-        # WhisperX's own word_segments (timed_words) ARE the real, word-
-        # accurate English captions already — used directly, untouched.
-        # Every other language: captions are now built independently of
-        # BEAT timing entirely. Real speech segments (pure silence-
-        # detection, zero content recognition) are computed across the
-        # WHOLE scene, and one LLM call translates the scene's real
-        # vo_text and decides how to distribute it across those segments
-        # itself. See _translate_scene_to_segment_words / _build_
-        # english_caption_words_from_segments and the module note above
-        # them. No fallback: if the call failed for this scene, captions
-        # are simply empty rather than falling back to a less accurate
-        # method.
-        if (request.langCode or "").strip().lower() == "en":
-            scene_out["caption_word_segments_en"] = timed_words
-        elif total_duration_sec is not None:
-            segments = _speech_segments_within(silence_gaps or [], 0.0, total_duration_sec)
-            if segments:
-                segment_durations = [e - s for s, e in segments]
-                english_texts = await _translate_scene_to_segment_words(
-                    vo_text, segment_durations, str(scene_id), lang_code=request.langCode,
-                )
-                scene_out["caption_word_segments_en"] = (
-                    _build_english_caption_words_from_segments(segments, english_texts)
-                    if any(english_texts) else []
-                )
-            else:
-                print(f"[edit-video] scene {scene_id}: no real speech segments detected — this scene will have no captions")
-                scene_out["caption_word_segments_en"] = []
-        else:
-            scene_out["caption_word_segments_en"] = []
+        # Captions: WhisperX's own word_segments (timed_words) ARE the
+        # real, word-accurate captions — used directly. English-only
+        # now, so no translation step and no per-language branching.
+        scene_out["caption_word_segments_en"] = timed_words
 
         fallback_keywords = _get_scene_broll_keywords(scene)
         await _fetch_beats_media(beats, str(scene_id))
@@ -12824,14 +12936,7 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         return await _finalize([])
 
     try:
-        # Indian languages go to Sarvam, which has no use for Fish-style
-        # voice tags (it would read them aloud) — send the plain vo_text.
-        # Every other language still goes through tagging + Fish as before.
-        tagged_text = (
-            vo_text
-            if _is_sarvam_language(request.langCode)
-            else await _get_or_create_tagged_text(scene, scene_id, request.userId, vo_text)
-        )
+        tagged_text = await _get_or_create_tagged_text(scene, scene_id, request.userId, vo_text)
     except Exception as e:
         print(f"[edit-video] scene {scene_id} tagging failed: {e}")
         scene_out["tagged_vo_text"] = None
@@ -12858,103 +12963,47 @@ async def _process_scene(scene: dict, request: EditVideo, category: str, script_
         scene_out["error"] = f"voice generation failed: {e}"
         return await _finalize([])
 
-    is_english = (request.langCode or "").strip().lower() == "en"
-
-    if is_english:
-        # English audio: real WhisperX word-level transcription/alignment,
-        # unchanged from before.
-        try:
-            scene_timestamps = await _generate_word_timestamps(speech_result["url"], lang_code=request.langCode)
-        except Exception as e:
-            print(f"[edit-video] scene {scene_id} whisperx alignment failed: {e}")
-            scene_out["tagged_vo_text"] = tagged_text
-            scene_out["voiceover"] = speech_result
-            scene_out["start"] = None
-            scene_out["end"] = None
-            scene_out["word_segments"] = []
-            scene_out["error"] = f"timestamp alignment failed: {e}"
-            return await _finalize([])
-
-        word_segments = scene_timestamps.get("word_segments", [])
-        timed_words = [w for w in word_segments if "start" in w and "end" in w]
-
-        if is_first_scene and timed_words and timed_words[0].get("start", 0.0) > 0.0:
-            print(
-                f"[edit-video] scene {scene_id}: clamping first word start "
-                f"{timed_words[0]['start']:.3f}s -> 0.0s so no leading audio is trimmed"
-            )
-            first_word_obj = timed_words[0]
-            for w in word_segments:
-                if w is first_word_obj:
-                    w["start"] = 0.0
-                    break
-            timed_words[0]["start"] = 0.0
-
+    # Non-English support has been removed entirely — only English audio
+    # is processed by /edit-video now. See chat: Sarvam, all translation/
+    # caption-building for non-English, and the proportional/silence-
+    # detection timing fallback that only existed to serve non-English
+    # scenes have all been removed as dead code alongside this branch.
+    try:
+        scene_timestamps = await _generate_word_timestamps(speech_result["url"], lang_code=request.langCode)
+    except Exception as e:
+        print(f"[edit-video] scene {scene_id} whisperx alignment failed: {e}")
         scene_out["tagged_vo_text"] = tagged_text
         scene_out["voiceover"] = speech_result
-        scene_out["start"] = timed_words[0]["start"] if timed_words else None
-        scene_out["end"] = timed_words[-1]["end"] if timed_words else None
-        scene_out["word_segments"] = word_segments
-        scene_out["error"] = None
-
-        return await _finalize(timed_words)
-
-    else:
-        # Non-English audio: NO WhisperX at all — neither for content nor
-        # for timing. A text-only LLM call (which is what "LLM for sync"
-        # refers to — _translate_scene_to_segment_words, which now drives
-        # captions) has no audio-perception capability, so it can never
-        # itself know exactly when a word is spoken; that was never on
-        # the table as a literal replacement for WhisperX's real
-        # transcription. What IS available without any transcription
-        # risk: real total duration (mutagen, reads the file header, no
-        # ML) and real pause locations (ffmpeg silencedetect, amplitude
-        # only, no content recognition of any kind) — combined with
-        # _assign_beat_times_proportional (real duration split by each
-        # beat's word-count share of the real, known-correct vo_text),
-        # for BEAT/B-roll timing only.
-        #
-        # Honest tradeoff, stated plainly: this removes ALL sub-beat/
-        # word-level precision for ANIMATIONS (they anchor to their full
-        # beat window only, never a specific phrase within it — see the
-        # build_timeline_from_scenes beat-clamp fix, which now applies to
-        # every non-English animation, not just the ones that fell
-        # through to it before). CAPTIONS are unaffected either way —
-        # they're built from real vo_text and real silence-detected
-        # segments via _translate_scene_to_segment_words, never from
-        # WhisperX, and were never anchored to beat timing at all (see
-        # _finalize).
-        try:
-            audio_bytes = await _download_bytes(speech_result["url"])
-            total_duration = _get_mp3_duration_seconds(audio_bytes)
-        except Exception as e:
-            print(f"[edit-video] scene {scene_id} failed to read audio duration: {e}")
-            scene_out["tagged_vo_text"] = tagged_text
-            scene_out["voiceover"] = speech_result
-            scene_out["start"] = None
-            scene_out["end"] = None
-            scene_out["word_segments"] = []
-            scene_out["error"] = f"audio duration read failed: {e}"
-            return await _finalize([])
-
-        try:
-            silence_gaps = await _detect_silence_gaps_seconds(audio_bytes)
-        except Exception as e:
-            print(f"[edit-video] scene {scene_id} silence detection failed: {e} — captions will use even pacing")
-            silence_gaps = []
-
-        scene_out["tagged_vo_text"] = tagged_text
-        scene_out["voiceover"] = speech_result
-        scene_out["start"] = 0.0
-        scene_out["end"] = round(total_duration, 3)
-        # No transcription runs for this scene at all — nothing to
-        # populate here. Anything downstream that re-slices a scene by
-        # time range has no ground-truth words to work from for non-
-        # English scenes. Flagged here, not silently hidden.
+        scene_out["start"] = None
+        scene_out["end"] = None
         scene_out["word_segments"] = []
-        scene_out["error"] = None
+        scene_out["error"] = f"timestamp alignment failed: {e}"
+        return await _finalize([])
 
-        return await _finalize([], total_duration_sec=total_duration, silence_gaps=silence_gaps)
+    word_segments = scene_timestamps.get("word_segments", [])
+    timed_words = [w for w in word_segments if "start" in w and "end" in w]
+
+    if is_first_scene and timed_words and timed_words[0].get("start", 0.0) > 0.0:
+        print(
+            f"[edit-video] scene {scene_id}: clamping first word start "
+            f"{timed_words[0]['start']:.3f}s -> 0.0s so no leading audio is trimmed"
+        )
+        first_word_obj = timed_words[0]
+        for w in word_segments:
+            if w is first_word_obj:
+                w["start"] = 0.0
+                break
+        timed_words[0]["start"] = 0.0
+
+    scene_out["tagged_vo_text"] = tagged_text
+    scene_out["voiceover"] = speech_result
+    scene_out["start"] = timed_words[0]["start"] if timed_words else None
+    scene_out["end"] = timed_words[-1]["end"] if timed_words else None
+    scene_out["word_segments"] = word_segments
+    scene_out["error"] = None
+
+    return await _finalize(timed_words)
+
 
 
 
@@ -13163,13 +13212,8 @@ def build_timeline_from_scenes(scenes: list, fps: int = TIMELINE_FPS) -> dict:
                 "scene_start_sec": start_sec, "scene_end_sec": end_sec,
             })
 
-        # FIX (no captions in non-English output): this was hardcoded to
-        # scene.get("word_segments"), which is now deliberately [] for
-        # non-English scenes (no WhisperX transcription runs on that audio
-        # anymore — see _assign_beat_times_proportional). caption_word_
-        # segments_en is populated for BOTH English (real WhisperX words)
-        # and non-English (beat-interpolated English translation) scenes in
-        # _process_scene — this just wasn't wired to read it before now.
+        # caption_word_segments_en holds the real, word-accurate WhisperX
+        # captions for this scene (English-only pipeline — see chat).
         word_segments = scene.get("caption_word_segments_en") or []
         timed_words_sec = [w for w in word_segments if "start" in w and "end" in w]
         words = []
@@ -13644,14 +13688,26 @@ def _split_oversized_scene(scene: dict, original_script: str) -> list:
 
 @app.post("/edit-video")
 async def edit_video(request: EditVideo):
-    # FIX: langCode is now required at the schema level (see EditVideo
-    # above), but Pydantic's `str` type still accepts "" as technically
-    # present — reject that explicitly too, since an empty string would
-    # otherwise silently fall through every langCode-gated fix in this
-    # pipeline (translation-skip, forced-language transcription, caption
-    # romanization) exactly like a missing field would.
+    # langCode is required at the schema level (see EditVideo above), but
+    # Pydantic's `str` type still accepts "" as technically present —
+    # reject that explicitly too.
     if not request.langCode or not request.langCode.strip():
         raise HTTPException(status_code=422, detail="langCode is required and cannot be empty")
+
+    # FIX (non-English support removed entirely): translation, Sarvam
+    # TTS, and all non-English caption/timing machinery have been removed
+    # from this pipeline — see chat. Reject anything other than English
+    # explicitly and loudly rather than silently mishandling it (e.g.
+    # sending non-English text through the English-only WhisperX path,
+    # which would produce garbage captions with no error raised).
+    if request.langCode.strip().lower() != "en":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"langCode '{request.langCode}' is not supported — /edit-video only "
+                f"processes English ('en') audio now. Non-English support has been removed."
+            ),
+        )
 
     try:
         res = await _openai_create_with_timeout(
@@ -14957,6 +15013,33 @@ def _display_text_to_string(display_text: Any) -> str:
     if isinstance(display_text, str):
         return display_text
     return ""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
