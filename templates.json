@@ -1,0 +1,2613 @@
+{
+  "Title Card": {
+    "pickWhen": "Opening the video or a new section; narration introduces a named topic.",
+    "props_schema": {
+      "type": "object",
+      "title": "Title Card",
+      "properties": {
+        "kicker": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 20,
+          "description": "Small accent-coloured label above the title — Label above the title, e.g. \"Chapter 2\". — 1-3 words, max 1 line(s)",
+          "examples": [
+            "Chapter 2"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 44,
+          "description": "The title — The main title. — 1-8 words, max 2 line(s)"
+        },
+        "subtitle": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 60,
+          "description": "Supporting line under the title — One supporting line. — 2-10 words, max 2 line(s)",
+          "examples": [
+            "The story of India's digital payment boom"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        },
+        "align": {
+          "type": "string",
+          "enum": [
+            "left",
+            "center"
+          ],
+          "default": "left",
+          "description": "Horizontal alignment of all text"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "kicker": "Chapter 2",
+      "title": "How UPI changed India",
+      "subtitle": "The story of India's digital payment boom",
+      "background": "theme",
+      "align": "left",
+      "animations": {
+        "title": "rise",
+        "subtitle": "fade_up"
+      },
+      "cue_times": [
+        0.2,
+        0.6,
+        1.8
+      ]
+    }
+  },
+  "Title + Metadata": {
+    "pickWhen": "Introducing an event, place, person or organisation together with 2–4 key facts (date, place, category, source).",
+    "props_schema": {
+      "type": "object",
+      "title": "Title + Metadata",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 44,
+          "description": "The title — The main title. — 1-8 words, max 2 line(s)"
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "meta": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 20,
+                "description": "Chip text — A fact: date, place, category, source. — 1-4 words, max 1 line(s)"
+              },
+              "icon": {
+                "type": "string",
+                "description": "Lucide icon name for this item (fallback: circle)"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "label"
+            ]
+          },
+          "minItems": 2,
+          "maxItems": 4,
+          "description": "Row of fact chips under the title",
+          "title": "Chip"
+        },
+        "layout": {
+          "type": "string",
+          "enum": [
+            "row",
+            "stacked"
+          ],
+          "default": "row",
+          "description": "Chips side by side or one per line"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        },
+        "align": {
+          "type": "string",
+          "enum": [
+            "left",
+            "center"
+          ],
+          "default": "left",
+          "description": "Horizontal alignment"
+        }
+      },
+      "required": [
+        "title",
+        "meta"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "Chandrayaan-3 lands on the Moon",
+      "meta": [
+        {
+          "icon": "calendar",
+          "label": "23 August 2023"
+        },
+        {
+          "icon": "map-pin",
+          "label": "Lunar south pole"
+        },
+        {
+          "icon": "rocket",
+          "label": "Space mission"
+        }
+      ],
+      "layout": "row",
+      "background": "theme",
+      "align": "left",
+      "cue_times": [
+        0.2,
+        1.6,
+        2.5,
+        3.4
+      ]
+    }
+  },
+  "Big Number": {
+    "pickWhen": "Narration states one striking figure: \"₹4,200 crore\", \"73% of Indians\", \"3 million users\".",
+    "props_schema": {
+      "type": "object",
+      "title": "Big Number",
+      "properties": {
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3,
+          "description": "Symbol before the number — Currency or symbol before the number: ₹, $, ~. — 1-1 words, max 1 line(s)",
+          "examples": [
+            "₹"
+          ]
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10,
+          "description": "Unit after the number — After the number: %, km, users, per day. — 1-2 words, max 1 line(s)",
+          "examples": [
+            "%"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 40,
+          "description": "Label under the number — What the number is: \"spent on ads in 2025\". — 1-8 words, max 2 line(s)",
+          "examples": [
+            "spent on digital ads in 2025"
+          ]
+        },
+        "context": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 90,
+          "description": "Supporting line under the label — One line that makes the number meaningful. — 2-16 words, max 2 line(s)",
+          "examples": [
+            "More than TV and print combined for the first time"
+          ]
+        },
+        "change_label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 20,
+          "description": "Text after the change value — What the change is measured against: \"vs 2024\". — 1-4 words, max 1 line(s)",
+          "examples": [
+            "vs 2024"
+          ]
+        },
+        "value": {
+          "type": "number",
+          "description": "The big number (formatted by the template) — Raw value, e.g. 42000000000 for ₹4,200 crore, 73 for 73%.",
+          "examples": [
+            42000000000
+          ]
+        },
+        "change": {
+          "type": "number",
+          "description": "Change indicator under the label (arrow + value) — Percent points when change_type = percent (12.4 = +12.4%), otherwise same unit as value. Negative = down.",
+          "examples": [
+            12.4
+          ]
+        },
+        "count_from": {
+          "type": "number",
+          "description": "Where the count-up starts (default 0)",
+          "examples": [
+            0
+          ]
+        },
+        "icon": {
+          "type": "string",
+          "description": "Icon above the number (fallback: none (no icon shown))",
+          "examples": [
+            "trending-up"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "indian_compact",
+            "international_compact"
+          ],
+          "default": "indian_compact",
+          "description": "How numbers are displayed: plain = raw digits, indian_compact = ₹1.2 Cr / 45 L style grouping, international_compact = 1.2M / 45K style grouping."
+        },
+        "decimals": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "0",
+            "1",
+            "2"
+          ],
+          "default": "auto",
+          "description": "Decimal places shown"
+        },
+        "change_type": {
+          "type": "string",
+          "enum": [
+            "percent",
+            "absolute"
+          ],
+          "default": "percent",
+          "description": "How change is shown: +12.4% or +₹1.2 Cr"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "up",
+            "down",
+            "flat"
+          ],
+          "default": "auto",
+          "description": "Arrow direction (auto = from the sign of change)"
+        },
+        "good_direction": {
+          "type": "string",
+          "enum": [
+            "up",
+            "down"
+          ],
+          "default": "up",
+          "description": "Which direction is shown green (e.g. down for prices or deaths)"
+        },
+        "align": {
+          "type": "string",
+          "enum": [
+            "center",
+            "left"
+          ],
+          "default": "center",
+          "description": "Horizontal alignment"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "label",
+        "value"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "prefix": "₹",
+      "value": 42000000000,
+      "label": "spent on digital ads in 2025",
+      "context": "More than TV and print combined for the first time",
+      "change": 18.5,
+      "change_label": "vs 2024",
+      "icon": "megaphone",
+      "format": "indian_compact",
+      "align": "center",
+      "background": "theme",
+      "animations": {
+        "value": "count_up_pop"
+      },
+      "cue_times": [
+        0.1,
+        1.0,
+        1.9,
+        2.8
+      ]
+    }
+  },
+  "Number Comparison": {
+    "pickWhen": "Two figures are compared, or the same metric before and after: \"from ₹12 lakh to ₹45 lakh\", \"India 7% vs China 5%\".",
+    "props_schema": {
+      "type": "object",
+      "title": "Number Comparison",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 40,
+          "description": "Heading above the comparison — What is being compared: \"Average salary, 2015 vs 2025\". — 1-8 words, max 1 line(s)",
+          "examples": [
+            "Average IT salary"
+          ]
+        },
+        "label_a": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 25,
+          "description": "Label under value A — What value A is: \"2015\", \"India\", \"Before\". — 1-4 words, max 2 line(s)",
+          "examples": [
+            "2015"
+          ]
+        },
+        "label_b": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 25,
+          "description": "Label under value B — What value B is. — 1-4 words, max 2 line(s)",
+          "examples": [
+            "2025"
+          ]
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3,
+          "description": "Symbol before both numbers — Currency or symbol for both values: ₹, $. — 1-1 words, max 1 line(s)",
+          "examples": [
+            "₹"
+          ]
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10,
+          "description": "Unit after both numbers — Unit for both values: %, km, per year. — 1-2 words, max 1 line(s)",
+          "examples": [
+            "/yr"
+          ]
+        },
+        "change_label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 20,
+          "description": "Text after the difference — Words after the difference: \"in ten years\", \"higher\". — 1-4 words, max 1 line(s)",
+          "examples": [
+            "in ten years"
+          ]
+        },
+        "context": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 90,
+          "description": "Supporting line at the bottom — One line explaining why the difference matters. — 2-16 words, max 2 line(s)",
+          "examples": [
+            "Salaries grew almost four times faster than rent"
+          ]
+        },
+        "value_a": {
+          "type": "number",
+          "description": "First (left / before) number — Raw value, e.g. 1200000.",
+          "examples": [
+            1200000
+          ]
+        },
+        "value_b": {
+          "type": "number",
+          "description": "Second (right / after) number — Raw value, same unit as value A.",
+          "examples": [
+            4500000
+          ]
+        },
+        "icon_a": {
+          "type": "string",
+          "description": "Icon above value A (fallback: none (no icon))",
+          "examples": [
+            "calendar"
+          ]
+        },
+        "icon_b": {
+          "type": "string",
+          "description": "Icon above value B (fallback: none (no icon))",
+          "examples": [
+            "calendar"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "layout": {
+          "type": "string",
+          "enum": [
+            "side_by_side",
+            "before_after",
+            "bars"
+          ],
+          "default": "side_by_side",
+          "description": "side_by_side: two cards with VS · before_after: A → B with an arrow · bars: two bars sized by value (positive values only)"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "indian_compact",
+            "international_compact"
+          ],
+          "default": "indian_compact",
+          "description": "How numbers are displayed: plain = raw digits, indian_compact = ₹1.2 Cr / 45 L style grouping, international_compact = 1.2M / 45K style grouping."
+        },
+        "decimals": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "0",
+            "1",
+            "2"
+          ],
+          "default": "auto",
+          "description": "Decimal places shown"
+        },
+        "show_change": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "percent",
+            "multiple",
+            "absolute",
+            "none"
+          ],
+          "default": "auto",
+          "description": "How B differs from A: +275% · 3.8× · +₹33 L · hidden (auto picks percent, or multiple for big jumps)"
+        },
+        "good_direction": {
+          "type": "string",
+          "enum": [
+            "up",
+            "down"
+          ],
+          "default": "up",
+          "description": "Which direction is shown green (down for prices, deaths, pollution)"
+        },
+        "highlight": {
+          "type": "string",
+          "enum": [
+            "none",
+            "a",
+            "b",
+            "higher",
+            "lower"
+          ],
+          "default": "none",
+          "description": "Which value is drawn in the accent colour"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "label_a",
+        "label_b",
+        "value_a",
+        "value_b"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "Average IT salary",
+      "prefix": "₹",
+      "value_a": 1200000,
+      "label_a": "2015",
+      "value_b": 4500000,
+      "label_b": "2025",
+      "change_label": "in ten years",
+      "context": "Salaries grew almost four times faster than rent",
+      "layout": "before_after",
+      "format": "indian_compact",
+      "highlight": "b",
+      "background": "theme",
+      "cue_times": [
+        0.1,
+        0.8,
+        2.0,
+        3.0,
+        3.8
+      ]
+    }
+  },
+  "Quote Card": {
+    "pickWhen": "Narration quotes a real person, speech, document or report word for word.",
+    "props_schema": {
+      "type": "object",
+      "title": "Quote Card",
+      "properties": {
+        "quote": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 160,
+          "description": "The quotation — Verbatim words only, no quotation marks (the template adds them). Trim with \"…\" if needed. — 3-30 words, max 4 line(s)",
+          "examples": [
+            "At the stroke of the midnight hour, when the world sleeps, India will awake to life and freedom."
+          ]
+        },
+        "speaker": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 30,
+          "description": "Speaker name — Full name of the person quoted. — 1-5 words, max 1 line(s)",
+          "examples": [
+            "Jawaharlal Nehru"
+          ]
+        },
+        "role": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "description": "Line under the speaker name — Who they are, at the time of the quote. — 1-7 words, max 1 line(s)",
+          "examples": [
+            "First Prime Minister of India"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 40,
+          "description": "Small source line — Where and when it was said: speech, interview, book, date. — 1-7 words, max 1 line(s)",
+          "examples": [
+            "Tryst with Destiny speech, 1947"
+          ]
+        },
+        "highlight": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 60,
+          "description": "Words of the quote drawn in the accent colour — Exact words from the quote to draw in the accent colour. — 1-10 words, max 1 line(s)",
+          "examples": [
+            "India will awake to life and freedom"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "portrait_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Photo of the speaker (portrait_left / portrait_right layouts)"
+        },
+        "layout": {
+          "type": "string",
+          "enum": [
+            "centered",
+            "portrait_left",
+            "portrait_right"
+          ],
+          "default": "centered",
+          "description": "Quote alone, or beside a portrait (portrait layouts need portrait_url; without it the card is centred)"
+        },
+        "align": {
+          "type": "string",
+          "enum": [
+            "center",
+            "left"
+          ],
+          "default": "center",
+          "description": "Text alignment in the centred layout (portrait layouts are left-aligned)"
+        },
+        "quote_mark": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "default": "on",
+          "description": "Large accent quote mark above the quote"
+        },
+        "portrait_shape": {
+          "type": "string",
+          "enum": [
+            "circle",
+            "rounded"
+          ],
+          "default": "circle",
+          "description": "Shape of the portrait"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "quote",
+        "speaker"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "quote": "At the stroke of the midnight hour, when the world sleeps, India will awake to life and freedom.",
+      "speaker": "Jawaharlal Nehru",
+      "role": "First Prime Minister of India",
+      "source": "Tryst with Destiny speech, 1947",
+      "highlight": "India will awake to life and freedom",
+      "layout": "centered",
+      "align": "center",
+      "background": "theme",
+      "animations": {
+        "quote": "word_fade"
+      },
+      "cue_times": [
+        0.2,
+        4.2
+      ]
+    },
+    "validation_notes": [
+      {
+        "field": "highlight",
+        "level": "warning",
+        "message": "Highlight phrase is not in the quote — nothing is highlighted",
+        "rule": "Fails when `highlight` is set but its words don't appear in `quote`."
+      },
+      {
+        "field": "quote",
+        "level": "warning",
+        "message": "Leave out quotation marks — the template adds its own",
+        "rule": "Fails when `quote` (trimmed) starts or ends with a quotation-mark character."
+      }
+    ]
+  },
+  "Key Statement": {
+    "pickWhen": "A thesis, warning, takeaway or \"here's the thing\" moment the viewer must remember.",
+    "props_schema": {
+      "type": "object",
+      "title": "Key Statement",
+      "properties": {
+        "statement": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 80,
+          "description": "The big statement — One clear sentence, no more than 14 words. — 2-14 words, max 3 line(s)",
+          "examples": [
+            "Your salary is not your wealth."
+          ]
+        },
+        "highlight": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "description": "Words of the statement that get the emphasis — Exact words from the statement to emphasise. — 1-6 words, max 1 line(s)",
+          "examples": [
+            "not your wealth"
+          ]
+        },
+        "explanation": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 140,
+          "description": "Supporting line under the statement — One or two short sentences that explain the statement. — 3-24 words, max 3 line(s)",
+          "examples": [
+            "What you keep and invest decides how rich you become."
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 20,
+          "description": "Pill above the statement — Small tag above: \"Key takeaway\", \"Warning\", \"Remember\". — 1-3 words, max 1 line(s)",
+          "examples": [
+            "Key takeaway"
+          ]
+        },
+        "icon": {
+          "type": "string",
+          "description": "Icon inside the label pill (fallback: none (text only))",
+          "examples": [
+            "lightbulb"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "emphasis": {
+          "type": "string",
+          "enum": [
+            "marker",
+            "underline",
+            "color"
+          ],
+          "default": "marker",
+          "description": "How the highlight is drawn: marker sweep behind the words · underline sweep · accent-coloured words"
+        },
+        "align": {
+          "type": "string",
+          "enum": [
+            "center",
+            "left"
+          ],
+          "default": "center",
+          "description": "Horizontal alignment"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "statement"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "label": "Key takeaway",
+      "icon": "lightbulb",
+      "statement": "Your salary is not your wealth.",
+      "highlight": "not your wealth",
+      "explanation": "What you keep and invest decides how rich you become.",
+      "emphasis": "marker",
+      "align": "center",
+      "background": "theme",
+      "cue_times": [
+        0.2,
+        1.1,
+        1.9
+      ]
+    },
+    "validation_notes": [
+      {
+        "field": "highlight",
+        "level": "warning",
+        "message": "Highlight phrase is not in the statement — nothing is emphasised",
+        "rule": "Fails when `highlight` is set but its words don't appear in `statement`."
+      }
+    ]
+  },
+  "Structured List": {
+    "pickWhen": "\"3 reasons why\", \"the causes are\", features, examples, steps without order, or a recap of key points.",
+    "props_schema": {
+      "type": "object",
+      "title": "Structured List",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 40,
+          "description": "Heading above the list — What the list is: \"3 reasons UPI won\". — 1-8 words, max 1 line(s)",
+          "examples": [
+            "3 reasons UPI took off"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 50,
+                "description": "Item text — One point per item, parallel wording across items. — 1-9 words, max 2 line(s)"
+              },
+              "sub": {
+                "type": "string",
+                "minLength": 5,
+                "maxLength": 60,
+                "description": "Smaller line under the item text — Optional detail under the item. — 1-10 words, max 2 line(s)"
+              },
+              "icon": {
+                "type": "string",
+                "description": "Lucide icon name for this item (fallback: number)"
+              },
+              "image_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Item picture (thumbnail in list layout, card top in cards layout)"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "text"
+            ]
+          },
+          "minItems": 2,
+          "maxItems": 6,
+          "description": "List items, revealed in order",
+          "title": "Item"
+        },
+        "layout": {
+          "type": "string",
+          "enum": [
+            "list",
+            "cards"
+          ],
+          "default": "list",
+          "description": "Rows with a marker on the left, or a grid of cards"
+        },
+        "marker": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "bullet",
+            "number",
+            "icon",
+            "check",
+            "image"
+          ],
+          "default": "auto",
+          "description": "What marks each item (auto = image if every item has one, else icon if every item has one, else number)"
+        },
+        "align": {
+          "type": "string",
+          "enum": [
+            "left",
+            "center"
+          ],
+          "default": "left",
+          "description": "List block on the left, or centred on screen (rows stay left-aligned)"
+        },
+        "focus": {
+          "type": "string",
+          "enum": [
+            "off",
+            "on"
+          ],
+          "default": "off",
+          "description": "Dim earlier items while a new one appears; the full list brightens again for the hold"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "3 reasons UPI took off",
+      "items": [
+        {
+          "icon": "zap",
+          "text": "Payments land in seconds",
+          "sub": "Bank to bank, any time of day"
+        },
+        {
+          "icon": "wallet",
+          "text": "Free for everyday users",
+          "sub": "No fee on regular person-to-person transfers"
+        },
+        {
+          "icon": "smartphone",
+          "text": "Works in any UPI app",
+          "sub": "One ID across banks and apps"
+        }
+      ],
+      "layout": "list",
+      "marker": "auto",
+      "background": "theme",
+      "cue_times": [
+        0.1,
+        0.9,
+        2.4,
+        3.9
+      ]
+    }
+  },
+  "Comparison Columns": {
+    "pickWhen": "Comparing 2–3 options, products, plans or countries on the same attributes (a comparison table).",
+    "props_schema": {
+      "type": "object",
+      "title": "Comparison Columns",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 40,
+          "description": "Heading above the table — What is compared: \"UPI vs cards vs cash\". — 1-8 words, max 1 line(s)",
+          "examples": [
+            "Ways to pay a shopkeeper"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20,
+                "description": "Column head — Option name. — 1-4 words, max 2 line(s)"
+              },
+              "icon": {
+                "type": "string",
+                "description": "Lucide icon name for this item (fallback: none)"
+              },
+              "image_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Picture above the column name (circle)"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "name"
+            ]
+          },
+          "minItems": 2,
+          "maxItems": 3,
+          "description": "Options being compared (left to right)",
+          "title": "Column"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 20,
+                "description": "Row label (left column) — Attribute name: \"Speed\", \"Fee\", \"Works offline\". Phrase it so \"yes\" is good — ticks are green, crosses red. — 1-4 words, max 2 line(s)"
+              },
+              "a": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 25,
+                "description": "Value for column 1 — Short value, or yes / no / – for a tick, cross or dash. — 1-5 words, max 2 line(s)"
+              },
+              "b": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 25,
+                "description": "Value for column 2 — Short value, or yes / no / – for a tick, cross or dash. — 1-5 words, max 2 line(s)"
+              },
+              "c": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 25,
+                "description": "Value for column 3 (only with 3 columns) — Short value, or yes / no / – for a tick, cross or dash. — 1-5 words, max 2 line(s)"
+              },
+              "best": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+                "description": "Column that wins this row (1, 2 or 3) — its cell is highlighted"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "label",
+              "a",
+              "b"
+            ]
+          },
+          "minItems": 2,
+          "maxItems": 6,
+          "description": "Attributes compared (top to bottom). a / b / c are the cells for columns 1 / 2 / 3",
+          "title": "Row"
+        },
+        "highlight_column": {
+          "type": "string",
+          "enum": [
+            "none",
+            "1",
+            "2",
+            "3"
+          ],
+          "default": "none",
+          "description": "Tint one whole column (e.g. the recommended option)"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "columns",
+        "rows"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "Ways to pay a shopkeeper",
+      "columns": [
+        {
+          "name": "UPI",
+          "icon": "smartphone"
+        },
+        {
+          "name": "Debit card",
+          "icon": "credit-card"
+        },
+        {
+          "name": "Cash",
+          "icon": "banknote"
+        }
+      ],
+      "rows": [
+        {
+          "label": "Speed",
+          "a": "Seconds",
+          "b": "Seconds",
+          "c": "Instant",
+          "best": 3
+        },
+        {
+          "label": "No machine needed",
+          "a": "yes",
+          "b": "no",
+          "c": "yes"
+        },
+        {
+          "label": "Works offline",
+          "a": "Limited",
+          "b": "no",
+          "c": "yes",
+          "best": 3
+        },
+        {
+          "label": "Payment record",
+          "a": "yes",
+          "b": "yes",
+          "c": "no"
+        }
+      ],
+      "highlight_column": "1",
+      "background": "theme"
+    },
+    "validation_notes": [
+      {
+        "field": "rows[].c",
+        "level": "warning",
+        "message": "Row N: no value for column 3 — a dash is shown",
+        "rule": "Fails per row when columns.length === 3 and that row's `c` is empty."
+      },
+      {
+        "field": "rows[].best",
+        "level": "warning",
+        "message": "Row N: best = X but there are only Y columns",
+        "rule": "Fails per row when `best` exceeds the number of columns given."
+      }
+    ]
+  },
+  "Bar Chart": {
+    "pickWhen": "Values compared across 3–10 categories: states, companies, years, products; rankings with numbers; a threshold to beat.",
+    "props_schema": {
+      "type": "object",
+      "title": "Bar Chart",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 50,
+          "description": "Heading above the chart — What is measured, with the unit if helpful: \"Monthly UPI payments (₹ lakh crore)\". — 1-10 words, max 1 line(s)",
+          "examples": [
+            "Top UPI apps by market share"
+          ]
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3,
+          "description": "Symbol before each value label — Currency or symbol before every value: ₹, $. — 1-1 words, max 1 line(s)"
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8,
+          "description": "Unit after each value label — Unit after every value: %, km, t. — 1-1 words, max 1 line(s)",
+          "examples": [
+            "%"
+          ]
+        },
+        "reference_label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 24,
+          "description": "Label on the reference line (vertical charts) — Name of the reference line: \"National average\", \"Target\". — 1-4 words, max 1 line(s)"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 60,
+          "description": "Source line under the chart — Where the data comes from: \"Source: NPCI, March 2025\". — 1-10 words, max 1 line(s)",
+          "examples": [
+            "Source: NPCI, illustrative"
+          ]
+        },
+        "reference_value": {
+          "type": "number",
+          "description": "Dashed line across the chart at this value (average, target, threshold)"
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "bars": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 18,
+                "description": "Category label (under the bar, or left of it) — Category name: \"PhonePe\", \"2024\", \"Kerala\". — 1-3 words, max 2 line(s)"
+              },
+              "value": {
+                "type": "number",
+                "description": "Bar value (raw number, same unit for all bars)"
+              },
+              "highlight": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "1 = draw this bar in the accent colour (others turn grey)"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "label",
+              "value"
+            ]
+          },
+          "minItems": 3,
+          "maxItems": 10,
+          "description": "One bar per category, in the order given (unless sorted)",
+          "title": "Bar"
+        },
+        "orientation": {
+          "type": "string",
+          "enum": [
+            "vertical",
+            "horizontal"
+          ],
+          "default": "vertical",
+          "description": "Columns (vertical) or rows (horizontal, better for long labels)"
+        },
+        "sort": {
+          "type": "string",
+          "enum": [
+            "none",
+            "desc",
+            "asc"
+          ],
+          "default": "none",
+          "description": "Keep the given order, or sort by value"
+        },
+        "highlight": {
+          "type": "string",
+          "enum": [
+            "none",
+            "max",
+            "min",
+            "first",
+            "last"
+          ],
+          "default": "none",
+          "description": "Which bar gets the accent colour (bars[].highlight = 1 also works)"
+        },
+        "show_values": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "default": "on",
+          "description": "Numbers on the bars"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "indian_compact",
+            "international_compact"
+          ],
+          "default": "indian_compact",
+          "description": "How numbers are displayed: plain = raw digits, indian_compact = ₹1.2 Cr / 45 L style grouping, international_compact = 1.2M / 45K style grouping."
+        },
+        "decimals": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "0",
+            "1",
+            "2"
+          ],
+          "default": "auto",
+          "description": "Decimal places shown"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "bars"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "UPI app market share (illustrative)",
+      "bars": [
+        {
+          "label": "PhonePe",
+          "value": 47
+        },
+        {
+          "label": "Google Pay",
+          "value": 36,
+          "highlight": 1
+        },
+        {
+          "label": "Paytm",
+          "value": 7
+        },
+        {
+          "label": "Others",
+          "value": 10
+        }
+      ],
+      "unit": "%",
+      "format": "plain",
+      "orientation": "vertical",
+      "reference_value": 25,
+      "reference_label": "Fair share",
+      "source": "Source: illustrative figures",
+      "background": "theme"
+    }
+  },
+  "Line Chart": {
+    "pickWhen": "A trend over time: growth, a crash, a peak, a recovery, or 2–4 things changing over the same years.",
+    "props_schema": {
+      "type": "object",
+      "title": "Line Chart",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 50,
+          "description": "Heading above the chart — What is measured: \"Petrol price in Delhi (₹/litre)\". — 1-10 words, max 1 line(s)",
+          "examples": [
+            "Sensex, 2019–2025 (illustrative)"
+          ]
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3,
+          "description": "Symbol before every value — ₹, $. — 1-1 words, max 1 line(s)"
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8,
+          "description": "Unit after every value — %, /litre, pts. — 1-1 words, max 1 line(s)"
+        },
+        "reference_label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 24,
+          "description": "Label on the reference line — \"Pre-covid level\", \"Target\". — 1-4 words, max 1 line(s)"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 60,
+          "description": "Source line under the chart — \"Source: RBI, 2025\". — 1-10 words, max 1 line(s)"
+        },
+        "axis_labels": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 12,
+          "description": "Year / month labels and value labels on the axes — 1-3 words, max 1 line(s)"
+        },
+        "reference_value": {
+          "type": "number",
+          "description": "Dashed line across the chart at this value"
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "transform": {
+          "type": "string",
+          "enum": [
+            "none",
+            "indexed",
+            "cumulative"
+          ],
+          "default": "none",
+          "description": "none · indexed (every series = 100 at the first point, to compare growth) · cumulative (running total)"
+        },
+        "area": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ],
+          "default": "auto",
+          "description": "Shade under the line (auto = on for a single series)"
+        },
+        "show_points": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ],
+          "default": "auto",
+          "description": "Dots on each point (auto = on up to 12 points)"
+        },
+        "end_labels": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "default": "on",
+          "description": "Value at the end of each line"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "indian_compact",
+            "international_compact"
+          ],
+          "default": "indian_compact",
+          "description": "How numbers are displayed: plain = raw digits, indian_compact = ₹1.2 Cr / 45 L style grouping, international_compact = 1.2M / 45K style grouping."
+        },
+        "decimals": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "0",
+            "1",
+            "2"
+          ],
+          "default": "auto",
+          "description": "Decimal places shown"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        },
+        "x_labels": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 40,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 12
+          },
+          "description": "Labels along the bottom, left to right."
+        },
+        "series": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "description": "Lines. values must have one number per x label (null for a gap).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "values"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20,
+                "description": "Legend name (needed with 2+ series)."
+              },
+              "values": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 40,
+                "items": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "description": "Raw numbers, same length as x_labels."
+              }
+            }
+          }
+        },
+        "annotations": {
+          "type": "array",
+          "maxItems": 3,
+          "description": "Callouts on points.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "at",
+              "text"
+            ],
+            "properties": {
+              "at": {
+                "type": [
+                  "string",
+                  "integer"
+                ],
+                "description": "x label or 0-based index of the point."
+              },
+              "text": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 25,
+                "description": "Callout text, 1–5 words."
+              },
+              "series": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4,
+                "description": "Series number (default 1)."
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "x_labels",
+        "series"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "Monthly UPI transactions (billion, illustrative)",
+      "x_labels": [
+        "2019",
+        "2020",
+        "2021",
+        "2022",
+        "2023",
+        "2024",
+        "2025"
+      ],
+      "series": [
+        {
+          "name": "UPI",
+          "values": [
+            0.8,
+            1.3,
+            3.2,
+            6.6,
+            10.2,
+            14.4,
+            18.4
+          ]
+        }
+      ],
+      "annotations": [
+        {
+          "at": "2020",
+          "text": "Lockdown boost"
+        }
+      ],
+      "format": "plain",
+      "area": "auto",
+      "source": "Source: illustrative figures",
+      "background": "theme"
+    },
+    "validation_notes": [
+      {
+        "field": "x_labels",
+        "level": "error",
+        "message": "x_labels needs 4–40 labels (got N)",
+        "rule": "Fails when x_labels has fewer than 4 entries."
+      },
+      {
+        "field": "series",
+        "level": "error",
+        "message": "At least one series is required",
+        "rule": "Fails when series is empty."
+      },
+      {
+        "field": "series[].values",
+        "level": "warning",
+        "message": "Series N has M values for L labels — extra values are dropped, missing ones are gaps",
+        "rule": "Fails per series when values.length !== x_labels.length."
+      },
+      {
+        "field": "series[].name",
+        "level": "warning",
+        "message": "Series N has no name for the legend",
+        "rule": "Fails per series when there is more than one series and that series has no non-empty name."
+      }
+    ]
+  },
+  "Pie / Donut Chart": {
+    "pickWhen": "\"X% of…\", market share, a budget split, or how a whole divides into 2–6 parts.",
+    "props_schema": {
+      "type": "object",
+      "title": "Pie / Donut Chart",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 50,
+          "description": "Heading above the chart — What the whole is: \"Where each ₹100 of tax goes\". — 1-10 words, max 1 line(s)",
+          "examples": [
+            "UPI market share (illustrative)"
+          ]
+        },
+        "center_label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 24,
+          "description": "Text under the number in the donut centre — Words under the centre number: \"of all payments\". — 1-5 words, max 2 line(s)",
+          "examples": [
+            "of all UPI payments"
+          ]
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3,
+          "description": "Symbol before raw values — 1-1 words, max 1 line(s)"
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8,
+          "description": "Unit after raw values — 1-1 words, max 1 line(s)"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 60,
+          "description": "Source line under the chart — \"Source: NPCI, March 2025\". — 1-10 words, max 1 line(s)"
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "slices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 24,
+                "description": "Legend label — Part name: \"PhonePe\", \"Defence\". — 1-4 words, max 2 line(s)"
+              },
+              "value": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Raw value of the slice (shares are computed from the total)"
+              },
+              "highlight": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "1 = pop this slice out and show it in the centre"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "label",
+              "value"
+            ]
+          },
+          "minItems": 2,
+          "maxItems": 6,
+          "description": "Parts of the whole, clockwise from 12 o'clock (unless sorted)",
+          "title": "Slice"
+        },
+        "chart": {
+          "type": "string",
+          "enum": [
+            "donut",
+            "pie"
+          ],
+          "default": "donut",
+          "description": "Ring with a centre number, or a full pie"
+        },
+        "show": {
+          "type": "string",
+          "enum": [
+            "percent",
+            "value",
+            "both"
+          ],
+          "default": "percent",
+          "description": "Share of the total, the raw value, or both"
+        },
+        "center": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "highlight",
+            "total",
+            "none"
+          ],
+          "default": "auto",
+          "description": "Donut centre: auto = highlighted (or largest) slice %, total = sum of values"
+        },
+        "sort": {
+          "type": "string",
+          "enum": [
+            "none",
+            "desc"
+          ],
+          "default": "none",
+          "description": "Keep the given order or largest first"
+        },
+        "highlight": {
+          "type": "string",
+          "enum": [
+            "none",
+            "max",
+            "min"
+          ],
+          "default": "none",
+          "description": "Slice that pops out (slices[].highlight = 1 also works)"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "indian_compact",
+            "international_compact"
+          ],
+          "default": "indian_compact",
+          "description": "How numbers are displayed: plain = raw digits, indian_compact = ₹1.2 Cr / 45 L style grouping, international_compact = 1.2M / 45K style grouping."
+        },
+        "decimals": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "0",
+            "1",
+            "2"
+          ],
+          "default": "auto",
+          "description": "Decimal places for raw values"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "slices"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "UPI market share (illustrative)",
+      "slices": [
+        {
+          "label": "PhonePe",
+          "value": 47,
+          "highlight": 1
+        },
+        {
+          "label": "Google Pay",
+          "value": 36
+        },
+        {
+          "label": "Paytm",
+          "value": 7
+        },
+        {
+          "label": "Others",
+          "value": 10
+        }
+      ],
+      "center_label": "of all UPI payments",
+      "chart": "donut",
+      "show": "percent",
+      "source": "Source: illustrative figures",
+      "background": "theme"
+    }
+  },
+  "Leaderboard": {
+    "pickWhen": "A top-N ranking: richest, biggest, most populous, most-watched — with or without values.",
+    "props_schema": {
+      "type": "object",
+      "title": "Leaderboard",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 50,
+          "description": "Heading above the list — \"Top 5 richest Indians (illustrative)\". — 1-10 words, max 1 line(s)",
+          "examples": [
+            "Most-used UPI apps (illustrative)"
+          ]
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3,
+          "description": "Symbol before every value — 1-1 words, max 1 line(s)"
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8,
+          "description": "Unit after every value — 1-1 words, max 1 line(s)"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 60,
+          "description": "Source line under the list — \"Source: Forbes, 2025\". — 1-10 words, max 1 line(s)"
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 28,
+                "description": "Row name — Who / what is ranked. — 1-5 words, max 1 line(s)"
+              },
+              "sub": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 40,
+                "description": "Line under the name — Small detail: company, city, category. — 1-7 words, max 1 line(s)"
+              },
+              "value": {
+                "type": "number",
+                "description": "Raw value shown on the right (and as a bar)"
+              },
+              "icon": {
+                "type": "string",
+                "description": "Lucide icon name for this item (fallback: none)"
+              },
+              "image_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Circle picture next to the rank (logo, face, flag)"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "label"
+            ]
+          },
+          "minItems": 3,
+          "maxItems": 10,
+          "description": "Ranked rows, #1 first",
+          "title": "Row"
+        },
+        "order": {
+          "type": "string",
+          "enum": [
+            "top_down",
+            "countdown"
+          ],
+          "default": "top_down",
+          "description": "Rows appear #1 first, or as a countdown ending on #1"
+        },
+        "sort": {
+          "type": "string",
+          "enum": [
+            "as_given",
+            "desc",
+            "asc"
+          ],
+          "default": "as_given",
+          "description": "Keep the given ranking, or rank by value (desc = biggest is #1)"
+        },
+        "bars": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ],
+          "default": "auto",
+          "description": "Bar sized by value behind each row (auto = on when every row has a value)"
+        },
+        "rank_style": {
+          "type": "string",
+          "enum": [
+            "number",
+            "medal"
+          ],
+          "default": "medal",
+          "description": "Plain numbers, or gold / silver / bronze badges for the top 3"
+        },
+        "highlight": {
+          "type": "string",
+          "enum": [
+            "first",
+            "none"
+          ],
+          "default": "first",
+          "description": "Accent outline on the #1 row"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "indian_compact",
+            "international_compact"
+          ],
+          "default": "indian_compact",
+          "description": "How numbers are displayed: plain = raw digits, indian_compact = ₹1.2 Cr / 45 L style grouping, international_compact = 1.2M / 45K style grouping."
+        },
+        "decimals": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "0",
+            "1",
+            "2"
+          ],
+          "default": "auto",
+          "description": "Decimal places shown"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "Most-used UPI apps (illustrative)",
+      "items": [
+        {
+          "label": "PhonePe",
+          "sub": "Walmart-owned",
+          "value": 47,
+          "icon": "smartphone"
+        },
+        {
+          "label": "Google Pay",
+          "sub": "Alphabet",
+          "value": 36,
+          "icon": "smartphone"
+        },
+        {
+          "label": "Paytm",
+          "sub": "One97 Communications",
+          "value": 7,
+          "icon": "smartphone"
+        },
+        {
+          "label": "Others",
+          "value": 10,
+          "icon": "smartphone"
+        }
+      ],
+      "unit": "%",
+      "format": "plain",
+      "order": "countdown",
+      "source": "Source: illustrative figures",
+      "background": "theme"
+    }
+  },
+  "Timeline": {
+    "pickWhen": "Several dated events in order: a history, a biography, a company's journey, how something unfolded.",
+    "props_schema": {
+      "type": "object",
+      "title": "Timeline",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 50,
+          "description": "Heading above the timeline — \"The UPI story\". — 1-10 words, max 1 line(s)",
+          "examples": [
+            "How UPI grew (illustrative)"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 60,
+          "description": "Source line under the timeline — 1-10 words, max 1 line(s)"
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "date": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20,
+                "description": "Date above the title — \"2016\", \"Aug 2016\", \"15 Aug 1947\". — 1-4 words, max 1 line(s)"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 35,
+                "description": "Event title — What happened, in a few words. — 1-6 words, max 2 line(s)"
+              },
+              "desc": {
+                "type": "string",
+                "minLength": 5,
+                "maxLength": 70,
+                "description": "Detail under the title — One short line of detail. — 2-12 words, max 3 line(s)"
+              },
+              "milestone": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "1 = bigger filled accent node and accent-coloured title"
+              },
+              "icon": {
+                "type": "string",
+                "description": "Lucide icon name for this item (fallback: dot)"
+              },
+              "image_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Picture inside the event node (circle)"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "date",
+              "title"
+            ]
+          },
+          "minItems": 3,
+          "maxItems": 8,
+          "description": "Events in time order",
+          "title": "Event"
+        },
+        "orientation": {
+          "type": "string",
+          "enum": [
+            "horizontal",
+            "vertical"
+          ],
+          "default": "horizontal",
+          "description": "Track across the screen (labels alternate above / below), or down the left side"
+        },
+        "focus": {
+          "type": "string",
+          "enum": [
+            "off",
+            "on"
+          ],
+          "default": "off",
+          "description": "Dim earlier events while a new one appears; everything brightens for the hold"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "events"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "How UPI grew (illustrative)",
+      "events": [
+        {
+          "date": "2016",
+          "title": "UPI launches",
+          "desc": "Announced by NPCI with 21 banks",
+          "icon": "rocket",
+          "milestone": 1
+        },
+        {
+          "date": "2017",
+          "title": "BHIM app arrives",
+          "icon": "smartphone"
+        },
+        {
+          "date": "2020",
+          "title": "Lockdown boosts QR payments",
+          "icon": "users"
+        },
+        {
+          "date": "2023",
+          "title": "UPI goes international",
+          "icon": "globe"
+        }
+      ],
+      "orientation": "horizontal",
+      "background": "theme"
+    }
+  },
+  "A → B Relationship": {
+    "pickWhen": "One thing leads to another: cause → effect, problem → solution, trigger → response, or a short chain of three.",
+    "props_schema": {
+      "type": "object",
+      "title": "A → B Relationship",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 50,
+          "description": "Heading above the cards — \"Why onion prices spike\". — 1-10 words, max 1 line(s)",
+          "examples": [
+            "Why onion prices spike"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 30,
+                "description": "Card label — The thing itself: \"Heavy rain in Nashik\". — 1-6 words, max 2 line(s)"
+              },
+              "sub": {
+                "type": "string",
+                "minLength": 5,
+                "maxLength": 60,
+                "description": "Detail under the label — One line of detail. — 1-11 words, max 3 line(s)"
+              },
+              "tag": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 16,
+                "description": "Small tag at the top of the card — Small label on the card; defaults from `kind` (Cause / Effect…). — 1-2 words, max 1 line(s)"
+              },
+              "arrow": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 20,
+                "description": "Label on the arrow to the next card — Words on the arrow AFTER this card: \"leads to\", \"causes\". Ignored on the last card. — 1-4 words, max 2 line(s)"
+              },
+              "icon": {
+                "type": "string",
+                "description": "Lucide icon name for this item (fallback: none)"
+              },
+              "image_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Circle picture at the top of the card"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "label"
+            ]
+          },
+          "minItems": 2,
+          "maxItems": 3,
+          "description": "Cards left to right (or top to bottom)",
+          "title": "Card"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "cause_effect",
+            "problem_solution",
+            "trigger_response",
+            "custom"
+          ],
+          "default": "cause_effect",
+          "description": "Sets default tags (Cause → Effect, Problem → Solution, Trigger → Response) and colours the last card (solution / response in accent)"
+        },
+        "orientation": {
+          "type": "string",
+          "enum": [
+            "horizontal",
+            "vertical"
+          ],
+          "default": "horizontal",
+          "description": "Cards in a row, or stacked top to bottom (better for long sub-lines)"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "Why onion prices spike",
+      "nodes": [
+        {
+          "label": "Heavy rain in Nashik",
+          "sub": "Crops damaged before harvest",
+          "icon": "umbrella",
+          "arrow": "cuts supply"
+        },
+        {
+          "label": "Onion prices double",
+          "sub": "Within a few weeks in city markets",
+          "icon": "trending-up"
+        }
+      ],
+      "kind": "cause_effect",
+      "background": "theme"
+    }
+  },
+  "Person Intro Card": {
+    "pickWhen": "The first time an important person is named: who they are, in one card.",
+    "props_schema": {
+      "type": "object",
+      "title": "Person Intro Card",
+      "properties": {
+        "kicker": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 24,
+          "description": "Small label above the name — Small label above the name: \"Meet\", \"The founder\". — 1-4 words, max 1 line(s)",
+          "examples": [
+            "Meet"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 30,
+          "description": "The name — Full name as it should appear. — 1-5 words, max 2 line(s)",
+          "examples": [
+            "Dr. A. P. J. Abdul Kalam"
+          ]
+        },
+        "role": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "description": "Role line under the name — \"11th President of India\". — 1-7 words, max 2 line(s)",
+          "examples": [
+            "11th President of India"
+          ]
+        },
+        "tagline": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 70,
+          "description": "Line under the role — Why they matter, in one line. — 2-12 words, max 2 line(s)",
+          "examples": [
+            "Led India’s missile programme before becoming President"
+          ]
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "portrait_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Photo of the person (portrait layouts)"
+        },
+        "layout": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "portrait_left",
+            "portrait_right",
+            "full_bleed",
+            "text_only"
+          ],
+          "default": "auto",
+          "description": "auto = portrait_left when a portrait is given, else text_only · full_bleed puts the portrait over one half of the frame"
+        },
+        "portrait_shape": {
+          "type": "string",
+          "enum": [
+            "circle",
+            "rounded"
+          ],
+          "default": "circle",
+          "description": "Shape of the portrait (left / right layouts)"
+        },
+        "align": {
+          "type": "string",
+          "enum": [
+            "left",
+            "center"
+          ],
+          "default": "left",
+          "description": "Text alignment in text_only"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "kicker": "Meet",
+      "name": "Dr. A. P. J. Abdul Kalam",
+      "role": "11th President of India",
+      "tagline": "Led India’s missile programme before becoming President",
+      "layout": "auto",
+      "background": "theme"
+    }
+  },
+  "Image + Label / Caption": {
+    "pickWhen": "Showing a specific photo that needs a name or one line of explanation (a place, an object, an archive picture).",
+    "props_schema": {
+      "type": "object",
+      "title": "Image + Label / Caption",
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 30,
+          "description": "Label tag — What it is: \"Gateway of India, 1924\". — 1-5 words, max 1 line(s)",
+          "examples": [
+            "Howrah Bridge, Kolkata"
+          ]
+        },
+        "caption": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 100,
+          "description": "Caption under the label — One or two lines that explain the picture. — 2-18 words, max 2 line(s)",
+          "examples": [
+            "Opened in 1943, it carries more than a lakh vehicles a day"
+          ]
+        },
+        "credit": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 40,
+          "description": "Small credit in the opposite corner — Photo credit or source: \"Photo: Wikimedia Commons\". — 1-7 words, max 1 line(s)"
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "The photo, full frame (omit to overlay the label / caption on footage)"
+        },
+        "position": {
+          "type": "string",
+          "enum": [
+            "bottom_left",
+            "bottom_center",
+            "top_left"
+          ],
+          "default": "bottom_left",
+          "description": "Where the label and caption sit (inside the safe box)"
+        },
+        "fit": {
+          "type": "string",
+          "enum": [
+            "cover",
+            "contain"
+          ],
+          "default": "cover",
+          "description": "Fill the frame (crops edges) or show the whole image over a blurred copy"
+        },
+        "caption_style": {
+          "type": "string",
+          "enum": [
+            "panel",
+            "bar",
+            "plain"
+          ],
+          "default": "panel",
+          "description": "panel: dark rounded box · bar: full-width strip along the bottom of the safe box · plain: text with a shadow"
+        }
+      },
+      "additionalProperties": false
+    },
+    "example_props": {
+      "image_url": "https://example.com/howrah-bridge.jpg",
+      "label": "Howrah Bridge, Kolkata",
+      "caption": "Opened in 1943, it carries more than a lakh vehicles a day",
+      "credit": "Photo: Wikimedia Commons",
+      "position": "bottom_left"
+    },
+    "validation_notes": [
+      {
+        "field": "label",
+        "level": "error",
+        "message": "Give a label, a caption, or both",
+        "rule": "Fails when neither `label` nor `caption` is a non-empty string."
+      }
+    ]
+  },
+  "Linear Process": {
+    "pickWhen": "Explaining how something works step by step: a workflow, a procedure, a pipeline, a supply chain with a value at each stage.",
+    "props_schema": {
+      "type": "object",
+      "title": "Linear Process",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 40,
+          "description": "Heading above the steps — What the process is, e.g. \"How a UPI payment works\". — 1-8 words, max 1 line(s)"
+        },
+        "image_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Background image, shown when the background option is set to 'image'"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 25,
+                "description": "Step title under the circle — Verb-first: \"Scan the QR code\". — 1-4 words, max 2 line(s)"
+              },
+              "desc": {
+                "type": "string",
+                "minLength": 10,
+                "maxLength": 60,
+                "description": "Step description under the title — One short supporting line. — 2-10 words, max 3 line(s)"
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 12,
+                "description": "Accent-coloured value under the step title — A number for the step: \"₹40/kg\", \"2 days\". — 1-2 words, max 1 line(s)"
+              },
+              "icon": {
+                "type": "string",
+                "description": "Lucide icon name for this item (fallback: number)"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "title"
+            ]
+          },
+          "minItems": 3,
+          "maxItems": 6,
+          "description": "Steps, left to right (or top to bottom)",
+          "title": "Step"
+        },
+        "orientation": {
+          "type": "string",
+          "enum": [
+            "horizontal",
+            "vertical"
+          ],
+          "default": "horizontal",
+          "description": "Steps in a row or a column"
+        },
+        "marker": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "icon",
+            "number"
+          ],
+          "default": "auto",
+          "description": "What shows inside each circle (auto = icons when every step has one)"
+        },
+        "highlight": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "default": "on",
+          "description": "Newest step filled, earlier steps outlined"
+        },
+        "background": {
+          "type": "string",
+          "enum": [
+            "theme",
+            "image",
+            "transparent"
+          ],
+          "default": "theme",
+          "description": "theme gradient, image_url, or transparent over footage"
+        }
+      },
+      "required": [
+        "steps"
+      ],
+      "additionalProperties": false
+    },
+    "example_props": {
+      "title": "How a UPI payment works",
+      "steps": [
+        {
+          "icon": "smartphone",
+          "title": "Scan the QR code",
+          "desc": "Open any UPI app and scan the shop's code"
+        },
+        {
+          "icon": "banknote",
+          "title": "Enter the amount",
+          "desc": "Type what you owe and add a note"
+        },
+        {
+          "icon": "lock",
+          "title": "Confirm with UPI PIN",
+          "desc": "Your PIN approves the transfer"
+        },
+        {
+          "icon": "check",
+          "title": "Money reaches the shop",
+          "desc": "Bank to bank in a few seconds"
+        }
+      ],
+      "orientation": "horizontal",
+      "marker": "auto",
+      "highlight": "on",
+      "background": "theme",
+      "cue_times": [
+        0.1,
+        0.9,
+        2.2,
+        3.4,
+        4.8
+      ]
+    }
+  }
+}

@@ -254,216 +254,190 @@
 # print("=" * 60)
 
 
+import os
+import json
 
-# import os
-# import json
+from supabase import create_client, Client
+from sentence_transformers import SentenceTransformer
 
-# from supabase import create_client, Client
-# from sentence_transformers import SentenceTransformer
 
+# ============================================================
+# CONFIG
+# ============================================================
 
-# # ============================================================
-# # CONFIG
-# # ============================================================
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# SUPABASE_URL = os.getenv("SUPABASE_URL")
-# SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+JSON_FILE = "templates.json"
+TABLE_NAME = "animations_template"
 
-# JSON_FILE = "metadata.json"
-# TABLE_NAME = "animations_template"
+MODEL_NAME = "BAAI/bge-m3"
+BATCH_SIZE = 10
 
-# MODEL_NAME = "BAAI/bge-m3"
-# BATCH_SIZE = 10
 
+# ============================================================
+# VALIDATE ENV
+# ============================================================
 
-# # ============================================================
-# # VALIDATE ENV
-# # ============================================================
+if not SUPABASE_URL:
+    raise RuntimeError("SUPABASE_URL environment variable is missing")
 
-# if not SUPABASE_URL:
-#     raise RuntimeError("SUPABASE_URL environment variable is missing")
+if not SUPABASE_KEY:
+    raise RuntimeError(
+        "SUPABASE_SERVICE_ROLE_KEY environment variable is missing"
+    )
 
-# if not SUPABASE_KEY:
-#     raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY environment variable is missing")
 
+# ============================================================
+# SUPABASE
+# ============================================================
 
-# # ============================================================
-# # SUPABASE
-# # ============================================================
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY
+)
 
-# supabase: Client = create_client(
-#     SUPABASE_URL,
-#     SUPABASE_KEY
-# )
 
+# ============================================================
+# EMBEDDING MODEL
+# ============================================================
 
-# # ============================================================
-# # EMBEDDING MODEL
-# # ============================================================
+print(f"Loading embedding model: {MODEL_NAME}")
 
-# print(f"Loading embedding model: {MODEL_NAME}")
+model = SentenceTransformer(MODEL_NAME)
 
-# model = SentenceTransformer(MODEL_NAME)
+print("Embedding model loaded.")
 
-# print("Embedding model loaded.")
 
+# ============================================================
+# LOAD JSON
+# ============================================================
 
-# # ============================================================
-# # LOAD JSON
-# # ============================================================
+print(f"Loading JSON file: {JSON_FILE}")
 
-# print(f"Loading JSON file: {JSON_FILE}")
+with open(JSON_FILE, "r", encoding="utf-8") as f:
+    data = json.load(f)
 
-# with open(JSON_FILE, "r", encoding="utf-8") as f:
-#     metadata = json.load(f)
+if not isinstance(data, dict):
+    raise ValueError(
+        "metadata.json must contain a JSON object at the top level."
+    )
 
-# templates = metadata.get("templates", [])
+print(f"Found {len(data)} templates.")
 
-# if not templates:
-#     raise RuntimeError("No templates found in JSON")
 
+# ============================================================
+# PREPARE TEMPLATES
+# ============================================================
 
-# print(f"Found {len(templates)} templates")
+templates = []
 
+for name, template_data in data.items():
 
-# # ============================================================
-# # MATCH OBJECT -> TEXT
-# # ============================================================
+    name = str(name).strip()
 
-# def match_to_text(match: dict) -> str:
-#     """
-#     Convert ONLY the match object into text.
+    if not name:
+        print("Skipping template with empty name.")
+        continue
 
-#     Nothing outside match is included.
-#     """
+    if not isinstance(template_data, dict):
+        print(f"Skipping invalid template: {name}")
+        continue
 
-#     parts = []
+    # Get props_schema from JSON
+    props = template_data.get("props_schema", {})
 
-#     if match.get("name"):
-#         parts.append(f"Name: {match['name']}")
+    # Get pickWhen from JSON
+    pick_when = template_data.get("pickWhen", "")
 
-#     if match.get("category"):
-#         parts.append(f"Category: {match['category']}")
+    templates.append({
+        "name": name,
+        "props": props,
+        "pick_when": pick_when
+    })
 
-#     if match.get("motion"):
-#         parts.append(f"Motion: {match['motion']}")
 
-#     if match.get("description"):
-#         parts.append(f"Description: {match['description']}")
+print(f"Prepared {len(templates)} templates.")
 
-#     if match.get("use_when"):
-#         parts.append(f"Use when: {match['use_when']}")
 
-#     if match.get("avoid_when"):
-#         parts.append(f"Avoid when: {match['avoid_when']}")
+# ============================================================
+# GENERATE EMBEDDINGS
+# ============================================================
+# IMPORTANT:
+# Embedding is generated ONLY from the template name.
+#
+# Example:
+#
+# "Title Card"
+#
+# NOT:
+# "Title Card + pickWhen + props_schema"
+# ============================================================
 
-#     tags = match.get("tags", [])
+names = [
+    template["name"]
+    for template in templates
+]
 
-#     if tags:
-#         parts.append(
-#             "Tags: " + ", ".join(tags)
-#         )
+print("Generating embeddings for template names...")
 
-#     return "\n".join(parts)
+embeddings = model.encode(
+    names,
+    batch_size=BATCH_SIZE,
+    normalize_embeddings=True,
+    show_progress_bar=True
+)
 
+print("Embeddings generated.")
 
-# # ============================================================
-# # PREPARE TEMPLATES
-# # ============================================================
 
-# records = []
-# embedding_texts = []
+# ============================================================
+# PREPARE SUPABASE ROWS
+# ============================================================
 
-# for template in templates:
+rows = []
 
-#     # --------------------------------------------------------
-#     # ONLY MATCH IS USED FOR EMBEDDING
-#     # --------------------------------------------------------
+for template, embedding in zip(templates, embeddings):
 
-#     match = template.get("match", {})
+    rows.append({
+        "name": template["name"],
+        "props": template["props"],
+        "pick_when": template["pick_when"],
+        "embedding": embedding.tolist()
+    })
 
-#     embedding_text = match_to_text(match)
 
-#     embedding_texts.append(embedding_text)
+# ============================================================
+# INSERT INTO SUPABASE
+# ============================================================
 
-#     # --------------------------------------------------------
-#     # EVERYTHING ELSE IS STORED AS-IS
-#     # --------------------------------------------------------
+print(
+    f"Inserting {len(rows)} templates "
+    f"into {TABLE_NAME}..."
+)
 
-#     props_schema = template.get("props_schema", {})
+for i in range(0, len(rows), BATCH_SIZE):
 
-#     record = {
-#         "category": match.get("category"),
-#         "motion": match.get("motion"),
+    batch = rows[i:i + BATCH_SIZE]
 
-#         "use_when": match.get("use_when"),
-#         "avoid_when": match.get("avoid_when"),
+    response = (
+        supabase
+        .table(TABLE_NAME)
+        .insert(batch)
+        .execute()
+    )
 
-#         "tags": match.get("tags", []),
+    print(
+        f"Inserted {len(batch)} templates "
+        f"({i + len(batch)}/{len(rows)})"
+    )
 
-#         "editing": template.get("editing"),
-#         "timing": template.get("timing"),
-#         "filters": template.get("filters"),
-#         "render": template.get("render"),
-#         "props_schema": props_schema,
 
-#         "subtitle": props_schema.get("subtitle"),
-#         "data": props_schema.get("data"),
-#         "color": props_schema.get("color"),
+# ============================================================
+# DONE
+# ============================================================
 
-#         "sample_props": template.get("sample_props"),
-#     }
-
-#     records.append(record)
-
-
-# # ============================================================
-# # GENERATE EMBEDDINGS
-# # ============================================================
-
-# print("Generating embeddings from MATCH objects only...")
-
-# embeddings = model.encode(
-#     embedding_texts,
-#     batch_size=BATCH_SIZE,
-#     normalize_embeddings=True,
-#     show_progress_bar=True
-# )
-
-
-# # ============================================================
-# # ADD EMBEDDINGS
-# # ============================================================
-
-# for record, embedding in zip(records, embeddings):
-
-#     record["embedding"] = embedding.tolist()
-
-
-# # ============================================================
-# # INSERT INTO SUPABASE
-# # ============================================================
-
-# print("Inserting into Supabase...")
-
-# for start in range(0, len(records), BATCH_SIZE):
-
-#     batch = records[start:start + BATCH_SIZE]
-
-#     print(
-#         f"Inserting "
-#         f"{start + 1}-{start + len(batch)} "
-#         f"of {len(records)}"
-#     )
-
-#     supabase \
-#         .table(TABLE_NAME) \
-#         .insert(batch) \
-#         .execute()
-
-# print("==========================================")
-# print("DONE")
-# print("==========================================")
-# print(f"Inserted {len(records)} templates.")
-
-
+print()
+print("============================================")
+print("Upload completed successfully.")
+print("============================================")

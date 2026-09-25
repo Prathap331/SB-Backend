@@ -9245,658 +9245,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 # editing 
 
 
-TEMPLATE_METADATA = {
-  "purpose": "Few-shot examples for the LLM that writes an ideal template spec for an editing beat. Embed output.match for semantic search; use output.editing, output.timing and output.requirements as filters and scoring. Remove _maps_to before using in the prompt.",
-  "examples": [
-    {
-      "_maps_to": "bar_chart",
-      "input": {
-        "narration": "In January the channel got 42 thousand views, and by June it crossed 96 thousand.",
-        "beat_role": "data_comparison",
-        "duration_sec": 5,
-        "available_images": 0,
-        "fps": 30,
-        "beat_start_sec": 42.0,
-        "beat_end_sec": 47.0,
-        "sync_keyword": "96 thousand",
-        "keyword_offset_sec": 1.5,
-        "prev_beat_role": "hook",
-        "next_beat_role": "emphasis"
-      },
-      "output": {
-        "match": {
-          "category": "data_visualization",
-          "motion": "bars_rise_staggered",
-          "description": "Vertical bar chart in a card over the footage comparing monthly views, bars rising one after another with value labels.",
-          "use_when": "Comparing 3-8 numeric values across months or categories.",
-          "tags": [
-            "chart",
-            "bar",
-            "growth",
-            "comparison"
-          ]
-        },
-        "editing": {
-          "beat_role": "data_comparison",
-          "energy": "medium",
-          "tone": [
-            "neutral",
-            "educational"
-          ],
-          "layer": "overlay",
-          "sync_target": "keyword",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 42.3,
-          "clip_end_sec": 47.0,
-          "duration_frames": 141,
-          "entrance_frames": 36,
-          "sync_frame": 36,
-          "sync_lands_at_sec": 43.5
-        },
-        "requirements": {
-          "covers_footage": False,
-          "placement": "center",
-          "item_count": 6,
-          "image_count": 0,
-          "transition_role": "null"
-        },
-        "props": {
-          "title": "Monthly Views (K)",
-          "data": [
-            {
-              "label": "Jan",
-              "value": 42
-            },
-            {
-              "label": "Feb",
-              "value": 58
-            },
-            {
-              "label": "Mar",
-              "value": 51
-            },
-            {
-              "label": "Apr",
-              "value": 73
-            },
-            {
-              "label": "May",
-              "value": 88
-            },
-            {
-              "label": "Jun",
-              "value": 96
-            }
-          ]
-        }
-      }
-    },
-    {
-      "_maps_to": "animated_list",
-      "input": {
-        "narration": "Four money habits that changed my life: an emergency fund, automatic SIPs, zero credit card debt, and reviewing insurance every year.",
-        "beat_role": "list",
-        "duration_sec": 6,
-        "available_images": 0,
-        "fps": 30,
-        "beat_start_sec": 118.5,
-        "beat_end_sec": 124.5,
-        "sync_keyword": "Four money habits",
-        "keyword_offset_sec": 0.0,
-        "prev_beat_role": "section_start",
-        "next_beat_role": "list"
-      },
-      "output": {
-        "match": {
-          "category": "list_and_steps",
-          "motion": "items_slide_in_staggered",
-          "description": "Bullet list in a card over the footage, each row sliding in with a matching icon.",
-          "use_when": "Narration lists 3-6 tips, habits or features with no fixed order.",
-          "tags": [
-            "list",
-            "tips",
-            "icons",
-            "points"
-          ]
-        },
-        "editing": {
-          "beat_role": "list",
-          "energy": "medium",
-          "tone": [
-            "neutral",
-            "educational"
-          ],
-          "layer": "overlay",
-          "sync_target": "keyword",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 118.5,
-          "clip_end_sec": 124.5,
-          "duration_frames": 180,
-          "entrance_frames": 35,
-          "sync_frame": 35,
-          "sync_lands_at_sec": 119.67
-        },
-        "requirements": {
-          "covers_footage": False,
-          "placement": "center",
-          "item_count": 4,
-          "image_count": 0,
-          "transition_role": "null"
-        },
-        "props": {
-          "items": [
-            "Emergency fund",
-            "Automatic SIPs",
-            "Zero credit card debt",
-            "Yearly insurance review"
-          ],
-          "icon_name": [
-            "piggy-bank",
-            "repeat",
-            "credit-card",
-            "shield"
-          ]
-        }
-      }
-    },
-    {
-      "_maps_to": "progress_steps",
-      "input": {
-        "narration": "The loan process is simple. You apply, complete KYC, get approval, and the money is disbursed.",
-        "beat_role": "process",
-        "duration_sec": 5,
-        "available_images": 0,
-        "fps": 30,
-        "beat_start_sec": 205.0,
-        "beat_end_sec": 210.0,
-        "sync_keyword": "The loan process",
-        "keyword_offset_sec": 0.0,
-        "prev_beat_role": "emphasis",
-        "next_beat_role": "key_stat"
-      },
-      "output": {
-        "match": {
-          "category": "list_and_steps",
-          "motion": "steps_activate_in_sequence",
-          "description": "Horizontal row of numbered steps connected by lines, lighting up one after another to show progress through a process.",
-          "use_when": "An ordered process of 3-6 stages where sequence matters.",
-          "tags": [
-            "process",
-            "steps",
-            "workflow",
-            "timeline"
-          ]
-        },
-        "editing": {
-          "beat_role": "process",
-          "energy": "medium",
-          "tone": [
-            "educational",
-            "neutral"
-          ],
-          "layer": "overlay",
-          "sync_target": "beat_start",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 205.0,
-          "clip_end_sec": 210.0,
-          "duration_frames": 150,
-          "entrance_frames": 150,
-          "sync_frame": 0,
-          "sync_lands_at_sec": 205.0
-        },
-        "requirements": {
-          "covers_footage": False,
-          "placement": "center",
-          "item_count": 4,
-          "image_count": 0,
-          "transition_role": "null"
-        },
-        "props": {
-          "items": [
-            "Apply",
-            "KYC",
-            "Approval",
-            "Disbursal"
-          ]
-        }
-      }
-    },
-    {
-      "_maps_to": "text_highlight",
-      "input": {
-        "narration": "Here's the truth: most people quit right before it starts working.",
-        "beat_role": "emphasis",
-        "duration_sec": 4,
-        "available_images": 0,
-        "fps": 30,
-        "beat_start_sec": 61.3,
-        "beat_end_sec": 65.3,
-        "sync_keyword": "right before it starts working",
-        "keyword_offset_sec": 2.1,
-        "prev_beat_role": "key_stat",
-        "next_beat_role": "list"
-      },
-      "output": {
-        "match": {
-          "category": "text_animation",
-          "motion": "marker_sweeps_over_phrase",
-          "description": "Sentence over the footage with a highlighter stroke sweeping across the most important phrase.",
-          "use_when": "One part of a spoken sentence needs extra emphasis.",
-          "tags": [
-            "text",
-            "highlight",
-            "emphasis",
-            "keyword"
-          ]
-        },
-        "editing": {
-          "beat_role": "emphasis",
-          "energy": "medium",
-          "tone": [
-            "educational",
-            "neutral"
-          ],
-          "layer": "overlay",
-          "sync_target": "keyword",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 62.2,
-          "clip_end_sec": 65.3,
-          "duration_frames": 93,
-          "entrance_frames": 36,
-          "sync_frame": 36,
-          "sync_lands_at_sec": 63.4
-        },
-        "requirements": {
-          "covers_footage": False,
-          "placement": "center",
-          "item_count": "null",
-          "image_count": 0,
-          "transition_role": "null"
-        },
-        "props": {
-          "text": "Most people quit right before it starts working",
-          "highlight": "right before it starts working"
-        }
-      }
-    },
-    {
-      "_maps_to": "ken_burns",
-      "input": {
-        "narration": "Built in 1653, the Taj Mahal took over twenty thousand workers and twenty-two years to complete.",
-        "beat_role": "visual_broll",
-        "duration_sec": 7,
-        "available_images": 1,
-        "fps": 30,
-        "beat_start_sec": 12.0,
-        "beat_end_sec": 19.0,
-        "sync_keyword": "Taj Mahal",
-        "keyword_offset_sec": 1.4,
-        "prev_beat_role": "intro",
-        "next_beat_role": "key_stat"
-      },
-      "output": {
-        "match": {
-          "category": "media_image",
-          "motion": "slow_zoom_pan",
-          "description": "A single historical photo filling the screen with a slow documentary-style zoom and pan.",
-          "use_when": "Narration describes a place, person or object and one still photo is available.",
-          "tags": [
-            "photo",
-            "documentary",
-            "zoom",
-            "history"
-          ]
-        },
-        "editing": {
-          "beat_role": "visual_broll",
-          "energy": "low",
-          "tone": [
-            "cinematic",
-            "serious"
-          ],
-          "layer": "full_screen",
-          "sync_target": "beat_start",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 12.0,
-          "clip_end_sec": 19.0,
-          "duration_frames": 210,
-          "entrance_frames": 0,
-          "sync_frame": 0,
-          "sync_lands_at_sec": 12.0
-        },
-        "requirements": {
-          "covers_footage": True,
-          "placement": "full_frame",
-          "item_count": "null",
-          "image_count": 1,
-          "transition_role": "null"
-        },
-        "props": {
-          "image": "<image_url_1>"
-        }
-      }
-    },
-    {
-      "_maps_to": "image_split_screen",
-      "input": {
-        "narration": "So which one should you buy, the iPhone 16 or the Pixel 9?",
-        "beat_role": "comparison",
-        "duration_sec": 5,
-        "available_images": 2,
-        "fps": 30,
-        "beat_start_sec": 300.2,
-        "beat_end_sec": 305.2,
-        "sync_keyword": "iPhone 16 or the Pixel 9",
-        "keyword_offset_sec": 1.0,
-        "prev_beat_role": "section_start",
-        "next_beat_role": "data_comparison"
-      },
-      "output": {
-        "match": {
-          "category": "media_image",
-          "motion": "halves_slide_in",
-          "description": "Two product photos side by side filling the screen, sliding in from each side with a label on each half.",
-          "use_when": "Visually comparing two things when an image of each is available.",
-          "tags": [
-            "split screen",
-            "versus",
-            "comparison",
-            "two images"
-          ]
-        },
-        "editing": {
-          "beat_role": "comparison",
-          "energy": "medium",
-          "tone": [
-            "neutral"
-          ],
-          "layer": "full_screen",
-          "sync_target": "keyword",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 300.3,
-          "clip_end_sec": 305.2,
-          "duration_frames": 147,
-          "entrance_frames": 30,
-          "sync_frame": 27,
-          "sync_lands_at_sec": 301.2
-        },
-        "requirements": {
-          "covers_footage": True,
-          "placement": "full_frame",
-          "item_count": 2,
-          "image_count": 2,
-          "transition_role": "null"
-        },
-        "props": {
-          "images": [
-            "<image_url_1>",
-            "<image_url_2>"
-          ],
-          "leftLabel": "iPhone 16",
-          "rightLabel": "Pixel 9"
-        }
-      }
-    },
-    {
-      "_maps_to": "intro_lower_third",
-      "input": {
-        "narration": "To understand this better, I spoke to Dr. Meera Iyer, an economist at IIM Bangalore.",
-        "beat_role": "speaker_intro",
-        "duration_sec": 5,
-        "available_images": 0,
-        "fps": 30,
-        "beat_start_sec": 88.0,
-        "beat_end_sec": 93.0,
-        "sync_keyword": "Dr. Meera Iyer",
-        "keyword_offset_sec": 1.0,
-        "prev_beat_role": "emphasis",
-        "next_beat_role": "quote"
-      },
-      "output": {
-        "match": {
-          "category": "lower_third",
-          "motion": "bar_slides_in_from_left",
-          "description": "Name bar in the bottom-left corner showing a person's name and role while the footage continues.",
-          "use_when": "Introducing a speaker, guest, expert or location.",
-          "tags": [
-            "lower third",
-            "name",
-            "speaker",
-            "corner"
-          ]
-        },
-        "editing": {
-          "beat_role": "speaker_intro",
-          "energy": "low",
-          "tone": [
-            "neutral",
-            "serious"
-          ],
-          "layer": "overlay",
-          "sync_target": "keyword",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 89.0,
-          "clip_end_sec": 93.0,
-          "duration_frames": 120,
-          "entrance_frames": 35,
-          "sync_frame": 0,
-          "sync_lands_at_sec": 89.0
-        },
-        "requirements": {
-          "covers_footage": False,
-          "placement": "bottom_left",
-          "item_count": "null",
-          "image_count": 0,
-          "transition_role": "null"
-        },
-        "props": {
-          "name": "Dr. Meera Iyer",
-          "role": "Economist, IIM Bangalore"
-        }
-      }
-    },
-    {
-      "_maps_to": "chapter_title",
-      "input": {
-        "narration": "Part two. The crash. What went wrong in 2008.",
-        "beat_role": "section_start",
-        "duration_sec": 4,
-        "available_images": 0,
-        "fps": 30,
-        "beat_start_sec": 240.0,
-        "beat_end_sec": 244.0,
-        "sync_keyword": "Part two",
-        "keyword_offset_sec": 0.0,
-        "prev_beat_role": "visual_broll",
-        "next_beat_role": "visual_broll"
-      },
-      "output": {
-        "match": {
-          "category": "title_card",
-          "motion": "number_scales_lines_extend",
-          "description": "Full-screen dark title card with a large chapter number, then the chapter title and a short subtitle.",
-          "use_when": "Starting a new numbered chapter or part of a long video.",
-          "tags": [
-            "chapter",
-            "section",
-            "title",
-            "number"
-          ]
-        },
-        "editing": {
-          "beat_role": "section_start",
-          "energy": "low",
-          "tone": [
-            "cinematic",
-            "serious"
-          ],
-          "layer": "full_screen",
-          "sync_target": "beat_start",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 240.0,
-          "clip_end_sec": 244.0,
-          "duration_frames": 120,
-          "entrance_frames": 40,
-          "sync_frame": 10,
-          "sync_lands_at_sec": 240.33
-        },
-        "requirements": {
-          "covers_footage": True,
-          "placement": "full_frame",
-          "item_count": "null",
-          "image_count": 0,
-          "transition_role": "null"
-        },
-        "props": {
-          "chapter": 2,
-          "title": "The Crash",
-          "subtitle": "What went wrong in 2008"
-        }
-      }
-    },
-    {
-      "_maps_to": "fade_through_black",
-      "input": {
-        "narration": "[cut] Ten years later, everything had changed.",
-        "beat_role": "transition",
-        "duration_sec": 1,
-        "available_images": 0,
-        "fps": 30,
-        "beat_start_sec": 239.5,
-        "beat_end_sec": 240.5,
-        "sync_keyword": "[cut]",
-        "keyword_offset_sec": 0.5,
-        "prev_beat_role": "visual_broll",
-        "next_beat_role": "section_start"
-      },
-      "output": {
-        "match": {
-          "category": "transition",
-          "motion": "fade_black_and_back",
-          "description": "Calm dip to black and back out, centered on the cut between two scenes.",
-          "use_when": "Time jumps, chapter changes or a quiet pause between scenes.",
-          "tags": [
-            "fade",
-            "black",
-            "time jump",
-            "calm"
-          ]
-        },
-        "editing": {
-          "beat_role": "transition",
-          "energy": "low",
-          "tone": [
-            "cinematic",
-            "serious"
-          ],
-          "layer": "transition",
-          "sync_target": "cut",
-          "exit": "clears_itself"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 239.5,
-          "clip_end_sec": 240.5,
-          "duration_frames": 30,
-          "entrance_frames": 30,
-          "sync_frame": 15,
-          "sync_lands_at_sec": 240.0
-        },
-        "requirements": {
-          "covers_footage": False,
-          "placement": "full_frame",
-          "item_count": "null",
-          "image_count": 0,
-          "transition_role": "across_cut"
-        },
-        "props": {}
-      }
-    },
-    {
-      "_maps_to": "vignette_pulse",
-      "input": {
-        "narration": "And then, at 2 a.m., the phone rang. Nobody expected what came next.",
-        "beat_role": "mood",
-        "duration_sec": 6,
-        "available_images": 0,
-        "fps": 30,
-        "beat_start_sec": 150.0,
-        "beat_end_sec": 156.0,
-        "sync_keyword": "2 a.m.",
-        "keyword_offset_sec": 1.8,
-        "prev_beat_role": "visual_broll",
-        "next_beat_role": "reveal"
-      },
-      "output": {
-        "match": {
-          "category": "overlay_fx",
-          "motion": "dark_edges_pulse",
-          "description": "Dark vignette pulsing around the edges of the footage to build tension, with no text.",
-          "use_when": "Suspense, mystery or tension where the footage should carry the moment.",
-          "tags": [
-            "suspense",
-            "vignette",
-            "mood",
-            "tension"
-          ]
-        },
-        "editing": {
-          "beat_role": "mood",
-          "energy": "low",
-          "tone": [
-            "dramatic",
-            "cinematic"
-          ],
-          "layer": "overlay",
-          "sync_target": "beat_start",
-          "exit": "hard_cut"
-        },
-        "timing": {
-          "fps": 30,
-          "clip_start_sec": 150.0,
-          "clip_end_sec": 156.0,
-          "duration_frames": 180,
-          "entrance_frames": 0,
-          "sync_frame": 0,
-          "sync_lands_at_sec": 150.0
-        },
-        "requirements": {
-          "covers_footage": False,
-          "placement": "full_frame",
-          "item_count": "null",
-          "image_count": 0,
-          "transition_role": "null"
-        },
-        "props": {}
-      }
-    }
-  ]
-}
-
 
 async def scene_breakdown(script):
     _start_token_tracking()
@@ -10067,8 +9415,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     last_word_index = word_count - 1
 
     SCENE_BEAT_DIRECTOR = f""" 
-        
-    You are a production-grade documentary video director and template-aware editing agent.
+    
+    You are a production-grade documentary video director.
 
     TASK
     Divide the narration into coherent visual beats. For each beat, choose:
@@ -10077,14 +9425,13 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     2. B-roll+overlay_animation
     3. full_screen_animation
 
-    For animation beats, select the best matching template from the supplied template metadata and populate its props with the information that should appear on screen.
+    For animation beats (overlay or full_screen), you do NOT pick a specific template.
+    Instead, provide keywords describing the visual pattern needed so it can be
+    semantically matched against a template library afterward.
 
     INPUT
 
     * Scene narration with WhisperX word-level indices.
-    * Animation template repository metadata as JSON.
-
-    The template metadata is the source of truth for available templates and their supported structure.
 
     BEATS
 
@@ -10095,7 +9442,12 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     * No gaps, overlaps, duplicates, or missing words.
     * First beat starts at 0; final beat ends at the last word.
     * Prefer sentence endings and natural changes in visual meaning.
-    * Target ~8–15 seconds per beat, but prioritize visual coherence.
+    * Target ~8-15 seconds per beat, but prioritize visual coherence.
+    * Every beat MUST include a "text" field containing the EXACT original narration
+    text covered by that beat's start_word_index through end_word_index.
+    - Do not paraphrase, summarize, or reword.
+    - Do not omit or add words.
+    - This must be the verbatim script text for that beat, word-for-word.
 
     WORD INDEX SAFETY — EXTREMELY STRICT
 
@@ -10119,6 +9471,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     * Do NOT estimate or calculate the word count from the narration.
     * Use ONLY the indices that exist in the supplied WORD-LEVEL TIMESTAMPS.
     * Before returning the JSON, internally verify that no beat contains an index outside 0-{last_word_index}.
+    * The "text" field for each beat MUST match exactly the words at that beat's
+    start_word_index through end_word_index — no drift, no rewording.
 
     VISUAL SELECTION
 
@@ -10126,80 +9480,62 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     Use for real people, places, objects, events, environments, machines, historical footage, and other subjects best represented by footage.
 
     Required:
-
     * Exactly 6 concrete Pexels-searchable keywords.
 
     "B-roll+overlay_animation"
     Use when footage should be enhanced by an animation such as statistics, numbers, charts, lists, names, dates, quotes, text emphasis, labels, lower thirds, callouts, icons, or visual effects.
 
     Required:
-
-    * Exactly 6 concrete Pexels-searchable keywords.
-    * Select a template with editing.layer = "overlay".
-    * Populate its supported props.
+    * Exactly 6 concrete Pexels-searchable keywords (for the footage).
+    * Up to 5 template_keywords (see TEMPLATE KEYWORDS below).
 
     "full_screen_animation"
     Use when animation should replace footage for processes, comparisons, charts, timelines, diagrams, data visualization, chapter cards, or concepts better represented graphically.
 
     Required:
+    * Up to 5 template_keywords (see TEMPLATE KEYWORDS below).
 
-    * Select a template with editing.layer = "full_screen".
-    * Populate its supported props.
+    TEMPLATE KEYWORDS
+    For every overlay or full_screen beat, provide UP TO 5 short keywords describing
+    the STRUCTURAL/VISUAL SHAPE of the content — not the topic, not a template name.
+    These will be embedded and semantically matched against a template library, so
+    precision matters: describe the pattern the content actually takes, using the
+    most specific and distinctive terms you can, ranked most-relevant first.
 
-    TEMPLATE SELECTION
+    Do NOT output a template name. Do NOT guess what templates exist. Only describe
+    the shape of the content itself.
 
-    * Read the supplied template metadata before selecting an animation.
-    * Match the beat semantically and functionally using the template metadata.
-    * Consider match, editing, requirements, and props.
-    * Select only templates present in the input.
-    * If no suitable animation template exists, use B-roll.
-    * Never invent or modify template metadata.
+    Use this reference list of common visual SHAPES to calibrate your keyword choices
+    (these are examples of shapes, not a menu to pick from or copy literally):
 
-    PROPS
-    For animation beats, populate the selected template's existing props structure.
+    * Opening/divider text with no other data → "title card", "section divider", "heading only"
+    * Title with supporting date/author/context info → "title with metadata", "heading plus details"
+    * One key number as the hero of the beat → "single statistic", "big number", "hero figure"
+    * Two numbers being compared → "number comparison", "two statistics", "before after figures"
+    * A direct spoken quote → "quote", "spoken statement", "direct quote"
+    * A short punchy standalone claim/statement → "key statement", "bold claim", "single line emphasis"
+    * A list of 3+ short items → "structured list", "bulleted items", "multiple items"
+    * Two options/entities compared side by side → "comparison columns", "side by side comparison", "two-way comparison"
+    * Categorical values compared by size → "bar chart", "category comparison", "ranked values"
+    * Values changing across a continuous period → "line chart", "trend over time", "data series"
+    * Parts of a whole / percentage breakdown → "pie chart", "donut chart", "proportional breakdown"
+    * Ranked entries from top to bottom → "leaderboard", "ranked list", "ordered ranking"
+    * Events across dates or a chronological span → "timeline", "chronological sequence", "dated events"
+    * One thing directly causing/leading to another → "cause and effect", "trigger and response", "leads to relationship"
+    * Introducing a specific named person → "person introduction", "name and role", "expert intro"
+    * A single image paired with a caption/label → "image with label", "captioned image", "picture and caption"
+    * An ordered sequence of steps/stages → "step by step process", "sequential steps", "workflow stages"
 
-    * Preserve property names, nesting, and structure.
-    * Populate only supported properties.
-    * Use only information supported by the narration and supplied context.
-    * Never invent facts, numbers, names, dates, quotes, statistics, examples, or assets.
-    * Preserve numerical values, labels, relationships, order, and meaning.
-    * Keep displayed text concise and screen-readable.
-    * Respect template requirements such as item_count, image_count, placement, and other supplied constraints.
-    * Do not generate timestamps, timing values, or unsupported props.
+    Pick keywords that best match the ACTUAL shape of THIS beat's content — do not
+    default to the same keywords for every beat. If a beat doesn't clearly fit any
+    of the above, describe its shape in your own words using the same style
+    (structural, not topical).
 
-    CONTENT MAPPING
-    Map the beat's information to the template according to its supported structure:
+    Do NOT include topical/subject keywords here (e.g. "onions", "UPI payment",
+    "finance") — those belong only in the B-roll "keywords" field. template_keywords
+    describe shape, not subject.
 
-    * Statistic → value/number fields.
-    * Multiple values or trends → data/series structure with correct labels and values.
-    * List → items structure.
-    * Ordered process → sequential steps.
-    * Two-way comparison → comparison structure with correct entity, label, and left/right relationships.
-    * Single or multiple images → image fields/arrays with correct labels when supported.
-    * Person/expert → name + role/title.
-    * Place/location → supported name/location fields.
-    * Key phrase → text + highlight fields.
-    * Quote → quote/text field using supplied wording.
-    * Chapter/section → chapter + title + subtitle.
-    * Title + explanation → supported title/subtitle/body fields.
-    * Text + icon → maintain correct text/icon pairing.
-    * List + icons → maintain one-to-one item/icon alignment.
-    * Number + label → preserve each value/label relationship.
-    * Chart + labels → preserve category/value relationships.
-    * Image + label → preserve image/label relationships.
-    * Sequential animation → preserve narration order.
-    * Callout/emphasis → highlight only the relevant information.
-    * Mood/effect or transition → use the template without unnecessary content.
-    * Specialized template → follow its supplied props structure directly.
-
-    For all mappings:
-
-    * Preserve relationships between text, numbers, labels, icons, and images.
-    * Use the minimum content needed to communicate the beat.
-    * Do not duplicate information unnecessarily.
-    * Never force content into an unsuitable field.
-
-    KEYWORDS
+    KEYWORDS (B-roll footage search terms — separate from template_keywords)
     For B-roll and B-roll+overlay_animation:
 
     * Exactly 6 concrete Pexels-searchable keywords.
@@ -10209,124 +9545,63 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     OUTPUT
     Return ONLY valid JSON.
 
-OUTPUT FORMAT — EXTREMELY STRICT
+    OUTPUT FORMAT — EXTREMELY STRICT
 
-The response MUST be a JSON ARRAY at the root level.
+    The response MUST be a JSON ARRAY at the root level.
+    The root JSON value MUST start with `[` and end with `]`.
+    NEVER return a JSON object as the root value.
+    NEVER wrap the array inside {{"beats": [...]}}, {{"directions": [...]}}, etc.
+    NEVER return markdown, ```json, or explanations outside the JSON array.
 
-The root JSON value MUST start with `[` and end with `]`.
+    The ONLY valid response format is:
 
-NEVER return a JSON object as the root value.
-
-NEVER wrap the array inside:
-- {{"beats": [...]}}
-- {{"directions": [...]}}
-- {{"result": [...]}}
-- {{"data": [...]}}
-- {{"visual_beats": [...]}}
-
-NEVER return a single beat object.
-
-NEVER return markdown.
-NEVER return ```json.
-NEVER return explanations or text outside the JSON array.
-
-The ONLY valid response format is:
-
-[
-  {{
-    "type": "B-roll",
-    "start_word_index": 0,
-    "end_word_index": 12,
-    "keywords": [
-      "...",
-      "...",
-      "...",
-      "...",
-      "...",
-      "..."
+    [
+    {{
+        "type": "B-roll",
+        "start_word_index": 0,
+        "end_word_index": 12,
+        "text": "Exact narration text for this beat",
+        "keywords": ["...", "...", "...", "...", "...", "..."]
+    }},
+    {{
+        "type": "B-roll+overlay_animation",
+        "start_word_index": 13,
+        "end_word_index": 25,
+        "text": "Exact narration text for this beat",
+        "keywords": ["...", "...", "...", "...", "...", "..."],
+        "template_keywords": ["single statistic", "big number", "hero figure"]
+    }},
+    {{
+        "type": "full_screen_animation",
+        "start_word_index": 26,
+        "end_word_index": 42,
+        "text": "Exact narration text for this beat",
+        "template_keywords": ["step by step process", "sequential steps", "workflow stages"]
+    }}
     ]
-  }},
-  {{
-    "type": "B-roll+overlay_animation",
-    "start_word_index": 13,
-    "end_word_index": 25,
-    "keywords": [
-      "...",
-      "...",
-      "...",
-      "...",
-      "...",
-      "..."
-    ],
-    "template": {{
-      "match": {{}}
-    }}
-  }},
-  {{
-    "type": "full_screen_animation",
-    "start_word_index": 26,
-    "end_word_index": 42,
-    "template": {{
-      "match": {{}}
-    }}
-  }}
-]
 
-IMPORTANT ROOT STRUCTURE RULES:
+    IMPORTANT ROOT STRUCTURE RULES:
 
-- The root MUST be an array.
-- Every element inside the array MUST be one beat object.
-- There is NO "beats" property.
-- There is NO "directions" property.
-- There is NO wrapper object.
-- Do not add any other top-level property.
-- If there is only one beat, still return an array containing that one object.
-- If there are 20 beats, return one array containing 20 beat objects.
-- The first character of the response MUST be `[`.
-- The last character of the response MUST be `]`.
-
-Each beat object MUST contain:
-
-For B-roll:
-{{
-  "type": "B-roll",
-  "start_word_index": <integer>,
-  "end_word_index": <integer>,
-  "keywords": [<exactly 6 strings>]
-}}
-
-For B-roll+overlay_animation:
-{{
-  "type": "B-roll+overlay_animation",
-  "start_word_index": <integer>,
-  "end_word_index": <integer>,
-  "keywords": [<exactly 6 strings>],
-  "template": <selected template object>
-}}
-
-For full_screen_animation:
-{{
-  "type": "full_screen_animation",
-  "start_word_index": <integer>,
-  "end_word_index": <integer>,
-  "template": <selected template object>
-}}
-
+    * The root MUST be an array.
+    * Every element inside the array MUST be one beat object.
+    * There is NO "beats" property, NO "directions" property, NO wrapper object.
+    * If there is only one beat, still return an array containing that one object.
+    * The first character of the response MUST be `[`.
+    * The last character of the response MUST be `]`.
 
     FINAL CHECK
     * Complete consecutive word coverage.
     * First index = 0; final index = {last_word_index}.
+    * Every beat has a "text" field with the exact, verbatim narration for its
+    word range — no paraphrasing, no omissions, no additions.
     * Exactly 6 keywords for B-roll types.
-    * Selected template exists in supplied metadata.
-    * Correct animation layer selected.
-    * Props conform to the selected template.
-    * Content is supported by the input.
-    * Relationships between props are preserved.
-    * No invented information.
+    * template_keywords present (up to 5 items, ranked most-relevant first) for
+    every overlay/full_screen beat, describing shape not topic, with no template
+    names guessed.
     * No start_word_index or end_word_index outside 0-{last_word_index}.
 
     The final response must be ONLY the JSON array.
-"""
+    """
 
     prompt = f"""
     {SCENE_BEAT_DIRECTOR}
@@ -10336,9 +9611,6 @@ For full_screen_animation:
 
     WORD-LEVEL TIMESTAMPS:
     {json.dumps(word_timestamps, ensure_ascii=False)}
-
-    Metadata JSON:
-    {TEMPLATE_METADATA}
 
     Now divide this scene into visual beats.
     """
@@ -10481,38 +9753,160 @@ def search_pexel_media(keywords: list):
 
 
 
-def get_best_animation_template(match_obj):
+
+
+
+async def get_accurate_template(text, template_keywords: list):
     model = _get_st_model()
-    match_text = " ".join([
-        str(match_obj.get("category", "")),
-        str(match_obj.get("motion", "")),
-        str(match_obj.get("description", "")),
-        str(match_obj.get("use_when", "")),
-        " ".join(match_obj.get("tags", []))
-    ])
 
-    embedding = model.encode(
-        match_text,
-        normalize_embeddings=True
-    ).tolist()
+    all_matches = []
+
+    for i, keyword in enumerate(template_keywords):
+
+        keyword_embedding = model.encode(
+            keyword,
+            normalize_embeddings=True
+        )
+
+        response = (
+            supabase
+            .rpc(
+                "match_animation_templates",
+                {
+                    "query_embedding": keyword_embedding.tolist(),
+                    "match_count": 3
+                }
+            )
+            .execute()
+        )
+
+        matches = response.data or []
+
+        all_matches.append({
+            "keyword": keyword,
+            "matches": matches
+        })
+
+    options_text = ""
+
+    for item in all_matches:
+        options_text += f"\nKeyword: {item['keyword']}\n"
+
+        for match in item["matches"]:
+            template_name = match.get("name")
+
+            if template_name:
+                options_text += f"- {template_name}\n"
 
 
-    result = supabase.rpc(
-        "match_animations_template",
-        {
-            "query_embedding": embedding,
-            "match_threshold": 0.0,
-            "match_count": 1
-        }
-    ).execute()
+    prompt = f"""
+    You are selecting an animation template for a video scene.
 
-    matches = result.data or []
+    TASK:
+    Choose the single animation template that best matches the meaning and purpose of the scene.
 
-    if not matches:
-        return None
+    SCENE:
+    {text}
 
-    return matches[0]["name"]
+    AVAILABLE TEMPLATE NAMES:
+    {options_text}
 
+    SELECTION RULES:
+    1. You may choose ONLY one template from the AVAILABLE TEMPLATE NAMES list.
+    2. The template name must match one of the names in the list EXACTLY.
+    3. Preserve the exact spelling, capitalization, spaces, punctuation, and symbols of the selected template name.
+    4. Do not rename, rephrase, shorten, expand, translate, or normalize the template name.
+    5. Do not create a new template name.
+    6. Do not return a description or explanation.
+    7. Do not return quotes, markdown, or any additional text.
+    8. Select the template based on how well its purpose fits the SCENE.
+
+    OUTPUT FORMAT:
+    Return ONLY the exact template name copied from the AVAILABLE TEMPLATE NAMES list.  
+    """
+
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                stream=False,
+            )
+        )
+
+        _record_token_usage("template_selection", res)
+
+        template_name = res.choices[0].message.content.strip()
+
+        print("chosen template is", template_name)
+
+        template_response = (
+            supabase
+            .table("animations_template")
+            .select("props")
+            .eq("name", template_name)
+            .single()
+            .execute()
+        )
+
+        template_props = template_response.data["props"]
+
+        props_prompt = f"""
+        Fill the animation template properties using the narration text.
+
+        Narration text:
+        {text}
+
+        Template name:
+        {template_name}
+
+        Template properties:
+        {json.dumps(template_props, indent=2)}
+
+        Rules:
+        - Fill only the values that should be determined from the narration text.
+        - Keep the existing property structure exactly the same.
+        - Do not add new properties.
+        - Do not remove properties.
+        - Preserve property types.
+        - Use the narration text as the source for the content.
+        - Do not invent facts or content that is not supported by the narration.
+        - Return ONLY valid JSON.
+        """
+
+        props_res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": props_prompt
+                    }
+                ],
+                stream=False,
+            )
+        )
+
+        _record_token_usage("template_props", props_res)
+
+        filled_props = json.loads(
+            props_res.choices[0].message.content.strip()
+        )
+
+        return template_name, filled_props
+
+    except Exception as e:
+        print(f"[Template Selection] failed: {e}")
+        return None , None
+
+
+   
 
 
 
@@ -10571,13 +9965,10 @@ async def edit_video(body: Editvideo):
                     direction["asserts"] = search_pexel_media(keywords)
 
                 if direction["type"] in ["B-roll+overlay_animation", "full_screen_animation"]:
-                    print("matching template metadata")
-                    match_obj = direction["template"]["match"]
-                    template_name = get_best_animation_template(match_obj)
-                    direction["template"]["name"] = template_name
-                    print("selected template:", template_name)
-         
-      
+                    template_name, template_props = await get_accurate_template(direction["text"],direction["template_keywords"])
+                    direction["template_name"] = template_name
+                    direction["template_props"] = template_props    
+
         supabase.table("videos").insert({
             "user_id": body.userId,
             "script": body.script,
@@ -10589,9 +9980,7 @@ async def edit_video(body: Editvideo):
             "timeline_version": 1
         }).execute()
 
-
         print("saved into db")
-
 
         return scenes
 
@@ -10629,6 +10018,19 @@ async def edit_video(body: Editvideo):
 
 
 
+        # supabase.table("videos").insert({
+        #     "user_id": body.userId,
+        #     "script": body.script,
+        #     "voice": body.voice,
+        #     "lang_code": body.langCode,
+        #     "timeline": {
+        #         "scenes": scenes
+        #     },
+        #     "timeline_version": 1
+        # }).execute()
+
+
+        # print("saved into db")
 
 
 
