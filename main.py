@@ -9338,6 +9338,7 @@ async def generate_audio_for_scene(scene_text,modelId,userId):
         audio = fish_audio_client.tts.convert(
             text=scene_text,
             reference_id=modelId,
+            speed=0.95,
         )   
         audio_bytes = bytes(audio)
         audio_id = str(uuid.uuid4())
@@ -9756,12 +9757,20 @@ def search_pexel_media(keywords: list):
 
 
 
-async def get_accurate_template(text, template_keywords: list):
+async def get_accurate_template(
+    text: str,
+    template_keywords: list,
+    template_type: str
+):
     model = _get_st_model()
 
     all_matches = []
+    available_template_names = set()
 
-    for i, keyword in enumerate(template_keywords):
+    # ---------------------------------------------------------
+    # 1. Find candidate templates from Supabase using embeddings
+    # ---------------------------------------------------------
+    for keyword in template_keywords:
 
         keyword_embedding = model.encode(
             keyword,
@@ -9787,46 +9796,48 @@ async def get_accurate_template(text, template_keywords: list):
             "matches": matches
         })
 
-    options_text = ""
-
-    for item in all_matches:
-        options_text += f"\nKeyword: {item['keyword']}\n"
-
-        for match in item["matches"]:
+        # Collect only templates that actually exist
+        for match in matches:
             template_name = match.get("name")
 
             if template_name:
-                options_text += f"- {template_name}\n"
+                available_template_names.add(template_name)
 
+    # ---------------------------------------------------------
+    # 2. Build unique template list for the LLM
+    # ---------------------------------------------------------
+    options_text = "\n".join(
+        f"- {name}"
+        for name in sorted(available_template_names)
+    )
 
+    if not available_template_names:
+        print("[Template Selection] No candidate templates found")
+        return None, None
+
+    # ---------------------------------------------------------
+    # 3. Ask LLM to select ONLY from the Supabase candidates
+    # ---------------------------------------------------------
     prompt = f"""
-    You are selecting an animation template for a video scene.
+You are selecting an animation template.
 
-    TASK:
-    Choose the single animation template that best matches the meaning and purpose of the scene.
+SCENE:
+{text}
 
-    SCENE:
-    {text}
+AVAILABLE TEMPLATES:
+{options_text}
 
-    AVAILABLE TEMPLATE NAMES:
-    {options_text}
+Choose exactly one template from the list.
 
-    SELECTION RULES:
-    1. You may choose ONLY one template from the AVAILABLE TEMPLATE NAMES list.
-    2. The template name must match one of the names in the list EXACTLY.
-    3. Preserve the exact spelling, capitalization, spaces, punctuation, and symbols of the selected template name.
-    4. Do not rename, rephrase, shorten, expand, translate, or normalize the template name.
-    5. Do not create a new template name.
-    6. Do not return a description or explanation.
-    7. Do not return quotes, markdown, or any additional text.
-    8. Select the template based on how well its purpose fits the SCENE.
-
-    OUTPUT FORMAT:
-    Return ONLY the exact template name copied from the AVAILABLE TEMPLATE NAMES list.  
-    """
-
+Rules:
+1. Return the exact template name.
+2. Do not create a new template.
+3. Do not rename a template.
+4. Return only the template name.
+"""
 
     try:
+
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
@@ -9842,10 +9853,29 @@ async def get_accurate_template(text, template_keywords: list):
 
         _record_token_usage("template_selection", res)
 
-        template_name = res.choices[0].message.content.strip()
+        template_name = (
+            res.choices[0].message.content.strip()
+        )
 
         print("chosen template is", template_name)
 
+        # -----------------------------------------------------
+        # 4. Validate LLM output
+        # -----------------------------------------------------
+        if template_name not in available_template_names:
+
+            print(
+                f"[Template Selection] Invalid template returned: "
+                f"{template_name}"
+            )
+
+            # Optional fallback
+            # Prevents querying Supabase with a nonexistent name.
+            return None, None
+
+        # -----------------------------------------------------
+        # 5. Get the selected template's props
+        # -----------------------------------------------------
         template_response = (
             supabase
             .table("animations_template")
@@ -9855,30 +9885,53 @@ async def get_accurate_template(text, template_keywords: list):
             .execute()
         )
 
+        if not template_response.data:
+            print(
+                f"[Template Selection] Template not found in DB: "
+                f"{template_name}"
+            )
+            return None, None
+
         template_props = template_response.data["props"]
 
+        # -----------------------------------------------------
+        # 6. Fill template props using LLM
+        # -----------------------------------------------------
         props_prompt = f"""
-        Fill the animation template properties using the narration text.
+Fill the template props using ONLY the narration.
 
-        Narration text:
-        {text}
+NARRATION:
+{text}
 
-        Template name:
-        {template_name}
+TEMPLATE NAME:
+{template_name}
 
-        Template properties:
-        {json.dumps(template_props, indent=2)}
+TEMPLATE TYPE:
+{template_type}
 
-        Rules:
-        - Fill only the values that should be determined from the narration text.
-        - Keep the existing property structure exactly the same.
-        - Do not add new properties.
-        - Do not remove properties.
-        - Preserve property types.
-        - Use the narration text as the source for the content.
-        - Do not invent facts or content that is not supported by the narration.
-        - Return ONLY valid JSON.
-        """
+PROPS SCHEMA:
+{json.dumps(template_props, indent=2)}
+
+RULES:
+1. Return a complete JSON object matching the schema exactly.
+2. Do not add or remove fields.
+3. Preserve field names and data types.
+4. Do not invent information.
+5. Return only valid JSON.
+6. image_url must always be "".
+7. Background:
+   - B-roll+overlay_animation → "transparent"
+   - full_screen_animation → "theme"
+8. Never choose another background value.
+9. If background is "theme":
+   - background_color → valid hex color
+   - background_2_color → valid hex color
+10. If background is not "theme":
+   - background_color → ""
+   - background_2_color → ""
+11. Never leave background colors empty when background is "theme".
+12. Return no explanation or markdown.
+"""
 
         props_res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
@@ -9903,10 +9956,7 @@ async def get_accurate_template(text, template_keywords: list):
 
     except Exception as e:
         print(f"[Template Selection] failed: {e}")
-        return None , None
-
-
-   
+        return None, None
 
 
 
@@ -9965,7 +10015,7 @@ async def edit_video(body: Editvideo):
                     direction["asserts"] = search_pexel_media(keywords)
 
                 if direction["type"] in ["B-roll+overlay_animation", "full_screen_animation"]:
-                    template_name, template_props = await get_accurate_template(direction["text"],direction["template_keywords"])
+                    template_name, template_props = await get_accurate_template(direction["text"],direction["template_keywords"],direction["type"])
                     direction["template_name"] = template_name
                     direction["template_props"] = template_props    
 
