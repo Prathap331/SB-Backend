@@ -9450,6 +9450,38 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     - Do not omit or add words.
     - This must be the verbatim script text for that beat, word-for-word.
 
+    CATEGORY DISTRIBUTION — IMPORTANT
+
+    Across the entire scene, distribute the three beat types approximately as follows:
+
+    * B-roll: 40–50% of the total scene runtime
+    * B-roll+overlay_animation: 30–40% of the total scene runtime
+    * full_screen_animation: 10–20% of the total scene runtime
+
+    These percentages describe the overall visual composition of the scene, not
+    individual beats.
+
+    * B-roll should be the dominant category and used for establishing context,
+      real subjects, places, objects, events, and general narration.
+    * B-roll+overlay_animation should be used when narration contains a specific
+      claim, number, name, date, comparison, list, label, or information that
+      benefits from visual reinforcement.
+    * full_screen_animation should be used selectively for structural beats such
+      as processes, comparisons, timelines, charts, diagrams, chapter moments,
+      or concepts that are better represented graphically.
+
+    Do NOT overuse full_screen_animation.
+    Do NOT turn every informational sentence into an animation.
+    Prefer B-roll when real footage can communicate the narration effectively.
+    Use B-roll+overlay_animation for information that needs visual emphasis.
+    Reserve full_screen_animation for moments where a dedicated graphic structure
+    materially improves understanding.
+
+    Because beats have discrete word ranges, exact percentages are not required.
+    Stay as close as reasonably possible to the target distribution while
+    preserving natural sentence boundaries, visual coherence, and the
+    8–15 second beat target.
+
     WORD INDEX SAFETY — EXTREMELY STRICT
 
     The supplied WORD-LEVEL TIMESTAMPS contains exactly {word_count} entries.
@@ -9592,17 +9624,22 @@ async def add_directions_for_scene(scene_text, word_timestamps):
 
     FINAL CHECK
     * Complete consecutive word coverage.
-    * First index = 0; final index = {last_word_index}.
+    * First index = 0; final beat ends at {last_word_index}.
     * Every beat has a "text" field with the exact, verbatim narration for its
-    word range — no paraphrasing, no omissions, no additions.
+      word range — no paraphrasing, no omissions, no additions.
+    * Overall scene distribution should approximately follow:
+      B-roll = 40–50% runtime,
+      B-roll+overlay_animation = 30–40% runtime,
+      full_screen_animation = 10–20% runtime.
     * Exactly 6 keywords for B-roll types.
     * template_keywords present (up to 5 items, ranked most-relevant first) for
-    every overlay/full_screen beat, describing shape not topic, with no template
-    names guessed.
+      every overlay/full_screen beat, describing shape not topic, with no template
+      names guessed.
     * No start_word_index or end_word_index outside 0-{last_word_index}.
 
     The final response must be ONLY the JSON array.
     """
+
 
     prompt = f"""
     {SCENE_BEAT_DIRECTOR}
