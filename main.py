@@ -31,6 +31,8 @@ from fishaudio import FishAudio
 import whisperx
 import tempfile
 import uuid
+import copy
+
 
 
 load_dotenv()
@@ -9411,12 +9413,22 @@ async def get_word_level_time_stamps(scenes: list):
 
 
 async def add_directions_for_scene(scene_text, word_timestamps):
-
     word_count = len(word_timestamps)
     last_word_index = word_count - 1
 
-    SCENE_BEAT_DIRECTOR = f""" 
-    
+    # Send explicit indices so the model never has to count words itself
+    indexed_words = [
+        {
+            "i": i,
+            "word": w["word"],
+            "start": w["start"],
+            "end": w["end"]
+        }
+        for i, w in enumerate(word_timestamps)
+    ]
+
+    SCENE_BEAT_DIRECTOR = f"""
+
     You are a production-grade documentary video director.
 
     TASK
@@ -9432,7 +9444,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
 
     INPUT
 
-    * Scene narration with WhisperX word-level indices.
+    * Scene narration with WhisperX word-level entries. Each entry has an explicit
+      index field "i". Use ONLY these "i" values as word indices.
 
     BEATS
 
@@ -9449,6 +9462,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     - Do not paraphrase, summarize, or reword.
     - Do not omit or add words.
     - This must be the verbatim script text for that beat, word-for-word.
+    * The number of words in "text" MUST equal (end_word_index - start_word_index + 1).
 
     CATEGORY DISTRIBUTION — IMPORTANT
 
@@ -9509,7 +9523,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     * The final beat MUST end at {last_word_index}.
     * Every index from 0 through {last_word_index} MUST be covered exactly once.
     * Do NOT estimate or calculate the word count from the narration.
-    * Use ONLY the indices that exist in the supplied WORD-LEVEL TIMESTAMPS.
+    * Use ONLY the "i" values that exist in the supplied WORD-LEVEL TIMESTAMPS.
     * Before returning the JSON, internally verify that no beat contains an index outside 0-{last_word_index}.
     * The "text" field for each beat MUST match exactly the words at that beat's
     start_word_index through end_word_index — no drift, no rewording.
@@ -9520,20 +9534,30 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     Use for real people, places, objects, events, environments, machines, historical footage, and other subjects best represented by footage.
 
     Required:
-    * Exactly 6 concrete Pexels-searchable keywords.
+    * Exactly 1 concrete Pexels-searchable keyword.
 
     "B-roll+overlay_animation"
     Use when footage should be enhanced by an animation such as statistics, numbers, charts, lists, names, dates, quotes, text emphasis, labels, lower thirds, callouts, icons, or visual effects.
 
     Required:
-    * Exactly 6 concrete Pexels-searchable keywords (for the footage).
+    * Exactly 2 concrete Pexels-searchable keywords (for the footage).
     * Up to 5 template_keywords (see TEMPLATE KEYWORDS below).
+    * overlay_start_word_index and overlay_end_word_index:
+      - The exact word range that the animation illustrates (e.g. the one
+        sentence or phrase containing the statistic, name, quote or claim).
+      - MUST lie inside the beat's own start_word_index..end_word_index.
+      - The animation is shown ONLY while these words are spoken, then it
+        disappears. The B-roll footage continues for the whole beat.
+      - Do NOT set the overlay range equal to the full beat unless the whole
+        beat is the graphic's content. Prefer a tighter range, typically one
+        sentence or phrase (roughly 3–8 seconds).
 
     "full_screen_animation"
     Use when animation should replace footage for processes, comparisons, charts, timelines, diagrams, data visualization, chapter cards, or concepts better represented graphically.
 
     Required:
     * Up to 5 template_keywords (see TEMPLATE KEYWORDS below).
+    * No overlay_start_word_index / overlay_end_word_index (the animation covers the full beat).
 
     TEMPLATE KEYWORDS
     For every overlay or full_screen beat, provide UP TO 5 short keywords describing
@@ -9578,7 +9602,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     KEYWORDS (B-roll footage search terms — separate from template_keywords)
     For B-roll and B-roll+overlay_animation:
 
-    * Exactly 6 concrete Pexels-searchable keywords.
+    * B-roll: exactly 1 concrete Pexels-searchable keyword.
+    * B-roll+overlay_animation: exactly 2 concrete Pexels-searchable keywords.
     * Describe visible subjects/scenes.
     * Avoid vague terms such as technology, concept, idea, or innovation.
 
@@ -9601,14 +9626,16 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         "start_word_index": 0,
         "end_word_index": 12,
         "text": "Exact narration text for this beat",
-        "keywords": ["...", "...", "...", "...", "...", "..."]
+        "keywords": ["..."]
     }},
     {{
         "type": "B-roll+overlay_animation",
         "start_word_index": 13,
         "end_word_index": 25,
+        "overlay_start_word_index": 16,
+        "overlay_end_word_index": 22,
         "text": "Exact narration text for this beat",
-        "keywords": ["...", "...", "...", "...", "...", "..."],
+        "keywords": ["...", "..."],
         "template_keywords": ["single statistic", "big number", "hero figure"]
     }},
     {{
@@ -9638,15 +9665,16 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       B-roll = 40–50% runtime,
       B-roll+overlay_animation = 30–40% runtime,
       full_screen_animation = 10–20% runtime.
-    * Exactly 6 keywords for B-roll types.
+    * B-roll beats have exactly 1 keyword; B-roll+overlay_animation beats have exactly 2 keywords.
     * template_keywords present (up to 5 items, ranked most-relevant first) for
       every overlay/full_screen beat, describing shape not topic, with no template
       names guessed.
+    * Every B-roll+overlay_animation beat has overlay_start_word_index and
+      overlay_end_word_index inside its own start/end range.
     * No start_word_index or end_word_index outside 0-{last_word_index}.
 
     The final response must be ONLY the JSON array.
     """
-
 
     prompt = f"""
     {SCENE_BEAT_DIRECTOR}
@@ -9654,8 +9682,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     SCENE:
     {scene_text}
 
-    WORD-LEVEL TIMESTAMPS:
-    {json.dumps(word_timestamps, ensure_ascii=False)}
+    WORD-LEVEL TIMESTAMPS (use the "i" field as the word index):
+    {json.dumps(indexed_words, ensure_ascii=False)}
 
     Now divide this scene into visual beats.
     """
@@ -9685,120 +9713,128 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         return e
 
 
-
 async def align_beats_to_voice(directions: list, word_timestamps: list):
 
     print("aligning beats to voice")
     print("word timestamps count:", len(word_timestamps))
 
-    for direction in directions:
-        start_index = int(direction["start_word_index"])
-        end_index = int(direction["end_word_index"])
+    last_idx = len(word_timestamps) - 1
 
-        print(
-            "beat:",
-            start_index,
-            "->",
-            end_index,
-            "available words:",
-            len(word_timestamps)
-        )
+    for direction in directions:
+        start_index = max(0, min(int(direction["start_word_index"]), last_idx))
+        end_index = max(start_index, min(int(direction["end_word_index"]), last_idx))
+
+        print("beat:", start_index, "->", end_index, "available words:", len(word_timestamps))
 
         direction["start"] = word_timestamps[start_index]["start"]
         direction["end"] = word_timestamps[end_index]["end"]
 
-    return directions
+        if direction.get("type") == "B-roll+overlay_animation":
+            o_start = direction.get("overlay_start_word_index", start_index)
+            o_end = direction.get("overlay_end_word_index", end_index)
 
+            try:
+                o_start = int(o_start)
+                o_end = int(o_end)
+            except (TypeError, ValueError):
+                o_start, o_end = start_index, end_index
+
+            o_start = max(start_index, min(o_start, end_index))
+            o_end = max(o_start, min(o_end, end_index))
+
+            direction["overlay_start_word_index"] = o_start
+            direction["overlay_end_word_index"] = o_end
+            direction["overlay_start"] = word_timestamps[o_start]["start"]
+            direction["overlay_end"] = word_timestamps[o_end]["end"]
+            direction["overlay_text"] = " ".join(
+                w["word"] for w in word_timestamps[o_start:o_end + 1]
+            )
+
+    return directions
     
 
 PEXELS_HEADERS = {
     "Authorization": PEXELS_API_KEY
 }
 
-def search_pexel_media(keywords: list):
+
+def search_pexel_media(keywords: list, media_type: str = "video"):
+    """media_type: 'photo' or 'video'. Fetches only one of them."""
 
     photos = []
     videos = []
 
     for keyword in keywords:
 
-
-        photo_response = requests.get(
-            "https://api.pexels.com/v1/search",
-            headers=PEXELS_HEADERS,
-            params={
-                "query": keyword,
-                "orientation": "landscape",
-                "per_page": 2
-            },
-            timeout=10
-        )
-
-        if photo_response.ok:
-            photo_data = photo_response.json()
-
-            for photo in photo_data.get("photos", []):
-                photos.append({
-                    "id": photo["id"],
-                    "type": "photo",
+        if media_type == "photo":
+            photo_response = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers=PEXELS_HEADERS,
+                params={
                     "query": keyword,
-                    "url": photo["url"],
-                    "image_url": photo["src"]["large2x"],
-                    "width": photo["width"],
-                    "height": photo["height"],
-                    "photographer": photo["photographer"]
-                })
+                    "orientation": "landscape",
+                    "per_page": 1
+                },
+                timeout=10
+            )
 
-
-        video_response = requests.get(
-            "https://api.pexels.com/v1/videos/search",
-            headers=PEXELS_HEADERS,
-            params={
-                "query": keyword,
-                "orientation": "landscape",
-                "per_page": 5
-            },
-            timeout=10
-        )
-
-        if video_response.ok:
-            video_data = video_response.json()
-
-            for video in video_data.get("videos", []):
-
-                video_files = video.get("video_files", [])
-
-                video_file = next(
-                    (
-                        f for f in video_files
-                        if f.get("width") >= 1280
-                        and f.get("height") >= 720
-                    ),
-                    None
-                )
-
-                if not video_file and video_files:
-                    video_file = video_files[0]
-
-                if video_file:
-                    videos.append({
-                        "id": video["id"],
-                        "type": "video",
+            if photo_response.ok:
+                for photo in photo_response.json().get("photos", []):
+                    photos.append({
+                        "id": photo["id"],
+                        "type": "photo",
                         "query": keyword,
-                        "url": video["url"],
-                        "video_url": video_file["link"],
-                        "width": video_file["width"],
-                        "height": video_file["height"],
-                        "duration": video["duration"]
+                        "url": photo["url"],
+                        "image_url": photo["src"]["large2x"],
+                        "width": photo["width"],
+                        "height": photo["height"],
+                        "photographer": photo["photographer"]
                     })
+
+        else:
+            video_response = requests.get(
+                "https://api.pexels.com/v1/videos/search",
+                headers=PEXELS_HEADERS,
+                params={
+                    "query": keyword,
+                    "orientation": "landscape",
+                    "per_page": 5
+                },
+                timeout=10
+            )
+
+            if video_response.ok:
+                for video in video_response.json().get("videos", []):
+                    video_files = video.get("video_files", [])
+
+                    video_file = next(
+                        (
+                            f for f in video_files
+                            if f.get("width") >= 1280
+                            and f.get("height") >= 720
+                        ),
+                        None
+                    )
+
+                    if not video_file and video_files:
+                        video_file = video_files[0]
+
+                    if video_file:
+                        videos.append({
+                            "id": video["id"],
+                            "type": "video",
+                            "query": keyword,
+                            "url": video["url"],
+                            "video_url": video_file["link"],
+                            "width": video_file["width"],
+                            "height": video_file["height"],
+                            "duration": video["duration"]
+                        })
+
     return {
         "photos": photos,
         "videos": videos
     }
-
-
-
-
 
 
 async def get_accurate_template(
@@ -9811,9 +9847,6 @@ async def get_accurate_template(
     all_matches = []
     available_template_names = set()
 
-    # ---------------------------------------------------------
-    # 1. Find candidate templates from Supabase using embeddings
-    # ---------------------------------------------------------
     for keyword in template_keywords:
 
         keyword_embedding = model.encode(
@@ -9840,16 +9873,12 @@ async def get_accurate_template(
             "matches": matches
         })
 
-        # Collect only templates that actually exist
         for match in matches:
             template_name = match.get("name")
 
             if template_name:
                 available_template_names.add(template_name)
 
-    # ---------------------------------------------------------
-    # 2. Build unique template list for the LLM
-    # ---------------------------------------------------------
     options_text = "\n".join(
         f"- {name}"
         for name in sorted(available_template_names)
@@ -9859,26 +9888,23 @@ async def get_accurate_template(
         print("[Template Selection] No candidate templates found")
         return None, None
 
-    # ---------------------------------------------------------
-    # 3. Ask LLM to select ONLY from the Supabase candidates
-    # ---------------------------------------------------------
     prompt = f"""
-You are selecting an animation template.
+    You are selecting an animation template.
 
-SCENE:
-{text}
+    SCENE:
+    {text}
 
-AVAILABLE TEMPLATES:
-{options_text}
+    AVAILABLE TEMPLATES:
+    {options_text}
 
-Choose exactly one template from the list.
+    Choose exactly one template from the list.
 
-Rules:
-1. Return the exact template name.
-2. Do not create a new template.
-3. Do not rename a template.
-4. Return only the template name.
-"""
+    Rules:
+    1. Return the exact template name.
+    2. Do not create a new template.
+    3. Do not rename a template.
+    4. Return only the template name.
+    """
 
     try:
 
@@ -9942,41 +9968,91 @@ Rules:
         # 6. Fill template props using LLM
         # -----------------------------------------------------
         props_prompt = f"""
-Fill the template props using ONLY the narration.
+        Fill the template props using ONLY the narration.
 
-NARRATION:
-{text}
+        NARRATION:
+        {text}
 
-TEMPLATE NAME:
-{template_name}
+        TEMPLATE NAME:
+        {template_name}
 
-TEMPLATE TYPE:
-{template_type}
+        TEMPLATE TYPE:
+        {template_type}
 
-PROPS SCHEMA:
-{json.dumps(template_props, indent=2)}
+        PROPS SCHEMA:
+        {json.dumps(template_props, indent=2)}
 
-RULES:
-1. Return a complete JSON object matching the schema exactly.
-2. Do not add or remove fields.
-3. Preserve field names and data types.
-4. Do not invent information.
-5. Return only valid JSON.
-6. image_url must always be "".
-7. Background:
-   - B-roll+overlay_animation → "transparent"
-   - full_screen_animation → "theme"
-8. Never choose another background value.
-9. If background is "theme":
-   - background_color → valid hex color
-   - background_2_color → valid hex color
-10. If background is not "theme":
-   - background_color → ""
-   - background_2_color → ""
-11. Never leave background colors empty when background is "theme".
-12. Return no explanation or markdown.
-"""
+        RULES:
 
+        1. Return ONE complete JSON object containing EVERY field present in PROPS SCHEMA.
+
+        2. FIELD COMPLETENESS IS MANDATORY:
+        - Before returning the JSON, compare your output against PROPS SCHEMA field-by-field.
+        - Every top-level field in PROPS SCHEMA MUST exist in the output.
+        - Every nested field in PROPS SCHEMA MUST also exist in the output.
+        - NEVER omit a field, even when the narration provides no information for it.
+        - NEVER add fields that are not present in PROPS SCHEMA.
+
+        3. Preserve the schema EXACTLY:
+        - Preserve every field name.
+        - Preserve every data type.
+        - Preserve nested object structure.
+        - Preserve arrays.
+        - Preserve the expected number/structure of fields inside nested objects.
+
+        4. If the narration does not provide a value for a field:
+        - Use the empty/default value already implied by the schema.
+        - For string fields, use "".
+        - For array fields, use [] unless the schema explicitly requires a different structure.
+        - For nullable fields, use null when appropriate.
+        - For object fields, preserve the complete object and all of its fields.
+        - NEVER remove the field just because its value is unavailable.
+
+        5. NEVER invent information from outside the narration.
+        Only use information explicitly supported by the narration.
+
+        6. Return a complete JSON object matching PROPS SCHEMA exactly.
+
+        7. image_url must ALWAYS be "".
+
+        8. Background:
+        - B-roll+overlay_animation → "transparent"
+        - full_screen_animation → "theme"
+
+        9. NEVER choose any other background value.
+
+        10. If background is "theme":
+            - background_color MUST contain a valid 6-digit hex color such as "#1A1A1A".
+            - background_2_color MUST contain a valid 6-digit hex color such as "#2A2A2A".
+            - NEVER leave either background color empty.
+
+        11. If background is NOT "theme":
+            - background_color MUST be "".
+            - background_2_color MUST be "".
+
+        12. Background color fields MUST still be present even when their values are "".
+
+        13. IMPORTANT:
+            The output JSON must contain fields such as "after_url", "before_url", "cue_times", etc. whenever they exist in PROPS SCHEMA, even if their values are empty.
+
+        14. DO NOT infer that an empty field can be removed.
+            Empty/default values are still required fields.
+
+        15. FINAL VALIDATION BEFORE OUTPUT:
+            - Check every field in PROPS SCHEMA exists in the output.
+            - Check every nested field exists.
+            - Check no extra fields exist.
+            - Check field names match exactly.
+            - Check data types match exactly.
+            - Check background rules are satisfied.
+            - Check image_url is "".
+            - Only after this validation, return the JSON.
+
+        16. Return ONLY valid JSON.
+        17. Return NO explanation.
+        18. Return NO markdown.
+        19. Do NOT wrap the JSON in ```json or any code block.
+        """
         props_res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
                 model="gpt-5.4-mini",
@@ -10011,6 +10087,11 @@ class Editvideo(BaseModel):
     voice : str
     durationMinutes:int 
 
+
+
+
+def _is_before_after(template_name) -> bool:
+    return (template_name or "").strip().lower() == "before / after"
 
 @app.post("/edit-video")
 async def edit_video(body: Editvideo):
@@ -10052,16 +10133,60 @@ async def edit_video(body: Editvideo):
                 scene["word_timestamps"]
             )
 
+        print("fetching templates and media for directions")
+
+        last_photos = None
+        last_videos = None
+
         for scene in scenes:
             for direction in scene["directions"]:
-                if direction["type"] in ["B-roll", "B-roll+overlay_animation"]:
-                    keywords = direction["keywords"]
-                    direction["asserts"] = search_pexel_media(keywords)
+                d_type = direction["type"]
+                use_photos = False
 
-                if direction["type"] in ["B-roll+overlay_animation", "full_screen_animation"]:
-                    template_name, template_props = await get_accurate_template(direction["text"],direction["template_keywords"],direction["type"])
+                if d_type in ["B-roll+overlay_animation", "full_screen_animation"]:
+                    # Overlay beats: fill props from the overlay's own words only
+                    template_text = direction.get("overlay_text") or direction["text"]
+
+                    template_name, template_props = await get_accurate_template(
+                        template_text,
+                        direction["template_keywords"],
+                        d_type
+                    )
                     direction["template_name"] = template_name
-                    direction["template_props"] = template_props    
+                    direction["template_props"] = template_props
+
+                    use_photos = _is_before_after(template_name)
+
+                if d_type in ["B-roll", "B-roll+overlay_animation"]:
+                    assets = search_pexel_media(
+                        direction["keywords"],
+                        media_type="photo" if use_photos else "video"
+                    )
+
+                    if use_photos:
+                        # Before / After: images only, never videos
+                        assets["videos"] = []
+
+                        if assets["photos"]:
+                            last_photos = assets["photos"]
+                        elif last_photos:
+                            print("no photos found, borrowing photos from previous Before / After beat")
+                            assets["photos"] = copy.deepcopy(last_photos)
+                        else:
+                            print("no photos found and nothing to borrow yet")
+                    else:
+                        # Everything else: videos only, never photos
+                        assets["photos"] = []
+
+                        if assets["videos"]:
+                            last_videos = assets["videos"]
+                        elif last_videos:
+                            print("no videos found, borrowing videos from previous beat")
+                            assets["videos"] = copy.deepcopy(last_videos)
+                        else:
+                            print("no videos found and nothing to borrow yet")
+
+                    direction["asserts"] = assets
 
         supabase.table("videos").insert({
             "user_id": body.userId,
@@ -10080,148 +10205,6 @@ async def edit_video(body: Editvideo):
 
     except Exception as e:
         print(e)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        # supabase.table("videos").insert({
-        #     "user_id": body.userId,
-        #     "script": body.script,
-        #     "voice": body.voice,
-        #     "lang_code": body.langCode,
-        #     "timeline": {
-        #         "scenes": scenes
-        #     },
-        #     "timeline_version": 1
-        # }).execute()
-
-
-        # print("saved into db")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
