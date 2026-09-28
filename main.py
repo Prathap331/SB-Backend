@@ -9482,6 +9482,13 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     preserving natural sentence boundaries, visual coherence, and the
     8–15 second beat target.
 
+
+    THEME COLOR CONSISTENCY — IMPORTANT
+
+    * ALL `full_screen_animation` beats across the ENTIRE VIDEO MUST use the SAME
+    background theme color.
+    * Do NOT choose or output a different background color
+
     WORD INDEX SAFETY — EXTREMELY STRICT
 
     The supplied WORD-LEVEL TIMESTAMPS contains exactly {word_count} entries.
