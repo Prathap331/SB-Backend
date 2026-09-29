@@ -10335,9 +10335,12 @@ async def edit_video(body: Editvideo):
             if not user_audio_link:
                 raise ValueError("No 'en' audio found in user_profiles.audio_url")
  
-            dl = requests.get(user_audio_link, timeout=30)
-            dl.raise_for_status()
-            reference_audio = dl.content
+            if user_audio_link.startswith("http"):
+                user_audio_path = user_audio_link.split("/object/sign/user-audio/", 1)[1].split("?", 1)[0]
+            else:
+                user_audio_path = user_audio_link
+ 
+            reference_audio = supabase.storage.from_("user-audio").download(user_audio_path)
  
             ref_path = None
             try:
@@ -10449,10 +10452,6 @@ async def edit_video(body: Editvideo):
  
     except Exception as e:
         print(e)
-
-
-
-
 
 
 
