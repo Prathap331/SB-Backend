@@ -254,9 +254,197 @@
 # print("=" * 60)
 
 
+# import os
+# import json
+
+# from supabase import create_client, Client
+# from sentence_transformers import SentenceTransformer
+
+
+# # ============================================================
+# # CONFIG
+# # ============================================================
+
+# SUPABASE_URL = os.getenv("SUPABASE_URL")
+# SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+# JSON_FILE = "templates.json"
+# TABLE_NAME = "animations_template"
+
+# MODEL_NAME = "BAAI/bge-m3"
+# BATCH_SIZE = 10
+
+
+# # ============================================================
+# # VALIDATE ENV
+# # ============================================================
+
+# if not SUPABASE_URL:
+#     raise RuntimeError("SUPABASE_URL environment variable is missing")
+
+# if not SUPABASE_KEY:
+#     raise RuntimeError(
+#         "SUPABASE_SERVICE_ROLE_KEY environment variable is missing"
+#     )
+
+
+# # ============================================================
+# # SUPABASE
+# # ============================================================
+
+# supabase: Client = create_client(
+#     SUPABASE_URL,
+#     SUPABASE_KEY
+# )
+
+
+# # ============================================================
+# # EMBEDDING MODEL
+# # ============================================================
+
+# print(f"Loading embedding model: {MODEL_NAME}")
+
+# model = SentenceTransformer(MODEL_NAME)
+
+# print("Embedding model loaded.")
+
+
+# # ============================================================
+# # LOAD JSON
+# # ============================================================
+
+# print(f"Loading JSON file: {JSON_FILE}")
+
+# with open(JSON_FILE, "r", encoding="utf-8") as f:
+#     data = json.load(f)
+
+# if not isinstance(data, dict):
+#     raise ValueError(
+#         "metadata.json must contain a JSON object at the top level."
+#     )
+
+# print(f"Found {len(data)} templates.")
+
+
+# # ============================================================
+# # PREPARE TEMPLATES
+# # ============================================================
+
+# templates = []
+
+# for name, template_data in data.items():
+
+#     name = str(name).strip()
+
+#     if not name:
+#         print("Skipping template with empty name.")
+#         continue
+
+#     if not isinstance(template_data, dict):
+#         print(f"Skipping invalid template: {name}")
+#         continue
+
+#     # Get props_schema from JSON
+#     props = template_data.get("props_schema", {})
+
+#     # Get pickWhen from JSON
+#     pick_when = template_data.get("pickWhen", "")
+
+#     templates.append({
+#         "name": name,
+#         "props": props,
+#         "pick_when": pick_when
+#     })
+
+
+# print(f"Prepared {len(templates)} templates.")
+
+
+# # ============================================================
+# # GENERATE EMBEDDINGS
+# # ============================================================
+# # IMPORTANT:
+# # Embedding is generated ONLY from the template name.
+# #
+# # Example:
+# #
+# # "Title Card"
+# #
+# # NOT:
+# # "Title Card + pickWhen + props_schema"
+# # ============================================================
+
+# names = [
+#     template["name"]
+#     for template in templates
+# ]
+
+# print("Generating embeddings for template names...")
+
+# embeddings = model.encode(
+#     names,
+#     batch_size=BATCH_SIZE,
+#     normalize_embeddings=True,
+#     show_progress_bar=True
+# )
+
+# print("Embeddings generated.")
+
+
+# # ============================================================
+# # PREPARE SUPABASE ROWS
+# # ============================================================
+
+# rows = []
+
+# for template, embedding in zip(templates, embeddings):
+
+#     rows.append({
+#         "name": template["name"],
+#         "props": template["props"],
+#         "pick_when": template["pick_when"],
+#         "embedding": embedding.tolist()
+#     })
+
+
+# # ============================================================
+# # INSERT INTO SUPABASE
+# # ============================================================
+
+# print(
+#     f"Inserting {len(rows)} templates "
+#     f"into {TABLE_NAME}..."
+# )
+
+# for i in range(0, len(rows), BATCH_SIZE):
+
+#     batch = rows[i:i + BATCH_SIZE]
+
+#     response = (
+#         supabase
+#         .table(TABLE_NAME)
+#         .insert(batch)
+#         .execute()
+#     )
+
+#     print(
+#         f"Inserted {len(batch)} templates "
+#         f"({i + len(batch)}/{len(rows)})"
+#     )
+
+
+# # ============================================================
+# # DONE
+# # ============================================================
+
+# print()
+# print("============================================")
+# print("Upload completed successfully.")
+# print("============================================")
+
+
 import os
 import json
-
 from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
 
@@ -268,7 +456,7 @@ from sentence_transformers import SentenceTransformer
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-JSON_FILE = "templates.json"
+JSON_FILE = "template.json"
 TABLE_NAME = "animations_template"
 
 MODEL_NAME = "BAAI/bge-m3"
@@ -280,7 +468,9 @@ BATCH_SIZE = 10
 # ============================================================
 
 if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL environment variable is missing")
+    raise RuntimeError(
+        "SUPABASE_URL environment variable is missing"
+    )
 
 if not SUPABASE_KEY:
     raise RuntimeError(
@@ -318,126 +508,208 @@ print(f"Loading JSON file: {JSON_FILE}")
 with open(JSON_FILE, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-if not isinstance(data, dict):
-    raise ValueError(
-        "metadata.json must contain a JSON object at the top level."
+templates = data.get("templates", [])
+
+if not isinstance(templates, list):
+    raise RuntimeError(
+        "'templates' must be a list in the JSON file"
     )
 
-print(f"Found {len(data)} templates.")
+print(f"Loaded {len(templates)} templates from JSON.")
+
+
+# ============================================================
+# LOAD SUPABASE TEMPLATES
+# ============================================================
+
+print(f"Loading templates from Supabase table: {TABLE_NAME}")
+
+response = (
+    supabase
+    .table(TABLE_NAME)
+    .select("id, name")
+    .execute()
+)
+
+supabase_rows = response.data or []
+
+print(f"Loaded {len(supabase_rows)} rows from Supabase.")
+
+
+# ============================================================
+# CREATE NAME LOOKUP
+# ============================================================
+
+supabase_by_name = {}
+
+for row in supabase_rows:
+
+    name = row.get("name")
+
+    if not name:
+        continue
+
+    # Keep the original name exactly for matching.
+    supabase_by_name[name.strip()] = row
 
 
 # ============================================================
 # PREPARE TEMPLATES
 # ============================================================
 
-templates = []
+updates = []
+not_found = []
 
-for name, template_data in data.items():
+for template in templates:
 
-    name = str(name).strip()
+    # --------------------------------------------------------
+    # BASIC VALIDATION
+    # --------------------------------------------------------
+
+    name = template.get("name")
 
     if not name:
-        print("Skipping template with empty name.")
+        print("WARNING: Template has no name. Skipping.")
         continue
 
-    if not isinstance(template_data, dict):
-        print(f"Skipping invalid template: {name}")
+    name = name.strip()
+
+    # --------------------------------------------------------
+    # FIND SUPABASE ROW
+    # --------------------------------------------------------
+
+    row = supabase_by_name.get(name)
+
+    if not row:
+
+        not_found.append(name)
+
+        print(
+            f"WARNING: '{name}' not found in Supabase. "
+            f"Skipping."
+        )
+
         continue
 
-    # Get props_schema from JSON
-    props = template_data.get("props_schema", {})
+    # --------------------------------------------------------
+    # EXTRACT FIELDS
+    # --------------------------------------------------------
 
-    # Get pickWhen from JSON
-    pick_when = template_data.get("pickWhen", "")
+    slot = template.get("slot", "")
+    sec = template.get("sec", [])
+    variants = template.get("variants", [])
+    description = template.get("description", "")
 
-    templates.append({
-        "name": name,
-        "props": props,
-        "pick_when": pick_when
-    })
+    # --------------------------------------------------------
+    # BUILD EMBEDDING TEXT
+    # --------------------------------------------------------
+    #
+    # Example:
+    #
+    # Name: Title Card
+    # Slot: full|overlay
+    # Duration: 3, 8 seconds
+    # Variants: left, center
+    # Description: Title Card: Open the video...
+    #
+    # --------------------------------------------------------
 
+    embedding_text = f"""
+Name: {name}
 
-print(f"Prepared {len(templates)} templates.")
+Slot: {slot}
+
+Duration: {sec}
+
+Variants: {", ".join(map(str, variants))}
+
+Description: {description}
+""".strip()
+
+    updates.append(
+        {
+            "id": row["id"],
+            "name": name,
+            "match": template,
+            "embedding_text": embedding_text,
+        }
+    )
 
 
 # ============================================================
 # GENERATE EMBEDDINGS
 # ============================================================
-# IMPORTANT:
-# Embedding is generated ONLY from the template name.
-#
-# Example:
-#
-# "Title Card"
-#
-# NOT:
-# "Title Card + pickWhen + props_schema"
-# ============================================================
-
-names = [
-    template["name"]
-    for template in templates
-]
-
-print("Generating embeddings for template names...")
-
-embeddings = model.encode(
-    names,
-    batch_size=BATCH_SIZE,
-    normalize_embeddings=True,
-    show_progress_bar=True
-)
-
-print("Embeddings generated.")
-
-
-# ============================================================
-# PREPARE SUPABASE ROWS
-# ============================================================
-
-rows = []
-
-for template, embedding in zip(templates, embeddings):
-
-    rows.append({
-        "name": template["name"],
-        "props": template["props"],
-        "pick_when": template["pick_when"],
-        "embedding": embedding.tolist()
-    })
-
-
-# ============================================================
-# INSERT INTO SUPABASE
-# ============================================================
 
 print(
-    f"Inserting {len(rows)} templates "
-    f"into {TABLE_NAME}..."
+    f"\nGenerating embeddings for "
+    f"{len(updates)} templates..."
 )
 
-for i in range(0, len(rows), BATCH_SIZE):
+embedding_texts = [
+    item["embedding_text"]
+    for item in updates
+]
 
-    batch = rows[i:i + BATCH_SIZE]
+embeddings = model.encode(
+    embedding_texts,
+    batch_size=BATCH_SIZE,
+    show_progress_bar=True,
+    normalize_embeddings=True,
+)
 
-    response = (
+
+# ============================================================
+# UPDATE SUPABASE
+# ============================================================
+
+print("\nUpdating Supabase...")
+
+
+for index, item in enumerate(updates):
+
+    embedding = embeddings[index]
+
+    # Convert numpy array to normal Python list.
+    embedding = embedding.tolist()
+
+    print(
+        f"[{index + 1}/{len(updates)}] "
+        f"Updating: {item['name']}"
+    )
+
+    (
         supabase
         .table(TABLE_NAME)
-        .insert(batch)
+        .update(
+            {
+                "match": item["match"],
+                "embeddings": embedding,
+            }
+        )
+        .eq("id", item["id"])
         .execute()
     )
 
-    print(
-        f"Inserted {len(batch)} templates "
-        f"({i + len(batch)}/{len(rows)})"
-    )
-
 
 # ============================================================
-# DONE
+# SUMMARY
 # ============================================================
 
-print()
-print("============================================")
-print("Upload completed successfully.")
-print("============================================")
+print("\n========================================")
+print("DONE")
+print("========================================")
+
+print(
+    f"Updated templates: {len(updates)}"
+)
+
+print(
+    f"Not found in Supabase: {len(not_found)}"
+)
+
+if not_found:
+
+    print("\nTemplates missing from Supabase:")
+
+    for name in not_found:
+        print(f"  - {name}")

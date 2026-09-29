@@ -1,0 +1,1085 @@
+{
+    "templates": [
+        {
+            "id": "FS-01",
+            "name": "Title Card",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "variants": [
+                "left",
+                "center"
+            ],
+            "description": "Title Card: Open the video or a new section with a named topic. Content: 1 title (≤44), optional kicker + subtitle. Narration cues: intro, new section, topic name, opening line. Variants: left — default, editorial look; center — symmetric hero title. Not for: Beat carries numbers, lists or a quote. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "FS-03",
+            "name": "Title + Metadata",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "variants": [
+                "row",
+                "stacked"
+            ],
+            "description": "Title + Metadata: Title plus 2–4 facts about it (date, place, source). Content: title + 2–4 label:value meta items. Narration cues: what/when/where, report released, case details, key facts at a glance. Variants: row — meta items side by side; stacked — meta items as a column. Not for: Facts are numbers to compare. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "FS-04",
+            "name": "Big Number",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "number"
+            ],
+            "variants": [
+                "with change",
+                "center",
+                "left"
+            ],
+            "description": "Big Number: One big number that is the point of the beat. Content: 1 number + label, optional change vs before. Narration cues: one statistic, ₹ X crore, grew by, record high. Variants: with change — shows +12% / ▲ vs previous; center — hero number; left — number with long label. Not for: Two or more numbers compared. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "FS-06",
+            "name": "Number Comparison",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2 numbers"
+            ],
+            "variants": [
+                "side_by_side",
+                "before_after",
+                "bars"
+            ],
+            "description": "Number Comparison: Two numbers compared head to head. Content: 2 numbers with labels, optional % / × change. Narration cues: X vs Y, then vs now, before/after figure, doubled. Variants: side_by_side — two equal columns; before_after — old → new with change; bars — two bars to show scale. Not for: 3+ values (use bar chart). Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "FS-08",
+            "name": "Quote Card",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "quote",
+                "speaker"
+            ],
+            "variants": [
+                "centered",
+                "portrait_left",
+                "portrait_right"
+            ],
+            "description": "Quote Card: A real quote with who said it. Content: quote ≤200 chars + name, role, optional portrait. Narration cues: said, according to, in his words, famous line. Variants: centered — quote only; portrait_left — photo left of quote; portrait_right — photo right of quote. Not for: Paraphrase or unattributed claim. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "FS-11",
+            "name": "Key Statement",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "variants": [
+                "marker",
+                "underline",
+                "color"
+            ],
+            "description": "Key Statement: One strong sentence to land a point, key words highlighted. Content: 1 statement ≤120 chars + highlight phrase. Narration cues: the key point, here's the thing, bottom line, takeaway. Variants: marker — highlighter sweep on key words; underline — hand underline; color — key words in accent colour. Not for: Beat has a list, numbers or a question. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "FS-14",
+            "name": "Structured List",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2+ items"
+            ],
+            "max": "6 items × 60 chars + sub-lines",
+            "variants": [
+                "list",
+                "cards",
+                "focus"
+            ],
+            "description": "Structured List: List of 2–6 items: reasons, features, tips, capabilities. Content: 2–6 items ≤60 chars, optional sub-line/icon/image. Narration cues: reasons, features, tips, types of, such as A, B, C, capabilities. Variants: list — rows with bullets/numbers/icons; cards — grid of cards (images/icons); focus — highlight one item at a time. Not for: Items are ordered steps (process) or numbers. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "FS-20",
+            "name": "Comparison Columns",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2+ options",
+                "2+ attributes"
+            ],
+            "max": "3 columns × 6 rows",
+            "variants": [
+                "highlight column",
+                "coloured columns"
+            ],
+            "description": "Comparison Columns: Compare 2–3 options across 2–6 attributes. Content: 2–3 columns × 2–6 rows of short values/ticks. Narration cues: compare plans, which is better, A vs B vs C, features side by side. Variants: highlight column — recommend one option; coloured columns — bg_color per column. Not for: Only one attribute (use bar/number comparison). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DV-01",
+            "name": "Bar Chart",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "3+ numbers"
+            ],
+            "max": "10 bars, labels 18 chars",
+            "variants": [
+                "vertical",
+                "horizontal",
+                "highlight",
+                "reference line"
+            ],
+            "description": "Bar Chart: Compare values across 3–10 categories. Content: 3–10 labels with numbers (same unit). Narration cues: market share, top companies, by state, ranking by value, compare amounts. Variants: vertical — ≤7 short labels (years, names); horizontal — long labels or 8–10 bars; highlight — one bar in accent; reference line — average/target line. Not for: Values over time (use line chart). Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "DV-04",
+            "name": "Line Chart",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "time series"
+            ],
+            "max": "40 points × 4 series + 3 notes",
+            "variants": [
+                "single line",
+                "multi series",
+                "indexed",
+                "annotated"
+            ],
+            "description": "Line Chart: Trend over time, 1–4 series. Content: 4–40 time points, 1–4 numeric series, ≤3 annotations. Narration cues: over the years, trend, rose/fell since, growth curve. Variants: single line — one trend + area; multi series — 2–4 lines compared; indexed — growth from 100; annotated — events marked on the line. Not for: Categories without time order. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "DV-08",
+            "name": "Pie / Donut Chart",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2+ parts"
+            ],
+            "max": "6 slices",
+            "variants": [
+                "donut",
+                "pie"
+            ],
+            "description": "Pie / Donut Chart: Parts of a whole (share %). Content: 2–6 slices that add up to a total. Narration cues: share of, split, percentage of total, breakdown. Variants: donut — total or highlight in centre; pie — classic pie. Not for: More than 6 parts or unrelated values. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "DV-12",
+            "name": "Gauge / Meter",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "number",
+                "scale"
+            ],
+            "variants": [
+                "zones",
+                "plain"
+            ],
+            "description": "Gauge / Meter: One reading on a scale with good/bad zones. Content: value + min/max + up to 5 zones. Narration cues: AQI, score out of, inflation vs target, how full, level. Variants: zones — coloured safe→severe bands; plain — 0–100 meter. Not for: No scale or zones implied. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DV-14",
+            "name": "Leaderboard",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "3+ ranked items"
+            ],
+            "max": "10 rows",
+            "variants": [
+                "top_down",
+                "countdown",
+                "medals",
+                "bars"
+            ],
+            "description": "Leaderboard: Ranked list, top N. Content: 3–10 ranked items, optional value/image. Narration cues: top 10, richest, ranked, leaderboard, countdown list. Variants: top_down — #1 first; countdown — reveal from last to #1; medals — 🥇 style ranks; bars — value bars behind rows. Not for: One item at a time reveal (use rank reveal). Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "DV-27",
+            "name": "Icon Array",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "ratio or %"
+            ],
+            "variants": [
+                "10 icons",
+                "100 icons",
+                "ratio/percent figure"
+            ],
+            "description": "Icon Array: A share made tangible with icons (1 in 5). Content: k of 10/20/50/100 icons + statement. Narration cues: 1 in 5, 3 out of 10, every second person, % of people. Variants: 10 icons — x in 10; 100 icons — percentages; ratio/percent figure — big figure style. Not for: Absolute amounts. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "TL-02",
+            "name": "Timeline",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "dates"
+            ],
+            "max": "8 events",
+            "variants": [
+                "horizontal",
+                "vertical",
+                "focus"
+            ],
+            "description": "Timeline: 3–8 dated events in order. Content: 3–8 events: date + title (+sub). Narration cues: in 1991… then 2005…, history of, milestones, timeline. Variants: horizontal — ≤6 events, short titles; vertical — 7–8 events or long titles; focus — highlight current event. Not for: Undated steps (use process). Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "TL-11",
+            "name": "Roadmap / Gantt",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "start/end values"
+            ],
+            "max": "8 rows × 12 axis labels",
+            "variants": [
+                "milestones",
+                "today marker"
+            ],
+            "description": "Roadmap / Gantt: Phases/projects overlapping over time (Gantt). Content: 2–8 tasks with start–end, milestones, today line. Narration cues: roadmap, phases, construction schedule, overlapping eras. Variants: milestones — start=end diamonds; today marker — current point. Not for: Single dates only (use timeline). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DG-01",
+            "name": "Linear Process",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "3+ steps"
+            ],
+            "max": "6 steps",
+            "variants": [
+                "horizontal",
+                "vertical",
+                "icons/numbers"
+            ],
+            "description": "Linear Process: Ordered steps of a process or workflow. Content: 3–6 steps: short label + optional description/icon. Narration cues: first… then… finally, how it works, step by step, pipeline, training → model → output. Variants: horizontal — ≤5 short steps, left→right; vertical — 6 steps or longer descriptions; icons/numbers — step markers. Not for: Unordered list (use list). Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "DG-05",
+            "name": "A → B Relationship",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2 linked ideas"
+            ],
+            "variants": [
+                "cause_effect",
+                "problem_solution",
+                "horizontal/vertical"
+            ],
+            "description": "A → B Relationship: A leads to B (cause→effect, problem→solution). Content: 2–3 nodes linked by arrows with labels. Narration cues: because, leads to, which causes, the fix was. Variants: cause_effect — → arrow; problem_solution — problem → fix; horizontal/vertical — layout direction. Not for: More than 3 stages (use process). Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "DG-09",
+            "name": "Decision Tree",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "conditions"
+            ],
+            "max": "9 nodes, 4 levels",
+            "variants": [
+                "good/bad outcomes"
+            ],
+            "description": "Decision Tree: Yes/no branching logic to outcomes. Content: 3–9 nodes: questions, branches, outcomes. Narration cues: if… then…, eligibility, depends on, should you. Variants: good/bad outcomes — green/red end nodes. Not for: Linear steps. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DG-10",
+            "name": "Funnel",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "3+ stages"
+            ],
+            "max": "6 stages",
+            "variants": [
+                "with rates",
+                "no values"
+            ],
+            "description": "Funnel: Numbers narrowing stage by stage. Content: 3–6 stages, optional values + % kept. Narration cues: applied → selected, drop-off, conversion, out of lakhs only. Variants: with rates — % of previous shown; no values — labels only. Not for: Stages without narrowing. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DG-14",
+            "name": "Hierarchy / Tree",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "parent-child"
+            ],
+            "max": "12 nodes, 4 levels",
+            "variants": [
+                "with photos/icons"
+            ],
+            "description": "Hierarchy / Tree: Hierarchy: org chart, family tree, group companies. Content: 2–12 nodes with parents, ≤4 levels. Narration cues: owns, subsidiaries, reports to, family tree, types of. Variants: with photos/icons — media per node. Not for: Flat list. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DG-17",
+            "name": "Architecture Diagram",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "components",
+                "connections"
+            ],
+            "max": "4 layers × 4 nodes + 8 arrows",
+            "variants": [
+                "coloured layers"
+            ],
+            "description": "Architecture Diagram: System architecture: components and data flow. Content: 2–4 layers × 1–4 components + arrows. Narration cues: how the system works, server, network, connects to, data flows. Variants: coloured layers — bg_color per layer. Not for: Simple sequence (use process). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DG-23",
+            "name": "Pros & Cons",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "pros",
+                "cons"
+            ],
+            "max": "5 + 5 points × 60 chars",
+            "variants": [
+                "alternate",
+                "columns"
+            ],
+            "description": "Pros & Cons: Pros and cons of one thing. Content: 1–5 pros + 1–5 cons, optional verdict. Narration cues: advantages, disadvantages, benefits and risks, upside/downside. Variants: alternate — pro, con, pro…; columns — all pros then cons. Not for: Two different options compared (use VS). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DG-24",
+            "name": "VS Face-Off",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2 rivals",
+                "stats"
+            ],
+            "max": "5 rows",
+            "variants": [
+                "with photos",
+                "winner per row"
+            ],
+            "description": "VS Face-Off: Two contenders head to head on stats. Content: 2 sides (image/icon) + 2–5 stat rows with winner. Narration cues: vs, face-off, which wins, rivalry. Variants: with photos — faces/products; winner per row — highlight better side. Not for: Single metric (use number comparison). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DG-25",
+            "name": "Myth vs Fact",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "myth",
+                "fact"
+            ],
+            "variants": [
+                "split",
+                "reveal"
+            ],
+            "description": "Myth vs Fact: Debunk a myth with the fact. Content: myth ≤90 + fact ≤130 + source. Narration cues: myth, people think, actually, truth is, fake news. Variants: split — side by side; reveal — myth crossed out, fact below. Not for: No false belief to correct. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "PE-01",
+            "name": "Person Intro Card",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "person name"
+            ],
+            "variants": [
+                "portrait_left/right",
+                "full_bleed",
+                "text_only"
+            ],
+            "description": "Person Intro Card: Introduce a person (name, role). Content: name + role + optional tagline/portrait. Narration cues: meet, this is, founder of, who is. Variants: portrait_left/right — photo beside text; full_bleed — big photo; text_only — no photo available. Not for: Many facts about them (use profile card). Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "PE-10",
+            "name": "Profile Card",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "portrait",
+                "facts"
+            ],
+            "max": "6 facts + 4 tags",
+            "variants": [
+                "portrait left/right",
+                "coloured facts"
+            ],
+            "description": "Profile Card: Person fact card: key facts about someone. Content: portrait + name + role + 2–6 facts + tags. Narration cues: born in, net worth, education, background of. Variants: portrait left/right — side choice; coloured facts — bg_color per fact. Not for: Just name and role (use person intro). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "VO-01",
+            "name": "Image + Label / Caption",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "image"
+            ],
+            "variants": [
+                "panel",
+                "bar",
+                "plain",
+                "contain"
+            ],
+            "description": "Image + Label / Caption: Show one photo with a label or caption. Content: image + label ≤30 or caption ≤100. Narration cues: this photo, look at, pictured, this is the place. Variants: panel — caption card; bar — caption bar; plain — text only; contain — whole image visible. Not for: No image. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "VO-06",
+            "name": "Image Grid",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "4+ images"
+            ],
+            "max": "9 images",
+            "variants": [
+                "uniform",
+                "masonry",
+                "feature"
+            ],
+            "description": "Image Grid: Many images at once (examples, collage). Content: 4–9 images, optional labels. Narration cues: examples, many of them, collage, all these. Variants: uniform — even grid; masonry — uneven columns; feature — one big + rest. Not for: Images must be seen one by one. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "VO-07",
+            "name": "Image Montage",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2+ images"
+            ],
+            "max": "8 images",
+            "variants": [
+                "cut",
+                "stack",
+                "with dates",
+                "value per image"
+            ],
+            "description": "Image Montage: Images in timed sequence (montage, chronology). Content: 2–8 images with label/date/value. Narration cues: over the years, one after another, montage, then… then…. Variants: cut — full-frame hard cuts/fades; stack — photo cards stacked; with dates — chronological; value per image — price/figure per image. Not for: Images need side-by-side comparison. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "VO-10",
+            "name": "Before / After",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2 images"
+            ],
+            "variants": [
+                "wipe",
+                "split",
+                "fade"
+            ],
+            "description": "Before / After: Before/after of the same thing. Content: 2 images + labels/dates. Narration cues: before and after, then vs now, transformed, used to look. Variants: wipe — slider reveal; split — side by side; fade — crossfade. Not for: Different subjects. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "VO-12",
+            "name": "Location Tag",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "footage"
+            ],
+            "variants": [
+                "pill/card/plain",
+                "corner position"
+            ],
+            "description": "Location Tag: Name the place shown in footage. Content: place ≤30 + optional region. Narration cues: in Mumbai, we are at, location. Variants: pill/card/plain — tag style; corner position — 7 anchors. Not for: Full-screen slot (it is an overlay). Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "VO-16",
+            "name": "Lower Third",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "footage",
+                "person"
+            ],
+            "variants": [
+                "bar/line/box",
+                "left/right/center"
+            ],
+            "description": "Lower Third: Name + role of person on screen. Content: name ≤34 + role ≤48. Narration cues: speaker on screen, interview, expert says. Variants: bar/line/box — look; left/right/center — position. Not for: Full-screen slot. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "VO-19",
+            "name": "Statistic Overlay",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "footage",
+                "number"
+            ],
+            "variants": [
+                "corner position"
+            ],
+            "description": "Statistic Overlay: Small stat over footage. Content: 1 number + label. Narration cues: quick figure while footage plays. Variants: corner position — 7 anchors. Not for: Full-screen slot; several numbers. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "VO-21",
+            "name": "Callout / Annotation",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "footage",
+                "spot positions"
+            ],
+            "max": "5 callouts",
+            "variants": [
+                "dot/ring",
+                "pill/box/accent"
+            ],
+            "description": "Callout / Annotation: Point at 1–5 spots in the footage with labels. Content: 1–5 callouts (x,y + label). Narration cues: notice this, here, this part. Variants: dot/ring — marker; pill/box/accent — label look. Not for: No known positions. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "VO-29",
+            "name": "Source Citation",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "source"
+            ],
+            "variants": [
+                "tag/plain"
+            ],
+            "description": "Source Citation: Cite the source of a claim. Content: source ≤48 + date. Narration cues: according to, report by, data from. Variants: tag/plain — look. Not for: Full-screen slot. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "KT-02",
+            "name": "Punch Word",
+            "slot": "full|overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "variants": [
+                "fill/outline/box",
+                "shake/flash"
+            ],
+            "description": "Punch Word: One punch word for impact. Content: 1–2 words ≤14 chars. Narration cues: BANNED, FREE, gone, never, shocking word. Variants: fill/outline/box — word style; shake/flash — impact. Not for: Sentence-length text. Full-screen animation or overlay over footage, 1.5–8 s."
+        },
+        {
+            "id": "KT-03",
+            "name": "Stacked Kinetic Text",
+            "slot": "full|overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "max": "4 lines",
+            "variants": [
+                "center/left",
+                "size per line"
+            ],
+            "description": "Stacked Kinetic Text: 2–4 short lines building up. Content: 2–4 lines ≤28 chars, sizes/accent. Narration cues: not X, not Y, but Z, rhetorical build, three beats. Variants: center/left — align; size per line — small/normal/big. Not for: Long sentences. Full-screen animation or overlay over footage, 1.5–8 s."
+        },
+        {
+            "id": "KT-08",
+            "name": "Question Hook",
+            "slot": "full|overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "question"
+            ],
+            "variants": [
+                "mark left/top"
+            ],
+            "description": "Question Hook: Open a loop with a question. Content: question ≤60 + highlight + sub. Narration cues: why did, what if, how is it possible, ?. Variants: mark left/top — big ? placement. Not for: Statement without question. Full-screen animation or overlay over footage, 1.5–8 s."
+        },
+        {
+            "id": "KT-10",
+            "name": "Word-Synced Captions",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "word timings"
+            ],
+            "variants": [
+                "pill/color/pop",
+                "bottom/center/top"
+            ],
+            "description": "Word-Synced Captions: Word-synced captions (Shorts style). Content: ≤40 timed words. Narration cues: captions, subtitles, hook line. Variants: pill/color/pop — active-word style; bottom/center/top — position. Not for: Full-screen visual needed. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "NV-01",
+            "name": "Chapter Card",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "chapter no."
+            ],
+            "variants": [
+                "split",
+                "stacked"
+            ],
+            "description": "Chapter Card: Start a chapter/part. Content: chapter number + title + sub + progress dots. Narration cues: chapter 2, part three, next up. Variants: split — big number left; stacked — centred. Not for: Mid-section content. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "NV-03",
+            "name": "Progress Tracker",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "footage",
+                "section list"
+            ],
+            "variants": [
+                "segments/line",
+                "top/bottom"
+            ],
+            "description": "Progress Tracker: Thin bar showing video sections and current one. Content: 2–8 section names + current. Narration cues: where we are, section 2 of 5. Variants: segments/line — look; top/bottom — position. Not for: Full-screen slot; explaining content. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "NV-04",
+            "name": "Countdown Rank Reveal",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "rank"
+            ],
+            "variants": [
+                "with picture",
+                "text only"
+            ],
+            "description": "Countdown Rank Reveal: Reveal one item of a Top-N countdown. Content: rank + title + sub + optional picture. Narration cues: number 7, at number 3, coming in at. Variants: with picture — image card; text only — no image. Not for: Whole ranking at once (use leaderboard). Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "NV-05",
+            "name": "Subscribe Reminder",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "footage"
+            ],
+            "variants": [
+                "red/accent"
+            ],
+            "description": "Subscribe Reminder: Ask viewers to subscribe. Content: channel name + CTA. Narration cues: subscribe, hit the bell. Variants: red/accent — button colour. Not for: Full-screen slot. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "NV-07",
+            "name": "End Screen",
+            "slot": "full",
+            "sec": [
+                5,
+                20
+            ],
+            "variants": [
+                "two_videos/one_video/video_playlist"
+            ],
+            "description": "End Screen: Final end screen with video slots. Content: headline + 1–2 video slots + subscribe. Narration cues: thanks for watching, watch next. Variants: two_videos/one_video/video_playlist — slot layout. Not for: Mid-video. Full-screen animation, 5–20 s."
+        },
+        {
+            "id": "UI-01",
+            "name": "Social Post",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "post text",
+                "author"
+            ],
+            "variants": [
+                "dark/light",
+                "with image"
+            ],
+            "description": "Social Post: Show a real social post. Content: author + text ≤280 + counts + optional image. Narration cues: tweeted, posted on X, viral post. Variants: dark/light — card theme; with image — attached picture. Not for: Not a real post. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "UI-04",
+            "name": "Chat Conversation",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "messages"
+            ],
+            "max": "8 messages",
+            "variants": [
+                "green/blue/neutral"
+            ],
+            "description": "Chat Conversation: Show a chat conversation. Content: 2–8 messages in/out. Narration cues: WhatsApp chat, scam message, they texted. Variants: green/blue/neutral — app look. Not for: Single message (use notification). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "UI-06",
+            "name": "News Headline Card",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "headline",
+                "publication"
+            ],
+            "max": "3 headlines",
+            "variants": [
+                "cards",
+                "band"
+            ],
+            "description": "News Headline Card: Show real news headlines. Content: 1–3 headlines + publication + date. Narration cues: reported, headlines, news said. Variants: cards — headline cards; band — breaking news band. Not for: Unsourced claims. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "UI-07",
+            "name": "Newspaper Clipping",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "headline"
+            ],
+            "variants": [
+                "aged/clean",
+                "tilt"
+            ],
+            "description": "Newspaper Clipping: Historical newspaper clipping. Content: masthead + date + headline + body. Narration cues: back in 1991 the papers, old newspaper, archive report. Variants: aged/clean — paper; tilt — angle. Not for: Current news (use headline card). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "UI-08",
+            "name": "Search Bar Typing",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "query"
+            ],
+            "max": "5 suggestions",
+            "variants": [
+                "light/dark",
+                "with pick"
+            ],
+            "description": "Search Bar Typing: Search query typed with suggestions. Content: query ≤60 + ≤5 suggestions. Narration cues: people searched, Google it, search trends. Variants: light/dark — box theme; with pick — one suggestion chosen. Not for: No search angle. Full-screen animation or overlay over footage, 3–8 s."
+        },
+        {
+            "id": "UI-12",
+            "name": "Notification Pop",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "footage"
+            ],
+            "variants": [
+                "dark/light",
+                "stacked"
+            ],
+            "description": "Notification Pop: Phone notification popping up. Content: 1–3 notifications (app, title, body). Narration cues: got an SMS, debit alert, OTP message. Variants: dark/light — look; stacked — up to 3. Not for: Full-screen slot. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "DC-01",
+            "name": "Document Highlight",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "document text"
+            ],
+            "variants": [
+                "marker colours",
+                "focus"
+            ],
+            "description": "Document Highlight: Highlight a line in a real document. Content: doc title + passage ≤420 + highlight. Narration cues: the judgment says, clause, the report states. Variants: marker colours — yellow/green/pink; focus — dim other text. Not for: No source document. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DC-04",
+            "name": "Investigation Board",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "entities",
+                "links"
+            ],
+            "max": "6 cards + 6 links",
+            "variants": [
+                "cork/dark"
+            ],
+            "description": "Investigation Board: Connections between people/companies (red strings). Content: 3–6 cards + up to 6 labelled links. Narration cues: connected to, paid, linked, follow the money, conspiracy. Variants: cork/dark — board. Not for: Simple hierarchy (use tree). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DC-05",
+            "name": "Case File",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "case facts"
+            ],
+            "max": "6 fields",
+            "variants": [
+                "stamp",
+                "redacted fields"
+            ],
+            "description": "Case File: Case file of a person/case. Content: subject + 2–6 fields + photo + stamp. Narration cues: case file, accused, FIR, investigation. Variants: stamp — CONFIDENTIAL/CLOSED…; redacted fields — black bars. Not for: Non-case topics. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DC-08",
+            "name": "Archive Photo",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "image",
+                "caption"
+            ],
+            "variants": [
+                "print",
+                "full",
+                "sepia/bw"
+            ],
+            "description": "Archive Photo: Historical photo with aged look. Content: image + caption + date + credit. Narration cues: archive photo, in 1947, old picture. Variants: print — bordered print; full — full frame; sepia/bw — treatment. Not for: Modern photo (use image caption). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "DC-09",
+            "name": "Sticky Notes Board",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2+ notes"
+            ],
+            "max": "6 notes × 70 chars",
+            "variants": [
+                "cork/dark/none"
+            ],
+            "description": "Sticky Notes Board: Loose clues or ideas on sticky notes. Content: 2–6 short notes + heading. Narration cues: what we know, clues, brainstorm, open questions. Variants: cork/dark/none — board. Not for: Ordered steps. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "MP-11",
+            "name": "Globe Zoom to Location",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "location"
+            ],
+            "max": "5 places + 5 regions",
+            "variants": [
+                "one place",
+                "several places",
+                "regions",
+                "with images"
+            ],
+            "description": "Globe Zoom to Location: Fly from globe to place(s) or region(s). Content: 1–5 places (lat/lon) and/or 1–5 countries, optional images. Narration cues: located in, this country, where it happened, zoom to. Variants: one place — zoom country/region/city; several places — framed together; regions — countries filled; with images — picture cards. Not for: Movement between places (use route). Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "MP-12",
+            "name": "Radius / Range",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "centre",
+                "km"
+            ],
+            "variants": [
+                "1–3 rings"
+            ],
+            "description": "Radius / Range: Distance rings around a place. Content: centre + 1–3 radius rings (km). Narration cues: within 500 km, range of, reach, radius. Variants: 1–3 rings — nested ranges. Not for: No distance. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "MP-13",
+            "name": "Travel Route Map",
+            "slot": "full",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "2+ locations"
+            ],
+            "max": "5 stops",
+            "variants": [
+                "air",
+                "sea",
+                "land",
+                "region stops"
+            ],
+            "description": "Travel Route Map: Journey/route between 2–5 stops by air/sea/land. Content: 2–5 stops (location, region, route_to_next). Narration cues: travelled from, route, shipped to, flew to, trade route. Variants: air — dotted arcs; sea — routes over water; land — routes over land; region stops — country as stop. Not for: Single place. Full-screen animation, 3–8 s."
+        },
+        {
+            "id": "EM-04",
+            "name": "Scribble Annotation",
+            "slot": "overlay",
+            "sec": [
+                1.5,
+                8
+            ],
+            "needs": [
+                "footage",
+                "spot positions"
+            ],
+            "max": "3 marks",
+            "variants": [
+                "circle/underline/box/arrow/cross/tick"
+            ],
+            "description": "Scribble Annotation: Hand-drawn marks on footage. Content: 1–3 marks (circle/arrow/cross…) + notes. Narration cues: look here, circled, crossed out. Variants: circle/underline/box/arrow/cross/tick — mark shape. Not for: Full-screen slot. Overlay drawn over footage, 1.5–8 s."
+        },
+        {
+            "id": "HC-02",
+            "name": "Media + Floating Card",
+            "slot": "full|overlay",
+            "sec": [
+                3,
+                8
+            ],
+            "needs": [
+                "footage"
+            ],
+            "max": "4 points",
+            "variants": [
+                "points/stat",
+                "left/right"
+            ],
+            "description": "Media + Floating Card: Info card floating beside footage. Content: title + 1–4 points or 1 stat + source. Narration cues: facts about what we see, explain the scene. Variants: points/stat — body type; left/right — side. Not for: No footage behind. Full-screen animation or overlay over footage, 3–8 s."
+        }
+    ]
+}
