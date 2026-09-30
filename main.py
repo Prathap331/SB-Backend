@@ -10435,7 +10435,7 @@ async def edit_video(body: Editvideo):
  
                     direction["asserts"] = assets
  
-        supabase.table("videos").insert({
+        res = supabase.table("videos").insert({
             "user_id": body.userId,
             "script": body.script,
             "voice": body.voice,
@@ -10445,10 +10445,56 @@ async def edit_video(body: Editvideo):
             },
             "timeline_version": 1
         }).execute()
- 
+        
+        video_id = res.data[0]["id"]
+
         print("saved into db")
+
+        EDIT_VIDEO_CREDITS_PER_MINUTE = 11
+        duration_minutes = body.durationMinutes 
+        credit_cost = round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
+
+        credit_result = {"cost": credit_cost, "deducted": False, "remaining_credits": None, "status": None}
+        try:
+            profile_res = supabase.table('user_profiles') \
+                .select('id, credit_batches') \
+                .eq('id', body.userId) \
+                .maybe_single() \
+                .execute()
+
+            if not profile_res.data:
+                print(f"[edit-video] credit deduction skipped for {body.userId}: user profile not found")
+                credit_result["status"] = "no credits"
+            else:
+                batches = profile_res.data.get('credit_batches') or []
+                now = datetime.datetime.now(datetime.timezone.utc)
+                active_batches = _expire_stale_batches(batches, now)
+                available = _sum_batches(active_batches)
+
+                if available < credit_cost:
+                    print(f"[edit-video] user {body.userId}: insufficient credits for cost {credit_cost} (has {available}) — video {video_id} was still generated and saved")
+                    credit_result["status"] = "no credits"
+                    credit_result["remaining_credits"] = available
+                else:
+                    updated_batches, deducted = _deduct_from_batches(active_batches, credit_cost)
+                    new_total = _sum_batches(updated_batches)
+
+                    supabase.table('user_profiles').update({
+                        'credit_batches': updated_batches,
+                        'credits_remaining': new_total,
+                    }).eq('id', body.userId).execute()
+
+                    credit_result["deducted"] = True
+                    credit_result["remaining_credits"] = new_total
+                    credit_result["status"] = "deducted"
+
+        except Exception as e:
+            print(f"[edit-video] credit deduction failed for {body.userId} (video {video_id} was still generated and saved): {e}")
+            credit_result["status"] = "error"
+
+
+        return {"video_id": video_id, "scenes": scenes}
  
-        return scenes
  
     except Exception as e:
         print(e)
@@ -10484,15 +10530,7 @@ class RenderQueueRequest(BaseModel):
  
 @app.post("/render/queue")
 async def enqueue_render(request: RenderQueueRequest):
-    """Adds a video to the render waitlist instead of rendering it
-    immediately. A background worker (started at app startup — see
-    _render_queue_worker) picks entries up in FIFO order, capped at
-    RENDER_QUEUE_MAX_CONCURRENT actually rendering at once, and dispatches
-    each one to RENDER_SERVICE_URL — the actual render box — via a plain
-    HTTP call to its existing /render/{video_id} endpoint. This process
-    doesn't have to be the render box itself; it can sit on your main API
-    server and just dispatch to wherever the render service actually
-    lives."""
+
     try:
         row = supabase.table("render_queue").insert({
             "video_id": request.video_id,
@@ -10527,8 +10565,6 @@ async def enqueue_render(request: RenderQueueRequest):
  
 @app.get("/render/queue/{queue_id}")
 async def get_render_queue_status(queue_id: str):
-    """Check one queued render's status: pending, processing, completed
-    (with final_video_url), or failed (with error_message)."""
     try:
         row = supabase.table("render_queue").select("*").eq("id", queue_id).maybe_single().execute()
     except Exception as e:
@@ -10540,8 +10576,7 @@ async def get_render_queue_status(queue_id: str):
  
 @app.get("/render/queue")
 async def list_render_queue(status: Optional[str] = None, limit: int = 50):
-    """Lists queue entries, most recent first. Pass status= to filter to
-    just pending/processing/completed/failed."""
+
     try:
         query = supabase.table("render_queue").select("*").order("created_at", desc=True).limit(min(limit, 200))
         if status:
@@ -10553,11 +10588,6 @@ async def list_render_queue(status: Optional[str] = None, limit: int = 50):
  
  
 async def _process_one_queued_render(entry: dict) -> None:
-    """Dispatches ONE queue entry to the render service over HTTP and
-    records the outcome. Runs inside the semaphore in _render_queue_worker,
-    so at most RENDER_QUEUE_MAX_CONCURRENT of these are ever in flight —
-    that's the actual point of this whole system: protecting the render
-    box from every /render call landing on it simultaneously."""
     queue_id = entry["id"]
     video_id = entry["video_id"]
     orientation = entry.get("orientation") or "landscape"
@@ -10599,21 +10629,6 @@ async def _process_one_queued_render(entry: dict) -> None:
  
  
 async def _recover_stale_processing_jobs() -> None:
-    """Runs once at startup. Any row still marked "processing" at boot
-    time is orphaned — the process that was working on it is the one
-    that just (re)started, so nothing is actually running it anymore. A
-    server restart mid-render otherwise leaves that row stuck showing
-    "processing" forever, since the worker only ever polls for "pending"
-    and the in-memory in_flight tracking that would have known about it
-    is gone along with the old process.
- 
-    Safe ONLY under the single-worker assumption this whole queue is
-    built for. If this is ever run with multiple worker processes, this
-    would incorrectly reset a job another still-live process is
-    legitimately processing, causing it to be dispatched twice — don't
-    add this without pgmq-style visibility timeouts (or similar) once
-    you're actually running more than one worker.
-    """
     try:
         stuck = supabase.table("render_queue").select("id", "video_id").eq("status", "processing").execute()
         for row in (stuck.data or []):
