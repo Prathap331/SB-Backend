@@ -10402,6 +10402,8 @@ async def edit_video(body: Editvideo):
         for scene in scenes:
             for direction in scene["directions"]:
                 direction["id"] = str(uuid.uuid4())
+                direction["selected_media_id"] = None
+                direction["selected_media_type"] = None
                 d_type = direction["type"]
  
                 if d_type in ["B-roll+overlay_animation", "full_screen_animation"]:
@@ -10582,8 +10584,6 @@ async def edit_beat_template_text(
 
 
 
-
-
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/color")
 async def edit_beat_template_color(
     videoId: str,
@@ -10645,10 +10645,186 @@ async def edit_beat_template_color(
 
 
 
+from fastapi import HTTPException
+from pydantic import BaseModel
 
 
+class AddBeatMediaRequest(BaseModel):
+    media_id: int
+    media_type: str
+    media_url: str
+
+    query: str = ""
+    width: int | None = None
+    height: int | None = None
+    duration: float | None = None
+    photographer: str | None = None
 
 
+@app.post("/edit/{videoId}/{sceneId}/{beatId}/add-media")
+async def add_beat_media(
+    videoId: str,
+    sceneId: int,
+    beatId: int,
+    body: AddBeatMediaRequest,
+):
+
+    if body.media_type not in ["video", "photo"]:
+        raise HTTPException(
+            status_code=400,
+            detail="media_type must be 'video' or 'photo'",
+        )
+
+    res = (
+        supabase
+        .table("videos")
+        .select("timeline")
+        .eq("id", videoId)
+        .single()
+        .execute()
+    )
+
+    if not res.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Video not found",
+        )
+
+    timeline = res.data.get("timeline")
+
+    if not timeline:
+        raise HTTPException(
+            status_code=404,
+            detail="Timeline not found",
+        )
+
+
+    scene = next(
+        (
+            scene
+            for scene in timeline.get("scenes", [])
+            if int(scene.get("id")) == sceneId
+        ),
+        None,
+    )
+
+    if scene is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Scene {sceneId} not found",
+        )
+
+
+    directions = scene.get("directions") or []
+
+    if beatId < 0 or beatId >= len(directions):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Beat {beatId} not found",
+        )
+
+    direction = directions[beatId]
+
+
+    if not isinstance(direction.get("asserts"), dict):
+        direction["asserts"] = {}
+
+    asserts = direction["asserts"]
+
+    if not isinstance(asserts.get("videos"), list):
+        asserts["videos"] = []
+
+    if not isinstance(asserts.get("photos"), list):
+        asserts["photos"] = []
+
+
+    if body.media_type == "video":
+
+        new_media = {
+            "id": body.media_id,
+            "type": "video",
+            "query": body.query,
+            "video_url": body.media_url,
+        }
+
+        if body.width is not None:
+            new_media["width"] = body.width
+
+        if body.height is not None:
+            new_media["height"] = body.height
+
+        if body.duration is not None:
+            new_media["duration"] = body.duration
+
+   
+        asserts["videos"] = [
+            video
+            for video in asserts["videos"]
+            if str(video.get("id")) != str(body.media_id)
+        ]
+
+
+        asserts["videos"].append(new_media)
+
+    else:
+
+        new_media = {
+            "id": body.media_id,
+            "type": "photo",
+            "query": body.query,
+            "image_url": body.media_url,
+        }
+
+        if body.width is not None:
+            new_media["width"] = body.width
+
+        if body.height is not None:
+            new_media["height"] = body.height
+
+        if body.photographer is not None:
+            new_media["photographer"] = body.photographer
+
+     
+        asserts["photos"] = [
+            photo
+            for photo in asserts["photos"]
+            if str(photo.get("id")) != str(body.media_id)
+        ]
+
+        asserts["photos"].append(new_media)
+
+
+    direction["selected_media_id"] = body.media_id
+    direction["selected_media_type"] = body.media_type
+
+    update_res = (
+        supabase
+        .table("videos")
+        .update({
+            "timeline": timeline
+        })
+        .eq("id", videoId)
+        .execute()
+    )
+
+    if not update_res.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update timeline",
+        )
+
+
+    return {
+        "success": True,
+        "video_id": videoId,
+        "scene_id": sceneId,
+        "beat_id": beatId,
+
+        "selected_media_id": body.media_id,
+        "selected_media_type": body.media_type,
+
+        "media": new_media,
+    }
 
 
 
