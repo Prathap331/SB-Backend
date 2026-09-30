@@ -10629,12 +10629,11 @@ async def _process_one_queued_render(entry: dict) -> None:
                 json={"orientation": orientation},
             )
  
-        # Keep the response body so the real error shows up in error_message
         if resp.status_code >= 400:
             raise RuntimeError(f"render service {resp.status_code}: {resp.text[:1500]}")
  
         result = resp.json()
-        final_url = result.get("final_video_url")
+        final_url = result.get("video_url")
  
         supabase.table("render_queue").update({
             "status": "completed",
@@ -10642,7 +10641,6 @@ async def _process_one_queued_render(entry: dict) -> None:
             "completed_at": _now_iso(),
         }).eq("id", queue_id).execute()
  
-        # Mirror the URL onto videos.video_url
         if final_url:
             try:
                 supabase.table("videos").update({"video_url": final_url}).eq("id", video_id).execute()
