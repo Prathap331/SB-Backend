@@ -10401,6 +10401,7 @@ async def edit_video(body: Editvideo):
  
         for scene in scenes:
             for direction in scene["directions"]:
+                direction["id"] = str(uuid.uuid4())
                 d_type = direction["type"]
  
                 if d_type in ["B-roll+overlay_animation", "full_screen_animation"]:
@@ -10505,6 +10506,166 @@ async def edit_video(body: Editvideo):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@app.post("/edit/{videoId}/{sceneId}/{beatId}/text")
+async def edit_beat_template_text(
+    videoId: str,
+    sceneId: int,
+    beatId: str,
+    props: dict
+):
+    res = (
+        supabase
+        .table("videos")
+        .select("timeline")
+        .eq("id", videoId)
+        .single()
+        .execute()
+    )
+
+    timeline = res.data["timeline"]
+
+    scene = next(
+        s for s in timeline["scenes"]
+        if s["id"] == sceneId
+    )
+
+    print("BEAT ID:", beatId)
+    print("DIRECTIONS:", scene["directions"])
+
+    beat = next(
+        b for b in scene["directions"]
+        if str(b["id"]) == str(beatId)
+    )
+
+    beat["template_props"].update(props)
+
+    supabase \
+        .table("videos") \
+        .update({"timeline": timeline}) \
+        .eq("id", videoId) \
+        .execute()
+
+    return {"success": True}
+
+
+
+
+
+
+
+
+@app.post("/edit/{videoId}/{sceneId}/{beatId}/color")
+async def edit_beat_template_color(
+    videoId: str,
+    sceneId: int,
+    beatId: str,
+    props: dict
+):
+    res = (
+        supabase
+        .table("videos")
+        .select("timeline")
+        .eq("id", videoId)
+        .single()
+        .execute()
+    )
+
+    timeline = res.data["timeline"]
+
+    scene = next(
+        s for s in timeline["scenes"]
+        if s["id"] == sceneId
+    )
+
+    print("BEAT ID:", beatId)
+    print("DIRECTIONS:", scene["directions"])
+
+    beat = next(
+        b for b in scene["directions"]
+        if str(b["id"]) == str(beatId)
+    )
+
+    beat["template_props"].update(props)
+
+    supabase \
+        .table("videos") \
+        .update({"timeline": timeline}) \
+        .eq("id", videoId) \
+        .execute()
+
+    return {"success": True}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://62.83.19.227:8000")
 RENDER_QUEUE_MAX_CONCURRENT = int(os.getenv("RENDER_QUEUE_MAX_CONCURRENT", "1"))
 RENDER_QUEUE_POLL_SECONDS = int(os.getenv("RENDER_QUEUE_POLL_SECONDS", "5"))
@@ -10549,6 +10710,80 @@ async def enqueue_render(request: RenderQueueRequest):
         "position_in_queue": position,
     }
  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
