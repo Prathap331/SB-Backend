@@ -10638,13 +10638,6 @@ async def edit_beat_template_color(
 
 
 
-
-
-
-
-
-
-
 from fastapi import HTTPException
 from pydantic import BaseModel
 
@@ -10665,7 +10658,7 @@ class AddBeatMediaRequest(BaseModel):
 async def add_beat_media(
     videoId: str,
     sceneId: int,
-    beatId: int,
+    beatId: str,
     body: AddBeatMediaRequest,
 ):
 
