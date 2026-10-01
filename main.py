@@ -768,6 +768,10 @@ class _LogBuffer:
         print("=" * 90)
 
 
+
+
+
+
 class Idea(BaseModel):
     title: str
     description: str
@@ -776,16 +780,21 @@ class Idea(BaseModel):
 class SaveIdeasRequest(BaseModel):
     userId: str
     topic: str
+    category: str
     topic_summary: str
     sources: List[Dict[str, Any]] = []
     books: List[Dict[str, Any]] = []
     ideas: List[Idea]
 
+
 @app.post("/save-ideas")
 async def save_ideas(data: SaveIdeasRequest):
+
     for i, idea in enumerate(data.ideas, start=1):
         print(f"\n{i}. {idea.title}")
         print(idea.description)
+
+    print(f"[SAVE-IDEAS] Category: {data.category}")
 
     model = _get_st_model()
 
@@ -796,21 +805,31 @@ async def save_ideas(data: SaveIdeasRequest):
         )
     )
 
-    ideas_payload = [idea.model_dump() for idea in data.ideas]
+    ideas_payload = [
+        idea.model_dump()
+        for idea in data.ideas
+    ]
 
     row = {
         "userId": data.userId,
         "topic": data.topic,
-        "topic_summary": data.topic_summary,     
+        "category": data.category,
+        "topic_summary": data.topic_summary,
         "ideas": ideas_payload,
-        "sources": data.sources,                
-        "books": data.books,                    
+        "sources": data.sources,
+        "books": data.books,
         "topic_embeddings": to_pgvector(topic_embedding),
         "summary_embeddings": to_pgvector(summary_embedding),
     }
 
     try:
-        result = supabase.table("saved_ideas").insert(row).execute()
+        result = (
+            supabase
+            .table("saved_ideas")
+            .insert(row)
+            .execute()
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -825,8 +844,12 @@ async def save_ideas(data: SaveIdeasRequest):
 
 
 
+
+
+
+
 try:
-    _TIKTOKEN_ENCODING = tiktoken.get_encoding("cl100k_base") if tiktoken else None
+    _TIKTOKEN_ENCODING = tiktoken.get_encoding("o200k_base") if tiktoken else None
 except Exception as e:
     print(f"[TOKENS] failed to load tiktoken encoding, using fallback estimator: {e}")
     _TIKTOKEN_ENCODING = None
@@ -905,6 +928,19 @@ def _get_token_usage_summary() -> dict:
         "total_output_tokens": total_output,
         "total_tokens": total,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 HYDE_MAX_TOKENS = 70
@@ -1040,9 +1076,49 @@ Description: <description text here>
 
 (continue through idea 10)
 
-### Output 2 — Topic Summary
+### Output 2 — Topic Category + Summary
 
-Write a concise **30-40 word** synthesis of the overall topic by combining insights from the user query and all retrieved chunks.
+First, classify the User Topic into exactly ONE category from the allowed categories below.
+
+Allowed categories:
+- Psychology
+- Philosophy
+- Knowledge
+- Explainer Videos
+- Historical
+- Science Facts
+- Tech Updates
+- Book Summaries
+- Business Cases
+- Business Lessons
+- Personal Finance
+- Leadership
+- Sales & Negotiation
+- Self Improvement
+- Relationships
+- Parenting
+- Persuasion & Influence
+- Health & Nutrition
+- Motivation
+- Religion & Stories
+- Manifestation
+- Mythology
+- Crime Stories
+- Conspiracy & Myths
+- Mental Health
+- Cultural Stories
+- Biographies
+- News
+- Geopolitics
+- Policy & Governance
+- Legal Breakdowns
+- Criminal Insights
+- Legal Rights
+- Future Tech
+- Science & Tech
+
+
+Then write a concise 30-40 word synthesis of the overall topic by combining insights from the User Topic and all retrieved chunks.
 
 The summary should:
 - Capture the core theme
@@ -1052,10 +1128,22 @@ The summary should:
 
 Output this section EXACTLY as:
 
-Topic Summary: <summary text here>
+Topic category : <ONE category from the allowed categories>
+Topic Summary: <30-40 word summary>
 
 Do not add any other headings, section titles, preambles, or closing remarks anywhere in the response. Output only the two sections above, in order, in the exact format specified.
 """
+
+
+
+
+
+
+
+
+
+
+
 
 KEYWORD_GEN_PROMPT_TEMPLATE = """
 You are a **Search Query Expansion Engine** for automated web crawling and knowledge retrieval.
@@ -2496,13 +2584,37 @@ def _clean_idea_text(text_value: str) -> str:
     return text_value.strip()
 
 
-def _split_ideas_and_summary(raw: str) -> tuple[str, str]:
-    parts = _SPLIT_ON_SUMMARY_HEADER.split(raw, maxsplit=1)
-    if len(parts) == 2:
-        return parts[0].strip(), parts[1].strip()
+def _split_ideas_and_summary(raw: str) -> tuple[str, str, str]:
+    summary_parts = re.split(
+        r"Topic\s*Summary\s*:",
+        raw,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
 
-    print("[IDEAS] no 'Topic Summary' header found, summary will be empty")
-    return raw.strip(), ""
+    if len(summary_parts) != 2:
+        print("[IDEAS] no 'Topic Summary' header found")
+        return raw.strip(), "", ""
+
+    before_summary = summary_parts[0].strip()
+    summary_block = summary_parts[1].strip()
+
+    category_parts = re.split(
+        r"Topic\s*category\s*:",
+        before_summary,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+
+    if len(category_parts) == 2:
+        ideas_block = category_parts[0].strip()
+        category_block = category_parts[1].strip()
+    else:
+        print("[IDEAS] no 'Topic category' header found")
+        ideas_block = before_summary
+        category_block = ""
+
+    return ideas_block, category_block, summary_block
 
 
 def _parse_ideas_markdown(raw: str) -> list[dict]:
@@ -2536,18 +2648,48 @@ def _parse_ideas_markdown(raw: str) -> list[dict]:
 
 def _clean_summary_text(text_value: str) -> str:
     text_value = text_value.strip()
-    text_value = re.sub(r"^\s*(?:#+\s*)?(?:\*\*)?(?:Output\s*2\b.*?)?(?:\*\*)?:?\s*", "", text_value, flags=re.IGNORECASE)
+
+    text_value = re.sub(
+        r"^\s*(?:#+\s*)?(?:\*\*)?"
+        r"(?:Topic\s*Summary|Output\s*2)"
+        r"(?:\*\*)?\s*:?\s*",
+        "",
+        text_value,
+        flags=re.IGNORECASE,
+    )
+
     text_value = text_value.strip("*_ \n")
     return text_value.strip()
 
 
+def _clean_category_text(text_value: str) -> str:
+    text_value = text_value.strip()
+
+    match = re.search(
+        r"Topic\s*category\s*:\s*(.+)",
+        text_value,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        text_value = match.group(1).strip()
+
+    text_value = text_value.strip("*_` \n")
+
+    text_value = text_value.splitlines()[0].strip()
+
+    return text_value
+
 async def generate_ideas_from_context(
-    topic: str, db_results: list[dict], new_articles: list[dict]
+    topic: str,
+    db_results: list[dict],
+    new_articles: list[dict],
 ) -> dict:
+
     context_block = _build_ideas_context(db_results, new_articles)
 
     user_prompt = f"""Topic: "{topic}"
-    Content Chunks:
+Content Chunks:
 {context_block}
 """
 
@@ -2560,29 +2702,53 @@ async def generate_ideas_from_context(
     print(user_prompt)
     print("=" * 100 + "\n")
 
-
     res = await _openai_create_with_timeout(
         lambda: openai_client.chat.completions.create(
             model="gpt-5.4-mini",
             messages=[
-                {"role": "system", "content": IDEAS_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {
+                    "role": "system",
+                    "content": IDEAS_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
             ],
             stream=False,
-            temperature=0.55,   
-            top_p=0.95     
+            temperature=0.55,
+            top_p=0.95,
         )
     )
+
     _record_token_usage("generate_ideas_from_context", res)
 
     raw = res.choices[0].message.content.strip()
 
-    ideas_block, summary_block = _split_ideas_and_summary(raw)
+    ideas_block, category_block, summary_block = _split_ideas_and_summary(raw)
 
     ideas = _parse_ideas_markdown(ideas_block)
-    topic_summary = _clean_summary_text(summary_block) if summary_block else ""
 
-    return {"ideas": ideas, "topic_summary": topic_summary}
+    topic_category = (
+        _clean_category_text(category_block)
+        if category_block
+        else ""
+    )
+
+    topic_summary = (
+        _clean_summary_text(summary_block)
+        if summary_block
+        else ""
+    )
+
+    print(f"[IDEAS] Topic category: {topic_category}")
+    print(f"[IDEAS] Topic summary: {topic_summary}")
+
+    return {
+        "ideas": ideas,
+        "topic_category": topic_category,
+        "topic_summary": topic_summary,
+    }
 
 
 @app.post("/generate-ideas")
@@ -2816,6 +2982,7 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
             result = await generate_ideas_from_context(topic, db_results, new_articles)
             ideas = result["ideas"]
             topic_summary = result["topic_summary"]
+            topic_category = result["topic_category"]
         except Exception as exc:
             print(f"[MAIN] idea generation failed: {exc}")
             ideas = []
@@ -2853,6 +3020,7 @@ async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
 
         return {
             "topic": topic,
+            "topic_category": topic_category,
             "topic_summary": topic_summary,
             "ideas": ideas,
             "similar_past_ideas": similar_saved_ideas,
@@ -4804,21 +4972,21 @@ async def run_final_qc_pass(
         return fallback
 
     user_prompt = f"""
-Idea Title: "{idea_title}"
-Idea Description: "{idea_description}"
+    Idea Title: "{idea_title}"
+    Idea Description: "{idea_description}"
 
-Generated Script:
-{script_text}
+    Generated Script:
+    {script_text}
 
-Generated YouTube Titles:
-{json.dumps(youtube_metadata.get("titles", []), ensure_ascii=False)}
+    Generated YouTube Titles:
+    {json.dumps(youtube_metadata.get("titles", []), ensure_ascii=False)}
 
-Generated YouTube Descriptions:
-{json.dumps(youtube_metadata.get("descriptions", []), ensure_ascii=False)}
+    Generated YouTube Descriptions:
+    {json.dumps(youtube_metadata.get("descriptions", []), ensure_ascii=False)}
 
-Generated Thumbnail Texts:
-{json.dumps(youtube_metadata.get("thumbnail_text", []), ensure_ascii=False)}
-"""
+    Generated Thumbnail Texts:
+    {json.dumps(youtube_metadata.get("thumbnail_text", []), ensure_ascii=False)}
+    """
 
     raw = ""
     try:
@@ -10287,6 +10455,28 @@ async def get_accurate_template(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class Editvideo(BaseModel):
     userId: str
     script: str
@@ -10357,7 +10547,6 @@ async def edit_video(body: Editvideo):
                 if ref_path and os.path.exists(ref_path):
                     os.remove(ref_path)
  
-            print("reference transcript:", reference_text)
  
         print("generating audio for scenes")
  
