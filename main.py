@@ -5386,7 +5386,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
         target_word_count = target_word_count_for_time(request.time)
         print(f"[STAGE 6] target word count: {target_word_count} (±3%) for {request.time} minute(s)")
         script_result = await generate_script_from_context(
-            request, selected_template, db_results, new_articles, target_word_count
+            request, selected_template, db_results, new_articles, target_word_count,request.language
         )
         script_text = script_result["script"]
         script_metrics = script_result["metrics"]
