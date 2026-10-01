@@ -613,8 +613,8 @@ except ImportError:
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=60.0, max_retries=1)
 
 GPT_IMAGE_MODEL = os.getenv("GPT_IMAGE_MODEL", "gpt-image-2")
-GPT_IMAGE_SIZE = os.getenv("GPT_IMAGE_SIZE", "1536x1024")
-GPT_IMAGE_QUALITY = os.getenv("GPT_IMAGE_QUALITY", "high")
+GPT_IMAGE_SIZE = os.getenv("GPT_IMAGE_SIZE", "1280x720")
+GPT_IMAGE_QUALITY = os.getenv("GPT_IMAGE_QUALITY", "medium")
 
 
 _ENCODE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -862,21 +862,27 @@ def _count_tokens(text_value: str) -> int:
     return max(1, int(len(text_value.split()) * 1.3))
 
 
+TOKENS_USAGE_TABLE = "user_tokens_usage"
+TEXT_LLM_MODEL = "gpt-5.4-mini"
+
 _request_token_log: contextvars.ContextVar = contextvars.ContextVar(
     "_request_token_log", default=None
 )
-
 _script_keywords_cache: contextvars.ContextVar = contextvars.ContextVar(
     "_script_keywords_cache", default=None
 )
+_request_usage_ctx: contextvars.ContextVar = contextvars.ContextVar(
+    "_request_usage_ctx", default=None
+)
 
 
-def _start_token_tracking() -> None:
+def _start_token_tracking(user_id: str | None = None, endpoint: str | None = None) -> None:
     _request_token_log.set([])
     _script_keywords_cache.set({})
+    _request_usage_ctx.set({"userId": user_id, "endpoint": endpoint})
 
 
-def _record_token_usage(label: str, completion) -> dict:
+def _record_token_usage(label: str, completion, model: str | None = None) -> dict:
     input_tokens = output_tokens = total_tokens = None
     try:
         usage = completion.usage
@@ -889,17 +895,45 @@ def _record_token_usage(label: str, completion) -> dict:
     if total_tokens is None:
         total_tokens = (input_tokens or 0) + (output_tokens or 0)
 
+    # completion.model returns a dated snapshot (e.g. gpt-5.4-mini-2026-xx-xx).
+    # For a clean name in the table, use: model_name = model or TEXT_LLM_MODEL
+    model_name = model or getattr(completion, "model", None) or TEXT_LLM_MODEL
+
     print(
-        f"[TOKENS] {label}: input_tokens={input_tokens} "
+        f"[TOKENS] {label} [{model_name}]: input_tokens={input_tokens} "
         f"output_tokens={output_tokens} total_tokens={total_tokens}"
     )
 
     entry = {
         "label": label,
+        "model": model_name,
         "input_tokens": input_tokens or 0,
         "output_tokens": output_tokens or 0,
         "total_tokens": total_tokens or 0,
     }
+
+    log = _request_token_log.get()
+    if log is not None:
+        log.append(entry)
+
+    return entry
+
+
+def _record_image_usage(label: str, response, model: str | None = None) -> dict:
+    """Call this after every gpt-image-2 call (images.generate / images.edit)."""
+    usage = getattr(response, "usage", None)
+    inp = getattr(usage, "input_tokens", 0) or 0
+    out = getattr(usage, "output_tokens", 0) or 0
+
+    entry = {
+        "label": label,
+        "model": model or GPT_IMAGE_MODEL,
+        "input_tokens": inp,
+        "output_tokens": out,
+        "total_tokens": inp + out,
+    }
+
+    print(f"[TOKENS] {label} [{entry['model']}]: input={inp} output={out}")
 
     log = _request_token_log.get()
     if log is not None:
@@ -930,8 +964,77 @@ def _get_token_usage_summary() -> dict:
     }
 
 
+async def _fetch_user_meta(user_id: str) -> tuple[str | None, str | None]:
+    """Returns (full_name, user_tier) from user_profiles."""
+    try:
+        res = await _run_io(
+            lambda: supabase.table(USER_PROFILES_TABLE)
+            .select("full_name, user_tier")
+            .eq(USER_PROFILES_ID_COLUMN, user_id)
+            .limit(1)
+            .execute()
+        )
+        row = (res.data or [{}])[0]
+        return row.get("full_name"), row.get("user_tier")
+    except Exception as e:
+        print(f"[TOKENS-DB] user meta lookup failed for {user_id}: {e}")
+        return None, None
 
 
+async def _flush_token_usage() -> None:
+
+    try:
+        log = _request_token_log.get()
+        ctx = _request_usage_ctx.get() or {}
+        user_id = ctx.get("userId")
+        if not log or not user_id:
+            return
+
+        full_name, user_tier = await _fetch_user_meta(user_id)
+
+        total_input = sum(c["input_tokens"] for c in log)
+        total_output = sum(c["output_tokens"] for c in log)
+
+        # distinct models used in this request, in first-seen order
+        models = list(dict.fromkeys(c["model"] for c in log if c.get("model")))
+
+        sub_api_request = {
+            "total_calls": len(log),
+            "total_input_tokens": total_input,
+            "total_output_tokens": total_output,
+            "total_tokens": total_input + total_output,
+            "calls": [
+                {
+                    "function": c["label"],
+                    "model": c["model"],
+                    "input_tokens": c["input_tokens"],
+                    "output_tokens": c["output_tokens"],
+                    "total_tokens": c["total_tokens"],
+                }
+                for c in log
+            ],
+        }
+
+        row = {
+            "userId": user_id,
+            "name": full_name,
+            "subscription_type": user_tier,
+            "API_request_description": ctx.get("endpoint"),
+            "Sub_API_request": sub_api_request,   # jsonb: pass the dict directly
+            "LLM Model": ", ".join(models),
+            "Input Tokens": str(total_input),     # text column
+            "Output Tokens": str(total_output),   # text column
+        }
+
+        await _run_io(
+            lambda: supabase.table(TOKENS_USAGE_TABLE).insert(row).execute()
+        )
+        print(
+            f"[TOKENS-DB] saved 1 usage row for userId={user_id} "
+            f"endpoint={ctx.get('endpoint')} ({len(log)} call(s), in={total_input}, out={total_output})"
+        )
+    except Exception as e:
+        print(f"[TOKENS-DB] failed to save usage row: {e}")
 
 
 
@@ -2759,11 +2862,14 @@ async def generate_ideas_endpoint(
     await require_valid_user(user_id)
 
     async with _pipeline_semaphore:
-        return await _generate_ideas_endpoint_impl(request)
+        _start_token_tracking(user_id, "/generate-ideas")
+        try:
+            return await _generate_ideas_endpoint_impl(request)
+        finally:
+            await _flush_token_usage()
 
 
 async def _generate_ideas_endpoint_impl(request: "GenerateIdeasRequest"):
-    _start_token_tracking()
 
     topic = request.topic.strip()
 
@@ -5057,8 +5163,11 @@ async def generate_script(request: ScriptRequest):
     await require_valid_user(request.userId)
 
     async with _pipeline_semaphore:
-        return await _generate_script_impl(request)
-
+        _start_token_tracking(request.userId, "/generate-script")
+        try:
+            return await _generate_script_impl(request)
+        finally:
+            await _flush_token_usage()
 
 _DEFAULT_CLASSIFICATION = {"category": "UNKNOWN", "subcategories": []}
 
@@ -5067,10 +5176,7 @@ async def generate_category_and_subcategory(
     description: str | None,
     script_text: str,
 ) -> dict:
-    """
-    Uses an LLM call to classify the content into exactly 1 category
-    and up to 5 subcategories, based on the title, description, and script.
-    """
+
     script_excerpt = (script_text or "")[:6000]
 
     classification_prompt = f"""You are a strict content classifier for YouTube-style video scripts.
@@ -5220,14 +5326,11 @@ def _tag_chunks_with_segment(chunks: list[dict], seg_info: dict) -> None:
 
 
 async def _generate_script_impl(request: "ScriptRequest"):
-    _start_token_tracking()
 
     total_start_time = time.time()
     topic_text = build_topic_text(request)
     print(f"[SCRIPT] ===== NEW REQUEST ===== title='{request.title}' time={request.time}min userId={request.userId}")
 
-    # Stage 4 (YouTube) has no dependency on Stage 1's HyDE output at all —
-    # kick it off immediately so it runs fully in the background.
     scraped_urls = set()
     stage4_task = asyncio.create_task(
         get_youtube_context(request.title, request.description, scraped_urls)
@@ -5693,7 +5796,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
-
 
 
 
@@ -6280,6 +6382,7 @@ def _generate_thumbnail_image_gpt_image_sync(
                 lambda: _call_images_generate_with_timeout(prompt, size, quality),
                 label="images.generate (text-to-image)",
             )
+   
     except Exception as e:
         error_str = str(e)
         print(f"[THUMBNAIL-GPT] request to GPT Image 2 failed: {e}")
@@ -6296,6 +6399,12 @@ def _generate_thumbnail_image_gpt_image_sync(
                 return {"image_base64": None, "error": f"request failed: {retry_e}"}
         else:
             return {"image_base64": None, "error": f"request failed: {e}"}
+    
+    _record_image_usage(
+            "thumbnail_image_generation (with face)" if used_face else "thumbnail_image_generation",
+            response,
+            model=GPT_IMAGE_MODEL,
+        )
 
     try:
         image_base64 = response.data[0].b64_json
@@ -6464,8 +6573,11 @@ async def generate_thumbnail_endpoint(request: ThumbnailRequest):
     await require_valid_user(request.userId)
 
     async with _pipeline_semaphore:
-        return await _generate_thumbnail_endpoint_impl(request)
-
+        _start_token_tracking(request.userId, "/generate-thumbnail")
+        try:
+            return await _generate_thumbnail_endpoint_impl(request)
+        finally:
+            await _flush_token_usage()
 
 FREE_TIER_LABELS = {"free", "free_tier", "free-tier", "trial", "none", ""}
 
@@ -6521,8 +6633,6 @@ async def _deduct_thumbnail_credits(user_id: str, amount: int = THUMBNAIL_CREDIT
 
 
 async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
-    _start_token_tracking()
-
     total_start_time = time.time()
     script_text = request.script or ""
 
@@ -6580,6 +6690,33 @@ async def _generate_thumbnail_endpoint_impl(request: "ThumbnailRequest"):
         },
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -9619,7 +9756,6 @@ TEMPLATE_FEW_SHOTS = [
 
 
 async def scene_breakdown(script):
-    _start_token_tracking()
     SCENES_BRAKDOWN_PROMPT = f"""
     You are a professional video script scene segmentation engine.
 
@@ -9698,7 +9834,6 @@ async def scene_breakdown(script):
     except Exception as e:
         print(f"[Scene Breakdown] failed: {e}")
         return e
-
 
 
 fish_audio_client = FishAudio(
@@ -10473,10 +10608,6 @@ async def get_accurate_template(
 
 
 
-
-
-
-
 class Editvideo(BaseModel):
     userId: str
     script: str
@@ -10487,6 +10618,17 @@ class Editvideo(BaseModel):
 
 @app.post("/edit-video")
 async def edit_video(body: Editvideo):
+    await require_valid_user(body.userId)
+
+    _start_token_tracking(body.userId, "/edit-video")
+    try:
+        return await _edit_video_impl(body)
+    finally:
+        await _flush_token_usage()
+
+
+
+async def _edit_video_impl(body: Editvideo):
     try:
         print("Breaking down of script into scenes")
  
