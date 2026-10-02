@@ -9765,8 +9765,8 @@ async def scene_breakdown(script):
     scene length.
 
     NARRATION SPEED:
-    - The narration is spoken at 150 words per minute.
-    - 1 minute = 150 words, 2 minutes = 300 words.
+    - The narration is spoken at 160 words per minute.
+    - 1 minute = 160 words, 2 minutes = 300 words.
 
     HARD LENGTH LIMIT (HIGHEST PRIORITY):
     - EVERY scene must be 2 minutes or shorter when spoken.
@@ -9780,41 +9780,32 @@ async def scene_breakdown(script):
     - If the whole script is 280 words or fewer, a single scene is fine.
 
     MULTIPLE SCENE REQUIREMENT:
-    - For scripts longer than 280 words, DO NOT try to minimize the number of scenes.
-    - The script MUST be distributed across multiple scenes.
-    - Prefer MORE scenes rather than fewer large scenes.
-    - Do not group large portions of the script together just because they
-    belong to the same broad topic.
-    - As a general target, aim for approximately 150 to 220 words per scene.
-    - Use the following minimum scene-count guideline based on the total script length:
-        - 1–280 words: 1 scene is allowed.
-        - 281–500 words: at least 2 scenes.
-        - 501–750 words: at least 3 scenes.
-        - 751–1000 words: at least 4 scenes.
-        - 1001–1250 words: at least 5 scenes.
-        - 1251–1500 words: at least 6 scenes.
-        - 1501–1750 words: at least 7 scenes.
-        - 1751–2000 words: at least 8 scenes.
-        - 2001–2250 words: at least 9 scenes.
-        - 2251–2500 words: at least 10 scenes.
-        - For scripts longer than 2500 words, continue increasing the minimum
-        scene count so that scenes average roughly 150–220 words.
-    - These are MINIMUM scene counts, not maximums.
-    - If narrative changes naturally before reaching the target word count,
-    create a new scene.
-    - If a scene would become too long, split it even if the resulting scene
-    is shorter than the ideal range.
-    - NEVER reduce the number of scenes merely to keep the output compact.
-    - For a long script, producing only 2, 3, 4, or 5 scenes when the script
-    clearly supports more scenes is incorrect.
-    - Before returning the answer, count both:
-        1. the total words in the original script
-        2. the number of words in every generated scene
-    - Verify that the generated scene count satisfies the minimum scene-count
-    guideline above.
-    - Verify that every scene contains at most 280 words.
-    - Verify that every word of the original script appears exactly once across
-    all scenes.
+    - The goal is to create MULTIPLE meaningful scenes throughout the script,
+    not to minimize the number of scenes.
+    - If the script is longer than 280 words, it MUST be divided into multiple scenes.
+    - NEVER put the entire script into only 2, 3, 4, or 5 scenes simply because
+    those scenes can technically fit within the word limit.
+    - Continue creating new scenes throughout the script whenever there is a
+    meaningful change in idea, subject, event, action, visual concept,
+    argument, example, location, time, or narrative beat.
+    - A scene may contain up to 280 words, but 280 words is a MAXIMUM, not a
+    target that should be reached before creating the next scene.
+    - Do NOT intentionally make scenes as close to 280 words as possible.
+    - Prefer a natural distribution of scenes across the entire script.
+    - For a long script, the final output should contain several scenes covering
+    the entire narration.
+    - For example, a script of approximately 1500 words should normally result
+    in several scenes distributed across the script rather than only 5 large
+    scenes.
+    - The exact number of scenes must be determined by the script's narrative
+    structure and sentence boundaries.
+    - Never sacrifice a meaningful scene transition just to reduce the number
+    of scenes.
+    - Never merge two clearly different visual or narrative ideas merely to
+    reduce the scene count.
+    - At the same time, do not create tiny scenes without a meaningful reason.
+    - The 280-word maximum is a hard limit, while the number of scenes should
+    be determined by the content and narrative flow.
 
     SCENE SEGMENTATION RULES:
     - Read the entire script before segmenting it.
@@ -9823,6 +9814,8 @@ async def scene_breakdown(script):
     or visual concept.
     - Create a new scene when the subject, idea, action, location, time, or visual
     context meaningfully changes.
+    - Create a new scene when the narration introduces a new argument, example,
+    historical event, person, concept, question, explanation, or visual subject.
     - Do NOT split sentences arbitrarily.
     - Do NOT merge unrelated ideas into the same scene.
     - Preserve the original order of the script.
@@ -9833,9 +9826,10 @@ async def scene_breakdown(script):
     - Avoid unnecessarily small scenes (under 60 words) unless the
     script itself changes topic sharply.
     - The 280-word limit always wins over keeping one idea together.
-    - When multiple valid sentence boundaries are available, prefer a boundary
-    that keeps scenes closer to 150–220 words rather than creating a few
-    very large scenes.
+    - If a scene approaches 280 words and the next sentence begins a new
+    meaningful idea, start a new scene.
+    - If an idea naturally continues but would exceed 280 words, split it at
+    the nearest appropriate sentence boundary.
 
     OUTPUT FORMAT:
     Return ONLY a valid JSON array.
@@ -9865,15 +9859,20 @@ async def scene_breakdown(script):
     - Do not leave any part of the original script outside the scenes.
     - "id" must start at 1 and increase sequentially.
     - No scene may have more than 280 words.
-    - If the script is longer than 280 words, it must contain multiple scenes.
-    - For long scripts, use multiple scenes rather than attempting to maximize
-    the amount of narration inside each scene.
-    - The final scene count must satisfy the MULTIPLE SCENE REQUIREMENT above.
+    - Every scene must be 2 minutes or shorter when spoken at 150 WPM.
+    - A scene may be shorter than 2 minutes.
+    - Do NOT try to make every scene exactly 2 minutes.
+    - If the script is longer than 280 words, create multiple scenes.
+    - For long scripts, create several scenes distributed throughout the entire
+    script based on narrative and visual changes.
+    - Do not minimize the scene count.
+    - Before returning the answer, verify that every part of the original script
+    is included exactly once.
+    - Before returning the answer, verify that no scene exceeds 280 words.
 
     SCRIPT TO SEGMENT:
     {script}
     """
-
     try:
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
