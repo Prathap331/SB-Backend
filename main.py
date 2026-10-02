@@ -11057,9 +11057,6 @@ async def add_beat_media(
     beatId: str,
     body: AddBeatMediaRequest,
 ):
-    # ============================================================
-    # 1. Validate media type
-    # ============================================================
 
     if body.media_type not in ["video", "photo"]:
         raise HTTPException(
@@ -11067,9 +11064,6 @@ async def add_beat_media(
             detail="media_type must be 'video' or 'photo'",
         )
 
-    # ============================================================
-    # 2. Get video timeline
-    # ============================================================
 
     res = (
         supabase
@@ -11094,9 +11088,6 @@ async def add_beat_media(
             detail="Timeline not found",
         )
 
-    # ============================================================
-    # 3. Find scene
-    # ============================================================
 
     scene = next(
         (
@@ -11113,9 +11104,6 @@ async def add_beat_media(
             detail=f"Scene {sceneId} not found",
         )
 
-    # ============================================================
-    # 4. Find beat using its UUID
-    # ============================================================
 
     directions = scene.get("directions") or []
 
@@ -11134,9 +11122,6 @@ async def add_beat_media(
             detail=f"Beat {beatId} not found",
         )
 
-    # ============================================================
-    # 5. Make sure asserts exists
-    # ============================================================
 
     if not isinstance(direction.get("asserts"), dict):
         direction["asserts"] = {}
@@ -11149,9 +11134,6 @@ async def add_beat_media(
     if not isinstance(asserts.get("photos"), list):
         asserts["photos"] = []
 
-    # ============================================================
-    # 6. Add the new media
-    # ============================================================
 
     if body.media_type == "video":
 
@@ -11161,14 +11143,12 @@ async def add_beat_media(
             "video_url": body.media_url,
         }
 
-        # Remove the same ID if it already exists
         asserts["videos"] = [
             video
             for video in asserts["videos"]
             if str(video.get("id")) != str(body.media_id)
         ]
 
-        # Add the new video
         asserts["videos"].append(new_media)
 
     else:
@@ -11179,26 +11159,18 @@ async def add_beat_media(
             "image_url": body.media_url,
         }
 
-        # Remove the same ID if it already exists
         asserts["photos"] = [
             photo
             for photo in asserts["photos"]
             if str(photo.get("id")) != str(body.media_id)
         ]
 
-        # Add the new photo
         asserts["photos"].append(new_media)
 
-    # ============================================================
-    # 7. Select the newly added media
-    # ============================================================
 
     direction["selected_media_id"] = body.media_id
     direction["selected_media_type"] = body.media_type
 
-    # ============================================================
-    # 8. Save updated timeline
-    # ============================================================
 
     update_res = (
         supabase
@@ -11216,9 +11188,6 @@ async def add_beat_media(
             detail="Failed to update timeline",
         )
 
-    # ============================================================
-    # 9. Return result
-    # ============================================================
 
     return {
         "success": True,
@@ -11241,17 +11210,60 @@ async def add_beat_media(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://62.83.19.227:8000")
 RENDER_QUEUE_MAX_CONCURRENT = int(os.getenv("RENDER_QUEUE_MAX_CONCURRENT", "1"))
 RENDER_QUEUE_POLL_SECONDS = int(os.getenv("RENDER_QUEUE_POLL_SECONDS", "5"))
-RENDER_QUEUE_HTTP_TIMEOUT = float(os.getenv("RENDER_QUEUE_HTTP_TIMEOUT", "1800"))
- 
- 
+RENDER_QUEUE_HTTP_TIMEOUT = float(os.getenv("RENDER_QUEUE_HTTP_TIMEOUT", "3600"))
+RENDER_RECOVERY_WAIT_SECONDS = int(os.getenv("RENDER_RECOVERY_WAIT_SECONDS", "900"))
+RENDER_RECOVERY_POLL_SECONDS = int(os.getenv("RENDER_RECOVERY_POLL_SECONDS", "10"))
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _format_error(e: Exception) -> str:
+    msg = str(e).strip()
+    return f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__} (no message)"
+
+
+
 class RenderQueueRequest(BaseModel):
     video_id: str
     orientation: Literal["landscape", "portrait"] = "landscape"
- 
- 
+
+
 @app.post("/render/queue")
 async def enqueue_render(request: RenderQueueRequest):
     try:
@@ -11261,12 +11273,12 @@ async def enqueue_render(request: RenderQueueRequest):
             "status": "pending",
         }).execute()
     except Exception as e:
-        print(f"[render-queue] failed to enqueue {request.video_id}: {e}")
+        print(f"[render-queue] failed to enqueue {request.video_id}: {_format_error(e)}")
         raise HTTPException(status_code=500, detail="Failed to add to render queue")
- 
+
     if not row.data:
         raise HTTPException(status_code=500, detail="Failed to add to render queue")
- 
+
     entry = row.data[0]
     try:
         pending_ahead = (
@@ -11279,140 +11291,52 @@ async def enqueue_render(request: RenderQueueRequest):
         position = (pending_ahead.count or 0) + 1
     except Exception:
         position = None
- 
+
     return {
-        "queue_id": entry["id"], "video_id": request.video_id, "status": "pending",
+        "queue_id": entry["id"],
+        "video_id": request.video_id,
+        "status": "pending",
         "position_in_queue": position,
     }
- 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
- 
 @app.get("/render/queue/{queue_id}")
 async def get_render_queue_status(queue_id: str):
     try:
-        row = supabase.table("render_queue").select("*").eq("id", queue_id).maybe_single().execute()
+        row = (
+            supabase.table("render_queue")
+            .select("*")
+            .eq("id", queue_id)
+            .maybe_single()
+            .execute()
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if not row.data:
+        raise HTTPException(status_code=500, detail=_format_error(e))
+    if not row or not row.data:
         raise HTTPException(status_code=404, detail="Queue entry not found")
     return row.data
- 
- 
+
+
 @app.get("/render/queue")
 async def list_render_queue(status: Optional[str] = None, limit: int = 50):
     try:
-        query = supabase.table("render_queue").select("*").order("created_at", desc=True).limit(min(limit, 200))
+        query = (
+            supabase.table("render_queue")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(min(limit, 200))
+        )
         if status:
             query = query.eq("status", status)
         rows = query.execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_format_error(e))
     return {"entries": rows.data or []}
- 
- 
-def _now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
- 
- 
+
+
+
 def _claim_entry(queue_id: str) -> bool:
-    """Atomically flip pending -> processing. True only if this caller won
-    the claim, so the same job is never picked up twice."""
+    """Atomically flip pending -> processing. True only if this caller won the claim."""
     try:
         res = (
             supabase.table("render_queue")
@@ -11423,78 +11347,141 @@ def _claim_entry(queue_id: str) -> bool:
         )
         return bool(res.data)
     except Exception as e:
-        print(f"[render-queue] failed to claim {queue_id}: {e}")
+        print(f"[render-queue] failed to claim {queue_id}: {_format_error(e)}")
         return False
- 
- 
+
+
+def _clear_video_url(video_id: str) -> None:
+    try:
+        supabase.table("videos").update({"video_url": None}).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[render-queue] could not clear video_url for {video_id}: {_format_error(e)}")
+
+
+def _get_video_url(video_id: str) -> Optional[str]:
+    try:
+        res = (
+            supabase.table("videos")
+            .select("video_url")
+            .eq("id", video_id)
+            .maybe_single()
+            .execute()
+        )
+        return (res.data or {}).get("video_url") if res else None
+    except Exception as e:
+        print(f"[render-queue] could not read video_url for {video_id}: {_format_error(e)}")
+        return None
+
+
+def _mark_completed(queue_id: str, video_id: str, final_url: Optional[str]) -> None:
+    supabase.table("render_queue").update({
+        "status": "completed",
+        "final_video_url": final_url,
+        "error_message": None,
+        "completed_at": _now_iso(),
+    }).eq("id", queue_id).execute()
+
+    if final_url:
+        try:
+            supabase.table("videos").update({"video_url": final_url}).eq("id", video_id).execute()
+        except Exception as e:
+            print(f"[render-queue] failed to set videos.video_url for {video_id}: {_format_error(e)}")
+
+
+def _mark_failed(queue_id: str, message: str) -> None:
+    try:
+        supabase.table("render_queue").update({
+            "status": "failed",
+            "error_message": message[-2000:],
+            "completed_at": _now_iso(),
+        }).eq("id", queue_id).execute()
+    except Exception as e:
+        print(f"[render-queue] could not record failure for {queue_id}: {_format_error(e)}")
+
+
+
+async def _wait_for_video_url(video_id: str) -> Optional[str]:
+    waited = 0
+    while waited < RENDER_RECOVERY_WAIT_SECONDS:
+        url = await asyncio.to_thread(_get_video_url, video_id)
+        if url:
+            return url
+        await asyncio.sleep(RENDER_RECOVERY_POLL_SECONDS)
+        waited += RENDER_RECOVERY_POLL_SECONDS
+    return None
+
+
 async def _process_one_queued_render(entry: dict) -> None:
     queue_id = entry["id"]
     video_id = entry["video_id"]
     orientation = entry.get("orientation") or "landscape"
- 
-    try:
-        async with httpx.AsyncClient(timeout=RENDER_QUEUE_HTTP_TIMEOUT) as client:
-            resp = await client.post(
+
+    await asyncio.to_thread(_clear_video_url, video_id)
+
+    timeout = httpx.Timeout(connect=15.0, read=None, write=60.0, pool=None)
+
+    async def _call_render_service() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.post(
                 f"{RENDER_SERVICE_URL}/render/{video_id}",
                 json={"orientation": orientation},
             )
- 
+
+    try:
+        resp = await asyncio.wait_for(_call_render_service(), timeout=RENDER_QUEUE_HTTP_TIMEOUT)
+
         if resp.status_code >= 400:
-            raise RuntimeError(f"render service {resp.status_code}: {resp.text[:1500]}")
- 
-        result = resp.json()
-        final_url = result.get("video_url")
- 
-        supabase.table("render_queue").update({
-            "status": "completed",
-            "final_video_url": final_url,
-            "completed_at": _now_iso(),
-        }).eq("id", queue_id).execute()
- 
-        if final_url:
-            try:
-                supabase.table("videos").update({"video_url": final_url}).eq("id", video_id).execute()
-            except Exception as e:
-                print(f"[render-queue] failed to set videos.video_url for {video_id}: {e}")
- 
+            await asyncio.to_thread(
+                _mark_failed, queue_id, f"render service {resp.status_code}: {resp.text[:1500]}"
+            )
+            print(f"[render-queue] {queue_id} ({video_id}) failed: HTTP {resp.status_code}")
+            return
+
+        final_url = resp.json().get("video_url")
+        await asyncio.to_thread(_mark_completed, queue_id, video_id, final_url)
         print(f"[render-queue] {queue_id} ({video_id}) completed")
- 
+
     except Exception as e:
-        print(f"[render-queue] {queue_id} ({video_id}) failed: {e}")
-        try:
-            supabase.table("render_queue").update({
-                "status": "failed",
-                "error_message": str(e)[:2000],
-                "completed_at": _now_iso(),
-            }).eq("id", queue_id).execute()
-        except Exception as e2:
-            print(f"[render-queue] also failed to record the failure for {queue_id}: {e2}")
- 
- 
+        err = _format_error(e)
+        print(f"[render-queue] {queue_id} ({video_id}) connection problem: {err}")
+
+        recovered_url = await _wait_for_video_url(video_id)
+        if recovered_url:
+            await asyncio.to_thread(_mark_completed, queue_id, video_id, recovered_url)
+            print(f"[render-queue] {queue_id} ({video_id}) completed (recovered after: {err})")
+        else:
+            await asyncio.to_thread(
+                _mark_failed,
+                queue_id,
+                f"{err} | no video appeared within {RENDER_RECOVERY_WAIT_SECONDS}s",
+            )
+
+
+
 async def _recover_stale_processing_jobs() -> None:
-    # Single-instance only: on restart, anything still 'processing' is orphaned.
     try:
         stuck = supabase.table("render_queue").select("id, video_id").eq("status", "processing").execute()
         for row in (stuck.data or []):
             supabase.table("render_queue").update({"status": "pending"}).eq("id", row["id"]).execute()
             print(f"[render-queue] recovered orphaned job {row['id']} ({row['video_id']}) — reset to 'pending'")
     except Exception as e:
-        print(f"[render-queue] failed to recover stale processing jobs on startup: {e}")
- 
- 
+        print(f"[render-queue] failed to recover stale processing jobs on startup: {_format_error(e)}")
+
+
 async def _render_queue_worker() -> None:
-    """Every RENDER_QUEUE_POLL_SECONDS, claims pending entries (oldest first)
-    and processes them, never exceeding RENDER_QUEUE_MAX_CONCURRENT."""
     await _recover_stale_processing_jobs()
-    print(f"[render-queue] worker started (max concurrent={RENDER_QUEUE_MAX_CONCURRENT}, polling every {RENDER_QUEUE_POLL_SECONDS}s, dispatching to {RENDER_SERVICE_URL})")
+    print(
+        f"[render-queue] worker started (max concurrent={RENDER_QUEUE_MAX_CONCURRENT}, "
+        f"polling every {RENDER_QUEUE_POLL_SECONDS}s, dispatching to {RENDER_SERVICE_URL})"
+    )
     in_flight: set = set()
     while True:
         try:
             in_flight = {t for t in in_flight if not t.done()}
             free_slots = RENDER_QUEUE_MAX_CONCURRENT - len(in_flight)
             if free_slots > 0:
-                pending = (
-                    supabase.table("render_queue")
+                pending = await asyncio.to_thread(
+                    lambda: supabase.table("render_queue")
                     .select("*")
                     .eq("status", "pending")
                     .order("created_at")
@@ -11502,11 +11489,11 @@ async def _render_queue_worker() -> None:
                     .execute()
                 )
                 for entry in (pending.data or []):
-                    if not _claim_entry(entry["id"]):
-                        continue  # another worker took it
+                    if not await asyncio.to_thread(_claim_entry, entry["id"]):
+                        continue 
                     task = asyncio.create_task(_process_one_queued_render(entry))
                     in_flight.add(task)
         except Exception as e:
-            print(f"[render-queue] worker loop error (will retry next poll): {e}")
- 
+            print(f"[render-queue] worker loop error (will retry next poll): {_format_error(e)}")
+
         await asyncio.sleep(RENDER_QUEUE_POLL_SECONDS)
