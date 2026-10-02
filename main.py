@@ -9757,7 +9757,7 @@ TEMPLATE_FEW_SHOTS = [
 
 async def scene_breakdown(script):
     SCENES_BRAKDOWN_PROMPT = f"""
-   
+    
     You are a professional video script scene segmentation engine.
 
     Your task is to break the provided script into multiple scenes based on the
@@ -9773,19 +9773,56 @@ async def scene_breakdown(script):
     - EVERY scene must contain at most 280 words. Never exceed this.
     - Ideal scene length is roughly 60 to 250 words.
     - If one idea runs longer than 280 words, split it at the nearest
-      sentence boundary into two or more scenes.
+    sentence boundary into two or more scenes.
     - Count the words of each scene before answering. If any scene is over the
-      limit, split it again.
+    limit, split it again.
     - Only end a scene at the end of a sentence. Never cut in the middle of a sentence.
     - If the whole script is 280 words or fewer, a single scene is fine.
+
+    MULTIPLE SCENE REQUIREMENT:
+    - For scripts longer than 280 words, DO NOT try to minimize the number of scenes.
+    - The script MUST be distributed across multiple scenes.
+    - Prefer MORE scenes rather than fewer large scenes.
+    - Do not group large portions of the script together just because they
+    belong to the same broad topic.
+    - As a general target, aim for approximately 150 to 220 words per scene.
+    - Use the following minimum scene-count guideline based on the total script length:
+        - 1–280 words: 1 scene is allowed.
+        - 281–500 words: at least 2 scenes.
+        - 501–750 words: at least 3 scenes.
+        - 751–1000 words: at least 4 scenes.
+        - 1001–1250 words: at least 5 scenes.
+        - 1251–1500 words: at least 6 scenes.
+        - 1501–1750 words: at least 7 scenes.
+        - 1751–2000 words: at least 8 scenes.
+        - 2001–2250 words: at least 9 scenes.
+        - 2251–2500 words: at least 10 scenes.
+        - For scripts longer than 2500 words, continue increasing the minimum
+        scene count so that scenes average roughly 150–220 words.
+    - These are MINIMUM scene counts, not maximums.
+    - If narrative changes naturally before reaching the target word count,
+    create a new scene.
+    - If a scene would become too long, split it even if the resulting scene
+    is shorter than the ideal range.
+    - NEVER reduce the number of scenes merely to keep the output compact.
+    - For a long script, producing only 2, 3, 4, or 5 scenes when the script
+    clearly supports more scenes is incorrect.
+    - Before returning the answer, count both:
+        1. the total words in the original script
+        2. the number of words in every generated scene
+    - Verify that the generated scene count satisfies the minimum scene-count
+    guideline above.
+    - Verify that every scene contains at most 280 words.
+    - Verify that every word of the original script appears exactly once across
+    all scenes.
 
     SCENE SEGMENTATION RULES:
     - Read the entire script before segmenting it.
     - Divide the script into logical, self-contained scenes.
     - Each scene should represent one clear idea, event, action, location, moment,
-      or visual concept.
+    or visual concept.
     - Create a new scene when the subject, idea, action, location, time, or visual
-      context meaningfully changes.
+    context meaningfully changes.
     - Do NOT split sentences arbitrarily.
     - Do NOT merge unrelated ideas into the same scene.
     - Preserve the original order of the script.
@@ -9794,8 +9831,11 @@ async def scene_breakdown(script):
     - Do not rewrite or summarize the script.
     - Keep the original script text inside each scene.
     - Avoid unnecessarily small scenes (under 60 words) unless the
-      script itself changes topic sharply.
+    script itself changes topic sharply.
     - The 280-word limit always wins over keeping one idea together.
+    - When multiple valid sentence boundaries are available, prefer a boundary
+    that keeps scenes closer to 150–220 words rather than creating a few
+    very large scenes.
 
     OUTPUT FORMAT:
     Return ONLY a valid JSON array.
@@ -9825,6 +9865,10 @@ async def scene_breakdown(script):
     - Do not leave any part of the original script outside the scenes.
     - "id" must start at 1 and increase sequentially.
     - No scene may have more than 280 words.
+    - If the script is longer than 280 words, it must contain multiple scenes.
+    - For long scripts, use multiple scenes rather than attempting to maximize
+    the amount of narration inside each scene.
+    - The final scene count must satisfy the MULTIPLE SCENE REQUIREMENT above.
 
     SCRIPT TO SEGMENT:
     {script}
