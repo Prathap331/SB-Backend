@@ -9757,18 +9757,35 @@ TEMPLATE_FEW_SHOTS = [
 
 async def scene_breakdown(script):
     SCENES_BRAKDOWN_PROMPT = f"""
+   
     You are a professional video script scene segmentation engine.
 
-    Your task is to break the provided script into multiple scenes based strictly
-    on the script's content and narrative flow.
+    Your task is to break the provided script into multiple scenes based on the
+    script's content and narrative flow, while respecting a strict maximum
+    scene length.
+
+    NARRATION SPEED:
+    - The narration is spoken at 150 words per minute.
+    - 1 minute = 150 words, 2 minutes = 300 words.
+
+    HARD LENGTH LIMIT (HIGHEST PRIORITY):
+    - EVERY scene must be 2 minutes or shorter when spoken.
+    - EVERY scene must contain at most 280 words. Never exceed this.
+    - Ideal scene length is roughly 60 to 250 words.
+    - If one idea runs longer than 280 words, split it at the nearest
+      sentence boundary into two or more scenes.
+    - Count the words of each scene before answering. If any scene is over the
+      limit, split it again.
+    - Only end a scene at the end of a sentence. Never cut in the middle of a sentence.
+    - If the whole script is 280 words or fewer, a single scene is fine.
 
     SCENE SEGMENTATION RULES:
     - Read the entire script before segmenting it.
     - Divide the script into logical, self-contained scenes.
     - Each scene should represent one clear idea, event, action, location, moment,
-    or visual concept.
+      or visual concept.
     - Create a new scene when the subject, idea, action, location, time, or visual
-    context meaningfully changes.
+      context meaningfully changes.
     - Do NOT split sentences arbitrarily.
     - Do NOT merge unrelated ideas into the same scene.
     - Preserve the original order of the script.
@@ -9776,8 +9793,9 @@ async def scene_breakdown(script):
     - Do not invent information.
     - Do not rewrite or summarize the script.
     - Keep the original script text inside each scene.
-    - Avoid unnecessarily small scenes.
-    - Avoid extremely large scenes containing multiple distinct ideas.
+    - Avoid unnecessarily small scenes (under 60 words) unless the
+      script itself changes topic sharply.
+    - The 280-word limit always wins over keeping one idea together.
 
     OUTPUT FORMAT:
     Return ONLY a valid JSON array.
@@ -9805,7 +9823,8 @@ async def scene_breakdown(script):
     - Do not omit text.
     - Do not duplicate text between scenes.
     - Do not leave any part of the original script outside the scenes.
-    - scene_number must start at 1 and increase sequentially.
+    - "id" must start at 1 and increase sequentially.
+    - No scene may have more than 280 words.
 
     SCRIPT TO SEGMENT:
     {script}
@@ -10394,7 +10413,6 @@ def set_selected_media(direction: dict, assets: dict):
     elif photos:
         direction["selected_media_id"] = photos[0]["id"]
         direction["selected_media_type"] = "photo"
-
 
 
 
