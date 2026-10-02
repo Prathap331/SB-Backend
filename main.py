@@ -11006,7 +11006,6 @@ async def edit_beat_template_text(
 
 
 
-
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/color")
 async def edit_beat_template_color(
     videoId: str,
