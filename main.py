@@ -11006,6 +11006,7 @@ async def edit_beat_template_text(
 
 
 
+
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/color")
 async def edit_beat_template_color(
     videoId: str,
@@ -11459,8 +11460,7 @@ def _mark_completed(queue_id: str, video_id: str, final_url) -> None:
 
 
 async def _wait_for_video_url(video_id: str) -> Optional[str]:
-    """The render service keeps rendering even if our connection dropped.
-    Wait for it to write videos.video_url."""
+
     waited = 0
     while waited < RENDER_RECOVERY_WAIT_SECONDS:
         url = await asyncio.to_thread(_get_video_url, video_id)
