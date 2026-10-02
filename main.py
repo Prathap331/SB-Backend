@@ -3929,7 +3929,7 @@ Do not over-explain merely to satisfy a segment percentage.
 
 The final script must contain exactly:
 
-*Target Duration × 150 words*
+*Target Duration × 180 words*
 
 This is a hard production requirement.
 
@@ -11276,7 +11276,6 @@ def _format_error(e: Exception) -> str:
     return f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__} (no message)"
 
 
-
 class RenderQueueRequest(BaseModel):
     video_id: str
     orientation: Literal["landscape", "portrait"] = "landscape"
@@ -11352,9 +11351,7 @@ async def list_render_queue(status: Optional[str] = None, limit: int = 50):
     return {"entries": rows.data or []}
 
 
-
 def _claim_entry(queue_id: str) -> bool:
-    """Atomically flip pending -> processing. True only if this caller won the claim."""
     try:
         res = (
             supabase.table("render_queue")
@@ -11391,19 +11388,17 @@ def _get_video_url(video_id: str) -> Optional[str]:
         return None
 
 
-def _mark_completed(queue_id: str, video_id: str, final_url: Optional[str]) -> None:
-    supabase.table("render_queue").update({
-        "status": "completed",
-        "final_video_url": final_url,
-        "error_message": None,
-        "completed_at": _now_iso(),
-    }).eq("id", queue_id).execute()
-
-    if final_url:
-        try:
-            supabase.table("videos").update({"video_url": final_url}).eq("id", video_id).execute()
-        except Exception as e:
-            print(f"[render-queue] failed to set videos.video_url for {video_id}: {_format_error(e)}")
+def _normalize_url(value) -> Optional[str]:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        return (
+            value.get("publicURL")
+            or value.get("publicUrl")
+            or value.get("public_url")
+            or None
+        )
+    return None
 
 
 def _mark_failed(queue_id: str, message: str) -> None:
@@ -11417,8 +11412,56 @@ def _mark_failed(queue_id: str, message: str) -> None:
         print(f"[render-queue] could not record failure for {queue_id}: {_format_error(e)}")
 
 
+def _mark_completed(queue_id: str, video_id: str, final_url) -> None:
+    final_url = _normalize_url(final_url) or _get_video_url(video_id)
+
+    if not final_url:
+        _mark_failed(
+            queue_id,
+            "Render finished but no video URL was returned or saved in videos.video_url",
+        )
+        print(f"[render-queue] {queue_id} ({video_id}) finished but no URL found")
+        return
+
+    payload = {
+        "status": "completed",
+        "final_video_url": final_url,
+        "error_message": None,
+        "completed_at": _now_iso(),
+    }
+
+    saved = None
+    for attempt in (1, 2):
+        supabase.table("render_queue").update(payload).eq("id", queue_id).execute()
+
+        check = (
+            supabase.table("render_queue")
+            .select("final_video_url")
+            .eq("id", queue_id)
+            .maybe_single()
+            .execute()
+        )
+        saved = (check.data or {}).get("final_video_url") if check else None
+        if saved:
+            break
+        print(f"[render-queue] {queue_id}: final_video_url still empty after write (attempt {attempt})")
+
+    if not saved:
+        print(
+            f"[render-queue] {queue_id}: final_video_url could not be saved. "
+            f"Check for a trigger, RLS policy or wrong key on render_queue."
+        )
+
+    # 4. Keep videos.video_url in sync
+    try:
+        supabase.table("videos").update({"video_url": final_url}).eq("id", video_id).execute()
+    except Exception as e:
+        print(f"[render-queue] failed to set videos.video_url for {video_id}: {_format_error(e)}")
+
 
 async def _wait_for_video_url(video_id: str) -> Optional[str]:
+    """The render service keeps rendering even if our connection dropped.
+    Wait for it to write videos.video_url."""
     waited = 0
     while waited < RENDER_RECOVERY_WAIT_SECONDS:
         url = await asyncio.to_thread(_get_video_url, video_id)
@@ -11436,6 +11479,8 @@ async def _process_one_queued_render(entry: dict) -> None:
 
     await asyncio.to_thread(_clear_video_url, video_id)
 
+    # No read timeout (the service sends nothing until the render ends);
+    # the overall limit is enforced by asyncio.wait_for below.
     timeout = httpx.Timeout(connect=15.0, read=None, write=60.0, pool=None)
 
     async def _call_render_service() -> httpx.Response:
@@ -11445,9 +11490,17 @@ async def _process_one_queued_render(entry: dict) -> None:
                 json={"orientation": orientation},
             )
 
+    resp = None
+    call_error = None
+
     try:
         resp = await asyncio.wait_for(_call_render_service(), timeout=RENDER_QUEUE_HTTP_TIMEOUT)
+    except Exception as e:
+        call_error = _format_error(e)
+        print(f"[render-queue] {queue_id} ({video_id}) connection problem: {call_error}")
 
+    # ---- The service answered ----
+    if resp is not None:
         if resp.status_code >= 400:
             await asyncio.to_thread(
                 _mark_failed, queue_id, f"render service {resp.status_code}: {resp.text[:1500]}"
@@ -11455,28 +11508,36 @@ async def _process_one_queued_render(entry: dict) -> None:
             print(f"[render-queue] {queue_id} ({video_id}) failed: HTTP {resp.status_code}")
             return
 
-        final_url = resp.json().get("video_url")
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        print(f"[render-queue] render service response for {video_id}: {str(body)[:500]}")
+
+        final_url = body.get("video_url") or body.get("final_video_url") or body.get("url")
         await asyncio.to_thread(_mark_completed, queue_id, video_id, final_url)
-        print(f"[render-queue] {queue_id} ({video_id}) completed")
+        print(f"[render-queue] {queue_id} ({video_id}) processed")
+        return
 
-    except Exception as e:
-        err = _format_error(e)
-        print(f"[render-queue] {queue_id} ({video_id}) connection problem: {err}")
-
-        recovered_url = await _wait_for_video_url(video_id)
-        if recovered_url:
-            await asyncio.to_thread(_mark_completed, queue_id, video_id, recovered_url)
-            print(f"[render-queue] {queue_id} ({video_id}) completed (recovered after: {err})")
-        else:
-            await asyncio.to_thread(
-                _mark_failed,
-                queue_id,
-                f"{err} | no video appeared within {RENDER_RECOVERY_WAIT_SECONDS}s",
-            )
+    # ---- The connection broke: the render may still have finished ----
+    recovered_url = await _wait_for_video_url(video_id)
+    if recovered_url:
+        await asyncio.to_thread(_mark_completed, queue_id, video_id, recovered_url)
+        print(f"[render-queue] {queue_id} ({video_id}) completed (recovered after: {call_error})")
+    else:
+        await asyncio.to_thread(
+            _mark_failed,
+            queue_id,
+            f"{call_error} | no video appeared within {RENDER_RECOVERY_WAIT_SECONDS}s",
+        )
 
 
+# ------------------------------------------------------------
+# Worker
+# ------------------------------------------------------------
 
 async def _recover_stale_processing_jobs() -> None:
+    # Single-instance only: on restart, anything still 'processing' is orphaned.
     try:
         stuck = supabase.table("render_queue").select("id, video_id").eq("status", "processing").execute()
         for row in (stuck.data or []):
@@ -11508,7 +11569,7 @@ async def _render_queue_worker() -> None:
                 )
                 for entry in (pending.data or []):
                     if not await asyncio.to_thread(_claim_entry, entry["id"]):
-                        continue 
+                        continue  # another worker took it
                     task = asyncio.create_task(_process_one_queued_render(entry))
                     in_flight.add(task)
         except Exception as e:
