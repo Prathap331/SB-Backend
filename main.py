@@ -3929,7 +3929,7 @@ Do not over-explain merely to satisfy a segment percentage.
 
 The final script must contain exactly:
 
-*Target Duration × 130 words*
+*Target Duration × 150 words*
 
 This is a hard production requirement.
 
@@ -4139,29 +4139,29 @@ async def generate_script_from_context(
     print(request.time)
 
     user_prompt = f"""
-Video Title: "{request.title}"
-Video Description: "{request.description}"
-Target Duration: {request.time} minute(s)
-Target Word Count: approximately {target_word_count} words
-Script Language: Write the ENTIRE script narration in {language}. All narration text must be in {language} — do not mix languages, do not default to English unless {language} is English. (Field names/JSON keys still stay in English as shown in the OUTPUT schema.)
+    Video Title: "{request.title}"
+    Video Description: "{request.description}"
+    Target Duration: {request.time} minute(s)
+    Target Word Count: approximately {target_word_count} words
+    Script Language: Write the ENTIRE script narration in {language}. All narration text must be in {language} — do not mix languages, do not default to English unless {language} is English. (Field names/JSON keys still stay in English as shown in the OUTPUT schema.)
 
 
-Template: "{selected_template.get('title')}" (cluster: {selected_template.get('cluster')})
-Template Purpose: {selected_template.get('about')}
+    Template: "{selected_template.get('title')}" (cluster: {selected_template.get('cluster')})
+    Template Purpose: {selected_template.get('about')}
 
-Segments (write the script in this exact order — each entry's guidance is
-that segment's llm_brief):
-{segments_block}
+    Segments (write the script in this exact order — each entry's guidance is
+    that segment's llm_brief):
+    {segments_block}
 
-Source Material (JSON — each knowledge_base_chunks entry may include a "book"
-object with title/author/year; each web_chunks entry includes its source
-"url". Every chunk also carries "segment_name" and "segment_brief" showing
-which template segment it was retrieved for — use that chunk's facts in the
-matching part of the narration, guided by that segment's brief. Attribute
-facts to their sources naturally in the narration, e.g. "According to
-[author]'s [title]..." or "As reported by [domain]..."; never attribute to a
-chunk whose "book" is null or whose "url" is empty):
-{context_block}
+    Source Material (JSON — each knowledge_base_chunks entry may include a "book"
+    object with title/author/year; each web_chunks entry includes its source
+    "url". Every chunk also carries "segment_name" and "segment_brief" showing
+    which template segment it was retrieved for — use that chunk's facts in the
+    matching part of the narration, guided by that segment's brief. Attribute
+    facts to their sources naturally in the narration, e.g. "According to
+    [author]'s [title]..." or "As reported by [domain]..."; never attribute to a
+    chunk whose "book" is null or whose "url" is empty):
+    {context_block}
 """
 
     fallback = {
@@ -9917,6 +9917,9 @@ async def get_word_level_time_stamps(scenes: list):
 
             for segment in aligned["segments"]:
                 for word in segment.get("words", []):
+                    if "start" not in word or "end" not in word:
+                        continue
+
                     word_timestamps.append({
                         "word": word["word"],
                         "start": word["start"],
@@ -9925,9 +9928,12 @@ async def get_word_level_time_stamps(scenes: list):
 
             scene["word_timestamps"] = word_timestamps
 
+            scene["duration"] = word_timestamps[-1]["end"] if word_timestamps else 0
+
         except Exception as e:
             print(f"Error processing scene: {e}")
             scene["word_timestamps"] = []
+            scene["duration"] = 0
 
         finally:
             if audio_path and os.path.exists(audio_path):
@@ -10276,10 +10282,16 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         return e
 
 
-async def align_beats_to_voice(directions: list, word_timestamps: list):
-
+async def align_beats_to_voice(
+    directions: list,
+    word_timestamps: list,
+    audio_duration: float | None = None
+):
     print("aligning beats to voice")
     print("word timestamps count:", len(word_timestamps))
+
+    if not directions or not word_timestamps:
+        return directions
 
     last_idx = len(word_timestamps) - 1
 
@@ -10287,8 +10299,8 @@ async def align_beats_to_voice(directions: list, word_timestamps: list):
         start_index = max(0, min(int(direction["start_word_index"]), last_idx))
         end_index = max(start_index, min(int(direction["end_word_index"]), last_idx))
 
-        print("beat:", start_index, "->", end_index, "available words:", len(word_timestamps))
-
+        direction["start_word_index"] = start_index
+        direction["end_word_index"] = end_index
         direction["start"] = word_timestamps[start_index]["start"]
         direction["end"] = word_timestamps[end_index]["end"]
 
@@ -10313,8 +10325,80 @@ async def align_beats_to_voice(directions: list, word_timestamps: list):
                 w["word"] for w in word_timestamps[o_start:o_end + 1]
             )
 
+    directions[0]["start"] = 0.0
+
+    for i in range(len(directions) - 1):
+        directions[i]["end"] = directions[i + 1]["start"]
+
+    last = directions[-1]
+    if audio_duration:
+        last["end"] = max(last["end"], audio_duration)
+
+    for d in directions:
+        if d.get("type") == "B-roll+overlay_animation":
+            d["overlay_start"] = max(d["start"], min(d["overlay_start"], d["end"]))
+            d["overlay_end"] = max(d["overlay_start"], min(d["overlay_end"], d["end"]))
+
     return directions
-    
+
+
+
+
+
+
+FILLABLE_URL_KEYS = {"image_url", "before_url", "after_url"}
+
+def _keywords_from_description(description: str, limit: int = 2) -> list:
+    phrases = re.findall(r"\*\*(.+?)\*\*", description or "")
+    return [p.strip() for p in phrases[:limit] if p.strip()]
+
+
+def _fill_media_urls(node, urls: list, counter: list):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in FILLABLE_URL_KEYS and isinstance(value, str) and not value:
+                node[key] = urls[counter[0] % len(urls)]
+                counter[0] += 1
+            else:
+                _fill_media_urls(value, urls, counter)
+    elif isinstance(node, list):
+        for item in node:
+            _fill_media_urls(item, urls, counter)
+
+
+def fill_template_props_with_photos(template_name: str, props: dict, photos: list):
+    if not props or not photos:
+        return props
+
+    urls = [p["image_url"] for p in photos if p.get("image_url")]
+    if not urls:
+        return props
+
+    if template_name == "Before / After":
+        if not props.get("before_url"):
+            props["before_url"] = urls[0]
+        if not props.get("after_url"):
+            props["after_url"] = urls[1] if len(urls) > 1 else urls[0]
+
+    _fill_media_urls(props, urls, [0])
+    return props
+
+
+def set_selected_media(direction: dict, assets: dict):
+    videos = assets.get("videos") or []
+    photos = assets.get("photos") or []
+
+    if videos:
+        direction["selected_media_id"] = videos[0]["id"]
+        direction["selected_media_type"] = "video"
+    elif photos:
+        direction["selected_media_id"] = photos[0]["id"]
+        direction["selected_media_type"] = "photo"
+
+
+
+
+
 
 PEXELS_HEADERS = {
     "Authorization": PEXELS_API_KEY
@@ -10590,24 +10674,6 @@ async def get_accurate_template(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class Editvideo(BaseModel):
     userId: str
     script: str
@@ -10631,16 +10697,16 @@ async def edit_video(body: Editvideo):
 async def _edit_video_impl(body: Editvideo):
     try:
         print("Breaking down of script into scenes")
- 
+
         scenes = await scene_breakdown(body.script)
- 
+
         voice_id = body.voice
         reference_audio = None
         reference_text = None
- 
+
         if body.voice == "user":
             print("voice is 'user', fetching user's en audio from user_profiles")
- 
+
             profile_res = (
                 supabase
                 .table("user_profiles")
@@ -10649,12 +10715,12 @@ async def _edit_video_impl(body: Editvideo):
                 .single()
                 .execute()
             )
- 
+
             audio_urls = profile_res.data.get("audio_url") if profile_res.data else None
- 
+
             if isinstance(audio_urls, str):
                 audio_urls = json.loads(audio_urls)
- 
+
             user_audio_link = next(
                 (
                     item["en"]
@@ -10663,23 +10729,23 @@ async def _edit_video_impl(body: Editvideo):
                 ),
                 None
             )
- 
+
             if not user_audio_link:
                 raise ValueError("No 'en' audio found in user_profiles.audio_url")
- 
+
             if user_audio_link.startswith("http"):
                 user_audio_path = user_audio_link.split("/object/sign/user-audio/", 1)[1].split("?", 1)[0]
             else:
                 user_audio_path = user_audio_link
- 
+
             reference_audio = supabase.storage.from_("user-audio").download(user_audio_path)
- 
+
             ref_path = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                     f.write(reference_audio)
                     ref_path = f.name
- 
+
                 ref_wave = whisperx.load_audio(ref_path)
                 ref_result = whisper_model.transcribe(ref_wave, batch_size=16)
                 reference_text = " ".join(
@@ -10688,77 +10754,84 @@ async def _edit_video_impl(body: Editvideo):
             finally:
                 if ref_path and os.path.exists(ref_path):
                     os.remove(ref_path)
- 
- 
+
         print("generating audio for scenes")
- 
+
         for scene in scenes:
             audio_url = await generate_audio_for_scene(
                 scene_text=scene["script"],
                 modelId=voice_id,
                 userId=body.userId,
-                reference_audio=reference_audio,    
-                reference_text=reference_text       
+                reference_audio=reference_audio,
+                reference_text=reference_text
             )
- 
+
             scene["audio_url"] = audio_url
- 
+
         print("generating word level timestamps for scenes")
- 
+
         scenes = await get_word_level_time_stamps(scenes)
- 
+
         print("generating directions for scenes")
- 
+
         for scene in scenes:
             directions = await add_directions_for_scene(
                 scene["script"],
                 scene["word_timestamps"]
             )
- 
+
+            if not isinstance(directions, list):
+                print(f"[edit-video] directions failed for scene, got: {directions}")
+                directions = []
+
             scene["directions"] = directions
- 
+
         print("aligning directions as per voice")
- 
+
         for scene in scenes:
             scene["directions"] = await align_beats_to_voice(
                 scene["directions"],
-                scene["word_timestamps"]
+                scene["word_timestamps"],
+                audio_duration=scene.get("duration"),
             )
- 
+
         print("fetching templates and media for directions")
- 
+
         last_photos = None
         last_videos = None
- 
+
         for scene in scenes:
             for direction in scene["directions"]:
                 direction["id"] = str(uuid.uuid4())
                 direction["selected_media_id"] = None
                 direction["selected_media_type"] = None
                 d_type = direction["type"]
- 
-                if d_type in ["B-roll+overlay_animation", "full_screen_animation"]:
-                    template_text = direction["text"]
- 
-                    template_name, template_props = await get_accurate_template(
-                        direction["template_description"],
-                        template_text,
-                        d_type
-                    )
-                    direction["template_name"] = template_name
-                    direction["template_props"] = template_props
- 
+
                 if d_type in ["B-roll", "B-roll+overlay_animation"]:
-                    assets = search_pexel_media(direction["keywords"])
- 
-                    if assets["photos"]:
-                        last_photos = assets["photos"]
-                    elif last_photos:
-                        print("no photos found, borrowing photos from previous beat")
-                        assets["photos"] = copy.deepcopy(last_photos)
-                    else:
-                        print("no photos found and nothing to borrow yet")
- 
+                    keywords = direction.get("keywords") or []
+                elif d_type == "full_screen_animation":
+                    keywords = (
+                        direction.get("keywords")
+                        or _keywords_from_description(
+                            direction.get("template_description")
+                        )
+                    )
+                else:
+                    keywords = []
+
+                assets = {"photos": [], "videos": []}
+                if keywords:
+                    assets = search_pexel_media(keywords)
+
+                if assets["photos"]:
+                    last_photos = assets["photos"]
+                elif last_photos:
+                    print("no photos found, borrowing photos from previous beat")
+                    assets["photos"] = copy.deepcopy(last_photos)
+                else:
+                    print("no photos found and nothing to borrow yet")
+
+                if d_type != "full_screen_animation":
                     if assets["videos"]:
                         last_videos = assets["videos"]
                     elif last_videos:
@@ -10766,9 +10839,33 @@ async def _edit_video_impl(body: Editvideo):
                         assets["videos"] = copy.deepcopy(last_videos)
                     else:
                         print("no videos found and nothing to borrow yet")
- 
+
+                if d_type in ["B-roll", "B-roll+overlay_animation"]:
                     direction["asserts"] = assets
- 
+                    set_selected_media(direction, assets)
+
+                elif d_type == "full_screen_animation":
+                    direction["template_photos"] = assets["photos"]
+                    if assets["photos"]:
+                        direction["selected_media_id"] = assets["photos"][0]["id"]
+                        direction["selected_media_type"] = "photo"
+
+                if d_type in ["B-roll+overlay_animation", "full_screen_animation"]:
+                    template_name, template_props = await get_accurate_template(
+                        direction["template_description"],
+                        direction["text"],
+                        d_type
+                    )
+                    direction["template_name"] = template_name
+
+                    if template_props:
+                        fill_template_props_with_photos(
+                            template_name,
+                            template_props,
+                            assets["photos"],
+                        )
+                    direction["template_props"] = template_props
+
         res = supabase.table("videos").insert({
             "user_id": body.userId,
             "script": body.script,
@@ -10779,13 +10876,13 @@ async def _edit_video_impl(body: Editvideo):
             },
             "timeline_version": 1
         }).execute()
-        
+
         video_id = res.data[0]["id"]
 
         print("saved into db")
 
         EDIT_VIDEO_CREDITS_PER_MINUTE = 11
-        duration_minutes = body.durationMinutes 
+        duration_minutes = body.durationMinutes
         credit_cost = round(duration_minutes * EDIT_VIDEO_CREDITS_PER_MINUTE)
 
         credit_result = {"cost": credit_cost, "deducted": False, "remaining_credits": None, "status": None}
@@ -10826,33 +10923,10 @@ async def _edit_video_impl(body: Editvideo):
             print(f"[edit-video] credit deduction failed for {body.userId} (video {video_id} was still generated and saved): {e}")
             credit_result["status"] = "error"
 
-
         return {"video_id": video_id, "scenes": scenes}
- 
- 
+
     except Exception as e:
         print(e)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
