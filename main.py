@@ -11296,18 +11296,14 @@ async def add_beat_media(
 
 
 
-
-
-
-
-
-
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://62.83.19.227:8000")
 RENDER_QUEUE_MAX_CONCURRENT = int(os.getenv("RENDER_QUEUE_MAX_CONCURRENT", "1"))
 RENDER_QUEUE_POLL_SECONDS = int(os.getenv("RENDER_QUEUE_POLL_SECONDS", "5"))
 RENDER_QUEUE_HTTP_TIMEOUT = float(os.getenv("RENDER_QUEUE_HTTP_TIMEOUT", "3600"))
 RENDER_RECOVERY_WAIT_SECONDS = int(os.getenv("RENDER_RECOVERY_WAIT_SECONDS", "900"))
 RENDER_RECOVERY_POLL_SECONDS = int(os.getenv("RENDER_RECOVERY_POLL_SECONDS", "10"))
+# Set to "false" on every instance except one
+RUN_RENDER_WORKER = os.getenv("RUN_RENDER_WORKER", "true").lower() == "true"
 
 
 def _now_iso() -> str:
@@ -11319,6 +11315,10 @@ def _format_error(e: Exception) -> str:
     return f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__} (no message)"
 
 
+# ------------------------------------------------------------
+# API
+# ------------------------------------------------------------
+
 class RenderQueueRequest(BaseModel):
     video_id: str
     orientation: Literal["landscape", "portrait"] = "landscape"
@@ -11327,11 +11327,13 @@ class RenderQueueRequest(BaseModel):
 @app.post("/render/queue")
 async def enqueue_render(request: RenderQueueRequest):
     try:
-        row = supabase.table("render_queue").insert({
-            "video_id": request.video_id,
-            "orientation": request.orientation,
-            "status": "pending",
-        }).execute()
+        row = await asyncio.to_thread(
+            lambda: supabase.table("render_queue").insert({
+                "video_id": request.video_id,
+                "orientation": request.orientation,
+                "status": "pending",
+            }).execute()
+        )
     except Exception as e:
         print(f"[render-queue] failed to enqueue {request.video_id}: {_format_error(e)}")
         raise HTTPException(status_code=500, detail="Failed to add to render queue")
@@ -11341,14 +11343,16 @@ async def enqueue_render(request: RenderQueueRequest):
 
     entry = row.data[0]
     try:
-        pending_ahead = (
-            supabase.table("render_queue")
+        pending_ahead = await asyncio.to_thread(
+            lambda: supabase.table("render_queue")
             .select("id", count="exact")
             .eq("status", "pending")
             .lt("created_at", entry["created_at"])
             .execute()
         )
-        position = (pending_ahead.count or 0) + 1
+        processing = await asyncio.to_thread(_count_processing)
+        # Jobs ahead = pending ahead + the ones currently rendering
+        position = (pending_ahead.count or 0) + processing + 1
     except Exception:
         position = None
 
@@ -11363,18 +11367,23 @@ async def enqueue_render(request: RenderQueueRequest):
 @app.get("/render/queue/{queue_id}")
 async def get_render_queue_status(queue_id: str):
     try:
-        row = (
-            supabase.table("render_queue")
+        res = await asyncio.to_thread(
+            lambda: supabase.table("render_queue")
             .select("*")
             .eq("id", queue_id)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
     except Exception as e:
+        print(f"[render-queue] status lookup failed for {queue_id}: {_format_error(e)}")
         raise HTTPException(status_code=500, detail=_format_error(e))
-    if not row or not row.data:
+
+    rows = (res.data if res else None) or []
+    if not rows:
+        print(f"[render-queue] status lookup: no row for id {queue_id}")
         raise HTTPException(status_code=404, detail="Queue entry not found")
-    return row.data
+
+    return rows[0]
 
 
 @app.get("/render/queue")
@@ -11388,13 +11397,30 @@ async def list_render_queue(status: Optional[str] = None, limit: int = 50):
         )
         if status:
             query = query.eq("status", status)
-        rows = query.execute()
+        rows = await asyncio.to_thread(query.execute)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_format_error(e))
     return {"entries": rows.data or []}
 
 
+# ------------------------------------------------------------
+# DB helpers (sync, called via asyncio.to_thread)
+# ------------------------------------------------------------
+
+def _count_processing() -> int:
+    res = (
+        supabase.table("render_queue")
+        .select("id", count="exact")
+        .eq("status", "processing")
+        .execute()
+    )
+    return res.count or 0
+
+
 def _claim_entry(queue_id: str) -> bool:
+    """Flip pending -> processing, then verify we are within the global limit.
+    If another worker claimed at the same moment and we're over the limit,
+    put the job back to pending so it waits in the queue."""
     try:
         res = (
             supabase.table("render_queue")
@@ -11403,13 +11429,36 @@ def _claim_entry(queue_id: str) -> bool:
             .eq("status", "pending")
             .execute()
         )
-        return bool(res.data)
+        if not res.data:
+            return False
+
+        # The oldest MAX_CONCURRENT processing rows are the ones allowed to run
+        allowed_rows = (
+            supabase.table("render_queue")
+            .select("id")
+            .eq("status", "processing")
+            .order("started_at")
+            .order("id")
+            .limit(RENDER_QUEUE_MAX_CONCURRENT)
+            .execute()
+        )
+        allowed_ids = {r["id"] for r in (allowed_rows.data or [])}
+
+        if queue_id not in allowed_ids:
+            supabase.table("render_queue").update(
+                {"status": "pending", "started_at": None}
+            ).eq("id", queue_id).execute()
+            print(f"[render-queue] {queue_id} released back to pending (limit reached)")
+            return False
+
+        return True
     except Exception as e:
         print(f"[render-queue] failed to claim {queue_id}: {_format_error(e)}")
         return False
 
 
 def _clear_video_url(video_id: str) -> None:
+    """Clear the old URL so a non-empty videos.video_url later means THIS render finished."""
     try:
         supabase.table("videos").update({"video_url": None}).eq("id", video_id).execute()
     except Exception as e:
@@ -11422,16 +11471,18 @@ def _get_video_url(video_id: str) -> Optional[str]:
             supabase.table("videos")
             .select("video_url")
             .eq("id", video_id)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
-        return (res.data or {}).get("video_url") if res else None
+        rows = (res.data if res else None) or []
+        return rows[0].get("video_url") if rows else None
     except Exception as e:
         print(f"[render-queue] could not read video_url for {video_id}: {_format_error(e)}")
         return None
 
 
 def _normalize_url(value) -> Optional[str]:
+    """Some supabase client versions return a dict instead of a string."""
     if isinstance(value, str):
         return value.strip() or None
     if isinstance(value, dict):
@@ -11456,6 +11507,7 @@ def _mark_failed(queue_id: str, message: str) -> None:
 
 
 def _mark_completed(queue_id: str, video_id: str, final_url) -> None:
+    # Use the response URL, else fall back to what the render service saved in videos
     final_url = _normalize_url(final_url) or _get_video_url(video_id)
 
     if not final_url:
@@ -11473,6 +11525,7 @@ def _mark_completed(queue_id: str, video_id: str, final_url) -> None:
         "completed_at": _now_iso(),
     }
 
+    # Write, then read back to confirm the URL really landed (retry once)
     saved = None
     for attempt in (1, 2):
         supabase.table("render_queue").update(payload).eq("id", queue_id).execute()
@@ -11481,10 +11534,11 @@ def _mark_completed(queue_id: str, video_id: str, final_url) -> None:
             supabase.table("render_queue")
             .select("final_video_url")
             .eq("id", queue_id)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
-        saved = (check.data or {}).get("final_video_url") if check else None
+        rows = (check.data if check else None) or []
+        saved = rows[0].get("final_video_url") if rows else None
         if saved:
             break
         print(f"[render-queue] {queue_id}: final_video_url still empty after write (attempt {attempt})")
@@ -11495,15 +11549,20 @@ def _mark_completed(queue_id: str, video_id: str, final_url) -> None:
             f"Check for a trigger, RLS policy or wrong key on render_queue."
         )
 
-    # 4. Keep videos.video_url in sync
+    # Keep videos.video_url in sync
     try:
         supabase.table("videos").update({"video_url": final_url}).eq("id", video_id).execute()
     except Exception as e:
         print(f"[render-queue] failed to set videos.video_url for {video_id}: {_format_error(e)}")
 
 
-async def _wait_for_video_url(video_id: str) -> Optional[str]:
+# ------------------------------------------------------------
+# Processing one job
+# ------------------------------------------------------------
 
+async def _wait_for_video_url(video_id: str) -> Optional[str]:
+    """The render service keeps rendering even if our connection dropped.
+    Wait for it to write videos.video_url."""
     waited = 0
     while waited < RENDER_RECOVERY_WAIT_SECONDS:
         url = await asyncio.to_thread(_get_video_url, video_id)
@@ -11579,11 +11638,22 @@ async def _process_one_queued_render(entry: dict) -> None:
 # ------------------------------------------------------------
 
 async def _recover_stale_processing_jobs() -> None:
-    # Single-instance only: on restart, anything still 'processing' is orphaned.
+    # Only safe when exactly ONE process runs the worker:
+    # on restart, anything still 'processing' is orphaned.
     try:
-        stuck = supabase.table("render_queue").select("id, video_id").eq("status", "processing").execute()
+        stuck = await asyncio.to_thread(
+            lambda: supabase.table("render_queue")
+            .select("id, video_id")
+            .eq("status", "processing")
+            .execute()
+        )
         for row in (stuck.data or []):
-            supabase.table("render_queue").update({"status": "pending"}).eq("id", row["id"]).execute()
+            await asyncio.to_thread(
+                lambda r=row: supabase.table("render_queue")
+                .update({"status": "pending", "started_at": None})
+                .eq("id", r["id"])
+                .execute()
+            )
             print(f"[render-queue] recovered orphaned job {row['id']} ({row['video_id']}) — reset to 'pending'")
     except Exception as e:
         print(f"[render-queue] failed to recover stale processing jobs on startup: {_format_error(e)}")
@@ -11595,11 +11665,12 @@ async def _render_queue_worker() -> None:
         f"[render-queue] worker started (max concurrent={RENDER_QUEUE_MAX_CONCURRENT}, "
         f"polling every {RENDER_QUEUE_POLL_SECONDS}s, dispatching to {RENDER_SERVICE_URL})"
     )
-    in_flight: set = set()
     while True:
         try:
-            in_flight = {t for t in in_flight if not t.done()}
-            free_slots = RENDER_QUEUE_MAX_CONCURRENT - len(in_flight)
+            # Count from the database so the limit holds across all processes
+            processing = await asyncio.to_thread(_count_processing)
+            free_slots = RENDER_QUEUE_MAX_CONCURRENT - processing
+
             if free_slots > 0:
                 pending = await asyncio.to_thread(
                     lambda: supabase.table("render_queue")
@@ -11611,9 +11682,8 @@ async def _render_queue_worker() -> None:
                 )
                 for entry in (pending.data or []):
                     if not await asyncio.to_thread(_claim_entry, entry["id"]):
-                        continue  # another worker took it
-                    task = asyncio.create_task(_process_one_queued_render(entry))
-                    in_flight.add(task)
+                        continue
+                    asyncio.create_task(_process_one_queued_render(entry))
         except Exception as e:
             print(f"[render-queue] worker loop error (will retry next poll): {_format_error(e)}")
 
