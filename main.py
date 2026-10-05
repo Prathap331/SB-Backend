@@ -10564,8 +10564,6 @@ async def align_beats_to_voice(
 
 
 
-
-
 FILLABLE_URL_KEYS = {"image_url", "before_url", "after_url"}
 
 def _keywords_from_description(description: str, limit: int = 2) -> list:
@@ -11472,15 +11470,12 @@ async def add_beat_media(
 
 
 
-
-
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://62.83.19.227:8000")
 RENDER_QUEUE_MAX_CONCURRENT = int(os.getenv("RENDER_QUEUE_MAX_CONCURRENT", "1"))
 RENDER_QUEUE_POLL_SECONDS = int(os.getenv("RENDER_QUEUE_POLL_SECONDS", "5"))
 RENDER_QUEUE_HTTP_TIMEOUT = float(os.getenv("RENDER_QUEUE_HTTP_TIMEOUT", "3600"))
 RENDER_RECOVERY_WAIT_SECONDS = int(os.getenv("RENDER_RECOVERY_WAIT_SECONDS", "900"))
 RENDER_RECOVERY_POLL_SECONDS = int(os.getenv("RENDER_RECOVERY_POLL_SECONDS", "10"))
-# Set to "false" on every instance except one
 RUN_RENDER_WORKER = os.getenv("RUN_RENDER_WORKER", "true").lower() == "true"
 
 
@@ -11492,10 +11487,6 @@ def _format_error(e: Exception) -> str:
     msg = str(e).strip()
     return f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__} (no message)"
 
-
-# ------------------------------------------------------------
-# API
-# ------------------------------------------------------------
 
 class RenderQueueRequest(BaseModel):
     video_id: str
@@ -11561,7 +11552,14 @@ async def get_render_queue_status(queue_id: str):
         print(f"[render-queue] status lookup: no row for id {queue_id}")
         raise HTTPException(status_code=404, detail="Queue entry not found")
 
-    return rows[0]
+    row = rows[0]
+    # The URL lives in videos.video_url only; attach it for completed jobs
+    row["video_url"] = (
+        await asyncio.to_thread(_get_video_url, row["video_id"])
+        if row.get("status") == "completed"
+        else None
+    )
+    return row
 
 
 @app.get("/render/queue")
@@ -11576,9 +11574,26 @@ async def list_render_queue(status: Optional[str] = None, limit: int = 50):
         if status:
             query = query.eq("status", status)
         rows = await asyncio.to_thread(query.execute)
+
+        entries = rows.data or []
+
+        # One batched lookup of video URLs for completed entries
+        ids = list({e["video_id"] for e in entries if e.get("status") == "completed"})
+        urls = {}
+        if ids:
+            vids = await asyncio.to_thread(
+                lambda: supabase.table("videos")
+                .select("id, video_url")
+                .in_("id", ids)
+                .execute()
+            )
+            urls = {v["id"]: v.get("video_url") for v in (vids.data or [])}
+
+        for e in entries:
+            e["video_url"] = urls.get(e["video_id"]) if e.get("status") == "completed" else None
     except Exception as e:
         raise HTTPException(status_code=500, detail=_format_error(e))
-    return {"entries": rows.data or []}
+    return {"entries": entries}
 
 
 # ------------------------------------------------------------
@@ -11696,42 +11711,22 @@ def _mark_completed(queue_id: str, video_id: str, final_url) -> None:
         print(f"[render-queue] {queue_id} ({video_id}) finished but no URL found")
         return
 
-    payload = {
-        "status": "completed",
-        "final_video_url": final_url,
-        "error_message": None,
-        "completed_at": _now_iso(),
-    }
-
-    # Write, then read back to confirm the URL really landed (retry once)
-    saved = None
-    for attempt in (1, 2):
-        supabase.table("render_queue").update(payload).eq("id", queue_id).execute()
-
-        check = (
-            supabase.table("render_queue")
-            .select("final_video_url")
-            .eq("id", queue_id)
-            .limit(1)
-            .execute()
-        )
-        rows = (check.data if check else None) or []
-        saved = rows[0].get("final_video_url") if rows else None
-        if saved:
-            break
-        print(f"[render-queue] {queue_id}: final_video_url still empty after write (attempt {attempt})")
-
-    if not saved:
-        print(
-            f"[render-queue] {queue_id}: final_video_url could not be saved. "
-            f"Check for a trigger, RLS policy or wrong key on render_queue."
-        )
-
-    # Keep videos.video_url in sync
+    # videos.video_url is the only copy, so save it before marking completed
     try:
         supabase.table("videos").update({"video_url": final_url}).eq("id", video_id).execute()
     except Exception as e:
+        _mark_failed(queue_id, f"Could not save videos.video_url: {_format_error(e)}")
         print(f"[render-queue] failed to set videos.video_url for {video_id}: {_format_error(e)}")
+        return
+
+    try:
+        supabase.table("render_queue").update({
+            "status": "completed",
+            "error_message": None,
+            "completed_at": _now_iso(),
+        }).eq("id", queue_id).execute()
+    except Exception as e:
+        print(f"[render-queue] failed to mark {queue_id} completed: {_format_error(e)}")
 
 
 # ------------------------------------------------------------
@@ -11845,7 +11840,7 @@ async def _render_queue_worker() -> None:
     )
     while True:
         try:
-            # Count from the database so the limit holds across all processes
+
             processing = await asyncio.to_thread(_count_processing)
             free_slots = RENDER_QUEUE_MAX_CONCURRENT - processing
 
