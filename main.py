@@ -728,7 +728,8 @@ DB_SIMILARITY_THRESHOLD = 0.5
 
 WORDS_PER_MINUTE = 180
 QC_TARGET_WORDS_PER_MINUTE = WORDS_PER_MINUTE   
-QC_MIN_WORDS_PER_MINUTE = 160                   
+QC_MIN_WORDS_PER_MINUTE = 160 
+GENERATION_OVERSHOOT = 1.2   # ask the writer for 20% more, because models undershoot                  
 
 
 BOOKS_TABLE_NAME = "english_books"
@@ -3922,7 +3923,7 @@ Segment proportions guide *pacing only* and must not appear as labels in the fin
 
 Maintain natural transitions so the story feels continuous rather than stitched together.
 
-Do not over-explain merely to satisfy a segment percentage.
+Do not pad with filler, but always meet each segment's minimum word budget by developing ideas fully.
 
 ### HARD WORD-COUNT REQUIREMENT
 
@@ -4042,6 +4043,24 @@ def _segments_brief(segments: list[dict], brief_field: str = "hyde_brief") -> st
     )
 
 
+def _segments_brief_with_budget(
+    segments: list[dict],
+    target_words: int,
+    brief_field: str = "llm_brief",
+) -> str:
+    if not segments:
+        return "No template segments available — write a natural documentary-style structure."
+
+    total_pct = sum(s.get("percentage", 0) for s in segments) or 100
+    lines = []
+    for seg in segments:
+        pct = seg.get("percentage", 0)
+        budget = int(round(target_words * pct / total_pct))
+        lines.append(
+            f"- {seg.get('segment_name', 'segment')} ({pct}% of runtime) "
+            f"=> WRITE AT LEAST {budget} WORDS: {seg.get(brief_field, '')}"
+        )
+    return "\n".join(lines)
 
 
 def _fetch_books_by_md5_map_sync(md5_list: list[str]) -> dict[str, dict]:
@@ -4129,19 +4148,36 @@ async def generate_script_from_context(
     db_results: list[dict],
     new_articles: list[dict],
     target_word_count: int,
-    language: str 
+    language: str
 ) -> dict:
     context_block, _context_payload = await _build_script_context_json(db_results, new_articles)
-    segments_block = _segments_brief(selected_template.get("segments") or [], brief_field="llm_brief")
 
-    print( "script_segments" + segments_block)
-    print(request.time)
+    # Ask the writer for more than the target, because models consistently undershoot.
+    budget_words = int(target_word_count * GENERATION_OVERSHOOT)
+    segments_block = _segments_brief_with_budget(
+        selected_template.get("segments") or [],
+        budget_words,
+        brief_field="llm_brief",
+    )
+
+    print("script_segments\n" + segments_block)
+    print(f"[SCRIPT] time={request.time}min | target_words={target_word_count} | asking writer for ~{budget_words}")
 
     user_prompt = f"""
     Video Title: "{request.title}"
     Video Description: "{request.description}"
     Target Duration: {request.time} minute(s)
-    Target Word Count: {target_word_count} words (minimum {int(target_word_count * 0.95)}, maximum {int(target_word_count * 1.05)})
+
+    LENGTH IS A HARD REQUIREMENT:
+    The narration must be AT LEAST {target_word_count} words (aim for about {budget_words}).
+    A script under {int(target_word_count * 0.95)} words is a FAILED output.
+    Each segment below has a minimum word budget. Meet EVERY segment's budget.
+    You have limited source facts, so reach the length by developing each fact fully:
+    set the scene, explain the mechanism step by step, give analogies and
+    comparisons, walk through cause and effect, state why it matters, and add
+    transitions. Do NOT reach the length by inventing facts, and do NOT compress
+    or summarize.
+
     Script Language: Write the ENTIRE script narration in {language}. All narration text must be in {language} — do not mix languages, do not default to English unless {language} is English. (Field names/JSON keys still stay in English as shown in the OUTPUT schema.)
 
 
@@ -4149,7 +4185,7 @@ async def generate_script_from_context(
     Template Purpose: {selected_template.get('about')}
 
     Segments (write the script in this exact order — each entry's guidance is
-    that segment's llm_brief):
+    that segment's llm_brief, with its minimum word budget):
     {segments_block}
 
     Source Material (JSON — each knowledge_base_chunks entry may include a "book"
@@ -4210,6 +4246,14 @@ async def generate_script_from_context(
 
     script_text = parsed["script"].strip()
 
+    # Log how close the writer got, so you can see which stage is short.
+    writer_words = len(script_text.split())
+    print(
+        f"[SCRIPT] writer returned {writer_words} words "
+        f"(target {target_word_count}, asked for ~{budget_words}) "
+        f"= {writer_words / max(target_word_count, 1):.0%} of target"
+    )
+
     raw_metrics = parsed.get("metrics")
     metrics = raw_metrics if isinstance(raw_metrics, dict) else {}
     clamped_metrics = dict(_DEFAULT_SCRIPT_METRICS)
@@ -4245,7 +4289,6 @@ async def generate_script_from_context(
         "metrics": clamped_metrics,
         "classification": {"category": category, "subcategories": subcategories},
     }
-
 
 
 
@@ -5011,24 +5054,22 @@ Each thumbnail must:
 
 ---
 
-## DURATION / WORD COUNT RULE
+## DURATION / WORD COUNT RULE (OVERRIDES THE "MINIMAL EDITS" RULES ABOVE)
 
-You will be given the video's Target Duration, the script's Current Word Count,
-a Minimum Word Count and a Target Word Count.
+You will be given the Target Duration, Current Word Count, Minimum Word Count,
+Target Word Count, and an Action line.
 
-- If the Current Word Count is BELOW the Minimum Word Count, you MUST expand the
-  script in this same pass so the returned script reaches the Target Word Count.
-  Aim slightly above the target (about 3% over), because word counts are easy to
-  undershoot. Never return fewer words than the Minimum.
-- Expand by enriching what is already there: fuller explanations, smoother
-  transitions, clearer examples and context drawn ONLY from facts already in the
-  script. Spread the added words across the whole script, not just the ending.
-- Do NOT invent new facts, names, numbers, quotes, or events to add length.
-- Do NOT change the structure, order, or core message.
-- If the Current Word Count is already at or above the Minimum, only fix quality
-  issues and do not add filler.
-- Write all numbers as spoken words, as in the original script.
-
+- If the Action says EXPAND REQUIRED, expansion is your PRIMARY job. The
+  "leave as-is" and "minimum edits" rules do not apply to the script's length.
+- Work paragraph by paragraph. Rewrite EVERY paragraph so it is longer by the
+  stated factor. Do not leave any paragraph at its original length.
+- Add words by: explaining each idea step by step, adding analogies and
+  comparisons, spelling out cause and effect, adding "why this matters"
+  context, and adding smooth spoken transitions. Use ONLY facts already in the script.
+- Do NOT invent new facts, names, numbers, quotes, or events.
+- Keep structure, order, tone, language, and core message.
+- Write all numbers as spoken words.
+- If the Action says no expansion is needed, only fix quality issues.
 ---
 
 ## HARD LENGTH RULE (NON-NEGOTIABLE)
@@ -5082,6 +5123,7 @@ Return exactly:
 def _script_word_count(text_value: str) -> int:
     return len((text_value or "").split())
 
+
 async def run_final_qc_pass(
     idea_title: str,
     idea_description: str,
@@ -5113,11 +5155,15 @@ async def run_final_qc_pass(
 
     length_block = ""
     if duration_minutes:
-        action = (
-            f"EXPAND the script by about {target_words - current_words} words to reach the Target Word Count."
-            if needs_expansion
-            else "No expansion needed — word count is acceptable."
-        )
+        if needs_expansion:
+            factor = target_words / max(current_words, 1)
+            action = (
+                f"EXPAND REQUIRED. The script is {current_words} words and must become about "
+                f"{int(target_words * 1.03)} words. Make EVERY paragraph roughly {factor:.1f}x longer "
+                f"than it is now. Returning a script near {current_words} words is a failed output."
+            )
+        else:
+            action = "No expansion needed — word count is acceptable."
         length_block = f"""
     Target Duration: {duration_minutes} minute(s)
     Current Word Count: {current_words}
@@ -5154,8 +5200,8 @@ async def run_final_qc_pass(
                     {"role": "user", "content": user_prompt},
                 ],
                 stream=False,
-                temperature=0.1,
-                top_p=0.85,
+                temperature=0.4 if needs_expansion else 0.1,
+                top_p=0.9 if needs_expansion else 0.85,
                 response_format={"type": "json_object"},
             ),
             timeout=max(OPENAI_CALL_TIMEOUT, 180.0),
@@ -5184,8 +5230,13 @@ async def run_final_qc_pass(
         print("[QC] corrected script missing/empty in QC output, keeping original script")
         corrected_script = script_text
 
+    qc_words = _script_word_count(corrected_script)
+    if qc_words < current_words:
+        print(f"[QC] QC output SHORTER than input ({qc_words} < {current_words}) — keeping original script")
+        corrected_script = script_text
+        qc_words = current_words
+
     if min_words:
-        qc_words = _script_word_count(corrected_script)
         status = "OK" if qc_words >= min_words else "STILL BELOW MINIMUM"
         print(
             f"[QC] after QC pass: {qc_words} words "
