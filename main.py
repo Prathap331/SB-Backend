@@ -727,7 +727,7 @@ MAX_BOOKS = 7
 WEB_CONTENT_SIMILARITY_THRESHOLD = 0.4
 DB_SIMILARITY_THRESHOLD = 0.5
 
-WORDS_PER_MINUTE = 140
+WORDS_PER_MINUTE = 180
 
 
 BOOKS_TABLE_NAME = "english_books"
@@ -3975,7 +3975,7 @@ Before returning the answer, silently verify:
 * script is TTS-ready
 * all numerical expressions in the script are written as spoken words
 * no unsupported claims or fabricated quotations
-* script contains exactly *Target Duration × 130 words*
+* script contains exactly *Target Duration × 180 words*
 * CTA explicitly invites comments/feedback when applicable
 * metrics are calculated from the actual generated script
 * JSON is valid
@@ -4140,7 +4140,7 @@ async def generate_script_from_context(
     Video Title: "{request.title}"
     Video Description: "{request.description}"
     Target Duration: {request.time} minute(s)
-    Target Word Count: approximately {target_word_count} words
+    Target Word Count: {target_word_count} words (minimum {int(target_word_count * 0.95)}, maximum {int(target_word_count * 1.05)})
     Script Language: Write the ENTIRE script narration in {language}. All narration text must be in {language} — do not mix languages, do not default to English unless {language} is English. (Field names/JSON keys still stay in English as shown in the OUTPUT schema.)
 
 
@@ -4857,7 +4857,7 @@ Your role is to review the generated Script, Titles, Descriptions, and Thumbnail
 2. Idea Description
 3. Generated Script
 4. Generated YouTube Titles (5)
-5. Generated YouTube Descriptions (5)
+5. Generated YouTube Descriptions (3)
 6. Generated Thumbnail Texts (5)
 
 ---
@@ -5043,8 +5043,6 @@ Return exactly:
     "..."
   ],
   "descriptions": [
-    "...",
-    "...",
     "...",
     "...",
     "..."
@@ -5783,6 +5781,43 @@ async def _generate_script_impl(request: "ScriptRequest"):
         "subcategories": classification.get("subcategories", []),
         "token_usage": token_usage,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
