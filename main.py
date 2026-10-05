@@ -11470,12 +11470,14 @@ async def add_beat_media(
 
 
 
+
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://62.83.19.227:8000")
 RENDER_QUEUE_MAX_CONCURRENT = int(os.getenv("RENDER_QUEUE_MAX_CONCURRENT", "1"))
 RENDER_QUEUE_POLL_SECONDS = int(os.getenv("RENDER_QUEUE_POLL_SECONDS", "5"))
 RENDER_QUEUE_HTTP_TIMEOUT = float(os.getenv("RENDER_QUEUE_HTTP_TIMEOUT", "3600"))
 RENDER_RECOVERY_WAIT_SECONDS = int(os.getenv("RENDER_RECOVERY_WAIT_SECONDS", "900"))
 RENDER_RECOVERY_POLL_SECONDS = int(os.getenv("RENDER_RECOVERY_POLL_SECONDS", "10"))
+# Set to "false" on every instance except one
 RUN_RENDER_WORKER = os.getenv("RUN_RENDER_WORKER", "true").lower() == "true"
 
 
@@ -11487,6 +11489,10 @@ def _format_error(e: Exception) -> str:
     msg = str(e).strip()
     return f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__} (no message)"
 
+
+# ------------------------------------------------------------
+# API
+# ------------------------------------------------------------
 
 class RenderQueueRequest(BaseModel):
     video_id: str
@@ -11840,7 +11846,7 @@ async def _render_queue_worker() -> None:
     )
     while True:
         try:
-
+            # Count from the database so the limit holds across all processes
             processing = await asyncio.to_thread(_count_processing)
             free_slots = RENDER_QUEUE_MAX_CONCURRENT - processing
 
