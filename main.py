@@ -406,7 +406,6 @@ RAG_CATEGORIES = [
 def _qdrant_collection_name(category: str) -> str:
     return f"RAG_{category}_supabase"
 
-
 def _supabase_content_table_name(category: str) -> str:
     return f"RAG_{category}"
 
@@ -728,6 +727,8 @@ WEB_CONTENT_SIMILARITY_THRESHOLD = 0.4
 DB_SIMILARITY_THRESHOLD = 0.5
 
 WORDS_PER_MINUTE = 180
+QC_TARGET_WORDS_PER_MINUTE = WORDS_PER_MINUTE   
+QC_MIN_WORDS_PER_MINUTE = 160                   
 
 
 BOOKS_TABLE_NAME = "english_books"
@@ -4996,7 +4997,7 @@ Each thumbnail must:
 
 - Leave anything that is already correct exactly as-is.
 - Make only the minimum edits required.
-- Preserve the script's length, structure, pacing, and narrative.
+- Preserve the script's structure, pacing, and narrative. Length may only change as required by the DURATION / WORD COUNT RULE.
 - Never invent new facts, names, statistics, events, claims, or examples.
 - Never change the video's core message.
 - Never introduce unsupported keywords, entities, or topics.
@@ -5007,6 +5008,26 @@ Each thumbnail must:
 - If multiple metadata assets conflict with the script, make them all consistent with the corrected final script.
 - Prioritize factual accuracy over marketing appeal whenever they conflict.
 
+
+---
+
+## DURATION / WORD COUNT RULE
+
+You will be given the video's Target Duration, the script's Current Word Count,
+a Minimum Word Count and a Target Word Count.
+
+- If the Current Word Count is BELOW the Minimum Word Count, you MUST expand the
+  script in this same pass so the returned script reaches the Target Word Count.
+  Aim slightly above the target (about 3% over), because word counts are easy to
+  undershoot. Never return fewer words than the Minimum.
+- Expand by enriching what is already there: fuller explanations, smoother
+  transitions, clearer examples and context drawn ONLY from facts already in the
+  script. Spread the added words across the whole script, not just the ending.
+- Do NOT invent new facts, names, numbers, quotes, or events to add length.
+- Do NOT change the structure, order, or core message.
+- If the Current Word Count is already at or above the Minimum, only fix quality
+  issues and do not add filler.
+- Write all numbers as spoken words, as in the original script.
 
 ---
 
@@ -5058,13 +5079,15 @@ Return exactly:
 
 """
 
-
+def _script_word_count(text_value: str) -> int:
+    return len((text_value or "").split())
 
 async def run_final_qc_pass(
     idea_title: str,
     idea_description: str,
     script_text: str,
     youtube_metadata: dict,
+    duration_minutes: float = 0,
 ) -> dict:
 
     fallback = {
@@ -5078,9 +5101,35 @@ async def run_final_qc_pass(
         print("[QC] no script text to review, skipping final QC pass")
         return fallback
 
+    current_words = _script_word_count(script_text)
+    target_words = int(duration_minutes * QC_TARGET_WORDS_PER_MINUTE) if duration_minutes else 0
+    min_words = int(duration_minutes * QC_MIN_WORDS_PER_MINUTE) if duration_minutes else 0
+    needs_expansion = bool(min_words) and current_words < min_words
+
+    print(
+        f"[QC] duration={duration_minutes}min | words={current_words} | "
+        f"min={min_words} | target={target_words} | needs_expansion={needs_expansion}"
+    )
+
+    length_block = ""
+    if duration_minutes:
+        action = (
+            f"EXPAND the script by about {target_words - current_words} words to reach the Target Word Count."
+            if needs_expansion
+            else "No expansion needed — word count is acceptable."
+        )
+        length_block = f"""
+    Target Duration: {duration_minutes} minute(s)
+    Current Word Count: {current_words}
+    Minimum Word Count: {min_words}
+    Target Word Count: {target_words}
+    Action required: {action}
+    """
+
     user_prompt = f"""
     Idea Title: "{idea_title}"
     Idea Description: "{idea_description}"
+    {length_block}
 
     Generated Script:
     {script_text}
@@ -5107,9 +5156,9 @@ async def run_final_qc_pass(
                 stream=False,
                 temperature=0.1,
                 top_p=0.85,
-                response_format={"type": "json_object"},   
+                response_format={"type": "json_object"},
             ),
-            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
+            timeout=max(OPENAI_CALL_TIMEOUT, 180.0),
         )
         _record_token_usage("final_qc_pass", res)
         raw = (res.choices[0].message.content or "").strip()
@@ -5135,6 +5184,14 @@ async def run_final_qc_pass(
         print("[QC] corrected script missing/empty in QC output, keeping original script")
         corrected_script = script_text
 
+    if min_words:
+        qc_words = _script_word_count(corrected_script)
+        status = "OK" if qc_words >= min_words else "STILL BELOW MINIMUM"
+        print(
+            f"[QC] after QC pass: {qc_words} words "
+            f"(min {min_words}, target {target_words}) -> {status}"
+        )
+
     def _corrected_list(key: str, original_list: list, expected_len: int = 3) -> list:
         values = parsed.get(key)
         if not isinstance(values, list) or len(values) == 0:
@@ -5156,7 +5213,6 @@ async def run_final_qc_pass(
         "descriptions": _corrected_list("descriptions", youtube_metadata.get("descriptions", [])),
         "thumbnail_text": _corrected_list("thumbnail_text", youtube_metadata.get("thumbnail_text", [])),
     }
-
 
 
 
