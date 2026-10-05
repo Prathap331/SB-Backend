@@ -5771,6 +5771,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
             idea_description=request.description,
             script_text=script_text,
             youtube_metadata=youtube_metadata,
+            duration_minutes=request.time,
         )
         script_text = qc_result["script"]
         youtube_metadata["titles"] = qc_result["titles"]
