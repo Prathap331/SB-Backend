@@ -410,7 +410,8 @@ def _qdrant_collection_name(category: str) -> str:
 def _supabase_content_table_name(category: str) -> str:
     return f"RAG_{category}"
 
-
+def _word_count(text_value: str) -> int:
+    return len(text_value.split())
  
 DEFAULT_LANGUAGE = "English"
  
@@ -1601,9 +1602,6 @@ async def retrieve_best_script_template(topic: str) -> dict | None:
 
     return selected_template
 
-
-def _word_count(text_value: str) -> int:
-    return len(text_value.split())
 
 
 async def _generate_length_constrained_hyde(
@@ -5009,6 +5007,18 @@ Each thumbnail must:
 - If multiple metadata assets conflict with the script, make them all consistent with the corrected final script.
 - Prioritize factual accuracy over marketing appeal whenever they conflict.
 
+
+---
+
+## HARD LENGTH RULE (NON-NEGOTIABLE)
+
+- The corrected script MUST contain at least as many words as the input script.
+- NEVER delete, shorten, summarize, merge, or skip any sentence or paragraph.
+- Fix grammar, spelling, wording, and flow in place only. Replace words, never remove content.
+- If a sentence is awkward, rewrite it at the same length or longer, never shorter.
+- If you are unsure whether to cut something, keep it.
+- Return the COMPLETE script from the first word to the last word.
+
 ---
 
 ## Output
@@ -5048,7 +5058,6 @@ Return exactly:
   ]
 }
 
-
 """
 
 
@@ -5059,13 +5068,7 @@ async def run_final_qc_pass(
     script_text: str,
     youtube_metadata: dict,
 ) -> dict:
-    """
-    Final teacher-style QC pass: cross-checks the generated script + YouTube
-    metadata against the original idea for consistency and correctness, and
-    makes minimal corrections. Never returns the idea title/description —
-    only the corrected script + metadata (titles/descriptions/thumbnail_text).
-    Hashtags are intentionally left untouched and are not sent to this pass.
-    """
+
     fallback = {
         "script": script_text,
         "titles": youtube_metadata.get("titles", []),
@@ -5125,14 +5128,6 @@ async def run_final_qc_pass(
         print("[QC] corrected script missing/empty in QC output, keeping original script")
         corrected_script = script_text
 
-    original_len = _word_count(script_text)
-    corrected_len = _word_count(corrected_script)
-    if original_len > 0 and corrected_len < original_len * 0.6:
-        print(
-            f"[QC] corrected script looks truncated ({corrected_len} words vs "
-            f"original {original_len}) — keeping original script instead"
-        )
-        corrected_script = script_text
 
     def _corrected_list(key: str, original_list: list, expected_len: int = 3) -> list:
         values = parsed.get(key)
@@ -5268,11 +5263,6 @@ def _extract_source_links(articles: list[dict]) -> list[str]:
             break
     return links
 
-
-
-
-# SCRIPT_RAG_POOL_PER_DOC = 40 
-# SCRIPT_TOP_K_PER_DOC = 2       
 
 
 def pick_topk_with_backfill(
@@ -5662,15 +5652,8 @@ async def _generate_script_impl(request: "ScriptRequest"):
         script_text = script_result["script"]
         script_metrics = script_result["metrics"]
         classification = script_result["classification"]
-        actual_words = _word_count(script_text)
-        deviation_pct = (
-            abs(actual_words - target_word_count) / target_word_count * 100
-            if target_word_count else 0
-        )
-        print(
-            f"[STAGE 6] done in {time.time() - stage6_start:.2f}s — {actual_words} word(s) generated "
-            f"(target {target_word_count}, deviation {deviation_pct:.1f}%)"
-        )
+
+        print(f"[STAGE 6] done in {time.time() - stage6_start:.2f}s")
         print(f"[STAGE 6] classification: category='{classification.get('category')}' subcategories={classification.get('subcategories')}")
     except Exception as exc:
         print(f"[STAGE 6] FAILED — script generation raised: {exc}")
@@ -5720,7 +5703,6 @@ async def _generate_script_impl(request: "ScriptRequest"):
     print("[STAGE 8] Final QC pass (script + YouTube metadata cross-check)")
     print("=" * 90)
     try:
-        pre_qc_words = _word_count(script_text)
         qc_result = await run_final_qc_pass(
             idea_title=request.title,
             idea_description=request.description,
@@ -5731,11 +5713,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
         youtube_metadata["titles"] = qc_result["titles"]
         youtube_metadata["descriptions"] = qc_result["descriptions"]
         youtube_metadata["thumbnail_text"] = qc_result["thumbnail_text"]
-        post_qc_words = _word_count(script_text)
-        print(
-            f"[STAGE 8] done in {time.time() - stage8_start:.2f}s — "
-            f"script words {pre_qc_words} -> {post_qc_words} after QC"
-        )
+        print(f"[STAGE 8] done in {time.time() - stage8_start:.2f}s")
     except Exception as exc:
         print(f"[STAGE 8] FAILED — final QC pass raised: {exc} — keeping pre-QC script/metadata")
         import traceback
@@ -5756,7 +5734,7 @@ async def _generate_script_impl(request: "ScriptRequest"):
 
     sources = _extract_source_links(new_articles)
     structure = _build_structure_response(selected_template)
-    total_words = _word_count(script_text) if script_text else 0
+    total_words = len(script_text.split()) if script_text else 0
     token_usage = _get_token_usage_summary()
 
     total_elapsed = time.time() - total_start_time
