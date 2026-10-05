@@ -3975,7 +3975,7 @@ Before returning the answer, silently verify:
 * script is TTS-ready
 * all numerical expressions in the script are written as spoken words
 * no unsupported claims or fabricated quotations
-* script contains exactly *Target Duration × 180 words*
+* script length falls within the minimum and maximum of the Target Word Count
 * CTA explicitly invites comments/feedback when applicable
 * metrics are calculated from the actual generated script
 * JSON is valid
@@ -4013,7 +4013,7 @@ json id="rpj990"
 "script": "Complete documentary narration in the requested Output Language, written as natural TTS-ready continuous paragraphs.",
 "metrics": {
 "videoLengthMinutes": 10,
-"wordCount": 1300,
+"wordCount": 0,
 "emotionalDepth": 1,
 "generalExamples": 1,
 "proverbs_count": 1,
@@ -4180,7 +4180,7 @@ async def generate_script_from_context(
                 temperature=0.6,
                 top_p=0.95,
             ),
-            timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
+            timeout=max(OPENAI_CALL_TIMEOUT, 180.0),
         )
         _record_token_usage("generate_script_from_context", completion)
         return (completion.choices[0].message.content or "").strip()
