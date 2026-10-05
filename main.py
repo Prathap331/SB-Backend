@@ -5109,6 +5109,7 @@ async def run_final_qc_pass(
                 stream=False,
                 temperature=0.1,
                 top_p=0.85,
+                response_format={"type": "json_object"},   
             ),
             timeout=max(OPENAI_CALL_TIMEOUT, 90.0),
         )
@@ -5118,7 +5119,15 @@ async def run_final_qc_pass(
         print(f"[QC] final QC call failed: {e} — keeping original script/metadata as-is")
         return fallback
 
-    parsed = _safe_parse_json(raw)
+    parsed = None
+    try:
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        parsed = json.loads(cleaned, strict=False)
+    except Exception as e:
+        print(f"[QC] strict=False parse failed ({e}), trying _safe_parse_json")
+        parsed = _safe_parse_json(raw)
+
     if not isinstance(parsed, dict):
         print(f"[QC] final QC output was not valid JSON, keeping originals. Raw (truncated): {raw[:500]}")
         return fallback
@@ -5127,7 +5136,6 @@ async def run_final_qc_pass(
     if not isinstance(corrected_script, str) or not corrected_script.strip():
         print("[QC] corrected script missing/empty in QC output, keeping original script")
         corrected_script = script_text
-
 
     def _corrected_list(key: str, original_list: list, expected_len: int = 3) -> list:
         values = parsed.get(key)
@@ -5150,6 +5158,7 @@ async def run_final_qc_pass(
         "descriptions": _corrected_list("descriptions", youtube_metadata.get("descriptions", [])),
         "thumbnail_text": _corrected_list("thumbnail_text", youtube_metadata.get("thumbnail_text", [])),
     }
+
 
 
 
