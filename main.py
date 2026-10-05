@@ -10306,15 +10306,20 @@ async def add_directions_for_scene(scene_text, word_timestamps):
          The footage plays for this entire range.
       2. ANIMATION DURATION: the overlay range (overlay_start_word_index to
          overlay_end_word_index). The animation plays only for this range.
-    * overlay_start_word_index and overlay_end_word_index:
-      - Choose them independently of the beat range, based only on the exact
-        words the animation illustrates (the statistic, name, date, quote, or claim).
-      - MUST lie inside the beat's own start_word_index..end_word_index.
-      - The animation duration MUST be shorter than the B-roll duration. Never
-        set the overlay range equal to the full beat.
+    * The animation MUST be in sync with the voice:
+      - overlay_start_word_index = the exact word where the narrator starts
+        speaking the content the animation shows.
+      - overlay_end_word_index = the exact word where the narrator finishes
+        speaking that content.
+      - The animation appears when the narrator starts that content and
+        disappears as soon as the narrator finishes it.
+      - The B-roll footage keeps playing after the animation disappears, until
+        the beat ends.
+      - Do NOT stretch the animation over words that it does not show.
+      - The overlay range MUST lie inside the beat's own
+        start_word_index..end_word_index.
       - The animation duration should be roughly 3-8 seconds.
-      - Where possible, leave some B-roll-only time before and/or after the
-        animation so the footage is visible on its own.
+
 
     "full_screen_animation"
     Use when animation should replace footage for processes, comparisons,
@@ -10447,10 +10452,10 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       details as reference examples, while allowing templates beyond the supplied
       examples.
     * No separate template_keywords field is output.
-    * No start_word_index or end_word_index outside 0-{last_word_index}.
     * No full_screen_animation beat is longer than 8.0 seconds.
-    * For every B-roll+overlay_animation beat, the overlay range is strictly
-      shorter than the beat range and sits inside it.
+    * For every B-roll+overlay_animation beat, the overlay range covers exactly
+      the words the animation illustrates, so the animation starts and ends in
+      sync with the voice, and lies inside the beat range.
 
     The final response must be ONLY the JSON array.
     """
