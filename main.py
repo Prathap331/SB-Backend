@@ -11794,7 +11794,7 @@ async def _process_one_queued_render(entry: dict) -> None:
             body = {}
         print(f"[render-queue] render service response for {video_id}: {str(body)[:500]}")
 
-        final_url = body.get("video_url") or body.get("final_video_url") or body.get("url")
+        final_url = body.get("video_url") or body.get("url")
         await asyncio.to_thread(_mark_completed, queue_id, video_id, final_url)
         print(f"[render-queue] {queue_id} ({video_id}) processed")
         return
