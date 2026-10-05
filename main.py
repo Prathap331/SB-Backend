@@ -10203,6 +10203,19 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     - This must be the verbatim script text for that beat, word-for-word.
     * The number of words in "text" MUST equal (end_word_index - start_word_index + 1).
 
+    FULL SCREEN ANIMATION DURATION LIMIT — HARD RULE
+
+    * Every full_screen_animation beat MUST be 8.0 seconds or shorter.
+    * Calculate its duration from the supplied timestamps:
+      (end of the word at end_word_index) minus (start of the word at start_word_index).
+    * This rule overrides the "~8-15 seconds per beat" target above, which applies
+      only to B-roll and B-roll+overlay_animation beats.
+    * If the content for a full_screen_animation would run longer than 8 seconds,
+      end the animation beat at the nearest sentence boundary within 8 seconds and
+      cover the remaining words with a B-roll or B-roll+overlay_animation beat.
+    * Never exceed 8 seconds, even if it means the animation shows only part of
+      the idea.
+
     CATEGORY DISTRIBUTION — IMPORTANT
 
     Across the entire scene, distribute the three beat types approximately as follows:
@@ -10283,18 +10296,25 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     numbers, charts, lists, names, dates, quotes, text emphasis, labels,
     lower thirds, callouts, icons, or visual effects.
 
+    
+
     Required:
     * Exactly 2 concrete Pexels-searchable keywords (for the footage).
     * template_description (see TEMPLATE DESCRIPTION below).
+    * Two SEPARATE durations must be defined for this beat:
+      1. B-ROLL DURATION: the full beat range (start_word_index to end_word_index).
+         The footage plays for this entire range.
+      2. ANIMATION DURATION: the overlay range (overlay_start_word_index to
+         overlay_end_word_index). The animation plays only for this range.
     * overlay_start_word_index and overlay_end_word_index:
-      - The exact word range that the animation illustrates (e.g. the one
-        sentence or phrase containing the statistic, name, quote or claim).
+      - Choose them independently of the beat range, based only on the exact
+        words the animation illustrates (the statistic, name, date, quote, or claim).
       - MUST lie inside the beat's own start_word_index..end_word_index.
-      - The animation is shown ONLY while these words are spoken, then it
-        disappears. The B-roll footage continues for the whole beat.
-      - Do NOT set the overlay range equal to the full beat unless the whole
-        beat is the graphic's content. Prefer a tighter range, typically one
-        sentence or phrase (roughly 3–8 seconds).
+      - The animation duration MUST be shorter than the B-roll duration. Never
+        set the overlay range equal to the full beat.
+      - The animation duration should be roughly 3-8 seconds.
+      - Where possible, leave some B-roll-only time before and/or after the
+        animation so the footage is visible on its own.
 
     "full_screen_animation"
     Use when animation should replace footage for processes, comparisons,
@@ -10428,6 +10448,9 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       examples.
     * No separate template_keywords field is output.
     * No start_word_index or end_word_index outside 0-{last_word_index}.
+    * No full_screen_animation beat is longer than 8.0 seconds.
+    * For every B-roll+overlay_animation beat, the overlay range is strictly
+      shorter than the beat range and sits inside it.
 
     The final response must be ONLY the JSON array.
     """
@@ -11118,6 +11141,26 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
