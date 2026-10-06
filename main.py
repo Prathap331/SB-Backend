@@ -10141,12 +10141,14 @@ _TEMPLATE_CATALOG_CACHE = None
  
  
 async def load_template_catalog(force_refresh: bool = False):
+
     global _TEMPLATE_CATALOG_CACHE
  
     if _TEMPLATE_CATALOG_CACHE and not force_refresh:
         return _TEMPLATE_CATALOG_CACHE
  
-    rows = await supabase.fetch("SELECT match FROM animations_template")
+    resp = supabase.table("animations_template").select("match").execute()
+    rows = resp.data or []
  
     catalog = []
     for r in rows:
@@ -10157,8 +10159,8 @@ async def load_template_catalog(force_refresh: bool = False):
             catalog.append({"id": m["id"], "description": m["description"]})
  
     _TEMPLATE_CATALOG_CACHE = catalog
+    print(f"[Template Catalog] loaded {len(catalog)} templates")
     return catalog
-
 
 
 
