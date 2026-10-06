@@ -10135,6 +10135,7 @@ async def get_word_level_time_stamps(scenes: list):
 
 
 
+
 async def add_directions_for_scene(scene_text, word_timestamps):
     word_count = len(word_timestamps)
     last_word_index = word_count - 1
@@ -10289,7 +10290,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     historical footage, and other subjects best represented by footage.
 
     Required:
-    * Exactly 1 concrete Pexels-searchable keyword.
+    * Exactly 2 concrete Pexels-searchable keywords (see KEYWORDS section).
 
     "B-roll+overlay_animation"
     Use when footage should be enhanced by an animation such as statistics,
@@ -10299,7 +10300,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     
 
     Required:
-    * Exactly 2 concrete Pexels-searchable keywords (for the footage).
+    * Exactly 2 concrete Pexels-searchable keywords (for the footage; see KEYWORDS section).
     * template_description (see TEMPLATE DESCRIPTION below).
     * Two SEPARATE durations must be defined for this beat:
       1. B-ROLL DURATION: the full beat range (start_word_index to end_word_index).
@@ -10374,12 +10375,37 @@ async def add_directions_for_scene(scene_text, word_timestamps):
 
     KEYWORDS (B-roll footage search terms — separate from template description)
 
-    For B-roll and B-roll+overlay_animation:
+    For BOTH "B-roll" and "B-roll+overlay_animation" beats:
 
-    * B-roll: exactly 1 concrete Pexels-searchable keyword.
-    * B-roll+overlay_animation: exactly 2 concrete Pexels-searchable keywords.
-    * Describe visible subjects/scenes.
-    * Avoid vague terms such as technology, concept, idea, or innovation.
+    * Output EXACTLY 2 keywords in the "keywords" array. Never 1, never 3.
+    * Each keyword is a short search phrase of 2-4 words describing something
+      that can literally be SEEN on camera.
+
+    ACCURACY RULES — STRICT
+
+    * Keywords MUST match what the narration of THAT beat is actually about.
+      Read the beat's "text" and the surrounding scene context before choosing.
+    * Keyword 1 = PRIMARY: the main visible subject + action/setting of the beat
+      (e.g. "farmer harvesting wheat", "cargo ship at port").
+    * Keyword 2 = SECONDARY: a different but equally accurate shot of the same
+      moment (different angle, close-up, or related visible detail), usable as a
+      fallback if keyword 1 returns poor footage
+      (e.g. "wheat field aerial", "grain being poured").
+    * The two keywords MUST NOT be synonyms or near-duplicates of each other.
+    * Resolve pronouns and references ("it", "they", "this") using the scene
+      context, and use the real subject, not the pronoun.
+    * If the narration is metaphorical or abstract, choose the closest literal
+      visual that supports the real meaning, not the metaphor taken literally.
+    * Include the setting or context when it changes the footage
+      (e.g. "doctor examining patient hospital", not just "doctor").
+    * Do NOT use vague or abstract words: technology, concept, idea, innovation,
+      success, growth, business, future, data.
+    * Do NOT use names of specific people, brands, or titles. Use a generic visual
+      equivalent (e.g. "electric car charging", not a brand name).
+    * Do NOT use words that describe on-screen text, graphics, charts, or
+      animations. Keywords are for real footage only.
+    * Avoid repeating the same keyword across consecutive beats; vary the visuals
+      while staying accurate.
 
 
     OUTPUT
@@ -10402,7 +10428,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         "start_word_index": 0,
         "end_word_index": 12,
         "text": "Exact narration text for this beat",
-        "keywords": ["..."]
+        "keywords": ["primary visual subject action", "secondary related visual shot"]
     }},
     {{
         "type": "B-roll+overlay_animation",
@@ -10411,7 +10437,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         "overlay_start_word_index": 16,
         "overlay_end_word_index": 22,
         "text": "Exact narration text for this beat",
-        "keywords": ["...", "..."],
+        "keywords": ["primary visual subject action", "secondary related visual shot"],
         "template_description": "Highlight the **single statistic** as a **hero figure** with clear visual emphasis."
     }},
     {{
@@ -10443,7 +10469,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       B-roll = 40–50% runtime,
       B-roll+overlay_animation = 30–40% runtime,
       full_screen_animation = 10–20% runtime.
-    * B-roll beats have exactly 1 keyword; B-roll+overlay_animation beats have exactly 2 keywords.
+    * Every B-roll beat AND every B-roll+overlay_animation beat has exactly 2 keywords.
+    * Both keywords are concrete, visible, accurate to the beat's narration, and not synonyms of each other.
     * Every B-roll+overlay_animation beat has overlay_start_word_index and
       overlay_end_word_index inside its own start/end range.
     * Every overlay/full_screen beat has exactly one template_description.
@@ -10500,6 +10527,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     except Exception as e:
         print(f"[Scene Breakdown] failed: {e}")
         return e
+
 
 
 async def align_beats_to_voice(
