@@ -10201,7 +10201,6 @@ async def add_directions_for_scene(scene_text, word_timestamps, theme_keywords=N
     ]
    
     SCENE_BEAT_DIRECTOR = f"""
-
     You are a production-grade documentary video director.
 
     TASK
@@ -10334,7 +10333,7 @@ async def add_directions_for_scene(scene_text, word_timestamps, theme_keywords=N
     * The "text" field for each beat MUST match exactly the words at that beat's
       start_word_index through end_word_index — no drift, no rewording.
 
-
+      
     VISUAL SELECTION
 
     "B-roll"
@@ -10404,21 +10403,14 @@ async def add_directions_for_scene(scene_text, word_timestamps, theme_keywords=N
       for THIS specific beat.
     * Use wording that is semantically relatable to the supplied template-match
       details and their demonstrated visual structures.
-    * Highlight the most relatable and visually meaningful keywords or short phrases
-      by wrapping them in double asterisks.
-    * Highlight only the words or phrases that are useful for identifying the
-      intended animation structure.
     * Do NOT exceed 20 words or go below 10 words.
     * Prefer concrete visual language describing the intended animation structure.
 
     Example:
     "Show a **three-step process** with **sequential stages** explaining how the product moves from source to customer."
 
-    The highlighted phrases should represent the most visually relevant structural
-    characteristics of the intended animation.
 
-
-    KEYWORDS (search phrase for footage/image)
+    KEYWORDS (search phrase for video/image)
 
     * Every beat outputs "keywords" as ONE plain string of 4-6 words.
     * The phrase MUST clearly define the overall theme AND accurately match the current narration/script.
@@ -10479,11 +10471,8 @@ async def add_directions_for_scene(scene_text, word_timestamps, theme_keywords=N
 
     * The root MUST be an array.
     * Every element inside the array MUST be one beat object.
-    * There is NO "beats" property, NO "directions" property, NO wrapper object.
-    * If there is only one beat, still return an array containing that one object.
     * The first character of the response MUST be [.
     * The last character of the response MUST be ].
-
 
     FINAL CHECK
 
