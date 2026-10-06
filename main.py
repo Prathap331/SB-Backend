@@ -10652,6 +10652,57 @@ PEXELS_HEADERS = {
     "Authorization": PEXELS_API_KEY
 }
 
+PEXELS_MAX_RETRIES = 5
+PEXELS_TIMEOUT = 20
+
+
+def _pexels_get(url: str, params: dict, label: str):
+    """
+    GET from Pexels with retries.
+    Returns parsed JSON on success (even if results are empty),
+    or None if every attempt failed.
+    """
+    for attempt in range(1, PEXELS_MAX_RETRIES + 1):
+        wait = min(2 ** attempt, 15)
+
+        try:
+            response = requests.get(
+                url,
+                headers=PEXELS_HEADERS,
+                params=params,
+                timeout=PEXELS_TIMEOUT
+            )
+
+            if response.ok:
+                return response.json()
+
+            if response.status_code == 429 or response.status_code >= 500:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    wait = int(retry_after)
+                print(
+                    f"[Pexels] {label} got {response.status_code} "
+                    f"(attempt {attempt}/{PEXELS_MAX_RETRIES}), retrying in {wait}s"
+                )
+            else:
+                print(f"[Pexels] {label} failed with {response.status_code}, not retrying")
+                return None
+
+        except (requests.Timeout, requests.ConnectionError) as e:
+            print(
+                f"[Pexels] {label} timeout/connection error "
+                f"(attempt {attempt}/{PEXELS_MAX_RETRIES}): {e}. Retrying in {wait}s"
+            )
+        except Exception as e:
+            print(f"[Pexels] {label} unexpected error: {e}")
+            return None
+
+        if attempt < PEXELS_MAX_RETRIES:
+            time.sleep(wait)
+
+    print(f"[Pexels] {label} failed after {PEXELS_MAX_RETRIES} attempts")
+    return None
+
 
 def search_pexel_media(keywords: list):
 
@@ -10660,79 +10711,72 @@ def search_pexel_media(keywords: list):
 
     for keyword in keywords:
 
-        try:
-            photo_response = requests.get(
-                "https://api.pexels.com/v1/search",
-                headers=PEXELS_HEADERS,
-                params={
-                    "query": keyword,
-                    "orientation": "landscape",
-                    "per_page": 2
-                },
-                timeout=10
-            )
+        photo_data = _pexels_get(
+            "https://api.pexels.com/v1/search",
+            {
+                "query": keyword,
+                "orientation": "landscape",
+                "per_page": 2
+            },
+            label=f"photo search '{keyword}'"
+        )
 
-            if photo_response.ok:
-                for photo in photo_response.json().get("photos", []):
-                    photos.append({
-                        "id": photo["id"],
-                        "type": "photo",
+        if photo_data:
+            for photo in photo_data.get("photos", []):
+                photos.append({
+                    "id": photo["id"],
+                    "type": "photo",
+                    "query": keyword,
+                    "url": photo["url"],
+                    "image_url": photo["src"]["large2x"],
+                    "width": photo["width"],
+                    "height": photo["height"],
+                    "photographer": photo["photographer"]
+                })
+
+        video_data = _pexels_get(
+            "https://api.pexels.com/v1/videos/search",
+            {
+                "query": keyword,
+                "orientation": "landscape",
+                "per_page": 2
+            },
+            label=f"video search '{keyword}'"
+        )
+
+        if video_data:
+            for video in video_data.get("videos", []):
+                video_files = video.get("video_files", [])
+
+                video_file = next(
+                    (
+                        f for f in video_files
+                        if (f.get("width") or 0) >= 1280
+                        and (f.get("height") or 0) >= 720
+                    ),
+                    None
+                )
+
+                if not video_file and video_files:
+                    video_file = video_files[0]
+
+                if video_file:
+                    videos.append({
+                        "id": video["id"],
+                        "type": "video",
                         "query": keyword,
-                        "url": photo["url"],
-                        "image_url": photo["src"]["large2x"],
-                        "width": photo["width"],
-                        "height": photo["height"],
-                        "photographer": photo["photographer"]
+                        "url": video["url"],
+                        "video_url": video_file["link"],
+                        "width": video_file["width"],
+                        "height": video_file["height"],
+                        "duration": video["duration"]
                     })
-        except Exception as e:
-            print(f"[Pexels] photo search failed for '{keyword}': {e}")
-
-        try:
-            video_response = requests.get(
-                "https://api.pexels.com/v1/videos/search",
-                headers=PEXELS_HEADERS,
-                params={
-                    "query": keyword,
-                    "orientation": "landscape",
-                    "per_page": 2
-                },
-                timeout=10
-            )
-
-            if video_response.ok:
-                for video in video_response.json().get("videos", []):
-                    video_files = video.get("video_files", [])
-
-                    video_file = next(
-                        (
-                            f for f in video_files
-                            if (f.get("width") or 0) >= 1280
-                            and (f.get("height") or 0) >= 720
-                        ),
-                        None
-                    )
-
-                    if not video_file and video_files:
-                        video_file = video_files[0]
-
-                    if video_file:
-                        videos.append({
-                            "id": video["id"],
-                            "type": "video",
-                            "query": keyword,
-                            "url": video["url"],
-                            "video_url": video_file["link"],
-                            "width": video_file["width"],
-                            "height": video_file["height"],
-                            "duration": video["duration"]
-                        })
-        except Exception as e:
-            print(f"[Pexels] video search failed for '{keyword}': {e}")
 
     return {
         "photos": photos,
         "videos": videos
     }
+
 
 
 async def get_accurate_template(
@@ -10941,7 +10985,6 @@ async def edit_video(body: Editvideo):
         await _flush_token_usage()
 
 
-
 async def _edit_video_impl(body: Editvideo):
     try:
         print("Breaking down of script into scenes")
@@ -11045,9 +11088,6 @@ async def _edit_video_impl(body: Editvideo):
 
         print("fetching templates and media for directions")
 
-        last_photos = None
-        last_videos = None
-
         for scene in scenes:
             for direction in scene["directions"]:
                 direction["id"] = str(uuid.uuid4())
@@ -11069,24 +11109,12 @@ async def _edit_video_impl(body: Editvideo):
 
                 assets = {"photos": [], "videos": []}
                 if keywords:
-                    assets = search_pexel_media(keywords)
+                    assets = await asyncio.to_thread(search_pexel_media, keywords)
 
-                if assets["photos"]:
-                    last_photos = assets["photos"]
-                elif last_photos:
-                    print("no photos found, borrowing photos from previous beat")
-                    assets["photos"] = copy.deepcopy(last_photos)
-                else:
-                    print("no photos found and nothing to borrow yet")
-
-                if d_type != "full_screen_animation":
-                    if assets["videos"]:
-                        last_videos = assets["videos"]
-                    elif last_videos:
-                        print("no videos found, borrowing videos from previous beat")
-                        assets["videos"] = copy.deepcopy(last_videos)
-                    else:
-                        print("no videos found and nothing to borrow yet")
+                if not assets["photos"]:
+                    print(f"[Pexels] no photos found for beat {direction['id']} ({keywords})")
+                if d_type != "full_screen_animation" and not assets["videos"]:
+                    print(f"[Pexels] no videos found for beat {direction['id']} ({keywords})")
 
                 if d_type in ["B-roll", "B-roll+overlay_animation"]:
                     direction["asserts"] = assets
@@ -11175,12 +11203,6 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
-
-
-
-
-
-
 
 
 
