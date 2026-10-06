@@ -10180,7 +10180,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     valid_template_ids = {t["id"] for t in template_catalog}
  
     SCENE_BEAT_DIRECTOR = f"""
- 
+
     You are a production-grade documentary video director.
  
     TASK
@@ -10363,40 +10363,21 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     * Do NOT output template names, descriptions, variants or keywords.
  
  
-    KEYWORDS (B-roll footage search terms) — IMPORTANT
+    KEYWORDS (B-roll footage search terms) — ACCURACY IS CRITICAL
  
     For B-roll and B-roll+overlay_animation:
  
     * B-roll: exactly 1 keyword.
     * B-roll+overlay_animation: exactly 2 keywords.
- 
-    Keywords must come from the actual content of the scene and the beat:
- 
-    * Read the WHOLE scene first to understand its topic, setting and tone, then
-      choose keywords for what the narrator is talking about in THIS beat.
-    * Use the scene topic to disambiguate. Example: in a scene about the tech
-      company Apple, "apple" must become "iphone store" or "smartphone", not fruit.
-    * Each keyword must be a short search phrase of 2-3 words made of a specific
-      visible subject plus its setting or action, e.g. "farmer harvesting wheat",
-      "stock market trader", "empty highway night".
-    * Prefer concrete nouns that can be filmed: people doing something, places,
-      objects, machines, nature, cities, crowds, workplaces.
-    * Translate abstract narration into something visible that a camera could
-      capture and that fits the scene. Example: "inflation is rising" ->
-      "grocery shopping prices", not "inflation".
-    * For B-roll+overlay_animation with 2 keywords, make them two different but
-      related shots of the beat's subject (for example one wide/establishing shot
-      and one close-up/detail), not two rewordings of the same thing.
-    * Do NOT use abstract or vague terms (technology, concept, idea, innovation,
-      success, growth, business, future).
-    * Do NOT use numbers, dates, statistics, or text overlays as keywords.
-    * Do NOT use names of specific real people, brands or logos unless generic
-      footage of them is realistically available; use the visible equivalent
-      instead (e.g. "electric car charging" instead of a brand name).
-    * Do NOT reuse the same keyword in consecutive beats; vary the shots while
-      staying on topic.
-    * Every keyword must be something that would look right on screen while the
-      narrator says that beat's words.
+    * Keywords MUST accurately match what the narrator is saying in THAT beat,
+      read in the context of the whole scene's topic.
+    * Use the specific subject, place, object or action the beat is actually about.
+      Do not pick a loosely related or generic visual.
+    * Each keyword is a short, concrete, filmable phrase (2-3 words).
+    * If the narration is abstract, use the closest real visual of what it is
+      actually describing, not an unrelated stock scene.
+    * For 2 keywords, both must relate to the beat's subject, showing different shots.
+    * Avoid vague terms such as technology, concept, idea, innovation, success.
  
  
     OUTPUT
@@ -10460,8 +10441,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       B-roll+overlay_animation = 30–40% runtime,
       full_screen_animation = 10–20% runtime.
     * B-roll beats have exactly 1 keyword; B-roll+overlay_animation beats have exactly 2 keywords.
-    * Every keyword is a specific, filmable 2-3 word phrase that matches the scene
-      topic and what the narrator says in that beat (no abstract or generic terms).
+    * Every keyword accurately matches what the narrator says in that beat and the
+      scene topic.
     * Every B-roll+overlay_animation beat has overlay_start_word_index and
       overlay_end_word_index inside its own start/end range.
     * Every overlay/full_screen beat has exactly one "template_id".
@@ -10473,8 +10454,13 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       sync with the voice, and lies inside the beat range.
  
     The final response must be ONLY the JSON array.
+
     """
- 
+
+
+
+
+
     prompt = f"""
     {SCENE_BEAT_DIRECTOR}
  
