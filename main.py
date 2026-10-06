@@ -9885,6 +9885,16 @@ TEMPLATE_FEW_SHOTS = [
 
 
 
+
+
+
+
+
+
+
+
+
+
 async def scene_breakdown(script):
     SCENES_BRAKDOWN_PROMPT = f"""
     
@@ -10028,6 +10038,46 @@ async def scene_breakdown(script):
         return e
 
 
+async def detect_script_theme(script: str):
+    """
+    Detect the overall theme of the full script ONCE and return 1-2 theme
+    keywords (e.g. ["health"], ["finance", "investing"]). These are reused
+    in every scene so B-roll searches stay on-theme across the whole video.
+    """
+    theme_prompt = f"""
+    Read the script below and identify its overall theme.
+
+    Return ONLY a valid JSON array of 1 or 2 short lowercase theme keywords
+    (single words preferred), e.g. ["health"] or ["space", "science"].
+    No markdown, no explanation.
+
+    SCRIPT:
+    {script[:6000]}
+    """
+
+    try:
+        res = await _openai_create_with_timeout(
+            lambda: openai_client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[{"role": "user", "content": theme_prompt}],
+                stream=False,
+            )
+        )
+
+        _record_token_usage("script_theme", res)
+
+        themes = json.loads(res.choices[0].message.content.strip())
+
+        if isinstance(themes, str):
+            themes = [themes]
+
+        return [str(t).strip().lower() for t in themes if str(t).strip()][:2]
+
+    except Exception as e:
+        print(f"[Script Theme] failed: {e}")
+        return []
+
+
 fish_audio_client = FishAudio(
     api_key=os.getenv("FISH_AUDIO_API_KEY")
 )    
@@ -10135,9 +10185,10 @@ async def get_word_level_time_stamps(scenes: list):
 
 
 
-async def add_directions_for_scene(scene_text, word_timestamps):
+async def add_directions_for_scene(scene_text, word_timestamps, theme_keywords=None):
     word_count = len(word_timestamps)
     last_word_index = word_count - 1
+    theme_text = ", ".join(theme_keywords or []) or "infer from the narration"
 
     indexed_words = [
         {
@@ -10184,6 +10235,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       limited to these templates. The final animation description should describe
       the most appropriate visual treatment for the current beat based on the
       narration and the template patterns demonstrated in the supplied input.
+
+    * THEME_KEYWORDS (overall script theme): {theme_text}
 
 
     BEATS
@@ -10289,17 +10342,15 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     historical footage, and other subjects best represented by footage.
 
     Required:
-    * Exactly 3 concrete Pexels-searchable keywords (see KEYWORDS section).
+    * "keywords": ONE search phrase (see KEYWORDS).
 
     "B-roll+overlay_animation"
     Use when footage should be enhanced by an animation such as statistics,
     numbers, charts, lists, names, dates, quotes, text emphasis, labels,
     lower thirds, callouts, icons, or visual effects.
 
-    
-
     Required:
-    * Exactly 3 concrete Pexels-searchable keywords (for the footage; see KEYWORDS section).
+    * "keywords": ONE search phrase (see KEYWORDS).
     * template_description (see TEMPLATE DESCRIPTION below).
     * Two SEPARATE durations must be defined for this beat:
       1. B-ROLL DURATION: the full beat range (start_word_index to end_word_index).
@@ -10327,6 +10378,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     better represented graphically.
 
     Required:
+    * "keywords": ONE search phrase (see KEYWORDS), used only for the image.
     * template_description (see TEMPLATE DESCRIPTION below).
     * No overlay_start_word_index / overlay_end_word_index (the animation covers
       the full beat).
@@ -10356,12 +10408,6 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       by wrapping them in double asterisks.
     * Highlight only the words or phrases that are useful for identifying the
       intended animation structure.
-    * Do NOT highlight unrelated topic words merely because they appear in the narration.
-    * Do NOT output template keywords as a separate field.
-    * Do NOT output template names unless explicitly required by another input rule.
-    * Do NOT copy long descriptions from TEMPLATE_FEW_SHOTS.
-    * Do NOT assume the supplied template examples represent the entire template
-      database.
     * Do NOT exceed 20 words or go below 10 words.
     * Prefer concrete visual language describing the intended animation structure.
 
@@ -10372,45 +10418,20 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     characteristics of the intended animation.
 
 
-    KEYWORDS (B-roll footage search terms — separate from template description)
+    KEYWORDS (search phrase for footage/image)
 
-    For BOTH "B-roll" and "B-roll+overlay_animation" beats:
-
-    * Output EXACTLY 3 keywords in the "keywords" array. Never 1, 2, or 4.
-    * Each keyword is a short search phrase of 2-4 words describing something
-      that can literally be SEEN on camera.
-
-    ACCURACY RULES — STRICT
-
-    * Keywords MUST match what the narration of THAT beat is actually about.
-      Read the beat's "text" and the surrounding scene context before choosing.
-    * Keyword 1 = PRIMARY: the main visible subject + action/setting of the beat
-      (e.g. "farmer harvesting wheat", "cargo ship at port").
-    * Keyword 2 = SECONDARY: a different but equally accurate shot of the same
-      moment (different angle, close-up, or related visible detail), usable as a
-      fallback if keyword 1 returns poor footage
-      (e.g. "wheat field aerial", "grain being poured").
-    * Keyword 3 = TERTIARY: a third accurate shot of the same moment, showing
-      another distinct visible detail, wider establishing view, or related
-      setting, usable as a final fallback
-      (e.g. "combine harvester close up", "farmland sunset wide shot").
-    * The three keywords MUST NOT be synonyms or near-duplicates of each other.
-      Each must describe a visibly different shot.
-    * Resolve pronouns and references ("it", "they", "this") using the scene
-      context, and use the real subject, not the pronoun.
-    * If the narration is metaphorical or abstract, choose the closest literal
-      visual that supports the real meaning, not the metaphor taken literally.
-    * Include the setting or context when it changes the footage
-      (e.g. "doctor examining patient hospital", not just "doctor").
-    * Do NOT use vague or abstract words: technology, concept, idea, innovation,
-      success, growth, business, future, data.
-    * Do NOT use names of specific people, brands, or titles. Use a generic visual
-      equivalent (e.g. "electric car charging", not a brand name).
-    * Do NOT use words that describe on-screen text, graphics, charts, or
-      animations. Keywords are for real footage only.
-    * Avoid repeating the same keyword across consecutive beats; vary the visuals
-      while staying accurate.
-
+    * Every beat outputs "keywords" as ONE plain string of 4-6 words.
+    * The phrase MUST clearly define the overall theme AND accurately match the current narration/script.
+    * Use 1-2 relevant theme words + 3-4 specific words describing the subject, action,
+    person, place, object, or event in THIS beat.
+    * Every word must be supported by the narration/script. Do NOT add unrelated or
+    invented details.
+    * Use concrete, visually searchable words. Avoid vague terms like "concept",
+    "idea", "impact", or "innovation".
+    * For B-roll+overlay_animation, keywords describe the underlying footage/image,
+    NOT the overlay animation.
+    * Example (theme "health"):
+    "keywords": "health doctor checking blood pressure"
 
     OUTPUT
 
@@ -10432,7 +10453,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         "start_word_index": 0,
         "end_word_index": 12,
         "text": "Exact narration text for this beat",
-        "keywords": ["primary visual subject action", "secondary related visual shot", "tertiary wider or detail shot"]
+        "keywords": "theme word + scene specific words"
     }},
     {{
         "type": "B-roll+overlay_animation",
@@ -10441,7 +10462,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         "overlay_start_word_index": 16,
         "overlay_end_word_index": 22,
         "text": "Exact narration text for this beat",
-        "keywords": ["primary visual subject action", "secondary related visual shot", "tertiary wider or detail shot"],
+        "keywords": "theme word + scene specific words",
         "template_description": "Highlight the **single statistic** as a **hero figure** with clear visual emphasis."
     }},
     {{
@@ -10449,6 +10470,7 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         "start_word_index": 26,
         "end_word_index": 42,
         "text": "Exact narration text for this beat",
+        "keywords": "theme word + scene specific words",
         "template_description": "Show the **sequential steps** as a **step-by-step process** with clear visual progression."
     }}
     ]
@@ -10473,8 +10495,8 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       B-roll = 40–50% runtime,
       B-roll+overlay_animation = 30–40% runtime,
       full_screen_animation = 10–20% runtime.
-    * Every B-roll beat AND every B-roll+overlay_animation beat has exactly 3 keywords.
-    * All 3 keywords are concrete, visible, accurate to the beat's narration, and not synonyms of each other.
+    * Every beat has "keywords" with exactly ONE phrase of 4-6 words
+      (1-2 theme words + 3-4 scene-specific words).
     * Every B-roll+overlay_animation beat has overlay_start_word_index and
       overlay_end_word_index inside its own start/end range.
     * Every overlay/full_screen beat has exactly one template_description.
@@ -10602,6 +10624,19 @@ def _keywords_from_description(description: str, limit: int = 2) -> list:
     return [p.strip() for p in phrases[:limit] if p.strip()]
 
 
+def _normalize_keywords(keywords) -> str:
+    """
+    Collapse whatever the director returned into ONE search sentence
+    (max 6 words) so a single Pexels query is made per beat.
+    """
+    if isinstance(keywords, str):
+        keywords = [keywords]
+
+    words = " ".join(str(k) for k in (keywords or [])).split()
+
+    return " ".join(words[:6])
+
+
 def _fill_media_urls(node, urls: list, counter: list):
     if isinstance(node, dict):
         for key, value in node.items():
@@ -10648,203 +10683,95 @@ def set_selected_media(direction: dict, assets: dict):
 
 
 
-
-import threading
-
-
 PEXELS_HEADERS = {
     "Authorization": PEXELS_API_KEY
 }
 
-PEXELS_MAX_RETRIES = 5
-PEXELS_TIMEOUT = 20
-PEXELS_MIN_INTERVAL = 0.4       
-PEXELS_MAX_RESET_WAIT = 3700     
 
-_pexels_lock = threading.Lock()  
-_pexels_last_call = 0.0
-_pexels_cache = {}                
+def search_pexel_media(keywords: str):
+    """
+    Searches the single 4-6 word phrase ONCE and returns
+    1 video + 1 photo for the beat.
+    """
 
-
-def _seconds_until_reset(response) -> float | None:
-    reset = response.headers.get("X-Ratelimit-Reset")
-    if reset and reset.isdigit():
-        return max(0.0, int(reset) - time.time()) + 1
-    return None
-
-
-def _pexels_get(url: str, params: dict, label: str):
-    global _pexels_last_call
-
-    for attempt in range(1, PEXELS_MAX_RETRIES + 1):
-        with _pexels_lock:
-            gap = time.time() - _pexels_last_call
-            if gap < PEXELS_MIN_INTERVAL:
-                time.sleep(PEXELS_MIN_INTERVAL - gap)
-
-            try:
-                response = requests.get(
-                    url,
-                    headers=PEXELS_HEADERS,
-                    params=params,
-                    timeout=PEXELS_TIMEOUT
-                )
-                _pexels_last_call = time.time()
-            except (requests.Timeout, requests.ConnectionError) as e:
-                _pexels_last_call = time.time()
-                wait = min(2 ** attempt, 15)
-                print(f"[Pexels] {label} timeout/connection error "
-                      f"(attempt {attempt}/{PEXELS_MAX_RETRIES}): {e}. Retrying in {wait}s")
-                if attempt < PEXELS_MAX_RETRIES:
-                    time.sleep(wait)
-                continue
-            except Exception as e:
-                print(f"[Pexels] {label} unexpected error: {e}")
-                return None
-
-            if response.ok:
-                remaining = response.headers.get("X-Ratelimit-Remaining")
-                if remaining is not None and remaining.isdigit() and int(remaining) <= 1:
-                    wait = _seconds_until_reset(response)
-                    if wait and wait <= PEXELS_MAX_RESET_WAIT:
-                        print(f"[Pexels] quota nearly exhausted, waiting {int(wait)}s for reset")
-                        time.sleep(wait)
-                return response.json()
-
-            if response.status_code == 429:
-                wait = _seconds_until_reset(response)
-                if wait is None:
-                    retry_after = response.headers.get("Retry-After")
-                    wait = int(retry_after) if retry_after and retry_after.isdigit() \
-                        else min(2 ** attempt * 5, 60)
-
-                if wait > PEXELS_MAX_RESET_WAIT:
-                    print(f"[Pexels] {label} 429, reset is {int(wait)}s away, giving up")
-                    return None
-
-                print(f"[Pexels] {label} got 429 (attempt {attempt}/{PEXELS_MAX_RETRIES}), "
-                      f"waiting {int(wait)}s for quota reset")
-                if attempt < PEXELS_MAX_RETRIES:
-                    time.sleep(wait)  
-                continue
-
-            if response.status_code >= 500:
-                wait = min(2 ** attempt, 15)
-                print(f"[Pexels] {label} got {response.status_code} "
-                      f"(attempt {attempt}/{PEXELS_MAX_RETRIES}), retrying in {wait}s")
-                if attempt < PEXELS_MAX_RETRIES:
-                    time.sleep(wait)
-                continue
-
-            print(f"[Pexels] {label} failed with {response.status_code}, not retrying")
-            return None
-
-    print(f"[Pexels] {label} failed after {PEXELS_MAX_RETRIES} attempts")
-    return None
-
-
-def _search_photos(keyword: str) -> list:
-    key = ("photo", keyword.strip().lower())
-    if key in _pexels_cache:
-        return copy.deepcopy(_pexels_cache[key])
-
-    data = _pexels_get(
-        "https://api.pexels.com/v1/search",
-        {"query": keyword, "orientation": "landscape", "per_page": 2},
-        label=f"photo search '{keyword}'"
-    )
-    if data is None:
-        return [] 
-
-    results = [
-        {
-            "id": p["id"],
-            "type": "photo",
-            "query": keyword,
-            "url": p["url"],
-            "image_url": p["src"]["large2x"],
-            "width": p["width"],
-            "height": p["height"],
-            "photographer": p["photographer"],
-        }
-        for p in data.get("photos", [])
-    ]
-    _pexels_cache[key] = results
-    return copy.deepcopy(results)
-
-
-def _search_videos(keyword: str) -> list:
-    key = ("video", keyword.strip().lower())
-    if key in _pexels_cache:
-        return copy.deepcopy(_pexels_cache[key])
-
-    data = _pexels_get(
-        "https://api.pexels.com/v1/videos/search",
-        {"query": keyword, "orientation": "landscape", "per_page": 2},
-        label=f"video search '{keyword}'"
-    )
-    if data is None:
-        return []
-
-    results = []
-    for video in data.get("videos", []):
-        video_files = video.get("video_files", [])
-        video_file = next(
-            (
-                f for f in video_files
-                if (f.get("width") or 0) >= 1280 and (f.get("height") or 0) >= 720
-            ),
-            None
-        )
-        if not video_file and video_files:
-            video_file = video_files[0]
-
-        if video_file:
-            results.append({
-                "id": video["id"],
-                "type": "video",
-                "query": keyword,
-                "url": video["url"],
-                "video_url": video_file["link"],
-                "width": video_file["width"],
-                "height": video_file["height"],
-                "duration": video["duration"],
-            })
-
-    _pexels_cache[key] = results
-    return copy.deepcopy(results)
-
-
-def search_pexel_media(
-    keywords: list,
-    want_videos: bool = True,
-    want_photos: bool = True,
-    photos_fallback: bool = False,
-):
     photos = []
     videos = []
 
-    if want_videos:
-        for keyword in keywords:
-            videos.extend(_search_videos(keyword))
+    for keyword in [keywords]:
 
-    if want_photos or (photos_fallback and not videos):
-        for keyword in keywords:
-            photos.extend(_search_photos(keyword))
+        try:
+            photo_response = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers=PEXELS_HEADERS,
+                params={
+                    "query": keyword,
+                    "orientation": "landscape",
+                    "per_page": 1
+                },
+                timeout=10
+            )
 
-    return {"photos": photos, "videos": videos}
+            if photo_response.ok:
+                for photo in photo_response.json().get("photos", [])[:1]:
+                    photos.append({
+                        "id": photo["id"],
+                        "type": "photo",
+                        "query": keyword,
+                        "url": photo["url"],
+                        "image_url": photo["src"]["large2x"],
+                        "width": photo["width"],
+                        "height": photo["height"],
+                        "photographer": photo["photographer"]
+                    })
+        except Exception as e:
+            print(f"[Pexels] photo search failed for '{keyword}': {e}")
 
+        try:
+            video_response = requests.get(
+                "https://api.pexels.com/v1/videos/search",
+                headers=PEXELS_HEADERS,
+                params={
+                    "query": keyword,
+                    "orientation": "landscape",
+                    "per_page": 1
+                },
+                timeout=10
+            )
 
+            if video_response.ok:
+                for video in video_response.json().get("videos", [])[:1]:
+                    video_files = video.get("video_files", [])
 
+                    video_file = next(
+                        (
+                            f for f in video_files
+                            if (f.get("width") or 0) >= 1280
+                            and (f.get("height") or 0) >= 720
+                        ),
+                        None
+                    )
 
+                    if not video_file and video_files:
+                        video_file = video_files[0]
 
+                    if video_file:
+                        videos.append({
+                            "id": video["id"],
+                            "type": "video",
+                            "query": keyword,
+                            "url": video["url"],
+                            "video_url": video_file["link"],
+                            "width": video_file["width"],
+                            "height": video_file["height"],
+                            "duration": video["duration"]
+                        })
+        except Exception as e:
+            print(f"[Pexels] video search failed for '{keyword}': {e}")
 
-
-
-
-
-
-
+    return {
+        "photos": photos,
+        "videos": videos
+    }
 
 
 
@@ -11056,11 +10983,17 @@ async def edit_video(body: Editvideo):
         await _flush_token_usage()
 
 
+
 async def _edit_video_impl(body: Editvideo):
     try:
         print("Breaking down of script into scenes")
 
         scenes = await scene_breakdown(body.script)
+
+        print("detecting script theme")
+
+        theme_keywords = await detect_script_theme(body.script)
+        print("theme keywords:", theme_keywords)
 
         voice_id = body.voice
         reference_audio = None
@@ -11139,7 +11072,8 @@ async def _edit_video_impl(body: Editvideo):
         for scene in scenes:
             directions = await add_directions_for_scene(
                 scene["script"],
-                scene["word_timestamps"]
+                scene["word_timestamps"],
+                theme_keywords
             )
 
             if not isinstance(directions, list):
@@ -11166,39 +11100,21 @@ async def _edit_video_impl(body: Editvideo):
                 direction["selected_media_type"] = None
                 d_type = direction["type"]
 
-                if d_type in ["B-roll", "B-roll+overlay_animation"]:
-                    keywords = direction.get("keywords") or []
-                elif d_type == "full_screen_animation":
-                    keywords = (
-                        direction.get("keywords")
-                        or _keywords_from_description(
+                # One 4-6 word sentence per beat (theme + scene-specific words)
+                keywords = _normalize_keywords(direction.get("keywords"))
+
+                if not keywords and d_type == "full_screen_animation":
+                    keywords = _normalize_keywords(
+                        _keywords_from_description(
                             direction.get("template_description")
                         )
                     )
-                else:
-                    keywords = []
 
-                # Only request the media types each beat type actually uses
-                if d_type == "B-roll":
-                    # videos only; photos only if no video was found
-                    fetch_kwargs = dict(want_videos=True, want_photos=False, photos_fallback=True)
-                elif d_type == "B-roll+overlay_animation":
-                    # videos for footage, photos for template props
-                    fetch_kwargs = dict(want_videos=True, want_photos=True)
-                else:  # full_screen_animation
-                    fetch_kwargs = dict(want_videos=False, want_photos=True)
+                direction["keywords"] = keywords
 
                 assets = {"photos": [], "videos": []}
                 if keywords:
-                    # run in a thread so rate-limit waits don't block the event loop
-                    assets = await asyncio.to_thread(
-                        search_pexel_media, keywords, **fetch_kwargs
-                    )
-
-                if fetch_kwargs["want_videos"] and not assets["videos"]:
-                    print(f"[Pexels] no videos found for beat {direction['id']} ({keywords})")
-                if fetch_kwargs["want_photos"] and not assets["photos"]:
-                    print(f"[Pexels] no photos found for beat {direction['id']} ({keywords})")
+                    assets = search_pexel_media(keywords)
 
                 if d_type in ["B-roll", "B-roll+overlay_animation"]:
                     direction["asserts"] = assets
@@ -11287,6 +11203,7 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
+
 
 
 
