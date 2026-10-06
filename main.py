@@ -10032,6 +10032,8 @@ fish_audio_client = FishAudio(
     api_key=os.getenv("FISH_AUDIO_API_KEY")
 )    
 
+
+
 async def generate_audio_for_scene(
     scene_text,
     modelId,
@@ -10135,59 +10137,74 @@ async def get_word_level_time_stamps(scenes: list):
 
 
 
+_TEMPLATE_CATALOG_CACHE = None
+ 
+ 
+async def load_template_catalog(force_refresh: bool = False):
+    global _TEMPLATE_CATALOG_CACHE
+ 
+    if _TEMPLATE_CATALOG_CACHE and not force_refresh:
+        return _TEMPLATE_CATALOG_CACHE
+ 
+    rows = await supabase.fetch("SELECT match FROM animations_template")
+ 
+    catalog = []
+    for r in rows:
+        m = r["match"]
+        if isinstance(m, str): 
+            m = json.loads(m)
+        if m and m.get("id") and m.get("description"):
+            catalog.append({"id": m["id"], "description": m["description"]})
+ 
+    _TEMPLATE_CATALOG_CACHE = catalog
+    return catalog
+
+
+
+
 async def add_directions_for_scene(scene_text, word_timestamps):
     word_count = len(word_timestamps)
     last_word_index = word_count - 1
-
+ 
     indexed_words = [
         {
             "i": i,
             "word": w["word"],
             "start": w["start"],
-            "end": w["end"]
+            "end": w["end"],
         }
         for i, w in enumerate(word_timestamps)
     ]
-   
+ 
+    template_catalog = await load_template_catalog()
+    valid_template_ids = {t["id"] for t in template_catalog}
+ 
     SCENE_BEAT_DIRECTOR = f"""
-
+ 
     You are a production-grade documentary video director.
-
+ 
     TASK
     Divide the narration into coherent visual beats. For each beat, choose:
-
+ 
     1. B-roll
     2. B-roll+overlay_animation
     3. full_screen_animation
-
-    For animation beats (overlay or full_screen), use the supplied
-    TEMPLATE_MATCH_TEMPLATES input as reference examples for understanding
-    how animation templates are structured and described.
-
-    The supplied templates are NOT the complete template library. They are examples
-    from the template-matching system and demonstrate the types of template
-    structures and descriptions available in the database.
-
+ 
+    For animation beats (overlay or full_screen), choose the single best-matching
+    template from the supplied TEMPLATE_CATALOG and return its id.
+ 
     INPUT
-
+ 
     * Scene narration with WhisperX word-level entries. Each entry has an explicit
       index field "i". Use ONLY these "i" values as word indices.
-
-    * TEMPLATE_MATCH_TEMPLATES:
-      A JSON input containing template-match details/examples from the animation
-      template library.
-
-      Use these details to understand the visual structure, composition, content
-      relationships, and descriptive language used for animation templates.
-
-      The supplied templates are examples only. Do NOT assume the database is
-      limited to these templates. The final animation description should describe
-      the most appropriate visual treatment for the current beat based on the
-      narration and the template patterns demonstrated in the supplied input.
-
-
+ 
+    * TEMPLATE_CATALOG:
+      A JSON list of {{"id", "description"}} objects. Each description explains what
+      the template is for, its content, its narration cues and when NOT to use it.
+ 
+ 
     BEATS
-
+ 
     * Do not generate or calculate timestamps.
     * Return only start_word_index and end_word_index; backend calculates exact times.
     * Preserve narration order.
@@ -10202,9 +10219,9 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     - Do not omit or add words.
     - This must be the verbatim script text for that beat, word-for-word.
     * The number of words in "text" MUST equal (end_word_index - start_word_index + 1).
-
+ 
     FULL SCREEN ANIMATION DURATION LIMIT — HARD RULE
-
+ 
     * Every full_screen_animation beat MUST be 8.0 seconds or shorter.
     * Calculate its duration from the supplied timestamps:
       (end of the word at end_word_index) minus (start of the word at start_word_index).
@@ -10215,18 +10232,18 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       cover the remaining words with a B-roll or B-roll+overlay_animation beat.
     * Never exceed 8 seconds, even if it means the animation shows only part of
       the idea.
-
+ 
     CATEGORY DISTRIBUTION — IMPORTANT
-
+ 
     Across the entire scene, distribute the three beat types approximately as follows:
-
+ 
     * B-roll: 40–50% of the total scene runtime
     * B-roll+overlay_animation: 30–40% of the total scene runtime
     * full_screen_animation: 10–20% of the total scene runtime
-
+ 
     These percentages describe the overall visual composition of the scene, not
     individual beats.
-
+ 
     * B-roll should be the dominant category and used for establishing context,
       real subjects, places, objects, events, and general narration.
     * B-roll+overlay_animation should be used when narration contains a specific
@@ -10235,37 +10252,37 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     * full_screen_animation should be used selectively for structural beats such
       as processes, comparisons, timelines, charts, diagrams, chapter moments,
       or concepts that are better represented graphically.
-
+ 
     Do NOT overuse full_screen_animation.
     Do NOT turn every informational sentence into an animation.
     Prefer B-roll when real footage can communicate the narration effectively.
     Use B-roll+overlay_animation for information that needs visual emphasis.
     Reserve full_screen_animation for moments where a dedicated graphic structure
     materially improves understanding.
-
+ 
     Because beats have discrete word ranges, exact percentages are not required.
     Stay as close as reasonably possible to the target distribution while
     preserving natural sentence boundaries, visual coherence, and the
     8–15 second beat target.
-
-
+ 
+ 
     THEME COLOR CONSISTENCY — IMPORTANT
-
+ 
     * ALL full_screen_animation beats across the ENTIRE VIDEO MUST use the SAME
       background theme color.
     * Do NOT choose or output a different background color
-
-
+ 
+ 
     WORD INDEX SAFETY — EXTREMELY STRICT
-
+ 
     The supplied WORD-LEVEL TIMESTAMPS contains exactly {word_count} entries.
-
+ 
     The valid word index range is:
-
+ 
     0 through {last_word_index}
-
+ 
     IMPORTANT:
-
+ 
     * start_word_index MUST be >= 0.
     * end_word_index MUST be >= 0.
     * start_word_index MUST be <= {last_word_index}.
@@ -10280,27 +10297,25 @@ async def add_directions_for_scene(scene_text, word_timestamps):
     * Before returning the JSON, internally verify that no beat contains an index outside 0-{last_word_index}.
     * The "text" field for each beat MUST match exactly the words at that beat's
       start_word_index through end_word_index — no drift, no rewording.
-
-
+ 
+ 
     VISUAL SELECTION
-
+ 
     "B-roll"
     Use for real people, places, objects, events, environments, machines,
     historical footage, and other subjects best represented by footage.
-
+ 
     Required:
     * Exactly 1 concrete Pexels-searchable keyword.
-
+ 
     "B-roll+overlay_animation"
     Use when footage should be enhanced by an animation such as statistics,
     numbers, charts, lists, names, dates, quotes, text emphasis, labels,
     lower thirds, callouts, icons, or visual effects.
-
-    
-
+ 
     Required:
     * Exactly 2 concrete Pexels-searchable keywords (for the footage).
-    * template_description (see TEMPLATE DESCRIPTION below).
+    * template_id (see TEMPLATE SELECTION).
     * Two SEPARATE durations must be defined for this beat:
       1. B-ROLL DURATION: the full beat range (start_word_index to end_word_index).
          The footage plays for this entire range.
@@ -10319,83 +10334,85 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       - The overlay range MUST lie inside the beat's own
         start_word_index..end_word_index.
       - The animation duration should be roughly 3-8 seconds.
-
-
+ 
+ 
     "full_screen_animation"
     Use when animation should replace footage for processes, comparisons,
     charts, timelines, diagrams, data visualization, chapter cards, or concepts
     better represented graphically.
-
+ 
     Required:
-    * template_description (see TEMPLATE DESCRIPTION below).
+    * template_id (see TEMPLATE SELECTION).
     * No overlay_start_word_index / overlay_end_word_index (the animation covers
       the full beat).
-
-
-    TEMPLATE DESCRIPTION
-
+ 
+ 
+    TEMPLATE SELECTION
+ 
     For every B-roll+overlay_animation and full_screen_animation beat:
-
-    * Use the supplied TEMPLATE_FEW_SHOTS JSON as reference examples for
-      understanding how animation templates are constructed and described.
-    * The supplied templates are NOT the complete template library.
-    * Do NOT limit the animation concept to the supplied templates.
-    * Do NOT assume that the final animation must use one of the supplied templates.
-    * Infer the appropriate visual structure for the current beat from the narration,
-      while using the supplied template details as examples of how similar visual
-      structures can be represented.
-    * The description must reflect the actual visual structure required by the
-      narration and should be compatible with the type of animation templates
-      represented in the template-match input.
-    * Write exactly ONE concise description containing 10–20 words.
-    * The description must explain what the animation should visually communicate
-      for THIS specific beat.
-    * Use wording that is semantically relatable to the supplied template-match
-      details and their demonstrated visual structures.
-    * Highlight the most relatable and visually meaningful keywords or short phrases
-      by wrapping them in double asterisks.
-    * Highlight only the words or phrases that are useful for identifying the
-      intended animation structure.
-    * Do NOT highlight unrelated topic words merely because they appear in the narration.
-    * Do NOT output template keywords as a separate field.
-    * Do NOT output template names unless explicitly required by another input rule.
-    * Do NOT copy long descriptions from TEMPLATE_FEW_SHOTS.
-    * Do NOT assume the supplied template examples represent the entire template
-      database.
-    * Do NOT exceed 20 words or go below 10 words.
-    * Prefer concrete visual language describing the intended animation structure.
-
-    Example:
-    "Show a **three-step process** with **sequential stages** explaining how the product moves from source to customer."
-
-    The highlighted phrases should represent the most visually relevant structural
-    characteristics of the intended animation.
-
-
-    KEYWORDS (B-roll footage search terms — separate from template description)
-
+ 
+    * Pick exactly ONE template from TEMPLATE_CATALOG.
+    * Return ONLY its "id" in the "template_id" field, copied exactly as it appears
+      in the catalog.
+    * Match using the template's content, narration cues and "Not for" notes against
+      the beat's narration.
+    * For full_screen_animation, choose a template whose description says it works
+      as full-screen. For B-roll+overlay_animation, choose one whose description says
+      it works as an overlay over footage.
+    * NEVER invent an id. NEVER output an id that is not in TEMPLATE_CATALOG.
+    * Do NOT output template names, descriptions, variants or keywords.
+ 
+ 
+    KEYWORDS (B-roll footage search terms) — IMPORTANT
+ 
     For B-roll and B-roll+overlay_animation:
-
-    * B-roll: exactly 1 concrete Pexels-searchable keyword.
-    * B-roll+overlay_animation: exactly 2 concrete Pexels-searchable keywords.
-    * Describe visible subjects/scenes.
-    * Avoid vague terms such as technology, concept, idea, or innovation.
-
-
+ 
+    * B-roll: exactly 1 keyword.
+    * B-roll+overlay_animation: exactly 2 keywords.
+ 
+    Keywords must come from the actual content of the scene and the beat:
+ 
+    * Read the WHOLE scene first to understand its topic, setting and tone, then
+      choose keywords for what the narrator is talking about in THIS beat.
+    * Use the scene topic to disambiguate. Example: in a scene about the tech
+      company Apple, "apple" must become "iphone store" or "smartphone", not fruit.
+    * Each keyword must be a short search phrase of 2-3 words made of a specific
+      visible subject plus its setting or action, e.g. "farmer harvesting wheat",
+      "stock market trader", "empty highway night".
+    * Prefer concrete nouns that can be filmed: people doing something, places,
+      objects, machines, nature, cities, crowds, workplaces.
+    * Translate abstract narration into something visible that a camera could
+      capture and that fits the scene. Example: "inflation is rising" ->
+      "grocery shopping prices", not "inflation".
+    * For B-roll+overlay_animation with 2 keywords, make them two different but
+      related shots of the beat's subject (for example one wide/establishing shot
+      and one close-up/detail), not two rewordings of the same thing.
+    * Do NOT use abstract or vague terms (technology, concept, idea, innovation,
+      success, growth, business, future).
+    * Do NOT use numbers, dates, statistics, or text overlays as keywords.
+    * Do NOT use names of specific real people, brands or logos unless generic
+      footage of them is realistically available; use the visible equivalent
+      instead (e.g. "electric car charging" instead of a brand name).
+    * Do NOT reuse the same keyword in consecutive beats; vary the shots while
+      staying on topic.
+    * Every keyword must be something that would look right on screen while the
+      narrator says that beat's words.
+ 
+ 
     OUTPUT
-
+ 
     Return ONLY valid JSON.
-
+ 
     OUTPUT FORMAT — EXTREMELY STRICT
-
+ 
     The response MUST be a JSON ARRAY at the root level.
     The root JSON value MUST start with [ and end with ].
     NEVER return a JSON object as the root value.
     NEVER wrap the array inside {{"beats": [...]}}, {{"directions": [...]}}, etc.
     NEVER return markdown, ```json, or explanations outside the JSON array.
-
+ 
     The ONLY valid response format is:
-
+ 
     [
     {{
         "type": "B-roll",
@@ -10412,29 +10429,28 @@ async def add_directions_for_scene(scene_text, word_timestamps):
         "overlay_end_word_index": 22,
         "text": "Exact narration text for this beat",
         "keywords": ["...", "..."],
-        "template_description": "Highlight the **single statistic** as a **hero figure** with clear visual emphasis."
+        "template_id": "OV-03"
     }},
     {{
         "type": "full_screen_animation",
         "start_word_index": 26,
         "end_word_index": 42,
         "text": "Exact narration text for this beat",
-        "template_description": "Show the **sequential steps** as a **step-by-step process** with clear visual progression."
+        "template_id": "FS-01"
     }}
     ]
-
+ 
     IMPORTANT ROOT STRUCTURE RULES:
-
+ 
     * The root MUST be an array.
     * Every element inside the array MUST be one beat object.
     * There is NO "beats" property, NO "directions" property, NO wrapper object.
     * If there is only one beat, still return an array containing that one object.
     * The first character of the response MUST be [.
     * The last character of the response MUST be ].
-
-
+ 
     FINAL CHECK
-
+ 
     * Complete consecutive word coverage.
     * First index = 0; final beat ends at {last_word_index}.
     * Every beat has a "text" field with the exact, verbatim narration for its
@@ -10444,37 +10460,36 @@ async def add_directions_for_scene(scene_text, word_timestamps):
       B-roll+overlay_animation = 30–40% runtime,
       full_screen_animation = 10–20% runtime.
     * B-roll beats have exactly 1 keyword; B-roll+overlay_animation beats have exactly 2 keywords.
+    * Every keyword is a specific, filmable 2-3 word phrase that matches the scene
+      topic and what the narrator says in that beat (no abstract or generic terms).
     * Every B-roll+overlay_animation beat has overlay_start_word_index and
       overlay_end_word_index inside its own start/end range.
-    * Every overlay/full_screen beat has exactly one template_description.
-    * Every template_description contains 10–20 words.
-    * template_description must be based on the supplied TEMPLATE_MATCH_TEMPLATES
-      details as reference examples, while allowing templates beyond the supplied
-      examples.
-    * No separate template_keywords field is output.
+    * Every overlay/full_screen beat has exactly one "template_id".
+    * Every "template_id" exists in TEMPLATE_CATALOG.
+    * No template_description, template_keywords or other template fields are output.
     * No full_screen_animation beat is longer than 8.0 seconds.
     * For every B-roll+overlay_animation beat, the overlay range covers exactly
       the words the animation illustrates, so the animation starts and ends in
       sync with the voice, and lies inside the beat range.
-
+ 
     The final response must be ONLY the JSON array.
     """
-
+ 
     prompt = f"""
     {SCENE_BEAT_DIRECTOR}
-
+ 
     SCENE:
     {scene_text}
-
+ 
     WORD-LEVEL TIMESTAMPS (use the "i" field as the word index):
     {json.dumps(indexed_words, ensure_ascii=False)}
-
-    Tempates few shotes :
-    {TEMPLATE_FEW_SHOTS}
-
+ 
+    TEMPLATE_CATALOG:
+    {json.dumps(template_catalog, ensure_ascii=False)}
+ 
     Now divide this scene into visual beats.
     """
-
+ 
     try:
         res = await _openai_create_with_timeout(
             lambda: openai_client.chat.completions.create(
@@ -10482,24 +10497,38 @@ async def add_directions_for_scene(scene_text, word_timestamps):
                 messages=[
                     {
                         "role": "user",
-                        "content": prompt
+                        "content": prompt,
                     }
                 ],
                 stream=False,
             )
         )
-
+ 
         _record_token_usage("beat_breakdown", res)
-
+ 
         response = res.choices[0].message.content.strip()
-        
-        print(json.loads(response))
-
-        return json.loads(response)
-
+        beats = json.loads(response)
+ 
+        # Validate the template ids returned by the LLM
+        for b in beats:
+            if b.get("type") in ("B-roll+overlay_animation", "full_screen_animation"):
+                if b.get("template_id") not in valid_template_ids:
+                    print(
+                        f"[Scene Breakdown] invalid template_id {b.get('template_id')!r} "
+                        f"for beat {b.get('start_word_index')}-{b.get('end_word_index')}"
+                    )
+                    b["template_id"] = None  
+ 
+        print(beats)
+        return beats
+ 
     except Exception as e:
         print(f"[Scene Breakdown] failed: {e}")
         return e
+
+
+
+
 
 
 async def align_beats_to_voice(
@@ -10566,9 +10595,6 @@ async def align_beats_to_voice(
 
 FILLABLE_URL_KEYS = {"image_url", "before_url", "after_url"}
 
-def _keywords_from_description(description: str, limit: int = 2) -> list:
-    phrases = re.findall(r"\*\*(.+?)\*\*", description or "")
-    return [p.strip() for p in phrases[:limit] if p.strip()]
 
 
 def _fill_media_urls(node, urls: list, counter: list):
@@ -10704,60 +10730,45 @@ def search_pexel_media(keywords: list):
     }
 
 
+
+
+
+
+
+
 async def get_accurate_template(
-    template_description: str,
+    template_id: str,
     text: str,
     template_type: str
 ):
-    model = _get_st_model()
 
     try:
-        clean_description = (template_description or "").replace("**", "").strip()
-
-        if not clean_description:
-            print("[Template Selection] Empty template_description")
+        if not template_id:
+            print("[Template Selection] Empty template_id")
             return None, None
-
-        embedding = await asyncio.to_thread(
-            lambda: model.encode(clean_description, normalize_embeddings=True).tolist()
-        )
-
-        match_response = supabase.rpc(
-            "match_animation_template",
-            {"query_embedding": embedding, "match_count": 5}
-        ).execute()
-
-        if not match_response.data:
-            print("[Template Selection] No matching template found in DB")
-            return None, None
-
-        best = max(
-            match_response.data,
-            key=lambda r: r.get("similarity", r.get("score", 0)) or 0
-        )
-        template_name = best["name"]
-        print(
-            f"[Template Selection] '{clean_description}' -> {template_name} "
-            f"(score: {best.get('similarity', best.get('score'))})"
-        )
 
         template_response = (
             supabase
             .table("animations_template")
-            .select("props")
-            .eq("name", template_name)
-            .single()
+            .select("name, props, match")
+            .eq("match->>id", template_id)
+            .limit(1)
             .execute()
         )
 
         if not template_response.data:
-            print(
-                f"[Template Selection] Template not found in DB: "
-                f"{template_name}"
-            )
+            print(f"[Template Selection] Template id not found in DB: {template_id}")
             return None, None
 
-        template_props = template_response.data["props"]
+        row = template_response.data[0]
+        match_data = row.get("match")
+        if isinstance(match_data, str):
+            match_data = json.loads(match_data)
+
+        template_name = row.get("name") or (match_data or {}).get("name")
+        template_props = row["props"]
+
+        print(f"[Template Selection] id '{template_id}' -> {template_name}")
 
         props_prompt = f"""
 
@@ -10865,7 +10876,7 @@ async def get_accurate_template(
         18. Return NO explanation.
         19. Return NO markdown.
         20. Do NOT wrap the JSON in ```json or any code block.
-      
+
         """
 
         props_res = await _openai_create_with_timeout(
@@ -10891,6 +10902,30 @@ async def get_accurate_template(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class Editvideo(BaseModel):
     userId: str
     script: str
@@ -10908,7 +10943,6 @@ async def edit_video(body: Editvideo):
         return await _edit_video_impl(body)
     finally:
         await _flush_token_usage()
-
 
 
 async def _edit_video_impl(body: Editvideo):
@@ -11024,17 +11058,7 @@ async def _edit_video_impl(body: Editvideo):
                 direction["selected_media_type"] = None
                 d_type = direction["type"]
 
-                if d_type in ["B-roll", "B-roll+overlay_animation"]:
-                    keywords = direction.get("keywords") or []
-                elif d_type == "full_screen_animation":
-                    keywords = (
-                        direction.get("keywords")
-                        or _keywords_from_description(
-                            direction.get("template_description")
-                        )
-                    )
-                else:
-                    keywords = []
+                keywords = direction.get("keywords") or []
 
                 assets = {"photos": [], "videos": []}
                 if keywords:
@@ -11069,7 +11093,7 @@ async def _edit_video_impl(body: Editvideo):
 
                 if d_type in ["B-roll+overlay_animation", "full_screen_animation"]:
                     template_name, template_props = await get_accurate_template(
-                        direction["template_description"],
+                        direction.get("template_id"),
                         direction["text"],
                         d_type
                     )
@@ -11144,10 +11168,6 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
-
-
-
-
 
 
 
