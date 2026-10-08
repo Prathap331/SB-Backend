@@ -11190,7 +11190,6 @@ async def split_beat(
 
 
 
-
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/move")
 async def move_beat(
     videoId: str,
@@ -11326,21 +11325,33 @@ async def move_beat(
         o_end = min(max(o_end, o_start), target["end_word_index"])
 
         if target is not beat:
-            if target["type"] != "B-roll":
+            if target["type"] == "full_screen_animation":
                 raise HTTPException(
                     status_code=400,
-                    detail="That beat already has an animation, drop it on a B-roll beat",
+                    detail="Cannot drop an overlay on a full_screen_animation beat",
                 )
 
-            # hand the template over to the target beat
-            for key in template_keys:
-                if key in beat:
-                    target[key] = beat.pop(key)
-            for key in overlay_keys:
-                beat.pop(key, None)
+            if target["type"] == "B-roll+overlay_animation":
+                # target already has an animation -> swap, so nothing is lost:
+                # the other beat gets this beat's animation (its overlay range stays as it is)
+                for key in template_keys:
+                    mine = beat.pop(key, None)
+                    theirs = target.pop(key, None)
+                    if theirs is not None:
+                        beat[key] = theirs
+                    if mine is not None:
+                        target[key] = mine
+            else:
+                # target is a plain B-roll -> hand the template over
+                for key in template_keys:
+                    if key in beat:
+                        target[key] = beat.pop(key)
+                for key in overlay_keys:
+                    beat.pop(key, None)
 
-            beat["type"] = "B-roll"
-            target["type"] = "B-roll+overlay_animation"
+                beat["type"] = "B-roll"
+                target["type"] = "B-roll+overlay_animation"
+
             beat = target
 
         beat["overlay_start_word_index"] = o_start
@@ -11349,6 +11360,10 @@ async def move_beat(
         beat["overlay_end"] = words[o_end]["end"]
         beat["overlay_text"] = " ".join(w["word"] for w in words[o_start:o_end + 1])
 
+    # =====================================================
+    # 3. MOVE THE B-ROLL FOOTAGE ANYWHERE IN THE SCENE
+    #    (it swaps with the footage of the beat at that time)
+    # =====================================================
     else:
         if beat["type"] == "full_screen_animation":
             raise HTTPException(status_code=400, detail="A full_screen_animation has no B-roll footage")
@@ -11376,8 +11391,6 @@ async def move_beat(
         .execute()
 
     return {"success": True, "beat": beat}
-
-
 
 
 
