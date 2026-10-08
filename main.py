@@ -11299,6 +11299,96 @@ async def delete_beat(
 
 
 
+@app.post("/edit/{videoId}/{sceneId}/{beatId}/duplicate")
+async def duplicate_beat(
+    videoId: str,
+    sceneId: int,
+    beatId: str,
+):
+    res = (
+        supabase
+        .table("videos")
+        .select("timeline, timeline_version")
+        .eq("id", videoId)
+        .single()
+        .execute()
+    )
+
+    timeline = res.data["timeline"]
+
+    scene = next(s for s in timeline["scenes"] if s["id"] == sceneId)
+    words = scene["word_timestamps"]
+    directions = scene["directions"]
+
+    position = next(
+        i for i, d in enumerate(directions) if str(d["id"]) == str(beatId)
+    )
+    original = directions[position]
+
+    mid = (original["start_word_index"] + original["end_word_index"] + 1) // 2
+
+    if not (original["start_word_index"] < mid <= original["end_word_index"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Beat is too short to duplicate (needs at least 2 words)",
+        )
+
+    copy_beat = copy.deepcopy(original)
+    copy_beat["id"] = str(uuid.uuid4())
+
+    copy_beat["start_word_index"] = mid
+    original["end_word_index"] = mid - 1
+    copy_beat["start"] = original["end"] = words[mid]["start"]
+
+    for part in [original, copy_beat]:
+        part["text"] = " ".join(
+            w["word"] for w in words[part["start_word_index"]:part["end_word_index"] + 1]
+        )
+
+        if part["type"] == "B-roll+overlay_animation":
+            o_start = max(part["overlay_start_word_index"], part["start_word_index"])
+            o_end = min(part["overlay_end_word_index"], part["end_word_index"])
+
+            if o_start > o_end:
+                o_start, o_end = part["start_word_index"], part["end_word_index"]
+
+            part["overlay_start_word_index"] = o_start
+            part["overlay_end_word_index"] = o_end
+            part["overlay_start"] = words[o_start]["start"]
+            part["overlay_end"] = words[o_end]["end"]
+            part["overlay_text"] = " ".join(
+                w["word"] for w in words[o_start:o_end + 1]
+            )
+
+    directions.insert(position + 1, copy_beat)
+
+    supabase \
+        .table("videos") \
+        .update({
+            "timeline": timeline,
+            "timeline_version": (res.data["timeline_version"] or 1) + 1,
+        }) \
+        .eq("id", videoId) \
+        .execute()
+
+    return {
+        "success": True,
+        "original_beat_id": original["id"],
+        "new_beat_id": copy_beat["id"],
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
