@@ -11190,25 +11190,13 @@ async def split_beat(
 
 
 
-
-
-
-
-
-
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/move")
 async def move_beat(
     videoId: str,
     sceneId: int,
     beatId: str,
-    body: dict,
-    # all keys optional, all in seconds (what the timeline gives after a drag):
-    #   "start" / "end"                -> drag the B-roll / full-screen beat edges
-    #   "overlay_start" / "overlay_end" -> drag the overlay animation inside its beat
+    body: dict,   # {"to_position": 2} (0-based)  OR  {"to_time": 31.5} (seconds, where it was dropped)
 ):
-    if not any(k in body for k in ["start", "end", "overlay_start", "overlay_end"]):
-        raise HTTPException(status_code=400, detail="Nothing to move")
-
     res = (
         supabase
         .table("videos")
@@ -11224,90 +11212,54 @@ async def move_beat(
     words = scene["word_timestamps"]
     directions = scene["directions"]
 
-    position = next(
+    old_position = next(
         i for i, d in enumerate(directions) if str(d["id"]) == str(beatId)
     )
-    beat = directions[position]
-    prev = directions[position - 1] if position > 0 else None
-    nxt = directions[position + 1] if position < len(directions) - 1 else None
 
-    nearest_start = lambda t: min(range(len(words)), key=lambda i: abs(words[i]["start"] - t))
-    nearest_end = lambda t: min(range(len(words)), key=lambda i: abs(words[i]["end"] - t))
-
-    new_start = beat["start_word_index"]
-    boundary = beat["end_word_index"] + 1   
-
-    if "start" in body:
-        if prev is None:
-            raise HTTPException(status_code=400, detail="The first beat's start cannot be moved")
-        new_start = nearest_start(float(body["start"]))
-
-    if "end" in body:
-        if nxt is None:
-            raise HTTPException(status_code=400, detail="The last beat's end cannot be moved")
-        boundary = nearest_start(float(body["end"]))
-
-    if prev and new_start <= prev["start_word_index"]:
-        raise HTTPException(status_code=400, detail="Beat cannot go past the previous beat")
-    if nxt and boundary > nxt["end_word_index"]:
-        raise HTTPException(status_code=400, detail="Beat cannot go past the next beat")
-    if new_start >= boundary:
-        raise HTTPException(status_code=400, detail="Beat must keep at least one word")
-
-    beat["start_word_index"] = new_start
-    beat["end_word_index"] = boundary - 1
-
-    if prev:
-        prev["end_word_index"] = new_start - 1
-        beat["start"] = prev["end"] = words[new_start]["start"]
-    if nxt:
-        nxt["start_word_index"] = boundary
-        beat["end"] = nxt["start"] = words[boundary]["start"]
-
-    if "overlay_start" in body or "overlay_end" in body:
-        if beat["type"] != "B-roll+overlay_animation":
-            raise HTTPException(status_code=400, detail="This beat has no overlay animation")
-
-        o_start = beat["overlay_start_word_index"]
-        o_end = beat["overlay_end_word_index"]
-
-        if "overlay_start" in body:
-            o_start = nearest_start(float(body["overlay_start"]))
-        if "overlay_end" in body:
-            o_end = nearest_end(float(body["overlay_end"]))
-
-        o_start = min(max(o_start, beat["start_word_index"]), beat["end_word_index"])
-        o_end = min(max(o_end, o_start), beat["end_word_index"])
-
-        beat["overlay_start_word_index"] = o_start
-        beat["overlay_end_word_index"] = o_end
-
-    for part in [prev, beat, nxt]:
-        if part is None:
-            continue
-
-        part["text"] = " ".join(
-            w["word"] for w in words[part["start_word_index"]:part["end_word_index"] + 1]
+    if "to_time" in body:
+        drop_time = float(body["to_time"])
+        new_position = next(
+            (i for i, d in enumerate(directions) if d["start"] <= drop_time < d["end"]),
+            len(directions) - 1,
         )
+    elif "to_position" in body:
+        new_position = int(body["to_position"])
+    else:
+        raise HTTPException(status_code=400, detail="Send to_position or to_time")
 
-        if part["type"] == "B-roll+overlay_animation":
-            o_start = max(part["overlay_start_word_index"], part["start_word_index"])
-            o_end = min(part["overlay_end_word_index"], part["end_word_index"])
+    if not 0 <= new_position < len(directions):
+        raise HTTPException(status_code=400, detail="to_position is out of range")
 
-            if o_start > o_end:
-                part["type"] = "B-roll"
-                for key in [
-                    "overlay_start_word_index", "overlay_end_word_index",
-                    "overlay_start", "overlay_end", "overlay_text",
-                    "template_name", "template_props", "template_description",
-                ]:
-                    part.pop(key, None)
-            else:
-                part["overlay_start_word_index"] = o_start
-                part["overlay_end_word_index"] = o_end
-                part["overlay_start"] = words[o_start]["start"]
-                part["overlay_end"] = words[o_end]["end"]
-                part["overlay_text"] = " ".join(
+    if new_position != old_position:
+        slots = [
+            {k: d[k] for k in ["start_word_index", "end_word_index", "start", "end", "text"]}
+            for d in directions
+        ]
+
+        beat = directions.pop(old_position)
+        directions.insert(new_position, beat)
+
+        for d, slot in zip(directions, slots):
+            if d["type"] == "full_screen_animation" and slot["end"] - slot["start"] > 8.0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A full_screen_animation cannot move into a slot longer than 8 seconds",
+                )
+
+            if d["type"] == "B-roll+overlay_animation":
+                overlay_length = d["overlay_end_word_index"] - d["overlay_start_word_index"]
+
+            d.update(slot)
+
+            if d["type"] == "B-roll+overlay_animation":
+                o_start = d["start_word_index"]
+                o_end = min(d["end_word_index"], o_start + overlay_length)
+
+                d["overlay_start_word_index"] = o_start
+                d["overlay_end_word_index"] = o_end
+                d["overlay_start"] = words[o_start]["start"]
+                d["overlay_end"] = words[o_end]["end"]
+                d["overlay_text"] = " ".join(
                     w["word"] for w in words[o_start:o_end + 1]
                 )
 
@@ -11320,7 +11272,13 @@ async def move_beat(
         .eq("id", videoId) \
         .execute()
 
-    return {"success": True, "beat": beat}
+    return {"success": True, "order": [d["id"] for d in directions]}
+
+
+
+
+
+
 
 
 
