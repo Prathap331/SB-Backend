@@ -11070,6 +11070,106 @@ async def split_beat(
 
 
 
+@app.delete("/edit/{videoId}/{sceneId}/{beatId}")
+async def delete_beat(
+    videoId: str,
+    sceneId: int,
+    beatId: str,
+    target: str = "beat",
+):
+    if target not in ["beat", "overlay"]:
+        raise HTTPException(status_code=400, detail="target must be 'beat' or 'overlay'")
+
+    res = (
+        supabase
+        .table("videos")
+        .select("timeline, timeline_version")
+        .eq("id", videoId)
+        .single()
+        .execute()
+    )
+
+    timeline = res.data["timeline"]
+
+    scene = next(s for s in timeline["scenes"] if s["id"] == sceneId)
+    words = scene["word_timestamps"]
+    directions = scene["directions"]
+
+    position = next(
+        i for i, d in enumerate(directions) if str(d["id"]) == str(beatId)
+    )
+    beat = directions[position]
+
+    if target == "overlay":
+        if beat["type"] != "B-roll+overlay_animation":
+            raise HTTPException(
+                status_code=400,
+                detail="Only B-roll+overlay_animation beats have an overlay to delete",
+            )
+
+        beat["type"] = "B-roll"
+        for key in [
+            "overlay_start_word_index", "overlay_end_word_index",
+            "overlay_start", "overlay_end", "overlay_text",
+            "template_name", "template_props", "template_description",
+        ]:
+            beat.pop(key, None)
+
+    else:
+        if len(directions) == 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete the only beat in a scene",
+            )
+
+        if position > 0:
+            neighbour = directions[position - 1]
+            neighbour["end_word_index"] = beat["end_word_index"]
+            neighbour["end"] = beat["end"]
+        else:
+            neighbour = directions[position + 1]
+            neighbour["start_word_index"] = beat["start_word_index"]
+            neighbour["start"] = beat["start"]
+
+        neighbour["text"] = " ".join(
+            w["word"]
+            for w in words[neighbour["start_word_index"]:neighbour["end_word_index"] + 1]
+        )
+
+        directions.pop(position)
+
+    supabase \
+        .table("videos") \
+        .update({
+            "timeline": timeline,
+            "timeline_version": (res.data["timeline_version"] or 1) + 1,
+        }) \
+        .eq("id", videoId) \
+        .execute()
+
+    return {"success": True, "deleted": target, "beat_id": beatId}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
