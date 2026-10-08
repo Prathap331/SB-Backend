@@ -10184,9 +10184,13 @@ def set_selected_media(direction: dict, assets: dict):
 
 
 
+
+
 PEXELS_HEADERS = {
     "Authorization": PEXELS_API_KEY
 }
+
+ALLOWED_VIDEO_RESOLUTIONS = [(1920, 1080), (1280, 720)]
 
 
 def search_pexel_media(keywords: str):
@@ -10239,17 +10243,17 @@ def search_pexel_media(keywords: str):
                 for video in video_response.json().get("videos", [])[:1]:
                     video_files = video.get("video_files", [])
 
-                    video_file = next(
-                        (
-                            f for f in video_files
-                            if (f.get("width") or 0) >= 1280
-                            and (f.get("height") or 0) >= 720
-                        ),
-                        None
-                    )
-
-                    if not video_file and video_files:
-                        video_file = video_files[0]
+                    video_file = None
+                    for w, h in ALLOWED_VIDEO_RESOLUTIONS:
+                        video_file = next(
+                            (
+                                f for f in video_files
+                                if f.get("width") == w and f.get("height") == h
+                            ),
+                            None
+                        )
+                        if video_file:
+                            break
 
                     if video_file:
                         videos.append({
@@ -10269,6 +10273,12 @@ def search_pexel_media(keywords: str):
         "photos": photos,
         "videos": videos
     }
+
+
+
+
+
+
 
 
 
