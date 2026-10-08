@@ -9985,24 +9985,62 @@ async def get_beats_for_scene(scene_text, word_timestamps):
 
 async def get_keywords_for_beat(full_script, beat):
     prompt = f"""
-    You write stock-footage search phrases.
+    You write stock-footage search phrases for the CURRENT BEAT.
 
-    FULL SCRIPT (for context):
+    FULL SCRIPT (primary source for context and theme):
     {full_script}
 
     CURRENT BEAT NARRATION:
     {beat["text"]}
 
-    Write ONE search phrase of 4-6 words to find B-roll footage for the CURRENT BEAT.
-    * First infer the overall theme of the FULL SCRIPT (e.g. health, finance, space).
-    * Use 1-2 theme words + 3-4 specific words about the subject, action, person,
-      place, object or event in this beat.
-    * Every word must be supported by the script. Do not invent details.
-    * Use concrete, visually searchable words. Avoid vague words like
-      "concept", "idea", "impact", "innovation".
-    * The phrase describes the footage, not any overlay graphic.
+    TASK:
+    Write ONE stock-footage search phrase of 4-6 words for the CURRENT BEAT.
 
-    Return ONLY JSON: {{"keywords": "health doctor checking blood pressure"}}
+    RULES:
+    1. Use the FULL SCRIPT as the primary source of truth. Understand its overall
+    theme, subject, historical period, people, places, objects, and context before
+    choosing keywords for the beat.
+
+    2. The CURRENT BEAT determines what specific moment, subject, action, person,
+    place, object, or event should be visually represented.
+
+    3. EVERY keyword phrase must include relevant theme/context words from the FULL
+    SCRIPT. Do not generate keywords using the beat sentence in isolation.
+
+    4. Use 1-2 strong theme/context words + 2-4 specific visual search terms from
+    the beat and script context.
+
+    5. Maintain semantic consistency across beats. If the script is about ancient
+    history, philosophy, Rome, Buddhism, space, finance, medicine, etc., every
+    beat should retain relevant contextual terms when appropriate.
+    Example: for an ancient philosophy script, prefer phrases such as
+    "ancient philosophy Marcus Aurelius" or "ancient Rome philosopher statue"
+    rather than generic phrases like "man thinking".
+
+    6. When relevant, include historically, culturally, geographically, or
+    contextually specific people, civilizations, locations, artifacts, statues,
+    architecture, documents, environments, or objects supported by the FULL
+    SCRIPT.
+
+    7. Prefer concrete, visually searchable stock-footage terms. Describe footage
+    that could realistically exist in a stock-footage library.
+
+    8. Every word must be supported or strongly implied by the FULL SCRIPT.
+    Never invent people, locations, events, objects, or visual details.
+
+    9. Avoid vague or abstract terms such as "concept", "idea", "impact",
+    "innovation", "importance", "meaning", or "story".
+
+    10. Do not describe overlay graphics, animations, text, transitions, camera
+        effects, or editing instructions. Describe ONLY the footage to search for.
+
+    11. Prefer specific searchable combinations over generic descriptions.
+        The phrase should maximize the likelihood of retrieving relevant footage.
+
+    12. Return ONLY valid JSON.
+
+    OUTPUT:
+    {{"keywords": "theme context specific visual footage"}}
     """
 
     try:
@@ -10245,9 +10283,9 @@ def load_templates():
 async def get_template_for_direction(full_script, direction, templates):
     try:
         pick_prompt = f"""
-        Pick the best animation template for the beat below.
+        Pick the ONE best animation template for the beat.
 
-        FULL SCRIPT (for context):
+        FULL SCRIPT (context):
         {full_script}
 
         BEAT NARRATION:
@@ -10259,10 +10297,36 @@ async def get_template_for_direction(full_script, direction, templates):
         AVAILABLE TEMPLATES (name + description):
         {json.dumps(templates, ensure_ascii=False)}
 
-        * Choose ONE template using the descriptions.
-        * Return the template name EXACTLY as written above, character for character.
+        SELECTION RULES:
 
-        Return ONLY JSON: {{"template_name": "<exact template name>"}}
+        - Choose the template that best matches the meaning and visual purpose of the beat.
+        - Prefer the SIMPLEST suitable template that clearly communicates the key idea.
+        - Do not over-visualize simple narration. Text highlights, paragraphs, quotes, chapters,
+        key facts, lists, etc. should use simple templates.
+        - Use data visualization templates only for meaningful data, statistics, comparisons,
+        rankings, trends, percentages, or quantities that benefit from visualization.
+        - Use process/timeline templates only when the narration describes steps, sequence,
+        progression, or transformation.
+        - Use location/map templates only when location or geography is important.
+        - Use travel-path/route templates only when movement between locations is explicitly relevant.
+        - Do not choose a complex template just because it can display the information.
+        - Never invent, assume, or add information required by a template.
+        - Never use a template that could imply unsupported data, relationships, comparisons,
+        sequences, locations, or conclusions.
+        - The animation should support the narration without distracting from the viewer's
+        watching experience.
+        - When multiple templates are suitable, choose the simpler and less distracting one.
+        - Use the full script only for context; select the template primarily for the current beat.
+        - Select ONLY from the available templates and rely on their descriptions.
+
+        FINAL RULE:
+        Clarity + simplicity + semantic fit > visual complexity.
+
+        Return ONLY valid JSON:
+        {{"template_name": "<exact template name>"}}
+
+        Return the template name EXACTLY as written above, character for character.
+
         """
 
         res = await _openai_create_with_timeout(
@@ -10298,9 +10362,9 @@ async def get_template_for_direction(full_script, direction, templates):
         template_props = props_res.data["props"]
 
         fill_prompt = f"""
-        Fill the template props using ONLY the narration.
+        Fill the template props using the SCRIPT as the information source.
 
-        FULL SCRIPT (for context):
+        FULL SCRIPT:
         {full_script}
 
         BEAT NARRATION:
@@ -10319,23 +10383,46 @@ async def get_template_for_direction(full_script, direction, templates):
         {json.dumps(template_props, indent=2)}
 
         RULES:
-        1. Return ONE complete JSON object with EVERY field (and nested field) of
-           PROPS SCHEMA. Never omit a field. Never add new fields.
-        2. Keep every field name, data type, nesting and array structure exactly.
-        3. Fill every text field, array and number with meaningful values drawn
-           from the BEAT NARRATION. Keep text short and display-ready.
-        4. Never invent facts, names, numbers, dates or claims not in the narration.
-        5. Boolean/style/variant/alignment/animation/size fields: keep the schema
-           default if present, otherwise choose a sensible value.
-        6. All URL/media fields (image_url, before_url, after_url, video_url,
-           logo_url, etc.) MUST be "" (media is attached later).
-        7. Background:
-           - B-roll+overlay_animation -> "transparent"
-           - full_screen_animation -> "theme"
-        8. If background is "theme": background_color and background_2_color MUST
-           be valid 6-digit hex colors (e.g. "#1A1A1A", "#2A2A2A").
-           Otherwise both MUST be "". Both fields must always be present.
-        9. Return ONLY valid JSON. No explanation, no markdown.
+
+        1. Return ONE complete JSON object containing EVERY field in the PROPS SCHEMA.
+        Never omit, rename, or add fields.
+
+        2. Keep the exact field names, data types, nesting and array structure of the schema.
+
+        3. Use the FULL SCRIPT to select relevant information for the template.
+        The BEAT NARRATION defines the current visual context, while the SCRIPT provides
+        supporting facts, examples, names, numbers, locations, comparisons, or other
+        relevant information needed to make the template meaningful.
+
+        4. Do NOT simply copy the BEAT NARRATION into the props. Select concise,
+        display-ready information from the script that complements the narration and
+        makes sense when viewed on screen alongside the voiceover.
+
+        5. Only use information explicitly supported by the FULL SCRIPT. Never invent,
+        assume, complete, or modify facts, names, numbers, dates or claims.
+
+        6. Keep all text concise and suitable for on-screen display. Avoid unnecessary
+        information that could distract from the narration.
+
+        7. Fill every field with meaningful values where applicable. For boolean, style,
+        variant, alignment, animation and size fields, use the schema default when
+        available; otherwise choose a sensible value.
+
+        8. All URL/media fields (image_url, before_url, after_url, video_url, logo_url,
+        etc.) MUST be "".
+
+        9. Background:
+        - B-roll+overlay_animation -> "transparent"
+        - full_screen_animation -> "theme"
+
+        10. If background is "theme", background_color and background_2_color MUST be
+            valid 6-digit hex colors. Otherwise both MUST be "".
+            Both fields must always be present.
+
+        11. The final props should create a visual that is relevant to the narration,
+            factually consistent with the script, and easy for the viewer to understand.
+
+        Return ONLY valid JSON. No explanation or markdown.
         """
 
         res = await _openai_create_with_timeout(
@@ -10814,6 +10901,12 @@ async def edit_beat_template_color(
 
 
 
+
+
+
+
+
+
 class AddBeatMediaRequest(BaseModel):
     media_id: int
     media_type: str
@@ -10979,12 +11072,20 @@ async def add_beat_media(
 
 
 
+
+
+
+
+
+
+
+
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/split")
 async def split_beat(
     videoId: str,
     sceneId: int,
     beatId: str,
-    body: dict,   # {"split_word_index": 50} OR {"split_time": 17.3} (seconds, e.g. where the user drags the playhead)
+    body: dict,
 ):
     res = (
         supabase
