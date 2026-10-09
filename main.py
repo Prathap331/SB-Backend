@@ -1144,6 +1144,12 @@ Avoid:
 Creativity:
 - Be imaginative while remaining grounded in the provided evidence.
 
+## Output Language — Strict Rule
+- Always generate the entire output in plain English only, regardless of the language requested by the user or the language of the retrieved knowledge chunks.
+- Even if the user explicitly requests video ideas in Telugu, Hindi, or any other language, the titles, descriptions, topic category, and topic summary must all be written in English only.
+- Never generate output in any other language or mix languages.
+
+
 ## Output
 
 ### Output 1 — Video Ideas
