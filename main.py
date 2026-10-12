@@ -11542,7 +11542,6 @@ async def custom_text(
 async def update_custom_text(
     videoId: str,
     sceneId: int,
-    beatId: int,
     text_id: str,
     body: dict
 ):
@@ -11594,7 +11593,6 @@ async def update_custom_text(
 async def delete_custom_text(
     videoId: str,
     sceneId: int,
-    beatId: int,
     text_id: str
 ):
     res = (
