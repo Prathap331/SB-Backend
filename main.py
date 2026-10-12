@@ -11479,9 +11479,9 @@ async def duplicate_beat(
 async def duplicate_beat(
     videoId: str,
     sceneId: int,
+    beatId: int,
     body: dict
 ):
-
     res = (
         supabase
         .table("videos")
@@ -11492,40 +11492,33 @@ async def duplicate_beat(
     )
 
     timeline = res.data["timeline"]
-    
-    for scene in timeline:
-        if scene["id"] == sceneId:
-            custom_text = scene.get("scene.get") or []
-            body["text_id"] = uuid.uuid4().hex 
-            custom_text.append(body)
-            scene["custom_text"] = custom_text
-        else:
-            raise HTTPException(status_code=404, detail="Scene not found")    
-            
-    supabase \
-        .table("videos") \
-        .update({
-            "timeline": timeline,
-            "timeline_version": (res.data["timeline_version"] or 1) + 1,
-        }) \
-        .eq("id", videoId) \
-        .execute()
 
+    scenes = timeline if isinstance(timeline, list) else timeline.get("scenes", [])
+
+    for scene in scenes:
+        if scene.get("id") == sceneId:
+            custom_text = scene.get("custom_text", [])
+
+            body["text_id"] = uuid.uuid4().hex
+            custom_text.append(body)
+
+            scene["custom_text"] = custom_text
+            break
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail="Scene not found"
+        )
+
+    supabase.table("videos").update({
+        "timeline": timeline,
+        "timeline_version": (res.data["timeline_version"] or 1) + 1,
+    }).eq("id", videoId).execute()
 
     return {
         "success": True,
-        "custom_text" : custom_text
+        "custom_text": custom_text
     }
-
-
-
-
-
-
-
-
-
-
 
 
 
