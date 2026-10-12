@@ -11475,8 +11475,9 @@ async def duplicate_beat(
 
 
 
+
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/custom-text")
-async def duplicate_beat(
+async def custom_text(
     videoId: str,
     sceneId: int,
     body: dict
@@ -11518,6 +11519,14 @@ async def duplicate_beat(
         "success": True,
         "custom_text": custom_text
     }
+
+
+
+
+
+
+
+
 
 
 
