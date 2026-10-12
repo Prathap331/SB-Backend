@@ -11538,7 +11538,106 @@ async def custom_text(
 
 
 
+@app.put("/edit/{videoId}/{sceneId}/{beatId}/custom-text/{text_id}")
+async def update_custom_text(
+    videoId: str,
+    sceneId: int,
+    beatId: int,
+    text_id: str,
+    body: dict
+):
+    res = (
+        supabase
+        .table("videos")
+        .select("timeline, timeline_version")
+        .eq("id", videoId)
+        .single()
+        .execute()
+    )
 
+    timeline = res.data["timeline"]
+    scenes = timeline if isinstance(timeline, list) else timeline.get("scenes", [])
+
+    for scene in scenes:
+        if scene.get("id") == sceneId:
+            custom_text = scene.get("custom_text", [])
+
+            for item in custom_text:
+                if item.get("text_id") == text_id:
+                    item.update(body)
+
+                    supabase.table("videos").update({
+                        "timeline": timeline,
+                        "timeline_version": (res.data["timeline_version"] or 1) + 1,
+                    }).eq("id", videoId).execute()
+
+                    return {
+                        "success": True,
+                        "custom_text": item
+                    }
+
+            raise HTTPException(
+                status_code=404,
+                detail="Custom text not found"
+            )
+
+    raise HTTPException(
+        status_code=404,
+        detail="Scene not found"
+    )
+
+
+
+
+
+@app.delete("/edit/{videoId}/{sceneId}/{beatId}/custom-text/{text_id}")
+async def delete_custom_text(
+    videoId: str,
+    sceneId: int,
+    beatId: int,
+    text_id: str
+):
+    res = (
+        supabase
+        .table("videos")
+        .select("timeline, timeline_version")
+        .eq("id", videoId)
+        .single()
+        .execute()
+    )
+
+    timeline = res.data["timeline"]
+    scenes = timeline if isinstance(timeline, list) else timeline.get("scenes", [])
+
+    for scene in scenes:
+        if scene.get("id") == sceneId:
+            custom_text = scene.get("custom_text", [])
+
+            for i, item in enumerate(custom_text):
+                if item.get("text_id") == text_id:
+                    deleted_text = custom_text.pop(i)
+
+                    scene["custom_text"] = custom_text
+
+                    supabase.table("videos").update({
+                        "timeline": timeline,
+                        "timeline_version": (res.data["timeline_version"] or 1) + 1,
+                    }).eq("id", videoId).execute()
+
+                    return {
+                        "success": True,
+                        "deleted_custom_text": deleted_text
+                    }
+
+            raise HTTPException(
+                status_code=404,
+                detail="Custom text not found"
+            )
+
+    raise HTTPException(
+        status_code=404,
+        detail="Scene not found"
+    )
 
 
 
