@@ -1149,7 +1149,6 @@ Creativity:
 - Even if the user explicitly requests video ideas in Telugu, Hindi, or any other language, the titles, descriptions, topic category, and topic summary must all be written in English only.
 - Never generate output in any other language or mix languages.
 
-
 ## Output
 
 ### Output 1 — Video Ideas
@@ -10191,7 +10190,6 @@ def set_selected_media(direction: dict, assets: dict):
 
 
 
-
 PEXELS_HEADERS = {
     "Authorization": PEXELS_API_KEY
 }
@@ -10279,12 +10277,6 @@ def search_pexel_media(keywords: str):
         "photos": photos,
         "videos": videos
     }
-
-
-
-
-
-
 
 
 
@@ -10462,6 +10454,69 @@ async def get_template_for_direction(full_script, direction, templates):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class Editvideo(BaseModel):
     userId: str
     script: str
@@ -10479,7 +10534,6 @@ async def edit_video(body: Editvideo):
         return await _edit_video_impl(body)
     finally:
         await _flush_token_usage()
-
 
 
 async def _edit_video_impl(body: Editvideo):
@@ -10685,137 +10739,6 @@ async def _edit_video_impl(body: Editvideo):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/text")
 async def edit_beat_template_text(
     videoId: str,
@@ -10902,18 +10825,6 @@ async def edit_beat_template_color(
         .execute()
 
     return {"success": True}
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -11083,19 +10994,6 @@ async def add_beat_media(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 @app.post("/edit/{videoId}/{sceneId}/{beatId}/split")
 async def split_beat(
     videoId: str,
@@ -11123,7 +11021,6 @@ async def split_beat(
     )
     first = directions[position]
     if "split_time" in body:
-        # timeline drag: snap the time to the nearest word start
         split_time = float(body["split_time"])
         split = min(range(len(words)), key=lambda i: abs(words[i]["start"] - split_time))
     else:
@@ -11136,11 +11033,9 @@ async def split_beat(
                    f"{first['start_word_index'] + 1} and {first['end_word_index']}",
         )
  
-    # second part = copy of the beat
     second = copy.deepcopy(first)
     second["id"] = str(uuid.uuid4())
  
-    # indices + times + text
     second["start_word_index"] = split
     first["end_word_index"] = split - 1
     second["start"] = first["end"] = words[split]["start"]
@@ -11150,7 +11045,6 @@ async def split_beat(
             w["word"] for w in words[part["start_word_index"]:part["end_word_index"] + 1]
         )
  
-        # keep the overlay inside this part, or turn it into plain B-roll
         if part["type"] == "B-roll+overlay_animation":
             o_start = max(part["overlay_start_word_index"], part["start_word_index"])
             o_end = min(part["overlay_end_word_index"], part["end_word_index"])
@@ -11581,6 +11475,47 @@ async def duplicate_beat(
 
 
 
+@app.post("/edit/{videoId}/{sceneId}/{beatId}/custom-text")
+async def duplicate_beat(
+    videoId: str,
+    sceneId: int,
+    body: dict
+):
+
+    res = (
+        supabase
+        .table("videos")
+        .select("timeline, timeline_version")
+        .eq("id", videoId)
+        .single()
+        .execute()
+    )
+
+    timeline = res.data["timeline"]
+    
+    for scene in timeline:
+        if scene["id"] == sceneId:
+            custom_text = scene.get("scene.get") or []
+            body["text_id"] = uuid.uuid4().hex 
+            custom_text.append(body)
+            scene["custom_text"] = custom_text
+        else:
+            raise HTTPException(status_code=404, detail="Scene not found")    
+            
+    supabase \
+        .table("videos") \
+        .update({
+            "timeline": timeline,
+            "timeline_version": (res.data["timeline_version"] or 1) + 1,
+        }) \
+        .eq("id", videoId) \
+        .execute()
+
+
+    return {
+        "success": True,
+        "custom_text" : custom_text
+    }
 
 
 
@@ -11591,6 +11526,119 @@ async def duplicate_beat(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# async def generate_india_language_audio(userId,scene_text,langCode):
+#     print("indian lang audio")
+#     url = "https://api.sarvam.ai/text-to-speech"
+#     headers = {
+#     "api-subscription-key": os.getenv("SARVAM_API_KEY"),
+#     "Content-Type": "application/json"
+#     }
+
+#     payload = {
+#     "inputs": scene_text,
+#     "target_language_code": f"{langCode}-IN",
+#     "speaker": "meera",             
+#     "pitch": 0,
+#     "pace": 1.0,
+#     "loudness": 1.0,
+#     "audio_format": "mp3"         
+#     }
+#     response = requests.post(url, json=payload, headers=headers)
+
+
+
+
+
+
+
+
+
+
+
+#         if body.langCode != "en":
+#             print("not english langcode")
+
+#             INDIAN_REGIONAL_LANGUAGES_CODE = [    
+#                 "as",  # Assamese
+#                 "bn",  # Bengali
+#                 "gu",  # Gujarati
+#                 "hi",  # Hindi
+#                 "kn",  # Kannada
+#                 "ml",  # Malayalam
+#                 "mr",  # Marathi
+#                 "or",  # Odia (not in your list)
+#                 "pa",  # Punjabi
+#                 "ta",  # Tamil
+#                 "te",  # Telugu
+#                 "ur",  # Urdu
+#             ]
+
+
+#             if body.langCode in INDIAN_REGIONAL_LANGUAGES_CODE:
+#                 print("generating voice in indian lang")
+
+#                 for scene in scenes:
+#                     generate_india_language_audio(userId=body.userId,scene_text=scene["script"],langCode=body.langCode)
 
 
 
@@ -11612,7 +11660,6 @@ RENDER_QUEUE_POLL_SECONDS = int(os.getenv("RENDER_QUEUE_POLL_SECONDS", "5"))
 RENDER_QUEUE_HTTP_TIMEOUT = float(os.getenv("RENDER_QUEUE_HTTP_TIMEOUT", "3600"))
 RENDER_RECOVERY_WAIT_SECONDS = int(os.getenv("RENDER_RECOVERY_WAIT_SECONDS", "900"))
 RENDER_RECOVERY_POLL_SECONDS = int(os.getenv("RENDER_RECOVERY_POLL_SECONDS", "10"))
-# Set to "false" on every instance except one
 RUN_RENDER_WORKER = os.getenv("RUN_RENDER_WORKER", "true").lower() == "true"
 
 
@@ -11624,10 +11671,6 @@ def _format_error(e: Exception) -> str:
     msg = str(e).strip()
     return f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__} (no message)"
 
-
-# ------------------------------------------------------------
-# API
-# ------------------------------------------------------------
 
 class RenderQueueRequest(BaseModel):
     video_id: str
