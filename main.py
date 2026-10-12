@@ -11479,7 +11479,6 @@ async def duplicate_beat(
 async def duplicate_beat(
     videoId: str,
     sceneId: int,
-    beatId: int,
     body: dict
 ):
     res = (
