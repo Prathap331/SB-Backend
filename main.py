@@ -9636,6 +9636,14 @@ async def scene_breakdown(script):
     script's content and narrative flow, while respecting a strict maximum
     scene length.
 
+
+    INDIAN LANGUAGE MAXIMUM LENGTH (HIGHEST PRIORITY):
+    - If the script is written in an Indian language (Telugu, Hindi, Tamil,
+      Kannada, Malayalam, Bengali, Marathi, Gujarati, Punjabi, Odia, Assamese,
+      Urdu), then EVERY scene must be LESS than 450 characters long.
+    - Count characters, not words. Spaces and punctuation count.
+    - Only end a scene at the end of a sentence.
+
     NARRATION SPEED:
     - The narration is spoken at 160 words per minute.
     - 1 minute = 160 words, 2 minutes = 300 words.
