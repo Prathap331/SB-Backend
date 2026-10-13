@@ -33,6 +33,11 @@ import tempfile
 import uuid
 import copy
 from fishaudio.types import ReferenceAudio
+import torch
+import torchaudio
+from transformers import AutoProcessor, Wav2Vec2ForCTC
+
+
 
 
 
@@ -10044,6 +10049,9 @@ async def get_keywords_for_beat(full_script, beat):
 
     12. Return ONLY valid JSON.
 
+    13. Always write the search phrase in English, even if the script and
+        narration are in another language.
+
     OUTPUT:
     {{"keywords": "theme context specific visual footage"}}
     """
@@ -10067,9 +10075,13 @@ async def get_keywords_for_beat(full_script, beat):
         return ""
 
 
-async def add_directions_for_scene(full_script, scene_text, word_timestamps):
+
+async def add_directions_for_scene(full_script, scene_text, word_timestamps, regional=False):
     try:
-        beats = await get_beats_for_scene(scene_text, word_timestamps)
+        if regional:
+            beats = await get_beats_for_scene_chunks(scene_text, word_timestamps)
+        else:
+            beats = await get_beats_for_scene(scene_text, word_timestamps)
     except Exception as e:
         print(f"[Beats] failed: {e}")
         return e
@@ -10454,6 +10466,140 @@ async def get_template_for_direction(full_script, direction, templates):
 
 
 
+from pydub import AudioSegment
+
+SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
+SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
+SARVAM_CHUNK_SECONDS = 28  
+
+
+def _sarvam_stt_chunk(audio_bytes: bytes, lang_code: str, api_key: str) -> dict:
+    response = requests.post(
+        SARVAM_STT_URL,
+        headers={"api-subscription-key": api_key},
+        files={"file": ("chunk.mp3", audio_bytes, "audio/mpeg")},
+        data={
+            "model": SARVAM_STT_MODEL,
+            "mode": "transcribe",
+            "language_code": f"{lang_code}-IN",
+            "with_timestamps": "true",
+        },
+        timeout=120,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Sarvam STT error {response.status_code}: {response.text}"
+        )
+
+    return response.json().get("timestamps") or {}
+
+
+def get_sarvam_caption_timestamps(audio_bytes: bytes, scene_text: str, lang_code: str):
+
+    if not scene_text.strip():
+        return []
+
+    api_key = os.getenv("SARVAM_API_KEY")
+    if not api_key:
+        raise ValueError("SARVAM_API_KEY is not configured")
+
+    audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+    chunk_ms = SARVAM_CHUNK_SECONDS * 1000
+
+    captions = []
+
+    for offset_ms in range(0, len(audio), chunk_ms):
+        piece = audio[offset_ms:offset_ms + chunk_ms]
+
+        buf = io.BytesIO()
+        piece.export(buf, format="mp3")
+
+        ts = _sarvam_stt_chunk(buf.getvalue(), lang_code, api_key)
+
+        texts = ts.get("words") or []
+        starts = ts.get("start_time_seconds") or []
+        ends = ts.get("end_time_seconds") or []
+        offset = offset_ms / 1000
+
+        for text, start, end in zip(texts, starts, ends):
+            if not text or not text.strip():
+                continue
+            captions.append({
+                "word": text.strip(),
+                "start": round(start + offset, 3),
+                "end": round(end + offset, 3),
+            })
+
+    return captions
+
+
+
+
+
+INDIAN_REGIONAL_LANGUAGES_CODE = [
+    "as", "bn", "gu", "hi", "kn", "ml",
+    "mr", "or", "pa", "ta", "te", "ur",
+]
+async def get_beats_for_scene_chunks(scene_text, chunks):
+    last = len(chunks) - 1
+
+    numbered = [
+        {"i": i, "text": c["word"], "start": c["start"], "end": c["end"]}
+        for i, c in enumerate(chunks)
+    ]
+
+    prompt = f"""
+    You are a documentary video director.
+
+    Group the caption chunks below into visual beats. Each beat uses
+    one or more CONSECUTIVE chunks. Choose one type for each beat:
+    - B-roll (default, most beats)
+    - B-roll+overlay_animation (beat has a number, name, date or key fact)
+    - full_screen_animation (diagram, process, comparison; use rarely,
+      and only if the beat is 8 seconds or shorter)
+
+    RULES:
+    - Use only chunk indices 0 to {last}.
+    - Every chunk belongs to exactly one beat, in order, no gaps or overlaps.
+    - First beat starts at 0, last beat ends at {last}.
+    - Do not return text, only indices.
+    - For B-roll+overlay_animation, also give overlay_start_word_index and
+      overlay_end_word_index (inside the beat's range).
+
+    Return ONLY a JSON array like:
+    [
+      {{"type": "B-roll", "start_word_index": 0, "end_word_index": 1}},
+      {{"type": "B-roll+overlay_animation", "start_word_index": 2, "end_word_index": 3,
+        "overlay_start_word_index": 3, "overlay_end_word_index": 3}},
+      {{"type": "full_screen_animation", "start_word_index": 4, "end_word_index": 4}}
+    ]
+
+    SCENE:
+    {scene_text}
+
+    CHUNKS:
+    {json.dumps(numbered, ensure_ascii=False)}
+    """
+
+    res = await _openai_create_with_timeout(
+        lambda: openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+    )
+    _record_token_usage("beat_breakdown_chunks", res)
+
+    beats = json.loads(res.choices[0].message.content.strip())
+
+    # add the text for each beat from the chunks
+    for beat in beats:
+        s = beat["start_word_index"]
+        e = beat["end_word_index"]
+        beat["text"] = " ".join(c["word"] for c in chunks[s:e + 1])
+
+    return beats
 
 
 
@@ -10461,54 +10607,83 @@ async def get_template_for_direction(full_script, direction, templates):
 
 
 
+async def generate_india_language_audio(userId, scene_text, langCode):
+    try:
+        print("Generating Indian language audio using Sarvam AI")
 
+        url = "https://api.sarvam.ai/text-to-speech"
 
+        api_key = os.getenv("SARVAM_API_KEY")
+        if not api_key:
+            raise ValueError("SARVAM_API_KEY is not configured")
 
+        headers = {
+            "api-subscription-key": api_key,
+            "Content-Type": "application/json",
+        }
 
+        payload = {
+            "inputs": [scene_text],
+            "target_language_code": f"{langCode}-IN",
+            "speaker": "meera",
+            "pitch": 0,
+            "pace": 1.0,
+            "loudness": 1.0,
+            "speech_sample_rate": 22050,
+            "output_audio_codec": "mp3",
+        }
 
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=120,
+        )
 
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Sarvam API error {response.status_code}: {response.text}"
+            )
 
+        result = response.json()
 
+        audio_bytes = base64.b64decode(result["audios"][0])
 
+        if not audio_bytes:
+            raise ValueError("Sarvam returned empty audio")
 
+        audio_id = str(uuid.uuid4())
+        path = f"{userId}/{audio_id}.mp3"
 
+        supabase.storage.from_("generated-audio").upload(
+            path,
+            audio_bytes,
+            {"content-type": "audio/mpeg"},
+        )
 
+        audio_url = supabase.storage.from_(
+            "generated-audio"
+        ).get_public_url(path)
 
+        print("Sarvam audio saved to Supabase")
+        print("Getting caption timestamps from Sarvam STT")
 
+        word_timestamps = get_sarvam_caption_timestamps(
+            audio_bytes=audio_bytes,
+            scene_text=scene_text,
+            lang_code=langCode,
+        )
 
+        print(f"Generated {len(word_timestamps)} caption timestamps")
 
+        return {
+            "audio_url": audio_url,
+            "word_timestamps": word_timestamps,
+        }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    except Exception as e:
+        print(f"Sarvam audio generation failed: {e}")
+        raise
 
 
 
@@ -10536,17 +10711,37 @@ async def edit_video(body: Editvideo):
         await _flush_token_usage()
 
 
+
 async def _edit_video_impl(body: Editvideo):
     try:
         print("Breaking down of script into scenes")
 
         scenes = await scene_breakdown(body.script)
 
+        is_regional = body.langCode in INDIAN_REGIONAL_LANGUAGES_CODE
+
+        if is_regional:
+            print("generating voice in indian lang")
+
+            for scene in scenes:
+                result = await generate_india_language_audio(
+                    userId=body.userId,
+                    scene_text=scene["script"],
+                    langCode=body.langCode,
+                )
+
+                scene["audio_url"] = result["audio_url"]
+                scene["word_timestamps"] = result["word_timestamps"]
+                scene["duration"] = (
+                    result["word_timestamps"][-1]["end"]
+                    if result["word_timestamps"] else 0
+                )
+
         voice_id = body.voice
         reference_audio = None
         reference_text = None
 
-        if body.voice == "user":
+        if not is_regional and body.voice == "user":
             print("voice is 'user', fetching user's en audio from user_profiles")
 
             profile_res = (
@@ -10600,6 +10795,9 @@ async def _edit_video_impl(body: Editvideo):
         print("generating audio for scenes")
 
         for scene in scenes:
+            if scene.get("audio_url"):
+                continue
+
             audio_url = await generate_audio_for_scene(
                 scene_text=scene["script"],
                 modelId=voice_id,
@@ -10610,17 +10808,18 @@ async def _edit_video_impl(body: Editvideo):
 
             scene["audio_url"] = audio_url
 
-        print("generating word level timestamps for scenes")
-
-        scenes = await get_word_level_time_stamps(scenes)
+        if not is_regional:
+            print("generating word level timestamps for scenes")
+            scenes = await get_word_level_time_stamps(scenes)
 
         print("generating directions for scenes")
 
         for scene in scenes:
             directions = await add_directions_for_scene(
-                body.script,              
+                body.script,
                 scene["script"],
-                scene["word_timestamps"]
+                scene["word_timestamps"],
+                regional=is_regional,
             )
 
             if not isinstance(directions, list):
@@ -10640,7 +10839,7 @@ async def _edit_video_impl(body: Editvideo):
 
         print("fetching media and templates for directions")
 
-        templates = load_templates()  
+        templates = load_templates()
 
         for scene in scenes:
             for direction in scene["directions"]:
@@ -10732,6 +10931,80 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
