@@ -10718,6 +10718,8 @@ async def _edit_video_impl(body: Editvideo):
 
         scenes = await scene_breakdown(body.script)
 
+        print(scenes)
+
         is_regional = body.langCode in INDIAN_REGIONAL_LANGUAGES_CODE
 
         if is_regional:
@@ -11261,6 +11263,12 @@ async def add_beat_media(
         "selected_media_type": body.media_type,
         "media": new_media,
     }
+
+
+
+
+
+
 
 
 
