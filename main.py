@@ -11957,64 +11957,6 @@ async def delete_custom_text(
 
 
 
-# async def generate_india_language_audio(userId,scene_text,langCode):
-#     print("indian lang audio")
-#     url = "https://api.sarvam.ai/text-to-speech"
-#     headers = {
-#     "api-subscription-key": os.getenv("SARVAM_API_KEY"),
-#     "Content-Type": "application/json"
-#     }
-
-#     payload = {
-#     "inputs": scene_text,
-#     "target_language_code": f"{langCode}-IN",
-#     "speaker": "meera",             
-#     "pitch": 0,
-#     "pace": 1.0,
-#     "loudness": 1.0,
-#     "audio_format": "mp3"         
-#     }
-#     response = requests.post(url, json=payload, headers=headers)
-
-
-
-
-
-
-
-
-
-
-
-#         if body.langCode != "en":
-#             print("not english langcode")
-
-#             INDIAN_REGIONAL_LANGUAGES_CODE = [    
-#                 "as",  # Assamese
-#                 "bn",  # Bengali
-#                 "gu",  # Gujarati
-#                 "hi",  # Hindi
-#                 "kn",  # Kannada
-#                 "ml",  # Malayalam
-#                 "mr",  # Marathi
-#                 "or",  # Odia (not in your list)
-#                 "pa",  # Punjabi
-#                 "ta",  # Tamil
-#                 "te",  # Telugu
-#                 "ur",  # Urdu
-#             ]
-
-
-#             if body.langCode in INDIAN_REGIONAL_LANGUAGES_CODE:
-#                 print("generating voice in indian lang")
-
-#                 for scene in scenes:
-#                     generate_india_language_audio(userId=body.userId,scene_text=scene["script"],langCode=body.langCode)
-
-
-
-
-
 
 
 
