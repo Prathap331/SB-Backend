@@ -10699,6 +10699,52 @@ async def generate_india_language_audio(userId, scene_text, langCode):
 
 
 
+import re
+
+SARVAM_MAX_CHARS = 450 
+
+def split_scenes_for_sarvam(scenes, max_chars=SARVAM_MAX_CHARS):
+    pieces = []
+
+    for scene in scenes:
+        text = scene["script"].strip()
+        sentences = re.split(r"(?<=[.?!।])\s+", text)
+
+        current = ""
+
+        for sentence in sentences:
+            while len(sentence) > max_chars:
+                cut = sentence.rfind(" ", 0, max_chars)
+                if cut == -1:
+                    cut = max_chars
+                if current:
+                    pieces.append(current)
+                    current = ""
+                pieces.append(sentence[:cut].strip())
+                sentence = sentence[cut:].strip()
+
+            if not sentence:
+                continue
+
+            if current and len(current) + 1 + len(sentence) > max_chars:
+                pieces.append(current)
+                current = sentence
+            else:
+                current = f"{current} {sentence}".strip()
+
+        if current:
+            pieces.append(current)
+
+    new_scenes = [{"id": i + 1, "script": p} for i, p in enumerate(pieces)]
+
+    before = "".join("".join(s["script"].split()) for s in scenes)
+    after = "".join("".join(s["script"].split()) for s in new_scenes)
+    if before != after:
+        raise ValueError("Scene split changed the script text")
+
+    return new_scenes
+
+
 
 class Editvideo(BaseModel):
     userId: str
@@ -10726,9 +10772,12 @@ async def _edit_video_impl(body: Editvideo):
 
         scenes = await scene_breakdown(body.script)
 
-        print(scenes)
-
         is_regional = body.langCode in INDIAN_REGIONAL_LANGUAGES_CODE
+
+        if is_regional:
+            scenes = split_scenes_for_sarvam(scenes)
+
+        print(scenes)
 
         if is_regional:
             print("generating voice in indian lang")
