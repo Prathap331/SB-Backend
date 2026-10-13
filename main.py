@@ -10625,7 +10625,7 @@ async def generate_india_language_audio(userId, scene_text, langCode):
         payload = {
             "inputs": [scene_text],
             "target_language_code": f"{langCode}-IN",
-            "speaker": "meera",
+            "speaker": "rahul",
             "pitch": 0,
             "pace": 1.0,
             "loudness": 1.0,
