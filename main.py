@@ -10450,6 +10450,15 @@ async def get_template_for_direction(full_script, direction, templates):
         11. The final props should create a visual that is relevant to the narration,
             factually consistent with the script, and easy for the viewer to understand.
 
+        12. LANGUAGE: Write every human-readable text value (titles, labels, captions,
+            list items, quotes, descriptions, etc.) in the SAME language and script as
+            the FULL SCRIPT / BEAT NARRATION. If the script is Telugu, Hindi, Tamil, etc.,
+            the props text must be in that language and its native script. Do NOT
+            translate to English and do NOT transliterate into Latin letters.
+            Only keep these unchanged and in English: field names, schema keys,
+            enum/style/variant/alignment values, hex colors, and numbers.
+            If the script is in English, write the props in English.
+
         Return ONLY valid JSON. No explanation or markdown.
         """
 
@@ -10540,8 +10549,6 @@ def get_sarvam_caption_timestamps(audio_bytes: bytes, scene_text: str, lang_code
             })
 
     return captions
-
-
 
 
 
