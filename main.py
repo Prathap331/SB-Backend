@@ -10453,7 +10453,7 @@ async def get_template_for_direction(full_script, direction, templates):
         12. LANGUAGE: Write every human-readable text value (titles, labels, captions,
             list items, quotes, descriptions, etc.) in the SAME language and script as
             the FULL SCRIPT / BEAT NARRATION. If the script is Telugu, Hindi, Tamil, etc.,
-            the props text must be in that language and its native script. Do NOT
+            the props text must bewife in that language and its native script. Do NOT
             translate to English and do NOT transliterate into Latin letters.
             Only keep these unchanged and in English: field names, schema keys,
             enum/style/variant/alignment values, hex colors, and numbers.
@@ -10512,6 +10512,41 @@ def _sarvam_stt_chunk(audio_bytes: bytes, lang_code: str, api_key: str) -> dict:
     return response.json().get("timestamps") or {}
 
 
+PAUSE_PUNCT = ".,?!।;:"
+
+def _split_chunk_into_words(text: str, start: float, end: float):
+    words = text.split()
+    if not words:
+        return []
+
+    if len(words) == 1:
+        return [{"word": words[0], "start": round(start, 3), "end": round(end, 3)}]
+
+    weights = []
+    for w in words:
+        weight = len(w)
+        if w[-1] in PAUSE_PUNCT:
+            weight += 2
+        weights.append(weight)
+
+    total = sum(weights)
+    duration = max(end - start, 0)
+    cursor = start
+    result = []
+
+    for w, weight in zip(words, weights):
+        w_end = cursor + duration * weight / total
+        result.append({
+            "word": w,
+            "start": round(cursor, 3),
+            "end": round(w_end, 3),
+        })
+        cursor = w_end
+
+    result[-1]["end"] = round(end, 3)  
+    return result
+
+
 def get_sarvam_caption_timestamps(audio_bytes: bytes, scene_text: str, lang_code: str):
 
     if not scene_text.strip():
@@ -10542,14 +10577,11 @@ def get_sarvam_caption_timestamps(audio_bytes: bytes, scene_text: str, lang_code
         for text, start, end in zip(texts, starts, ends):
             if not text or not text.strip():
                 continue
-            captions.append({
-                "word": text.strip(),
-                "start": round(start + offset, 3),
-                "end": round(end + offset, 3),
-            })
+            captions.extend(
+                _split_chunk_into_words(text.strip(), start + offset, end + offset)
+            )
 
     return captions
-
 
 
 INDIAN_REGIONAL_LANGUAGES_CODE = [
