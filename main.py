@@ -10588,6 +10588,7 @@ INDIAN_REGIONAL_LANGUAGES_CODE = [
     "as", "bn", "gu", "hi", "kn", "ml",
     "mr", "or", "pa", "ta", "te", "ur",
 ]
+
 async def get_beats_for_scene_chunks(scene_text, chunks):
     last = len(chunks) - 1
 
@@ -10599,33 +10600,37 @@ async def get_beats_for_scene_chunks(scene_text, chunks):
     prompt = f"""
     You are a documentary video director.
 
-    Group the caption chunks below into visual beats. Each beat uses
-    one or more CONSECUTIVE chunks. Choose one type for each beat:
+    Group the words below into visual beats. Each beat uses
+    one or more CONSECUTIVE words. Choose one type for each beat:
     - B-roll (default, most beats)
     - B-roll+overlay_animation (beat has a number, name, date or key fact)
     - full_screen_animation (diagram, process, comparison; use rarely,
       and only if the beat is 8 seconds or shorter)
 
     RULES:
-    - Use only chunk indices 0 to {last}.
-    - Every chunk belongs to exactly one beat, in order, no gaps or overlaps.
+    - Use only word indices 0 to {last}.
+    - Every word belongs to exactly one beat, in order, no gaps or overlaps.
     - First beat starts at 0, last beat ends at {last}.
     - Do not return text, only indices.
     - For B-roll+overlay_animation, also give overlay_start_word_index and
       overlay_end_word_index (inside the beat's range).
+    - Target roughly 8-15 seconds per beat; prefer ending beats at sentence endings.
+    - Each full_screen_animation beat MUST be 8 seconds or shorter
+      (end time of last word - start time of first word).
+    - For B-roll+overlay_animation, the overlay range should be roughly 3-8 seconds.
 
     Return ONLY a JSON array like:
     [
-      {{"type": "B-roll", "start_word_index": 0, "end_word_index": 1}},
-      {{"type": "B-roll+overlay_animation", "start_word_index": 2, "end_word_index": 3,
-        "overlay_start_word_index": 3, "overlay_end_word_index": 3}},
-      {{"type": "full_screen_animation", "start_word_index": 4, "end_word_index": 4}}
+      {{"type": "B-roll", "start_word_index": 0, "end_word_index": 12}},
+      {{"type": "B-roll+overlay_animation", "start_word_index": 13, "end_word_index": 25,
+        "overlay_start_word_index": 16, "overlay_end_word_index": 22}},
+      {{"type": "full_screen_animation", "start_word_index": 26, "end_word_index": 42}}
     ]
 
     SCENE:
     {scene_text}
 
-    CHUNKS:
+    WORDS:
     {json.dumps(numbered, ensure_ascii=False)}
     """
 
@@ -10640,14 +10645,12 @@ async def get_beats_for_scene_chunks(scene_text, chunks):
 
     beats = json.loads(res.choices[0].message.content.strip())
 
-    # add the text for each beat from the chunks
     for beat in beats:
         s = beat["start_word_index"]
         e = beat["end_word_index"]
         beat["text"] = " ".join(c["word"] for c in chunks[s:e + 1])
 
     return beats
-
 
 
 
