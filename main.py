@@ -294,90 +294,27 @@ IDEAS_HYDE_DOC_COUNT = 5
 
 
 SUPPORTED_LANGUAGES = {
-    "afrikaans": "af",
-    "albanian": "sq",
-    "amharic": "am",
-    "arabic": "ar",
-    "armenian": "hy",
-    "assamese": "as",
-    "azerbaijani": "az",
-    "basque": "eu",
-    "belarusian": "be",
-    "bengali": "bn",
-    "bosnian": "bs",
-    "breton": "br",
-    "bulgarian": "bg",
-    "burmese": "my",
-    "catalan": "ca",
-    "chinese": "zh",
-    "croatian": "hr",
-    "czech": "cs",
-    "danish": "da",
-    "dutch": "nl",
     "english": "en",
-    "estonian": "et",
-    "faroese": "fo",
-    "finnish": "fi",
-    "french": "fr",
-    "galician": "gl",
-    "georgian": "ka",
-    "german": "de",
-    "greek": "el",
-    "gujarati": "gu",
-    "haitian creole": "ht",
-    "hebrew": "iw",
-    "hindi": "hi",
-    "hungarian": "hu",
-    "icelandic": "is",
-    "indonesian": "id",
-    "italian": "it",
     "japanese": "ja",
-    "javanese": "jw",
-    "kannada": "kn",
-    "kazakh": "kk",
-    "khmer": "km",
+    "chinese": "zh",
+    "arabic": "ar",
+    "french": "fr",
+    "german": "de",
     "korean": "ko",
-    "latin": "la",
-    "latvian": "lv",
-    "lithuanian": "lt",
-    "macedonian": "mk",
-    "malay": "ms",
-    "malayalam": "ml",
-    "maori": "mi",
-    "marathi": "mr",
-    "mongolian": "mn",
-    "nepali": "ne",
-    "norwegian": "no",
-    "norwegian nynorsk": "nn",
-    "pashto": "ps",
-    "persian": "fa",
-    "polish": "pl",
     "portuguese": "pt",
-    "punjabi": "pa",
-    "romanian": "ro",
     "russian": "ru",
-    "sanskrit": "sa",
-    "serbian": "sr",
-    "shona": "sn",
-    "sindhi": "sd",
-    "sinhala": "si",
-    "slovak": "sk",
-    "slovenian": "sl",
     "spanish": "es",
-    "swahili": "sw",
-    "swedish": "sv",
-    "filipino": "tl",
+
+    "hindi": "hi",
+    "bengali": "bn",
     "tamil": "ta",
     "telugu": "te",
-    "thai": "th",
-    "tibetan": "bo",
-    "turkish": "tr",
-    "ukrainian": "uk",
-    "urdu": "ur",
-    "vietnamese": "vi",
-    "welsh": "cy",
-    "yiddish": "yi",
-    "yoruba": "yo",
+    "gujarati": "gu",
+    "kannada": "kn",
+    "malayalam": "ml",
+    "marathi": "mr",
+    "punjabi": "pa",
+    "odia": "or",
 }
 
 
@@ -9627,6 +9564,21 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 async def scene_breakdown(script):
     SCENES_BRAKDOWN_PROMPT = f"""
     
@@ -9823,7 +9775,98 @@ async def generate_audio_for_scene(
  
 
 
-async def get_word_level_time_stamps(scenes: list):
+
+import unicodedata
+
+WHISPERX_ALIGN_LANGS = {
+    "en", "fr", "de", "es", "it", "pt", "nl", "ja", "zh", "uk", "ar", "cs",
+    "ru", "pl", "hu", "fi", "fa", "el", "tr", "da", "he", "vi", "ko", "ur",
+    "te", "hi", "ca", "ml", "no", "nn", "sk", "sl", "hr", "ro", "eu", "gl",
+    "ka", "lv", "tl",
+}
+
+NO_SPACE_LANGS = {"zh", "ja", "th", "my", "km", "bo"}
+PAUSE_PUNCT = ".,?!।;:"
+
+_ALIGN_CACHE = {}
+
+
+def _joiner(lang):
+    return "" if lang in NO_SPACE_LANGS else " "
+
+
+def _get_align_model(lang):
+    # English keeps using your existing global model
+    if lang == "en":
+        return align_model, align_metadata
+
+    if lang in _ALIGN_CACHE:
+        return _ALIGN_CACHE[lang]
+
+    if lang not in WHISPERX_ALIGN_LANGS:
+        _ALIGN_CACHE[lang] = (None, None)
+        return _ALIGN_CACHE[lang]
+
+    try:
+        _ALIGN_CACHE[lang] = whisperx.load_align_model(
+            language_code=lang, device="cpu"
+        )
+    except Exception as e:
+        print(f"[Align] no alignment model for '{lang}': {e}")
+        _ALIGN_CACHE[lang] = (None, None)
+
+    return _ALIGN_CACHE[lang]
+
+
+def _split_graphemes(text, group=3):
+    units = []
+    for ch in text:
+        if ch.isspace():
+            continue
+        if units and unicodedata.category(ch).startswith("M"):
+            units[-1] += ch
+        else:
+            units.append(ch)
+    return ["".join(units[i:i + group]) for i in range(0, len(units), group)]
+
+
+def _split_chunk_into_words(text, start, end, lang=None):
+    words = text.split()
+    if lang in NO_SPACE_LANGS and len(words) <= 1:
+        words = _split_graphemes(text)
+    if not words:
+        return []
+
+    if len(words) == 1:
+        return [{"word": words[0], "start": round(start, 3), "end": round(end, 3)}]
+
+    weights = []
+    for w in words:
+        weight = len(w)
+        if w[-1] in PAUSE_PUNCT:
+            weight += 2
+        weights.append(weight)
+
+    total = sum(weights)
+    duration = max(end - start, 0)
+    cursor = start
+    result = []
+
+    for w, weight in zip(words, weights):
+        w_end = cursor + duration * weight / total
+        result.append({
+            "word": w,
+            "start": round(cursor, 3),
+            "end": round(w_end, 3),
+        })
+        cursor = w_end
+
+    result[-1]["end"] = round(end, 3)
+    return result
+
+
+async def get_word_level_time_stamps(scenes: list, lang_code: str = "en"):
+    lang_align_model, lang_align_meta = _get_align_model(lang_code)
 
     for scene in scenes:
         audio_url = scene["audio_url"]
@@ -9843,30 +9886,41 @@ async def get_word_level_time_stamps(scenes: list):
 
             result = whisper_model.transcribe(
                 audio,
-                batch_size=16
-            )
-
-            aligned = whisperx.align(
-                result["segments"],
-                align_model,
-                align_metadata,
-                audio,
-                "cpu",
-                return_char_alignments=False
+                batch_size=16,
+                language=lang_code,
             )
 
             word_timestamps = []
 
-            for segment in aligned["segments"]:
-                for word in segment.get("words", []):
-                    if "start" not in word or "end" not in word:
-                        continue
+            if lang_align_model:
+                aligned = whisperx.align(
+                    result["segments"],
+                    lang_align_model,
+                    lang_align_meta,
+                    audio,
+                    "cpu",
+                    return_char_alignments=False
+                )
 
-                    word_timestamps.append({
-                        "word": word["word"],
-                        "start": word["start"],
-                        "end": word["end"]
-                    })
+                for segment in aligned["segments"]:
+                    for word in segment.get("words", []):
+                        if "start" not in word or "end" not in word:
+                            continue
+
+                        word_timestamps.append({
+                            "word": word["word"],
+                            "start": word["start"],
+                            "end": word["end"]
+                        })
+            else:
+                for seg in result["segments"]:
+                    text = seg["text"].strip()
+                    if text:
+                        word_timestamps.extend(
+                            _split_chunk_into_words(
+                                text, seg["start"], seg["end"], lang_code
+                            )
+                        )
 
             scene["word_timestamps"] = word_timestamps
 
@@ -10084,7 +10138,8 @@ async def get_keywords_for_beat(full_script, beat):
 
 
 
-async def add_directions_for_scene(full_script, scene_text, word_timestamps, regional=False):
+async def add_directions_for_scene(full_script, scene_text, word_timestamps,
+                                   regional=False, lang="en"):
     try:
         if regional:
             beats = await get_beats_for_scene_chunks(scene_text, word_timestamps)
@@ -10094,7 +10149,14 @@ async def add_directions_for_scene(full_script, scene_text, word_timestamps, reg
         print(f"[Beats] failed: {e}")
         return e
 
+    joiner = _joiner(lang)
+    last = len(word_timestamps) - 1
+
     for beat in beats:
+        s = max(0, min(int(beat["start_word_index"]), last))
+        e = max(s, min(int(beat["end_word_index"]), last))
+        beat["text"] = joiner.join(w["word"] for w in word_timestamps[s:e + 1])
+
         if beat["type"] in ["B-roll", "B-roll+overlay_animation"]:
             beat["keywords"] = await get_keywords_for_beat(full_script, beat)
 
@@ -10104,7 +10166,8 @@ async def add_directions_for_scene(full_script, scene_text, word_timestamps, reg
 async def align_beats_to_voice(
     directions: list,
     word_timestamps: list,
-    audio_duration: float | None = None
+    audio_duration: float | None = None,
+    lang: str = "en",
 ):
     print("aligning beats to voice")
     print("word timestamps count:", len(word_timestamps))
@@ -10112,6 +10175,7 @@ async def align_beats_to_voice(
     if not directions or not word_timestamps:
         return directions
 
+    joiner = _joiner(lang)
     last_idx = len(word_timestamps) - 1
 
     for direction in directions:
@@ -10140,7 +10204,7 @@ async def align_beats_to_voice(
             direction["overlay_end_word_index"] = o_end
             direction["overlay_start"] = word_timestamps[o_start]["start"]
             direction["overlay_end"] = word_timestamps[o_end]["end"]
-            direction["overlay_text"] = " ".join(
+            direction["overlay_text"] = joiner.join(
                 w["word"] for w in word_timestamps[o_start:o_end + 1]
             )
 
@@ -10512,41 +10576,6 @@ def _sarvam_stt_chunk(audio_bytes: bytes, lang_code: str, api_key: str) -> dict:
     return response.json().get("timestamps") or {}
 
 
-PAUSE_PUNCT = ".,?!।;:"
-
-def _split_chunk_into_words(text: str, start: float, end: float):
-    words = text.split()
-    if not words:
-        return []
-
-    if len(words) == 1:
-        return [{"word": words[0], "start": round(start, 3), "end": round(end, 3)}]
-
-    weights = []
-    for w in words:
-        weight = len(w)
-        if w[-1] in PAUSE_PUNCT:
-            weight += 2
-        weights.append(weight)
-
-    total = sum(weights)
-    duration = max(end - start, 0)
-    cursor = start
-    result = []
-
-    for w, weight in zip(words, weights):
-        w_end = cursor + duration * weight / total
-        result.append({
-            "word": w,
-            "start": round(cursor, 3),
-            "end": round(w_end, 3),
-        })
-        cursor = w_end
-
-    result[-1]["end"] = round(end, 3)  
-    return result
-
-
 def get_sarvam_caption_timestamps(audio_bytes: bytes, scene_text: str, lang_code: str):
 
     if not scene_text.strip():
@@ -10585,8 +10614,8 @@ def get_sarvam_caption_timestamps(audio_bytes: bytes, scene_text: str, lang_code
 
 
 INDIAN_REGIONAL_LANGUAGES_CODE = [
-    "as", "bn", "gu", "hi", "kn", "ml",
-    "mr", "or", "pa", "ta", "te", "ur",
+    "hi", "bn", "ta", "te", "gu",
+    "kn", "ml", "mr", "pa", "or",
 ]
 
 async def get_beats_for_scene_chunks(scene_text, chunks):
@@ -10911,7 +10940,7 @@ async def _edit_video_impl(body: Editvideo):
 
         if not is_regional:
             print("generating word level timestamps for scenes")
-            scenes = await get_word_level_time_stamps(scenes)
+            scenes = await get_word_level_time_stamps(scenes, body.langCode)
 
         print("generating directions for scenes")
 
@@ -10921,6 +10950,7 @@ async def _edit_video_impl(body: Editvideo):
                 scene["script"],
                 scene["word_timestamps"],
                 regional=is_regional,
+                lang=body.langCode,
             )
 
             if not isinstance(directions, list):
@@ -10936,6 +10966,7 @@ async def _edit_video_impl(body: Editvideo):
                 scene["directions"],
                 scene["word_timestamps"],
                 audio_duration=scene.get("duration"),
+                lang=body.langCode,
             )
 
         print("fetching media and templates for directions")
@@ -11032,28 +11063,6 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
