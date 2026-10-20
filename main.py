@@ -9577,8 +9577,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
 async def scene_breakdown(script):
     SCENES_BRAKDOWN_PROMPT = f"""
     
@@ -10517,7 +10515,7 @@ async def get_template_for_direction(full_script, direction, templates):
         12. LANGUAGE: Write every human-readable text value (titles, labels, captions,
             list items, quotes, descriptions, etc.) in the SAME language and script as
             the FULL SCRIPT / BEAT NARRATION. If the script is Telugu, Hindi, Tamil, etc.,
-            the props text must bewife in that language and its native script. Do NOT
+            the props text must be written in that language and its native script. Do NOT
             translate to English and do NOT transliterate into Latin letters.
             Only keep these unchanged and in English: field names, schema keys,
             enum/style/variant/alignment values, hex colors, and numbers.
@@ -10684,52 +10682,133 @@ async def get_beats_for_scene_chunks(scene_text, chunks):
 
 
 
+# ---------------------------------------------------------------------------
+# NEW: load the user's reference voice (used by both Fish Audio paths)
+# ---------------------------------------------------------------------------
+def load_user_reference_voice(user_id: str, lang_code: str):
+    profile_res = (
+        supabase
+        .table("user_profiles")
+        .select("audio_url")
+        .eq("id", user_id)
+        .single()
+        .execute()
+    )
 
+    audio_urls = profile_res.data.get("audio_url") if profile_res.data else None
 
-async def generate_india_language_audio(userId, scene_text, langCode):
+    if isinstance(audio_urls, str):
+        audio_urls = json.loads(audio_urls)
+
+    def find(code):
+        return next(
+            (
+                item[code]
+                for item in (audio_urls or [])
+                if isinstance(item, dict) and item.get(code)
+            ),
+            None,
+        )
+
+    # Prefer a sample recorded in the target language, fall back to English
+    ref_lang = lang_code if find(lang_code) else "en"
+    link = find(ref_lang)
+
+    if not link:
+        raise ValueError("No reference audio found in user_profiles.audio_url")
+
+    if link.startswith("http"):
+        path = link.split("/object/sign/user-audio/", 1)[1].split("?", 1)[0]
+    else:
+        path = link
+
+    reference_audio = supabase.storage.from_("user-audio").download(path)
+
+    ref_path = None
     try:
-        print("Generating Indian language audio using Sarvam AI")
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(reference_audio)
+            ref_path = f.name
 
-        url = "https://api.sarvam.ai/text-to-speech"
+        ref_wave = whisperx.load_audio(ref_path)
+        ref_result = whisper_model.transcribe(
+            ref_wave,
+            batch_size=16,
+            language=ref_lang,
+        )
+        reference_text = " ".join(
+            seg["text"].strip() for seg in ref_result["segments"]
+        ).strip()
+    finally:
+        if ref_path and os.path.exists(ref_path):
+            os.remove(ref_path)
 
+    return reference_audio, reference_text
+
+
+# ---------------------------------------------------------------------------
+# UPDATED: Indian language audio now supports voice cloning via Fish Audio.
+# Without reference_audio it still uses the Sarvam preset voice.
+# ---------------------------------------------------------------------------
+async def generate_india_language_audio(
+    userId,
+    scene_text,
+    langCode,
+    reference_audio=None,
+    reference_text=None,
+    speaker="rahul",
+):
+    try:
         api_key = os.getenv("SARVAM_API_KEY")
         if not api_key:
             raise ValueError("SARVAM_API_KEY is not configured")
 
-        headers = {
-            "api-subscription-key": api_key,
-            "Content-Type": "application/json",
-        }
+        if reference_audio:
+            print("Generating Indian language audio with cloned voice (Fish Audio)")
 
-        payload = {
-            "inputs": [scene_text],
-            "target_language_code": f"{langCode}-IN",
-            "speaker": "rahul",
-            "pitch": 0,
-            "pace": 1.0,
-            "loudness": 1.0,
-            "speech_sample_rate": 22050,
-            "output_audio_codec": "mp3",
-        }
+            audio = fish_audio_client.tts.convert(
+                text=scene_text,
+                references=[
+                    ReferenceAudio(
+                        audio=reference_audio,
+                        text=reference_text or ""
+                    )
+                ],
+                speed=0.95,
+            )
+            audio_bytes = bytes(audio)
 
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=120,
-        )
+        else:
+            print("Generating Indian language audio using Sarvam AI")
 
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Sarvam API error {response.status_code}: {response.text}"
+            response = requests.post(
+                "https://api.sarvam.ai/text-to-speech",
+                json={
+                    "inputs": [scene_text],
+                    "target_language_code": f"{langCode}-IN",
+                    "speaker": speaker,
+                    "pitch": 0,
+                    "pace": 1.0,
+                    "loudness": 1.0,
+                    "speech_sample_rate": 22050,
+                    "output_audio_codec": "mp3",
+                },
+                headers={
+                    "api-subscription-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=120,
             )
 
-        result = response.json()
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Sarvam API error {response.status_code}: {response.text}"
+                )
 
-        audio_bytes = base64.b64decode(result["audios"][0])
+            audio_bytes = base64.b64decode(response.json()["audios"][0])
 
         if not audio_bytes:
-            raise ValueError("Sarvam returned empty audio")
+            raise ValueError("TTS returned empty audio")
 
         audio_id = str(uuid.uuid4())
         path = f"{userId}/{audio_id}.mp3"
@@ -10744,9 +10823,10 @@ async def generate_india_language_audio(userId, scene_text, langCode):
             "generated-audio"
         ).get_public_url(path)
 
-        print("Sarvam audio saved to Supabase")
+        print("Audio saved to Supabase")
         print("Getting caption timestamps from Sarvam STT")
 
+        # Sarvam STT works on any mp3, so it gives timestamps for both paths
         word_timestamps = get_sarvam_caption_timestamps(
             audio_bytes=audio_bytes,
             scene_text=scene_text,
@@ -10761,10 +10841,8 @@ async def generate_india_language_audio(userId, scene_text, langCode):
         }
 
     except Exception as e:
-        print(f"Sarvam audio generation failed: {e}")
+        print(f"Indian language audio generation failed: {e}")
         raise
-
-
 
 
 
@@ -10850,6 +10928,18 @@ async def _edit_video_impl(body: Editvideo):
 
         print(scenes)
 
+        # UPDATED: load the user's reference voice for ALL languages
+        # (regional and non-regional) when voice == "user"
+        voice_id = body.voice
+        reference_audio = None
+        reference_text = None
+
+        if body.voice == "user":
+            print("voice is 'user', loading reference audio from user_profiles")
+            reference_audio, reference_text = load_user_reference_voice(
+                body.userId, body.langCode
+            )
+
         if is_regional:
             print("generating voice in indian lang")
 
@@ -10858,6 +10948,8 @@ async def _edit_video_impl(body: Editvideo):
                     userId=body.userId,
                     scene_text=scene["script"],
                     langCode=body.langCode,
+                    reference_audio=reference_audio,
+                    reference_text=reference_text,
                 )
 
                 scene["audio_url"] = result["audio_url"]
@@ -10866,61 +10958,6 @@ async def _edit_video_impl(body: Editvideo):
                     result["word_timestamps"][-1]["end"]
                     if result["word_timestamps"] else 0
                 )
-
-        voice_id = body.voice
-        reference_audio = None
-        reference_text = None
-
-        if not is_regional and body.voice == "user":
-            print("voice is 'user', fetching user's en audio from user_profiles")
-
-            profile_res = (
-                supabase
-                .table("user_profiles")
-                .select("audio_url")
-                .eq("id", body.userId)
-                .single()
-                .execute()
-            )
-
-            audio_urls = profile_res.data.get("audio_url") if profile_res.data else None
-
-            if isinstance(audio_urls, str):
-                audio_urls = json.loads(audio_urls)
-
-            user_audio_link = next(
-                (
-                    item["en"]
-                    for item in (audio_urls or [])
-                    if isinstance(item, dict) and item.get("en")
-                ),
-                None
-            )
-
-            if not user_audio_link:
-                raise ValueError("No 'en' audio found in user_profiles.audio_url")
-
-            if user_audio_link.startswith("http"):
-                user_audio_path = user_audio_link.split("/object/sign/user-audio/", 1)[1].split("?", 1)[0]
-            else:
-                user_audio_path = user_audio_link
-
-            reference_audio = supabase.storage.from_("user-audio").download(user_audio_path)
-
-            ref_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                    f.write(reference_audio)
-                    ref_path = f.name
-
-                ref_wave = whisperx.load_audio(ref_path)
-                ref_result = whisper_model.transcribe(ref_wave, batch_size=16)
-                reference_text = " ".join(
-                    seg["text"].strip() for seg in ref_result["segments"]
-                ).strip()
-            finally:
-                if ref_path and os.path.exists(ref_path):
-                    os.remove(ref_path)
 
         print("generating audio for scenes")
 
@@ -11063,57 +11100,6 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
