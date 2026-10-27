@@ -33,11 +33,6 @@ import tempfile
 import uuid
 import copy
 from fishaudio.types import ReferenceAudio
-import torch
-import torchaudio
-from transformers import AutoProcessor, Wav2Vec2ForCTC
-
-
 
 
 
@@ -345,11 +340,111 @@ RAG_CATEGORIES = [
 ]
 
 
-def _qdrant_collection_name(category: str) -> str:
-    return f"RAG_{category}_supabase"
 
-def _supabase_content_table_name(category: str) -> str:
-    return f"RAG_{category}"
+def _both(name: str) -> list[str]:
+    return [f"RAG_{name}", f"RAG_{name}_pg"]
+
+# Qdrant: exactly ONE collection per category (names are not uniform)
+QDRANT_COLLECTION_BY_CATEGORY = {
+    "Anthropology": "RAG_Anthropology",
+    "Astronomy": "RAG_Astronomy_pg",
+    "Biography": "RAG_Biography",
+    "Business": "RAG_Business",
+    "Communication": "RAG_Communication_pg",
+    "Criminology": "RAG_Criminology_pg",
+    "CulturalStudies": "RAG_CulturalStudies_pg",
+    "Economics": "RAG_Economics",
+    "Entrepreneurship": "RAG_Entrepreneurship",
+    "Film & Theatre": "RAG_Film & Theatre_pg",
+    "Finance": "RAG_Finance",
+    "Geography": "RAG_Geography_supabase",
+    "Health": "RAG_Health",
+    "History": "RAG_History_supabase",
+    "Knowledge": "RAG_Knowledge",
+    "Law": "RAG_Law",
+    "Neuroscience": "RAG_Neuroscience_pg",
+    "Personal_Development": "RAG_Personal_Development_supabase",
+    "Philosophy": "RAG_Philosophy",
+    "Politics": "RAG_Politics",
+    "Psychology": "RAG_Psychology",
+    "Religion": "RAG_Religion",
+    "Science": "RAG_Science",
+    "SelfHelp": "RAG_SelfHelp",
+    "SocialScience": "RAG_SocialScience",
+    "Sociology": "RAG_Sociology",
+    "Sports": "RAG_Sports",
+    "Technology": "RAG_Technology",
+    "Travel": "RAG_Travel",
+}
+
+# Supabase: one OR two content tables per category (searched together)
+SUPABASE_TABLES_BY_CATEGORY = {
+    "Anthropology": _both("Anthropology"),
+    "Astronomy": ["RAG_Astronomy_pg"],
+    "Biography": _both("Biography"),
+    "Business": _both("Business"),
+    "Communication": _both("Communication"),
+    "Criminology": _both("Criminology"),
+    "CulturalStudies": _both("CulturalStudies"),
+    "Economics": _both("Economics"),
+    "Entrepreneurship": _both("Entrepreneurship"),
+    "Film & Theatre": _both("Film & Theatre"),
+    "Finance": _both("Finance"),
+    "Geography": ["RAG_Geography"],
+    "Health": _both("Health"),
+    "History": ["RAG_History"],
+    "Knowledge": _both("Knowledge"),
+    "Law": _both("Law"),
+    "Neuroscience": _both("Neuroscience"),
+    "Personal_Development": _both("Personal Development"),  # table name has a space
+    "Philosophy": _both("Philosophy"),
+    "Politics": _both("Politics"),
+    "Psychology": _both("Psychology"),
+    "Religion": _both("Religion"),
+    "Science": _both("Science"),
+    "SelfHelp": _both("SelfHelp"),
+    "SocialScience": _both("SocialScience"),
+    "Sociology": _both("Sociology"),
+    "Sports": _both("Sports"),
+    "Technology": _both("Technology"),
+    "Travel": _both("Travel"),
+}
+
+def _qdrant_collection_name(category: str) -> str:
+    return QDRANT_COLLECTION_BY_CATEGORY.get(category, f"RAG_{category}")
+
+def _supabase_content_table_names(category: str) -> list[str]:
+    return SUPABASE_TABLES_BY_CATEGORY.get(category, [f"RAG_{category}", f"RAG_{category}_pg"])
+
+
+async def _fetch_chunks_from_supabase_tables(tables: list[str], chunk_ids: list) -> list[dict]:
+    """Query every Supabase content table for these chunk_ids and merge the rows.
+    A failure in one table is logged and does not drop the other table's results."""
+    async def _one(tbl: str) -> list[dict]:
+        try:
+            res = await _run_io(
+                lambda: supabase.table(tbl)
+                .select("chunk_id, md5, content")
+                .in_("chunk_id", chunk_ids)
+                .execute()
+            )
+            return res.data or []
+        except Exception as e:
+            print(f"[QDRANT] Supabase content lookup against '{tbl}' failed: {e}")
+            return []
+
+    per_table = await asyncio.gather(*[_one(t) for t in tables])
+
+    merged, seen = [], set()
+    for rows in per_table:
+        for row in rows:
+            cid = row.get("chunk_id")
+            if cid in seen:
+                continue
+            seen.add(cid)
+            merged.append(row)
+    return merged
+
 
 def _word_count(text_value: str) -> int:
     return len(text_value.split())
@@ -980,10 +1075,6 @@ async def _flush_token_usage() -> None:
         )
     except Exception as e:
         print(f"[TOKENS-DB] failed to save usage row: {e}")
-
-
-
-
 
 
 
@@ -1715,6 +1806,9 @@ async def select_template_and_generate_hyde(topic: str) -> dict:
     }
 
 
+
+
+
 async def get_context_from_db(
     topic: str,
     hyde_doc: str = None,
@@ -1727,7 +1821,7 @@ async def get_context_from_db(
 
     category = table_name
     collection_name = _qdrant_collection_name(category)
-    supabase_table = _supabase_content_table_name(category)
+    supabase_tables = _supabase_content_table_names(category)
 
     embedding_source = hyde_doc if hyde_doc else topic
 
@@ -1793,17 +1887,7 @@ async def get_context_from_db(
     if not chunk_ids:
         return []
 
-    try:
-        supabase_rows = await _run_io(
-            lambda: supabase.table(supabase_table)
-            .select("chunk_id, md5, content")
-            .in_("chunk_id", chunk_ids)
-            .execute()
-        )
-        rows = supabase_rows.data or []
-    except Exception as e:
-        print(f"[QDRANT] Supabase content lookup against '{supabase_table}' failed: {e}")
-        return []
+    rows = await _fetch_chunks_from_supabase_tables(supabase_tables, chunk_ids)
 
     matches = []
     for row in rows:
@@ -1823,6 +1907,7 @@ async def get_context_from_db(
 
     matches.sort(key=lambda r: r["combined_score"], reverse=True)
     return matches[:final_k]
+
 
 
 def _parse_keyword_lines(raw: str) -> list[str]:
@@ -3262,7 +3347,6 @@ def bucket_segments_by_time(segments: list[dict], num_docs: int) -> list[list[di
 def num_hyde_docs_for_time(minutes: float) -> int:
     return max(1, math.ceil(minutes / 2))
 
-
 def _strip_json_fences(raw: str) -> str:
     cleaned = raw.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
@@ -3289,7 +3373,7 @@ async def get_context_from_db_segment(
 ) -> list[dict]:
     category = table_name
     collection_name = _qdrant_collection_name(category)
-    supabase_table = _supabase_content_table_name(category)
+    supabase_table = _supabase_content_table_names(category)
 
     model = _get_st_model()
     client = get_qdrant_client()
@@ -10826,7 +10910,6 @@ async def generate_india_language_audio(
         print("Audio saved to Supabase")
         print("Getting caption timestamps from Sarvam STT")
 
-        # Sarvam STT works on any mp3, so it gives timestamps for both paths
         word_timestamps = get_sarvam_caption_timestamps(
             audio_bytes=audio_bytes,
             scene_text=scene_text,
@@ -10928,8 +11011,6 @@ async def _edit_video_impl(body: Editvideo):
 
         print(scenes)
 
-        # UPDATED: load the user's reference voice for ALL languages
-        # (regional and non-regional) when voice == "user"
         voice_id = body.voice
         reference_audio = None
         reference_text = None
@@ -11357,14 +11438,6 @@ async def add_beat_media(
         "selected_media_type": body.media_type,
         "media": new_media,
     }
-
-
-
-
-
-
-
-
 
 
 
