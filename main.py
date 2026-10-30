@@ -9878,7 +9878,6 @@ def _joiner(lang):
 
 
 def _get_align_model(lang):
-    # English keeps using your existing global model
     if lang == "en":
         return align_model, align_metadata
 
@@ -10342,16 +10341,23 @@ def fill_template_props_with_photos(template_name: str, props: dict, photos: lis
     return props
 
 
+
 def set_selected_media(direction: dict, assets: dict):
+
     videos = assets.get("videos") or []
     photos = assets.get("photos") or []
 
     if videos:
         direction["selected_media_id"] = videos[0]["id"]
         direction["selected_media_type"] = "video"
+
     elif photos:
         direction["selected_media_id"] = photos[0]["id"]
         direction["selected_media_type"] = "photo"
+
+    else:
+        direction["selected_media_id"] = None
+        direction["selected_media_type"] = None
 
 
 
@@ -10360,7 +10366,22 @@ PEXELS_HEADERS = {
     "Authorization": PEXELS_API_KEY
 }
 
+
+
+
+import re
+
 ALLOWED_VIDEO_RESOLUTIONS = [(1920, 1080), (1280, 720)]
+
+
+def keyword_score(keywords: str, description: str) -> float:
+    terms = set(re.findall(r"[a-z0-9]+", keywords.lower()))
+    words = set(re.findall(r"[a-z0-9]+", (description or "").lower()))
+
+    if not terms or not words:
+        return 0.0
+
+    return len(terms & words) / len(terms)
 
 
 def search_pexel_media(keywords: str):
@@ -10368,76 +10389,115 @@ def search_pexel_media(keywords: str):
     photos = []
     videos = []
 
-    for keyword in [keywords]:
+    if not keywords or not keywords.strip():
+        return {"photos": [], "videos": []}
 
-        try:
-            photo_response = requests.get(
-                "https://api.pexels.com/v1/search",
-                headers=PEXELS_HEADERS,
-                params={
-                    "query": keyword,
-                    "orientation": "landscape",
-                    "per_page": 1
-                },
-                timeout=10
+    keyword = keywords.strip()
+
+    try:
+        photo_response = requests.get(
+            "https://api.pexels.com/v1/search",
+            headers=PEXELS_HEADERS,
+            params={
+                "query": keyword,
+                "orientation": "landscape",
+                "per_page": 15
+            },
+            timeout=10
+        )
+
+        if photo_response.ok:
+            candidates = photo_response.json().get("photos", [])
+
+            # Rank candidates using their actual descriptions.
+            candidates.sort(
+                key=lambda p: keyword_score(
+                    keyword, p.get("alt", "")
+                ),
+                reverse=True
             )
 
-            if photo_response.ok:
-                for photo in photo_response.json().get("photos", [])[:1]:
-                    photos.append({
-                        "id": photo["id"],
-                        "type": "photo",
-                        "query": keyword,
-                        "url": photo["url"],
-                        "image_url": photo["src"]["large2x"],
-                        "width": photo["width"],
-                        "height": photo["height"],
-                        "photographer": photo["photographer"]
-                    })
-        except Exception as e:
-            print(f"[Pexels] photo search failed for '{keyword}': {e}")
+            for photo in candidates:
+                score = keyword_score(keyword, photo.get("alt", ""))
 
-        try:
-            video_response = requests.get(
-                "https://api.pexels.com/v1/videos/search",
-                headers=PEXELS_HEADERS,
-                params={
+                # Reject candidates with no meaningful keyword match.
+                if score < 0.2:
+                    continue
+
+                photos.append({
+                    "id": photo["id"],
+                    "type": "photo",
                     "query": keyword,
-                    "orientation": "landscape",
-                    "per_page": 1
-                },
-                timeout=10
-            )
+                    "relevance_score": round(score, 3),
+                    "alt": photo.get("alt", ""),
+                    "url": photo["url"],
+                    "image_url": photo["src"]["large2x"],
+                    "width": photo["width"],
+                    "height": photo["height"],
+                    "photographer": photo["photographer"]
+                })
 
-            if video_response.ok:
-                for video in video_response.json().get("videos", [])[:1]:
-                    video_files = video.get("video_files", [])
+                if len(photos) >= 3:
+                    break
 
-                    video_file = None
-                    for w, h in ALLOWED_VIDEO_RESOLUTIONS:
-                        video_file = next(
-                            (
-                                f for f in video_files
-                                if f.get("width") == w and f.get("height") == h
-                            ),
-                            None
-                        )
-                        if video_file:
-                            break
+    except Exception as e:
+        print(f"[Pexels] photo search failed: {e}")
+
+    try:
+        video_response = requests.get(
+            "https://api.pexels.com/v1/videos/search",
+            headers=PEXELS_HEADERS,
+            params={
+                "query": keyword,
+                "orientation": "landscape",
+                "per_page": 10
+            },
+            timeout=10
+        )
+
+        if video_response.ok:
+            candidates = video_response.json().get("videos", [])
+
+            for video in candidates:
+                video_files = video.get("video_files", [])
+
+                video_file = None
+
+                for w, h in ALLOWED_VIDEO_RESOLUTIONS:
+                    video_file = next(
+                        (
+                            f for f in video_files
+                            if f.get("width") == w
+                            and f.get("height") == h
+                        ),
+                        None
+                    )
 
                     if video_file:
-                        videos.append({
-                            "id": video["id"],
-                            "type": "video",
-                            "query": keyword,
-                            "url": video["url"],
-                            "video_url": video_file["link"],
-                            "width": video_file["width"],
-                            "height": video_file["height"],
-                            "duration": video["duration"]
-                        })
-        except Exception as e:
-            print(f"[Pexels] video search failed for '{keyword}': {e}")
+                        break
+
+                if not video_file:
+                    continue
+
+                videos.append({
+                    "id": video["id"],
+                    "type": "video",
+                    "query": keyword,
+                    "url": video["url"],
+                    "video_url": video_file["link"],
+                    "width": video_file["width"],
+                    "height": video_file["height"],
+                    "duration": video["duration"],
+                    "thumbnail": (
+                        video.get("video_pictures", [{}])[0].get("picture")
+                    )
+                })
+
+                if len(videos) >= 3:
+                    break
+
+    except Exception as e:
+        print(f"[Pexels] video search failed: {e}")
 
     return {
         "photos": photos,
@@ -10766,9 +10826,6 @@ async def get_beats_for_scene_chunks(scene_text, chunks):
 
 
 
-# ---------------------------------------------------------------------------
-# NEW: load the user's reference voice (used by both Fish Audio paths)
-# ---------------------------------------------------------------------------
 def load_user_reference_voice(user_id: str, lang_code: str):
     profile_res = (
         supabase
