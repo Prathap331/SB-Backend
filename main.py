@@ -10307,9 +10307,11 @@ async def align_beats_to_voice(
             d["overlay_end"] = max(d["overlay_start"], min(d["overlay_end"], d["end"]))
 
             if regional:
+                # keep the template on screen until the beat (voice) finishes
                 d["overlay_end"] = d["end"]
                 d["overlay_end_word_index"] = d["end_word_index"]
 
+                # guarantee a readable minimum duration
                 if d["overlay_end"] - d["overlay_start"] < MIN_OVERLAY_SECONDS:
                     d["overlay_start"] = max(
                         d["start"], d["overlay_end"] - MIN_OVERLAY_SECONDS
@@ -10323,7 +10325,6 @@ async def align_beats_to_voice(
                 )
 
     return directions
-
 
 FILLABLE_URL_KEYS = {"image_url", "before_url", "after_url"}
 
@@ -10777,6 +10778,8 @@ INDIAN_REGIONAL_LANGUAGES_CODE = [
 ]
 
 
+
+
 async def get_beats_for_scene_chunks(scene_text, chunks):
     last = len(chunks) - 1
 
@@ -10906,6 +10909,8 @@ def load_user_reference_voice(user_id: str, lang_code: str):
 
 
 
+
+
 async def generate_india_language_audio(
     userId,
     scene_text,
@@ -11005,7 +11010,6 @@ async def generate_india_language_audio(
         raise
 
 
-
 import re
 
 SARVAM_MAX_CHARS = 450 
@@ -11069,6 +11073,7 @@ async def edit_video(body: Editvideo):
         return await _edit_video_impl(body)
     finally:
         await _flush_token_usage()
+
 
 
 async def _edit_video_impl(body: Editvideo):
@@ -11256,7 +11261,6 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
-
 
 
 
