@@ -10307,11 +10307,9 @@ async def align_beats_to_voice(
             d["overlay_end"] = max(d["overlay_start"], min(d["overlay_end"], d["end"]))
 
             if regional:
-                # keep the template on screen until the beat (voice) finishes
                 d["overlay_end"] = d["end"]
                 d["overlay_end_word_index"] = d["end_word_index"]
 
-                # guarantee a readable minimum duration
                 if d["overlay_end"] - d["overlay_start"] < MIN_OVERLAY_SECONDS:
                     d["overlay_start"] = max(
                         d["start"], d["overlay_end"] - MIN_OVERLAY_SECONDS
@@ -10779,7 +10777,6 @@ INDIAN_REGIONAL_LANGUAGES_CODE = [
 ]
 
 
-
 async def get_beats_for_scene_chunks(scene_text, chunks):
     last = len(chunks) - 1
 
@@ -11055,7 +11052,6 @@ def split_scenes_for_sarvam(scenes, max_chars=SARVAM_MAX_CHARS):
     return new_scenes
 
 
-
 class Editvideo(BaseModel):
     userId: str
     script: str
@@ -11073,7 +11069,6 @@ async def edit_video(body: Editvideo):
         return await _edit_video_impl(body)
     finally:
         await _flush_token_usage()
-
 
 
 async def _edit_video_impl(body: Editvideo):
