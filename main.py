@@ -10249,6 +10249,7 @@ async def align_beats_to_voice(
     word_timestamps: list,
     audio_duration: float | None = None,
     lang: str = "en",
+    regional: bool = False,
 ):
     print("aligning beats to voice")
     print("word timestamps count:", len(word_timestamps))
@@ -10298,13 +10299,32 @@ async def align_beats_to_voice(
     if audio_duration:
         last["end"] = max(last["end"], audio_duration)
 
+    MIN_OVERLAY_SECONDS = 4.0
+
     for d in directions:
         if d.get("type") == "B-roll+overlay_animation":
             d["overlay_start"] = max(d["start"], min(d["overlay_start"], d["end"]))
             d["overlay_end"] = max(d["overlay_start"], min(d["overlay_end"], d["end"]))
 
-    return directions
+            if regional:
+                # keep the template on screen until the beat (voice) finishes
+                d["overlay_end"] = d["end"]
+                d["overlay_end_word_index"] = d["end_word_index"]
 
+                # guarantee a readable minimum duration
+                if d["overlay_end"] - d["overlay_start"] < MIN_OVERLAY_SECONDS:
+                    d["overlay_start"] = max(
+                        d["start"], d["overlay_end"] - MIN_OVERLAY_SECONDS
+                    )
+
+                d["overlay_text"] = joiner.join(
+                    w["word"]
+                    for w in word_timestamps[
+                        d["overlay_start_word_index"]:d["overlay_end_word_index"] + 1
+                    ]
+                )
+
+    return directions
 
 
 FILLABLE_URL_KEYS = {"image_url", "before_url", "after_url"}
@@ -10409,7 +10429,6 @@ def search_pexel_media(keywords: str):
         if photo_response.ok:
             candidates = photo_response.json().get("photos", [])
 
-            # Rank candidates using their actual descriptions.
             candidates.sort(
                 key=lambda p: keyword_score(
                     keyword, p.get("alt", "")
@@ -10420,7 +10439,6 @@ def search_pexel_media(keywords: str):
             for photo in candidates:
                 score = keyword_score(keyword, photo.get("alt", ""))
 
-                # Reject candidates with no meaningful keyword match.
                 if score < 0.2:
                     continue
 
@@ -10760,6 +10778,8 @@ INDIAN_REGIONAL_LANGUAGES_CODE = [
     "kn", "ml", "mr", "pa", "or",
 ]
 
+
+
 async def get_beats_for_scene_chunks(scene_text, chunks):
     last = len(chunks) - 1
 
@@ -10785,10 +10805,14 @@ async def get_beats_for_scene_chunks(scene_text, chunks):
     - Do not return text, only indices.
     - For B-roll+overlay_animation, also give overlay_start_word_index and
       overlay_end_word_index (inside the beat's range).
+      overlay_start_word_index = the word where the narrator starts talking
+      about the content the animation shows; overlay_end_word_index = the
+      word where the narrator finishes that content. The animation must stay
+      visible for the whole time the narrator speaks about it, so do NOT end
+      the overlay early. Overlay duration should be at least 4 seconds.
     - Target roughly 8-15 seconds per beat; prefer ending beats at sentence endings.
     - Each full_screen_animation beat MUST be 8 seconds or shorter
       (end time of last word - start time of first word).
-    - For B-roll+overlay_animation, the overlay range should be roughly 3-8 seconds.
 
     Return ONLY a JSON array like:
     [
@@ -10824,8 +10848,6 @@ async def get_beats_for_scene_chunks(scene_text, chunks):
     return beats
 
 
-
-
 def load_user_reference_voice(user_id: str, lang_code: str):
     profile_res = (
         supabase
@@ -10851,7 +10873,6 @@ def load_user_reference_voice(user_id: str, lang_code: str):
             None,
         )
 
-    # Prefer a sample recorded in the target language, fall back to English
     ref_lang = lang_code if find(lang_code) else "en"
     link = find(ref_lang)
 
@@ -10887,10 +10908,7 @@ def load_user_reference_voice(user_id: str, lang_code: str):
     return reference_audio, reference_text
 
 
-# ---------------------------------------------------------------------------
-# UPDATED: Indian language audio now supports voice cloning via Fish Audio.
-# Without reference_audio it still uses the Sarvam preset voice.
-# ---------------------------------------------------------------------------
+
 async def generate_india_language_audio(
     userId,
     scene_text,
@@ -10975,16 +10993,19 @@ async def generate_india_language_audio(
 
         print(f"Generated {len(word_timestamps)} caption timestamps")
 
+        real_duration = len(
+            AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+        ) / 1000
+
         return {
             "audio_url": audio_url,
             "word_timestamps": word_timestamps,
+            "duration": real_duration,
         }
 
     except Exception as e:
         print(f"Indian language audio generation failed: {e}")
         raise
-
-
 
 
 
@@ -11092,10 +11113,11 @@ async def _edit_video_impl(body: Editvideo):
 
                 scene["audio_url"] = result["audio_url"]
                 scene["word_timestamps"] = result["word_timestamps"]
-                scene["duration"] = (
+                last_ts = (
                     result["word_timestamps"][-1]["end"]
                     if result["word_timestamps"] else 0
                 )
+                scene["duration"] = max(last_ts, result.get("duration") or 0)
 
         print("generating audio for scenes")
 
@@ -11142,6 +11164,7 @@ async def _edit_video_impl(body: Editvideo):
                 scene["word_timestamps"],
                 audio_duration=scene.get("duration"),
                 lang=body.langCode,
+                regional=is_regional,
             )
 
         print("fetching media and templates for directions")
@@ -11238,8 +11261,6 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
-
-
 
 
 
