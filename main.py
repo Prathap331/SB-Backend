@@ -9659,8 +9659,6 @@ async def add_script_tags(request: AddScriptTagsRequest):
 
 
 
-
-
 async def scene_breakdown(script):
     SCENES_BRAKDOWN_PROMPT = f"""
     
@@ -10307,11 +10305,9 @@ async def align_beats_to_voice(
             d["overlay_end"] = max(d["overlay_start"], min(d["overlay_end"], d["end"]))
 
             if regional:
-                # keep the template on screen until the beat (voice) finishes
                 d["overlay_end"] = d["end"]
                 d["overlay_end_word_index"] = d["end_word_index"]
 
-                # guarantee a readable minimum duration
                 if d["overlay_end"] - d["overlay_start"] < MIN_OVERLAY_SECONDS:
                     d["overlay_start"] = max(
                         d["start"], d["overlay_end"] - MIN_OVERLAY_SECONDS
@@ -10386,11 +10382,13 @@ PEXELS_HEADERS = {
 }
 
 
-
-
 import re
+import hashlib
 
 ALLOWED_VIDEO_RESOLUTIONS = [(1920, 1080), (1280, 720)]
+
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+SERP_MAX_PHOTOS = 3
 
 
 def keyword_score(keywords: str, description: str) -> float:
@@ -10403,6 +10401,82 @@ def keyword_score(keywords: str, description: str) -> float:
     return len(terms & words) / len(terms)
 
 
+def search_serpapi_images(keywords: str, limit: int = SERP_MAX_PHOTOS):
+    
+    if not SERPAPI_API_KEY:
+        print("[SerpAPI] SERPAPI_API_KEY is not configured, skipping")
+        return []
+
+    photos = []
+
+    try:
+        response = requests.get(
+            "https://serpapi.com/search.json",
+            params={
+                "engine": "google_images",
+                "q": keywords,
+                "api_key": SERPAPI_API_KEY,
+                "ijn": 0,
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+
+        images = response.json().get("images_results", [])
+
+        for image in images:
+            if len(photos) >= limit:
+                break
+
+            image_url = image.get("original")
+            if not image_url:
+                continue
+
+            width = image.get("original_width") or 0
+            height = image.get("original_height") or 0
+
+            if width <= height:
+                continue
+
+            try:
+                check = requests.get(
+                    image_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=15,
+                    stream=True,
+                )
+                ok = (
+                    check.ok
+                    and check.headers.get("Content-Type", "").startswith("image/")
+                )
+                check.close()
+                if not ok:
+                    continue
+            except requests.RequestException:
+                continue
+
+            title = image.get("title") or ""
+
+            photos.append({
+                "id": hashlib.md5(image_url.encode("utf-8")).hexdigest(),
+                "type": "photo",
+                "source": "serpapi",
+                "query": keywords,
+                "relevance_score": round(keyword_score(keywords, title), 3),
+                "alt": title,
+                "url": image.get("link") or image_url,
+                "image_url": image_url,
+                "width": width,
+                "height": height,
+                "photographer": image.get("source") or ""
+            })
+
+    except Exception as e:
+        print(f"[SerpAPI] image search failed: {e}")
+
+    return photos
+
+
 def search_pexel_media(keywords: str):
 
     photos = []
@@ -10413,52 +10487,55 @@ def search_pexel_media(keywords: str):
 
     keyword = keywords.strip()
 
-    try:
-        photo_response = requests.get(
-            "https://api.pexels.com/v1/search",
-            headers=PEXELS_HEADERS,
-            params={
-                "query": keyword,
-                "orientation": "landscape",
-                "per_page": 15
-            },
-            timeout=10
-        )
+    photos = search_serpapi_images(keyword)
 
-        if photo_response.ok:
-            candidates = photo_response.json().get("photos", [])
-
-            candidates.sort(
-                key=lambda p: keyword_score(
-                    keyword, p.get("alt", "")
-                ),
-                reverse=True
+    if not photos:
+        try:
+            photo_response = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers=PEXELS_HEADERS,
+                params={
+                    "query": keyword,
+                    "orientation": "landscape",
+                    "per_page": 4
+                },
+                timeout=10
             )
 
-            for photo in candidates:
-                score = keyword_score(keyword, photo.get("alt", ""))
+            if photo_response.ok:
+                candidates = photo_response.json().get("photos", [])
 
-                if score < 0.2:
-                    continue
+                candidates.sort(
+                    key=lambda p: keyword_score(
+                        keyword, p.get("alt", "")
+                    ),
+                    reverse=True
+                )
 
-                photos.append({
-                    "id": photo["id"],
-                    "type": "photo",
-                    "query": keyword,
-                    "relevance_score": round(score, 3),
-                    "alt": photo.get("alt", ""),
-                    "url": photo["url"],
-                    "image_url": photo["src"]["large2x"],
-                    "width": photo["width"],
-                    "height": photo["height"],
-                    "photographer": photo["photographer"]
-                })
+                for photo in candidates:
+                    score = keyword_score(keyword, photo.get("alt", ""))
 
-                if len(photos) >= 3:
-                    break
+                    if score < 0.2:
+                        continue
 
-    except Exception as e:
-        print(f"[Pexels] photo search failed: {e}")
+                    photos.append({
+                        "id": photo["id"],
+                        "type": "photo",
+                        "query": keyword,
+                        "relevance_score": round(score, 3),
+                        "alt": photo.get("alt", ""),
+                        "url": photo["url"],
+                        "image_url": photo["src"]["large2x"],
+                        "width": photo["width"],
+                        "height": photo["height"],
+                        "photographer": photo["photographer"]
+                    })
+
+                    if len(photos) >= 3:
+                        break
+
+        except Exception as e:
+            print(f"[Pexels] photo search failed: {e}")
 
     try:
         video_response = requests.get(
@@ -10467,7 +10544,7 @@ def search_pexel_media(keywords: str):
             params={
                 "query": keyword,
                 "orientation": "landscape",
-                "per_page": 10
+                "per_page": 4
             },
             timeout=10
         )
@@ -10778,8 +10855,6 @@ INDIAN_REGIONAL_LANGUAGES_CODE = [
 ]
 
 
-
-
 async def get_beats_for_scene_chunks(scene_text, chunks):
     last = len(chunks) - 1
 
@@ -10906,8 +10981,6 @@ def load_user_reference_voice(user_id: str, lang_code: str):
             os.remove(ref_path)
 
     return reference_audio, reference_text
-
-
 
 
 
@@ -11261,6 +11334,337 @@ async def _edit_video_impl(body: Editvideo):
 
     except Exception as e:
         print(e)
+
+
+
+
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
